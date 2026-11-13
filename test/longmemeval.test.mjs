@@ -19,9 +19,9 @@ async function toolsFor(prepared) {
     await drive.remember({ mems: prepared.mems });
     return createTools({ drive });
 }
-const response = (content, calls) => ({ choices: [{ finish_reason: calls ? 'tool_calls' : 'stop',
-    message: { role: 'assistant', content, ...(calls ? { tool_calls: calls } : {}) } }] });
-const call = (id, name, args) => ({ id, type: 'function', function: { name, arguments: JSON.stringify(args) } });
+const response = (text, calls) => ({ status: 'completed', output: calls
+    ?? [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] }] });
+const call = (id, name, args) => ({ id: 'item-' + id, call_id: id, type: 'function_call', name, arguments: JSON.stringify(args) });
 
 test('tool schema comparison ignores only enum ordering and retains actual schema changes', () => {
     const definitions = [{ name: 'test', inputSchema: { enum: ['b', 'a'], oneOf: [{ const: 2 }, { const: 1 }] }, outputSchema: {} }];
@@ -49,10 +49,17 @@ test('public tools collect only delivered source spans and pack them within a co
     const prepared = prepareCase(row(), config), tools = await toolsFor(prepared);
     const original = prepared.mems[0];
     let round = 0;
+    const reasoning = { type: 'reasoning', id: 'reasoning-1', encrypted_content: 'opaque-test-state', summary: [] };
+    const commentary = { type: 'message', id: 'commentary-1', role: 'assistant', status: 'completed', phase: 'commentary',
+        content: [{ type: 'output_text', text: 'Searching the archive.', annotations: [] }] };
     const collected = await collectEvidence({ mode: 'agentic', tools, prepared, config, countTokens: textCount,
         ask: async request => {
-            assert(request.tools.every(tool => !tool.function.name.includes('remember')));
-            if (round++ === 0) return response(null, [call('r', 'memdrive_recall', { requests: [{ query: 'key' }] })]);
+            assert(request.tools.every(tool => !tool.name.includes('remember') && tool.strict === false));
+            assert.equal(request.store, false); assert.deepEqual(request.include, ['reasoning.encrypted_content']);
+            assert.equal(request.reasoning.effort, 'low'); assert.equal(request.max_output_tokens, 4096);
+            if (round++ === 0) return response(null, [reasoning, commentary, call('r', 'memdrive_recall', { requests: [{ query: 'key' }] })]);
+            assert.deepEqual(request.input.slice(2, 4), [reasoning, commentary]);
+            assert.equal(request.input[5].type, 'function_call_output'); assert.equal(request.input[5].call_id, 'r');
             if (round === 2) return response(null, [call('read', 'memdrive_read', { ids: [original.id] })]);
             return response(JSON.stringify({ evidence: [{ memId: original.id }] }));
         } });
@@ -67,6 +74,18 @@ test('public tools collect only delivered source spans and pack them within a co
         ask: async () => response(JSON.stringify({ evidence: [{ memId: original.id }] })) }), /not delivered/);
 });
 
+test('Responses collector rejects incomplete generation and duplicate call IDs without retry', async () => {
+    const prepared = prepareCase(row(), config), tools = await toolsFor(prepared);
+    let asked = 0, executed = 0;
+    const tracked = { definitions: tools.definitions, execute: async (...args) => { executed++; return tools.execute(...args); } };
+    await assert.rejects(collectEvidence({ mode: 'agentic', tools: tracked, prepared, config, countTokens: textCount,
+        ask: async () => { asked++; return { ...response('{"evidence":[]}'), status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } }; } }), /incomplete/);
+    assert.equal(asked, 1); assert.equal(executed, 0);
+    await assert.rejects(collectEvidence({ mode: 'agentic', tools: tracked, prepared, config, countTokens: textCount,
+        ask: async () => response(null, [call('same', 'memdrive_read', { ids: [prepared.mems[0].id] })]) }), /Invalid tool call ID/);
+    assert.equal(executed, 1);
+});
+
 test('oversized read becomes an explicit undelivered tool error without fabricated evidence', async () => {
     const input = row(); input.haystack_sessions[0][0].content = 'Cedar '.repeat(500);
     const prepared = prepareCase(input, config), tools = await toolsFor(prepared);
@@ -75,7 +94,7 @@ test('oversized read becomes an explicit undelivered tool error without fabricat
     const collected = await collectEvidence({ mode: 'agentic', tools, prepared, config: limited, countTokens: textCount,
         ask: async request => {
             if (round++ === 0) return response(null, [call('read', 'memdrive_read', { ids: [prepared.mems[0].id] })]);
-            assert.equal(JSON.parse(request.messages.at(-1).content).error.code, 'BENCHMARK_RESULT_LIMIT');
+            assert.equal(JSON.parse(request.input.at(-1).output).error.code, 'BENCHMARK_RESULT_LIMIT');
             return response('{"evidence":[]}');
         } });
     assert.equal(collected.retrieved.length, 1); assert.equal(collected.delivered.length, 0);
@@ -180,6 +199,25 @@ test('model mismatch retains known usage and interrupted requests are never retr
         await atomic(file, { binding: 'test', requestHash: jsonHash(receipt), request: receipt, status: 'pending' });
         await assert.rejects(journal.request({ file, url: config.modelEndpoint, body: {}, key: keys.modelKey, kind: 'collector' }), /interrupted/);
         assert.equal(calls, 1);
+    } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('Responses journal reserves output budget and records native usage before incomplete handling', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'memdrive-lme-responses-'));
+    try {
+        const q = state(); let requests = 0;
+        const request = { model: config.model.model, max_output_tokens: 4096, input: [], reasoning: { effort: 'low' } };
+        const fetcher = async (url, options) => {
+            requests++; assert.equal(url, config.collectorEndpoint); assert.deepEqual(JSON.parse(options.body), request);
+            return new Response(JSON.stringify({ model: config.model.model, status: 'incomplete', output: [],
+                usage: { input_tokens: 20, output_tokens: 12, output_tokens_details: { reasoning_tokens: 8 } } }), { status: 200 });
+        };
+        const journal = new Journal({ root, config, binding: 'test', credentials: keys, state: q, save: async () => {}, fetcher });
+        assert.equal((await journal.model('collector', request, 'collector-0.json')).status, 'incomplete');
+        assert.equal(q.modelTokens, 32); assert.equal(q.models.collector.outputTokens, 12); assert.equal(q.models.collector.unknownUsageCalls, 0);
+        journal.config = { ...config, limits: { ...config.limits, modelTokensPerQuestion: 32 } };
+        await assert.rejects(journal.model('collector', request, 'collector-1.json'), /budget/);
+        assert.equal(requests, 1); assert.equal(q.models.collector.calls, 1);
     } finally { await rm(root, { recursive: true, force: true }); }
 });
 

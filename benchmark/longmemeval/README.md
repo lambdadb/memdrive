@@ -19,8 +19,9 @@ be relabelled as MemDrive results.
 
 ## Ingest once
 
-Use Node.js 20.12+ from the repository root. The live workflow is implemented but
-has not been qualified against a live database or model provider.
+Use Node.js 20.12+ from the repository root. Live three-question smoke checks
+exercise ingestion and single-pass retrieval; they do not establish full-cohort
+quality or model-provider compatibility for every configuration.
 
 ```sh
 npm ci
@@ -109,6 +110,15 @@ Environment variables (or an untracked env file):
 
 Endpoints, historical model IDs, prompts and limits are configured in
 `config.json`; offline checks do not establish provider/model availability.
+The collector uses the OpenAI Responses API with the configured reasoning effort,
+`store: false`, explicit non-strict function schemas, and unchanged opaque reasoning
+items carried into the next request. Answer generation uses Chat Completions
+without tools. This separation preserves `gpt-6.1-sol` with low reasoning: live
+Chat Completions rejected that combination when function tools were included.
+Incomplete collector responses remain failed attempts with recorded usage; no
+automatic fallback to another model, reasoning effort or API is performed.
+See the [official Responses migration guide](https://developers.openai.com/api/docs/guides/migrate-to-responses)
+and [reasoning-item guidance](https://developers.openai.com/api/docs/guides/reasoning).
 Judging uses the retained Jev Noul task-specific rules and a 0.5 threshold, not a
 claim of equivalence with the upstream GPT-4o evaluator.
 

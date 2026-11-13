@@ -13,8 +13,8 @@ export function canonicalToolDefinitions(definitions) {
 
 export function modelTools(definitions) {
     assert(definitions.every(tool => tool.annotations.readOnlyHint && !tool.annotations.destructiveHint), 'Only read-only tools are allowed');
-    return definitions.map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description,
-        parameters: tool.inputSchema } }));
+    return definitions.map(tool => ({ type: 'function', name: tool.name, description: tool.description,
+        parameters: tool.inputSchema, strict: false }));
 }
 const unique = spans => [...new Map(spans.map(span => [spanKey(span), span])).values()];
 
@@ -45,32 +45,39 @@ export async function collectEvidence({ mode, tools, prepared, config, countToke
         assert(trace[0].delivered.ok, 'Single-pass result exceeds delivery budget');
         return { trace, retrieved: unique(retrieved), delivered: unique(delivered), selected: unique(delivered), rounds: 0 };
     }
-    const messages = [{ role: 'system', content: config.prompts.collect },
+    assert.equal(config.collectorTransport, 'openai-responses');
+    const input = [{ role: 'system', content: config.prompts.collect },
         { role: 'user', content: JSON.stringify(context(prepared)) }];
     const definitions = modelTools(tools.definitions), ids = new Set();
     for (let round = 0; round < config.limits.rounds; round++) {
-        const request = { ...config.model, messages: structuredClone(messages), tools: definitions, parallel_tool_calls: false };
-        assert(countTokens(JSON.stringify(request)) + config.model.max_completion_tokens <= config.limits.contextTokens,
+        const request = { model: config.model.model, reasoning: { effort: config.model.reasoning_effort },
+            max_output_tokens: config.model.max_completion_tokens, store: false, include: ['reasoning.encrypted_content'],
+            input: structuredClone(input), tools: definitions, parallel_tool_calls: false };
+        assert(countTokens(JSON.stringify(request)) + request.max_output_tokens <= config.limits.contextTokens,
             'Agent context budget exhausted');
         const response = await ask(request, round);
-        const choice = response.choices?.[0], message = choice?.message;
-        assert(message?.role === 'assistant', 'Expected assistant response');
-        if (choice.finish_reason === 'stop') {
-            assert(!message.tool_calls?.length && typeof message.content === 'string');
-            const selected = selectEvidence(JSON.parse(message.content), delivered);
+        assert.equal(response.status, 'completed', 'Collector response incomplete or failed');
+        assert(Array.isArray(response.output) && response.output.every(item => ['reasoning', 'function_call', 'message'].includes(item.type)),
+            'Unexpected collector output item');
+        const toolCalls = response.output.filter(item => item.type === 'function_call');
+        if (!toolCalls.length) {
+            const messages = response.output.filter(item => item.type === 'message' && item.phase !== 'commentary');
+            assert(messages.length && messages.every(item => item.role === 'assistant' && item.status === 'completed'
+                && Array.isArray(item.content) && item.content.every(part => part.type === 'output_text')), 'Collector did not return final text');
+            const text = messages.flatMap(item => item.content.map(part => part.text)).join('');
+            const selected = selectEvidence(JSON.parse(text), delivered);
             return { trace, retrieved: unique(retrieved), delivered: unique(delivered), selected, rounds: round + 1 };
         }
-        assert(choice.finish_reason === 'tool_calls' && Array.isArray(message.tool_calls) && message.tool_calls.length > 0,
-            'Collector did not finish or call a tool');
-        assert(calls + message.tool_calls.length <= config.limits.toolCalls, 'Tool-call budget exhausted');
-        messages.push({ role: 'assistant', content: message.content ?? null, tool_calls: message.tool_calls });
-        for (const call of message.tool_calls) {
-            assert(call.type === 'function' && typeof call.id === 'string' && call.id.length && !ids.has(call.id), 'Invalid tool call ID');
-            ids.add(call.id);
-            assert(typeof call.function?.name === 'string' && typeof call.function.arguments === 'string');
+        assert(calls + toolCalls.length <= config.limits.toolCalls, 'Tool-call budget exhausted');
+        // Preserve opaque reasoning and message phase fields exactly for stateless continuation.
+        input.push(...structuredClone(response.output));
+        for (const call of toolCalls) {
+            assert(typeof call.call_id === 'string' && call.call_id.length && !ids.has(call.call_id), 'Invalid tool call ID');
+            ids.add(call.call_id);
+            assert(typeof call.name === 'string' && typeof call.arguments === 'string');
             // Invalid model JSON is a recorded protocol failure, never silently repaired.
-            const result = await execute(call.function.name, JSON.parse(call.function.arguments), call.id);
-            messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result) });
+            const result = await execute(call.name, JSON.parse(call.arguments), call.call_id);
+            input.push({ type: 'function_call_output', call_id: call.call_id, output: JSON.stringify(result) });
         }
     }
     throw new Error('Agent round budget exhausted before evidence selection');

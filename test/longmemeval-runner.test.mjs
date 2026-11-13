@@ -35,8 +35,8 @@ test('reusable corpus grows once, serves both retrieval modes and verifies after
                 let message = { role: 'assistant', content: 'cedar' }, finish_reason = 'stop';
                 if (request.tools && emptySelection) message.content = JSON.stringify({ evidence: [] });
                 else if (request.tools) {
-                    const outputs = request.messages.filter(message => message.role === 'tool');
-                    const tool = outputs.find(message => JSON.parse(message.content).value?.results);
+                    const outputs = request.input.filter(item => item.type === 'function_call_output');
+                    const tool = outputs.find(item => JSON.parse(item.output).value?.results);
                     if (!tool) {
                         const step = outputs.length, name = step < 3 ? 'memdrive_count_values' : 'memdrive_recall';
                         const args = step < 3 ? { fields: ['metadata.role'] } : { requests: [{ query: 'key' }] };
@@ -44,9 +44,19 @@ test('reusable corpus grows once, serves both retrieval modes and verifies after
                         message = { role: 'assistant', content: null, tool_calls: [{ id: 'search-' + step, type: 'function', function: { name, arguments: JSON.stringify(args) } }] };
                         finish_reason = 'tool_calls';
                     } else {
-                        const match = JSON.parse(tool.content).value.results[0].matches[0];
+                        const match = JSON.parse(tool.output).value.results[0].matches[0];
                         message.content = JSON.stringify({ evidence: [{ memId: match.memId, start: match.start, end: match.end }] });
                     }
+                }
+                if (request.tools) {
+                    assert.equal(url, config.collectorEndpoint); assert.equal(request.store, false);
+                    const output = [{ type: 'reasoning', id: 'reason-' + modelCalls, encrypted_content: 'opaque-test-state', summary: [] },
+                        ...(message.tool_calls?.map(call => ({ type: 'function_call', id: 'item-' + call.id, call_id: call.id,
+                            name: call.function.name, arguments: call.function.arguments }))
+                            ?? [{ type: 'message', id: 'message-' + modelCalls, role: 'assistant', status: 'completed', phase: 'final_answer',
+                                content: [{ type: 'output_text', text: message.content, annotations: [] }] }])];
+                    return new Response(JSON.stringify({ model: request.model, status: 'completed', output,
+                        usage: { input_tokens: 100, output_tokens: 20 } }), { status: 200 });
                 }
                 return new Response(JSON.stringify({ model: request.model, choices: [{ message, finish_reason }], usage: { prompt_tokens: 100, completion_tokens: 20 } }), { status: 200 });
             };

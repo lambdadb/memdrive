@@ -253,13 +253,14 @@ export async function verify(root) {
                 const receipt = await readJSON(path.join(qroot, filename)); validateReceipt(receipt, binding);
                 modelReceipts.set(filename, receipt);
                 const kind = receipt.request.kind; assert.equal(kind, filename.startsWith('collector-') ? 'collector' : filename.slice(0, -5));
-                assert.equal(receipt.request.url, kind === 'judge' ? config.judge.endpoint : config.modelEndpoint);
+                assert.equal(receipt.request.url, kind === 'judge' ? config.judge.endpoint
+                    : kind === 'collector' ? config.collectorEndpoint : config.modelEndpoint);
                 const usage = models[kind] ??= { calls: 0, inputTokens: 0, outputTokens: 0, unknownUsageCalls: 0, milliseconds: 0 };
                 usage.calls++; usage.unknownUsageCalls++; usage.milliseconds += receipt.status === 'complete' ? receipt.milliseconds : 0;
                 if (receipt.status === 'complete' && receipt.httpStatus === 200) {
                     let response; try { response = JSON.parse(receipt.raw); } catch { assert.equal(q.status, 'failed'); }
-                    const input = response?.usage?.[kind === 'judge' ? 'input_tokens' : 'prompt_tokens'];
-                    const output = response?.usage?.[kind === 'judge' ? 'output_tokens' : 'completion_tokens'];
+                    const input = response?.usage?.[kind === 'answer' ? 'prompt_tokens' : 'input_tokens'];
+                    const output = response?.usage?.[kind === 'answer' ? 'completion_tokens' : 'output_tokens'];
                     if (integer(input) && (kind === 'judge' || integer(output))) {
                         usage.unknownUsageCalls--; usage.inputTokens += input;
                         usage.outputTokens = integer(output) && usage.outputTokens !== null ? usage.outputTokens + output : null;

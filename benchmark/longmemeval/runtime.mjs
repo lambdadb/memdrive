@@ -80,21 +80,23 @@ export class Journal {
         if (!isJudge && !await exists(file)) {
             const encoder = get_encoding('cl100k_base');
             try {
-                const reservation = encoder.encode(JSON.stringify(request), [], []).length + request.max_completion_tokens;
+                const reservation = encoder.encode(JSON.stringify(request), [], []).length
+                    + (kind === 'collector' ? request.max_output_tokens : request.max_completion_tokens);
                 assert(reservation <= this.config.limits.contextTokens, 'Model context budget exhausted');
                 assert(this.state.modelTokens + reservation <= this.config.limits.modelTokensPerQuestion, 'Model token budget exhausted before request');
             } finally { encoder.free(); }
         }
         const usage = this.state.models[kind] ??= { calls: 0, inputTokens: 0, outputTokens: 0, unknownUsageCalls: 0, milliseconds: 0 };
         usage.calls++; usage.unknownUsageCalls++; await this.save();
-        const receipt = await this.request({ file, url: isJudge ? this.config.judge.endpoint : this.config.modelEndpoint,
+        const receipt = await this.request({ file, url: isJudge ? this.config.judge.endpoint
+            : kind === 'collector' ? this.config.collectorEndpoint : this.config.modelEndpoint,
             body: request, key: isJudge ? this.keys.judgeKey : this.keys.modelKey, kind });
         usage.milliseconds += receipt.milliseconds;
         await this.save();
         assert.equal(receipt.httpStatus, 200, `${kind} service returned HTTP ${receipt.httpStatus}`);
         const response = JSON.parse(receipt.raw);
-        const input = response.usage?.[isJudge ? 'input_tokens' : 'prompt_tokens'];
-        const output = response.usage?.[isJudge ? 'output_tokens' : 'completion_tokens'];
+        const input = response.usage?.[kind === 'answer' ? 'prompt_tokens' : 'input_tokens'];
+        const output = response.usage?.[kind === 'answer' ? 'completion_tokens' : 'output_tokens'];
         if (integer(input) && (isJudge || integer(output))) {
             usage.unknownUsageCalls--; usage.inputTokens += input;
             usage.outputTokens = integer(output) && usage.outputTokens !== null ? usage.outputTokens + output : null;
