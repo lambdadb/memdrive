@@ -157,7 +157,9 @@ export async function ingest(journal, prepared, entry, profile = storageProfile(
         description: 'Reusable LongMemEval conversation history.', labels: { 'eval.owner': entry.owner, 'eval.scope': entry.scope },
         embedding: { mode: 'managed' }, textSearch: profile.textSearch }, { signal: journal.signal });
     validateDescriptor(await drive.describe({ signal: journal.signal }), entry, profile);
-    if (prepared.mems.length) await drive.remember({ mems: prepared.mems }, { signal: journal.signal });
+    // Bound the number of originals in each managed-embedding request.
+    for (let index = 0; index < prepared.mems.length; index += 20)
+        await drive.remember({ mems: prepared.mems.slice(index, index + 20) }, { signal: journal.signal });
     await validateOriginals(drive, journal, prepared);
     return createTools({ drive }, { signal: journal.signal });
 }

@@ -117,6 +117,32 @@ test('native SDK ingestion/readback/tool execution and owned cleanup record repl
     } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test('ingestion batches originals and stops without retrying an uncertain batch', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'memdrive-lme-batches-'));
+    try {
+        const original = prepareCase(row(), config).mems[0];
+        const prepared = { mems: Array.from({ length: 41 }, (_, index) => ({ ...original, id: 'original-' + index })) };
+        const entry = { collection: 'mdlme_' + 'a'.repeat(24), owner: 'b'.repeat(64), scope: 'c'.repeat(64), absent: false };
+        for (const fail of [false, true]) {
+            const wire = nativeFixture(), q = state(); let attempts = 0;
+            const journal = new Journal({ root: path.join(root, String(fail)), config, binding: 'test', credentials: keys, state: q,
+                save: async () => {}, fetcher: async (url, options) => {
+                    if (url.endsWith('/docs/upsert') && ++attempts === 2 && fail) throw new Error('Uncertain batch');
+                    return wire.fetcher(url, options);
+                } });
+            if (fail) await assert.rejects(ingest(journal, prepared, entry), /write failed/);
+            else await ingest(journal, prepared, entry);
+            assert.equal(attempts, fail ? 2 : 3);
+            const writes = wire.requests.filter(request => request.pathname.endsWith('/docs/upsert'));
+            const originals = writes.map(request => request.body.docs.filter(doc => doc.kind === 'mem'));
+            assert.deepEqual(originals.map(batch => batch.length), fail ? [20] : [20, 20, 1]);
+            assert.deepEqual(originals.flat().map(doc => doc.memId), prepared.mems.slice(0, fail ? 20 : 41).map(mem => mem.id));
+            assert.equal(wire.collections.size, 1); assert(!wire.requests.some(request => request.method === 'DELETE'));
+            if (fail) assert.equal((await readJSON(path.join(journal.root, 'database', q.receiptNumber + '.json'))).status, 'uncertain');
+        }
+    } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('budgets reject before dispatch and leave receipt counters consistent', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'memdrive-lme-budget-'));
     try {

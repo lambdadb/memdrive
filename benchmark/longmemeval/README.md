@@ -37,6 +37,9 @@ sorted IDs (default 10), verifies original readback, then marks each entry ready
 A matching ready entry is skipped without create, upsert, embedding or any other
 native request. To grow the same corpus, run `ingest --limit 500`; the first ten
 ready collections are preserved and only missing entries are created.
+Ingestion submits at most 20 originals per public `remember()` call to bound
+managed-embedding request size. A failed batch stops ingestion without retrying
+or deleting the possibly accepted data; retain its receipts for inspection.
 
 The immutable `corpus.json` binds the dataset, archived-original hashes, metadata
 schema, managed embedding configuration, analyzers and per-question ownership.
