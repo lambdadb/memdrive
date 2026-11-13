@@ -8,8 +8,31 @@ LambdaDB client; the caller owns connection credentials and transport.
 
 The package is `@functional-systems/memdrive`, licensed under Apache-2.0.
 It builds ESM and CommonJS with TypeScript declarations and supports Node.js
-20.12+ and browser bundlers. Install this stable release and the LambdaDB client
-used to initialize it:
+20.12+ and browser bundlers.
+
+## Quick start
+
+### 1. Set up LambdaDB
+
+1. [Create a LambdaDB account](https://app.lambdadb.ai/auth/signup), or sign in
+   to [LambdaDB Cloud](https://app.lambdadb.ai) if you already have one.
+2. Create a project and choose an AWS region for your data.
+3. Open the project's **API Keys** tab, select **Create key** (or
+   **Create your first key**), enter a name, and create the key. Creating a
+   project does not automatically issue an API key.
+4. Save the key securely when it appears; the full value is shown only once.
+   Copy the project's region-specific **base URL** and **project name** from
+   the console as well.
+
+In the example below, use the base URL as `baseUrl`, the project name as
+`projectName`, and the API key as `projectApiKey`. Keep the API key out of source
+control and load it from your application's secret configuration. See the
+[LambdaDB setup guide](https://docs.lambdadb.ai/guides/get-started/quickstart)
+for account setup and API key management details.
+
+### 2. Install the packages
+
+Install this stable release and the LambdaDB client used to initialize it:
 
 ```sh
 npm install @functional-systems/memdrive@0.1.0 @functional-systems/lambdadb@0.12.0
@@ -18,10 +41,12 @@ npm install @functional-systems/memdrive@0.1.0 @functional-systems/lambdadb@0.12
 An unqualified install follows the stable `latest` channel. Use `@rc` to follow
 release candidates, `@dev` for development builds, or an exact version for
 reproducibility.
-To build locally, run `npm ci`, `npm run build`, and `npm pack`, then install the
-resulting tarball in the consumer project. See [CONTRIBUTING.md](CONTRIBUTING.md)
-for development and
-[RELEASING.md](RELEASING.md) for the release policy.
+
+### 3. Store and recall a memory
+
+Replace the connection placeholders below with your project's values.
+The `create` call sets up the MemDrive collection; no manual collection setup
+is needed in the console.
 
 ```ts
 import { LambdaDBClient } from '@functional-systems/lambdadb';
@@ -231,3 +256,9 @@ orchestration and final prompt assembly. The standalone API no longer accepts
 `mode` or `agent`; consumers of the earlier prototype must remove those options
 and move any agent loop to the application. SDK unit and package checks do not establish
 benchmark answer quality or live service compatibility.
+
+## Development
+
+To build locally, run `npm ci`, `npm run build`, and `npm pack`, then install the
+resulting tarball in the consumer project. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for development and [RELEASING.md](RELEASING.md) for the release policy.
