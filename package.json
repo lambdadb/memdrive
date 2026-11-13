@@ -1,6 +1,6 @@
 {
   "name": "@functional-systems/memdrive",
-  "version": "0.1.0",
+  "version": "0.1.0-rc.1",
   "description": "Source-linked memory storage and retrieval backed by LambdaDB.",
   "type": "module",
   "engines": {
