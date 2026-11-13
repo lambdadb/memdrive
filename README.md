@@ -204,6 +204,14 @@ A hosted MCP service can expose these SDK operations and supply tool description
 and protocol handling. The service or calling agent owns orchestration; MemDrive
 has no model-specific tool schemas, short evidence aliases or finish/report tool.
 
+## Agent tools
+
+Import `createTools` from `@functional-systems/memdrive/tools` to expose portable
+memory operations to a calling agent. The common layer provides JSON Schema input
+and output definitions, descriptions, effect annotations and SDK execution. It
+contains no internal agent loop or MCP server. See [the tool contract](docs/tools.md)
+for the catalog, branch binding, write opt-in, error outcomes and direct/MCP mapping.
+
 ## Consumers
 
 The prototype was exercised by BEAM, LongMemEval and SillyMemory integrations.

@@ -9,6 +9,7 @@ test('browser bundle executes managed and supplied-vector storage without Node g
     const result = await build({ absWorkingDir: fileURLToPath(new URL('..', import.meta.url)),
         stdin: { resolveDir: fileURLToPath(new URL('..', import.meta.url)), contents: `
             import { create, open } from './dist/esm/index.js';
+            import { createTools } from './dist/esm/tools/index.js';
             import { memdriveClient } from './test/helpers/memdrive-client.mjs';
             globalThis.smoke = async () => {
                 const f = memdriveClient();
@@ -26,7 +27,9 @@ test('browser bundle executes managed and supplied-vector storage without Node g
                 const originals = await managed.read({ ids: ['short', 'long'] });
                 f.search = (_request, docs) => docs.filter(doc => doc.memId === 'short');
                 const unranked = await managed.recall({ query: 'short original', rerank: false });
-                return JSON.stringify({ embedding: reopened.embedding, recall, read, originals, unranked,
+                const tools = await createTools({ drive: managed });
+                const toolRead = await tools.execute('memdrive_read', { ids: ['short'] });
+                return JSON.stringify({ embedding: reopened.embedding, recall, read, originals, unranked, toolRead,
                     rerankSent: Object.hasOwn(f.calls.findLast(call => call.kind === 'query').request, 'rerank'),
                     writes: f.calls.filter(call => call.kind === 'upsert').map(call => ({ name: call.name, count: call.request.docs.length })) });
             };`, loader: 'js' }, bundle: true, platform: 'browser', format: 'iife', write: false });
@@ -44,5 +47,6 @@ test('browser bundle executes managed and supplied-vector storage without Node g
     assert.equal(actual.rerankSent, false);
     assert.equal(actual.unranked.matches.length, 1);
     assert.equal(actual.unranked.matches[0].memId, 'short');
+    assert.deepEqual(actual.toolRead, { ok: true, value: { mems: [{ id: 'short', content: 'A short original.' }] } });
     assert.deepEqual(actual.writes, [{ name: 'external', count: 2 }, { name: 'managed', count: 4 }]);
 });

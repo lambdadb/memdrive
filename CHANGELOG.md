@@ -9,3 +9,5 @@
 
 - Remove internal agent orchestration and retrieval modes; callers own repeated searches and evidence selection.
 - Expose branch-aware keyword distributions through `countValues`; retain `describe` as the sole schema inspection API.
+
+- Add portable memory tools with JSON Schema contracts, effect annotations, branch binding and optional writes under the `tools` export.

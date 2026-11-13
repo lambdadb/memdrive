@@ -16,10 +16,11 @@ try {
     const [archive] = JSON.parse(run('npm', ['pack', '--json', '--pack-destination', temporary], root));
     const paths = new Set(archive.files.map(file => file.path));
     for (const path of ['package.json', 'README.md', 'CHANGELOG.md', 'LICENSE', 'dist/esm/index.js',
-        'dist/esm/index.d.ts', 'dist/commonjs/index.js', 'dist/commonjs/index.d.ts'])
+        'dist/esm/index.d.ts', 'dist/commonjs/index.js', 'dist/commonjs/index.d.ts', 'docs/tools.md',
+        'dist/esm/tools/index.js', 'dist/esm/tools/index.d.ts', 'dist/commonjs/tools/index.js', 'dist/commonjs/tools/index.d.ts'])
         assert(paths.has(path), `Package is missing ${path}`);
     for (const path of paths)
-        assert(/^(?:dist\/|src\/|package\.json$|README\.md$|CHANGELOG\.md$|LICENSE$|NOTICE$)/.test(path),
+        assert(/^(?:dist\/|src\/|docs\/tools\.md$|package\.json$|README\.md$|CHANGELOG\.md$|LICENSE$|NOTICE$)/.test(path),
             `Unexpected package file: ${path}`);
     writeFileSync(join(temporary, 'package.json'), JSON.stringify({ private: true, type: 'module' }));
     // npm ci has already cached the dependency tree. The consumer check needs no registry access.
@@ -29,12 +30,15 @@ try {
     }`;
     run(process.execPath, ['--input-type=module', '-e', `import * as sdk from ${JSON.stringify(pkg.name)}; ${assertion}`]);
     run(process.execPath, ['--input-type=commonjs', '-e', `const sdk = require(${JSON.stringify(pkg.name)}); ${assertion}`]);
+    const toolAssertion = `if (typeof createTools !== 'function') throw new Error('Missing createTools export');`;
+    run(process.execPath, ['--input-type=module', '-e', `import { createTools } from ${JSON.stringify(`${pkg.name}/tools`)}; ${toolAssertion}`]);
+    run(process.execPath, ['--input-type=commonjs', '-e', `const { createTools } = require(${JSON.stringify(`${pkg.name}/tools`)}); ${toolAssertion}`]);
     for (const file of readdirSync(join(root, 'test/types')).filter(file => /\.(?:mts|cts|ts)$/.test(file)))
         copyFileSync(join(root, 'test/types', file), join(temporary, file));
     copyFileSync(join(root, 'test/types/tsconfig.json'), join(temporary, 'tsconfig.json'));
     run(process.execPath, [resolve(root, 'node_modules/typescript/bin/tsc'), '-p', join(temporary, 'tsconfig.json')]);
     await build({
-        stdin: { contents: `export { create, open, list } from ${JSON.stringify(pkg.name)};`,
+        stdin: { contents: `export { create, open, list } from ${JSON.stringify(pkg.name)}; export { createTools } from ${JSON.stringify(`${pkg.name}/tools`)};`,
             resolveDir: temporary, sourcefile: 'consumer.js' },
         bundle: true, platform: 'browser', format: 'esm', target: 'es2022', write: false,
     });
