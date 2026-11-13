@@ -9,7 +9,7 @@ import { createTools } from '@functional-systems/memdrive/tools';
 import { memdriveClient } from './helpers/memdrive-client.mjs';
 import { prepareCase, timestamp, metadataSchema, packEvidence, evidenceMetrics, validateSpan, jsonHash } from '../benchmark/longmemeval/protocol.mjs';
 import { collectEvidence } from '../benchmark/longmemeval/agent.mjs';
-import { Journal, ingest, cleanup, readJSON } from '../benchmark/longmemeval/runtime.mjs';
+import { Journal, ingest, reuse, cleanup, readJSON } from '../benchmark/longmemeval/runtime.mjs';
 const config = JSON.parse(await readFile(new URL('../benchmark/longmemeval/config.json', import.meta.url)));
 
 const textCount = text => text.length;
@@ -38,7 +38,7 @@ test('public tools collect only delivered source spans and pack them within a co
     const prepared = prepareCase(row(), config), tools = await toolsFor(prepared);
     const original = prepared.mems[0];
     let round = 0;
-    const collected = await collectEvidence({ mode: 'tools', tools, prepared, config, countTokens: textCount,
+    const collected = await collectEvidence({ mode: 'agentic', tools, prepared, config, countTokens: textCount,
         ask: async request => {
             assert(request.tools.every(tool => !tool.function.name.includes('remember')));
             if (round++ === 0) return response(null, [call('r', 'memdrive_recall', { requests: [{ query: 'key' }] })]);
@@ -52,7 +52,7 @@ test('public tools collect only delivered source spans and pack them within a co
     assert.equal(metrics.stages.packed.archived.fullTurnRecall, 1);
     const small = { ...config, retrieval: { ...config.retrieval, memoryTokens: 10 } };
     assert.equal(packEvidence(prepared, collected.selected, small, textCount).spans.length, 0);
-    await assert.rejects(collectEvidence({ mode: 'tools', tools, prepared, config, countTokens: textCount,
+    await assert.rejects(collectEvidence({ mode: 'agentic', tools, prepared, config, countTokens: textCount,
         ask: async () => response(JSON.stringify({ evidence: [{ memId: original.id }] })) }), /not delivered/);
 });
 
@@ -61,7 +61,7 @@ test('oversized read becomes an explicit undelivered tool error without fabricat
     const prepared = prepareCase(input, config), tools = await toolsFor(prepared);
     const limited = { ...config, limits: { ...config.limits, toolResultTokens: 1600 } };
     let round = 0;
-    const collected = await collectEvidence({ mode: 'tools', tools, prepared, config: limited, countTokens: textCount,
+    const collected = await collectEvidence({ mode: 'agentic', tools, prepared, config: limited, countTokens: textCount,
         ask: async request => {
             if (round++ === 0) return response(null, [call('read', 'memdrive_read', { ids: [prepared.mems[0].id] })]);
             assert.equal(JSON.parse(request.messages.at(-1).content).error.code, 'BENCHMARK_RESULT_LIMIT');
@@ -95,15 +95,22 @@ test('native SDK ingestion/readback/tool execution and owned cleanup record repl
         const entry = { collection: 'mdlme_' + 'a'.repeat(24), owner: 'b'.repeat(64), scope: 'c'.repeat(64), absent: false };
         const journal = new Journal({ root, config, binding: 'test', credentials: keys, state: q, save: async () => {}, fetcher: wire.fetcher });
         const tools = await ingest(journal, prepared, entry);
-        const result = await collectEvidence({ mode: 'single', tools, prepared, config, countTokens: textCount });
+        const result = await collectEvidence({ mode: 'single_pass', tools, prepared, config, countTokens: textCount });
         assert.equal(result.selected.length, 2);
+        const beforeReuse = wire.requests.length;
+        const reused = await collectEvidence({ mode: 'single_pass', tools: await reuse(journal, prepared, entry), prepared, config, countTokens: textCount });
+        assert.deepEqual(reused.selected, result.selected);
+        assert(wire.requests.slice(beforeReuse).every(request => request.method !== 'DELETE'
+            && !request.pathname.endsWith('/collections') && !request.pathname.endsWith('/docs/upsert')));
         await cleanup(journal, entry); assert(entry.absent); assert.equal(wire.collection, undefined);
         const replayState = state();
         const replay = new Journal({ root, config, binding: 'test', credentials: keys, state: replayState, save: async () => {}, replay: true,
             fetcher: async () => { throw new Error('Network forbidden'); } });
         const replayTools = await ingest(replay, prepared, entry);
-        const repeated = await collectEvidence({ mode: 'single', tools: replayTools, prepared, config, countTokens: textCount });
+        const repeated = await collectEvidence({ mode: 'single_pass', tools: replayTools, prepared, config, countTokens: textCount });
         assert.deepEqual(repeated.selected, result.selected);
+        const replayedReuse = await collectEvidence({ mode: 'single_pass', tools: await reuse(replay, prepared, entry), prepared, config, countTokens: textCount });
+        assert.deepEqual(replayedReuse.selected, reused.selected);
         await cleanup(replay, { ...entry, absent: false });
         assert.equal(q.receiptNumber, replayState.receiptNumber);
         for (let i = 1; i <= q.receiptNumber; i++) assert(!JSON.stringify(await readJSON(path.join(root, `database/${i}.json`))).includes(keys.databaseKey));

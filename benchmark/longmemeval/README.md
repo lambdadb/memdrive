@@ -1,179 +1,224 @@
 # LongMemEval-S with MemDrive
 
-This runner measures whether a model can use the public MemDrive tools to find
-conversation evidence. It has two modes, using the same final answer and judge:
+Ingest a reusable corpus once, then run independent retrieval experiments against
+it. Each LongMemEval question retains its own isolated history collection; no
+question can search another question's memories. Successful, failed and aborted
+evaluation runs retain these collections. Only explicit corpus cleanup deletes
+them.
 
 | Mode | Evidence collection |
 | --- | --- |
-| `single` | One question-only recall with limit 50 and SDK-default hybrid retrieval/reranking |
-| `tools` | A model chooses among the five read-only `createTools()` operations, then selects previously delivered evidence |
+| `single_pass` | One question-only recall with limit 50 and SDK-default hybrid retrieval/reranking |
+| `agentic` | A model chooses among the five read-only `createTools()` operations, then selects previously delivered evidence |
 
-Evidence collection and answer generation are separate model contexts. This
-isolates retrieval and evidence selection; it is not a same-agent end-to-end
-conversation evaluation. No live MemDrive benchmark result is included.
-Historical SillyMemory scores belong to different source preparation, prompt
-assembly and runtime configurations and must not be relabelled as these results.
+These are benchmark modes, not SDK options. Evidence collection and optional
+answer generation use separate model contexts. The same answer packing and judge
+apply to both modes; this is not a same-agent end-to-end conversation evaluation.
+No live benchmark score is included, and historical SillyMemory scores must not
+be relabelled as MemDrive results.
 
-## Setup and a small run
+## Ingest once
 
-Use Node.js 20.12+ and run from the repository root. The live workflow has been
-implemented but not qualified against a live database or model provider.
+Use Node.js 20.12+ from the repository root. The live workflow is implemented but
+has not been qualified against a live database or model provider.
 
 ```sh
 npm ci
 npm run build
-node benchmark/longmemeval/run.mjs setup --root artifacts/lme-tools
-node benchmark/longmemeval/run.mjs prepare --root artifacts/lme-tools --mode tools --limit 10
-node benchmark/longmemeval/run.mjs run --root artifacts/lme-tools --env-file /path/to/evaluation.env
-node benchmark/longmemeval/run.mjs verify --root artifacts/lme-tools
+node benchmark/longmemeval/run.mjs setup --root artifacts/lme-corpus
+node benchmark/longmemeval/run.mjs ingest --root artifacts/lme-corpus --limit 10 --env-file /path/to/evaluation.env
 ```
 
-`setup` downloads the pinned 277 MB public LongMemEval-S cleaned dataset and
-checks its size and SHA-256. Use `setup --dataset /path/to/downloaded.json` to use
-an existing copy with the same checks. `prepare` defaults to the first 10 sorted
-question IDs; this is a smoke cohort, not a stratified or held-out sample. Both
-modes with the same limit use the same IDs. Use a different root and `--mode
-single` for the baseline. Use `--limit 500` only after validating the small run
-and reviewing the model/database operation budget. These are separate paid runs;
-no existing collections or old benchmark artifacts are adopted.
+`setup` downloads the pinned 277 MB LongMemEval-S cleaned dataset, checks size and
+SHA-256, and writes a corpus manifest covering all 500 question IDs. It makes no
+database calls. Use `setup --dataset /path/to/downloaded.json` for an existing
+copy with the same checks. `ingest` materializes only the selected prefix of
+sorted IDs (default 10), verifies original readback, then marks each entry ready.
+A matching ready entry is skipped without create, upsert, embedding or any other
+native request. To grow the same corpus, run `ingest --limit 500`; the first ten
+ready collections are preserved and only missing entries are created.
+
+The immutable `corpus.json` binds the dataset, archived-original hashes, metadata
+schema, managed embedding configuration, analyzers and per-question ownership.
+Collector/answer models, prompts, query limits, judge settings and run-code hashes
+are not corpus compatibility requirements. Changes that alter stored originals
+or storage settings reject reuse and require a different corpus. The public
+`open()` operation also validates MemDrive's stored format on every reuse.
+Mutable readiness/deletion state and ingestion HTTP receipts live separately;
+cleanup never rewrites the immutable manifest.
+
+## Repeat retrieval independently
+
+```sh
+node benchmark/longmemeval/run.mjs prepare --root artifacts/lme-single-1 --corpus artifacts/lme-corpus --mode single_pass --limit 10
+node benchmark/longmemeval/run.mjs recall --root artifacts/lme-single-1 --env-file /path/to/evaluation.env
+node benchmark/longmemeval/run.mjs verify --root artifacts/lme-single-1
+
+node benchmark/longmemeval/run.mjs prepare --root artifacts/lme-agent-1 --corpus artifacts/lme-corpus --mode agentic --limit 10
+node benchmark/longmemeval/run.mjs recall --root artifacts/lme-agent-1 --env-file /path/to/evaluation.env
+node benchmark/longmemeval/run.mjs verify --root artifacts/lme-agent-1
+```
+
+`prepare` requires ready corpus entries. Defaults are `agentic` and the first ten
+sorted IDs, a smoke cohort rather than a stratified or held-out sample. Both
+modes with the same limit use the same IDs. Each run freezes its own settings,
+prompts, judge rules, executable/runtime fingerprints and public tool definitions.
+To change settings, edit `config.json` and prepare a new run directory against the
+same corpus. Existing runs continue to use their frozen settings.
+
+`recall` never creates, writes or deletes collections. It opens the existing
+collection, checks ownership/schema/embedding/analyzers, and reads all expected
+originals back before collecting evidence. Validation database operations and
+elapsed time are reported separately from retrieval operations/time. Reuse
+removes repeated ingestion and embedding, not these integrity reads. This proves
+expected originals match; it does not prove absence of externally injected data
+or every internal chunk invariant. The harness treats corpora as immutable,
+exposes only read-only tools, and rejects returned spans that differ from source.
+External corpus mutation is unsupported.
+
+A `single_pass` recall requires only database credentials and makes no model or
+judge call. An `agentic` recall additionally makes paid collector-model calls,
+but still makes no answer or judge call. A completed retrieval-only run can pass
+`verify`; its answer accuracy remains null.
+
+## Optional answering and judging
+
+```sh
+node benchmark/longmemeval/run.mjs score --root artifacts/lme-single-1 --env-file /path/to/model.env
+node benchmark/longmemeval/run.mjs verify --root artifacts/lme-single-1
+```
+
+`score` validates saved evidence offline, then calls the answer model and judge.
+It needs no database credentials, no live corpus and no corpus lease. It can run
+after explicit remote corpus cleanup. Collector usage is retained separately
+when answer/judge usage is added. Scoring is not automatically retried after an
+interrupted or failed paid attempt.
 
 Environment variables (or an untracked env file):
 
-- `LAMBDADB_BASE_URL`, `LAMBDADB_PROJECT_NAME`, `LAMBDADB_PROJECT_API_KEY`: a
-  dedicated test project. The runner creates and deletes temporary collections.
-- `LLM_API_KEY`: collector and answer model authentication.
-- `TYPESAFE_API_KEY`: Jev judge authentication.
+- `LAMBDADB_BASE_URL`, `LAMBDADB_PROJECT_NAME`, `LAMBDADB_PROJECT_API_KEY`: required
+  for ingest, recall and cleanup; use a dedicated test project.
+- `LLM_API_KEY`: required for agentic recall and scoring.
+- `TYPESAFE_API_KEY`: required only for scoring.
 
-The endpoints, historical model IDs, prompts and limits are in `config.json`.
-They are frozen by `prepare`; model availability is not established by offline
-checks. The judge uses the retained task-specific Jev Noul rules and a 0.5
-threshold. This is not a claim of equivalence with the upstream GPT-4o evaluator.
-Changing configuration requires a new run root and preparation.
+Endpoints, historical model IDs, prompts and limits are configured in
+`config.json`; offline checks do not establish provider/model availability.
+Judging uses the retained Jev Noul task-specific rules and a 0.5 threshold, not a
+claim of equivalence with the upstream GPT-4o evaluator.
 
-## Protocol
+## Source and evidence protocol
 
-The frozen dataset is revision `98d7416c24c778c2fee6e6f3006e7a073259d48f` of
-`xiaowu0162/longmemeval-cleaned`, SHA-256
+Dataset revision: `98d7416c24c778c2fee6e6f3006e7a073259d48f` of
+`xiaowu0162/longmemeval-cleaned`; SHA-256:
 `d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442`.
 
-Each case stores original message bodies, role, session ID/position and global
-message position. Session clocks are calendar-validated and interpreted as UTC;
-original date strings remain metadata. They are conversation times, not inferred
-event times. The current question and recent window (at least five messages
-including the question, aligned at an adjacent user/assistant pair) stay outside
-the index. Recent context is supplied identically to both answer conditions.
-Source bodies are preserved literally: no SillyTavern template escaping or
-application prompt machinery is imported. Answers, `has_answer` and
-`answer_session_ids` are available only to evaluation, never to indexing or the
-collector/answer model.
+Stored Mems preserve literal message bodies, roles, session identifiers and global
+message positions. Calendar-validated session clocks are interpreted as UTC;
+original date strings remain metadata. These are conversation times, not inferred
+event dates. At least five recent messages including the question remain outside
+the index, aligned at an adjacent user/assistant pair. Both answer conditions get
+the same recent context. Answers, `has_answer` and `answer_session_ids` are
+available only to evaluation, never to storage, the collector or answer model.
+No SillyTavern escaping or application prompt machinery is imported.
 
-The runner uses managed embeddings, English hybrid search and current SDK
-reranking defaults. It serializes database operations with a single SDK request
-slot; tool batches still accept up to five searches. Model-chosen query text,
-filters, limits and reranking options are recorded without rewriting them.
-The `single` baseline's limit 50 is not an equal-search-work constraint on the
-model, whose default recall limit is 10.
+Managed embeddings, English hybrid search and SDK-default reranking are used.
+Database operations are serialized with one SDK request slot. Tool batches still
+accept up to five searches; model-chosen queries, filters, limits and reranking
+options are recorded without rewriting. Baseline limit 50 is not a constraint on
+the agent's search work; the tool recall default is 10.
 
-The model sees the unchanged public tool results unless a result exceeds 16,000
-`cl100k_base` tokens. In that case it receives an explicit size-limit error and
-none of that result's text. The raw return is retained for diagnostics. Full
-originals obtained via `read`/`list` and exact recall spans can be selected; the
-model cannot introduce new source spans or arbitrary summaries. Selection is a
-collector JSON response, not an added SDK tool. Tools that return no text, such
-as value counts, can help query planning but do not themselves count as evidence.
+The collector sees unchanged public tool results unless a result exceeds 16,000
+`cl100k_base` tokens. Then it receives a size-limit error and none of that result's
+text; the raw return remains in diagnostics. Selection is a JSON response naming
+exact previously delivered recall spans or complete read/list originals, not an
+extra SDK tool. The final 4,096-token serialized evidence block admits candidates
+in selected order, merges overlapping/adjacent spans, and presents them
+chronologically. Whole candidates that do not fit are skipped, never silently
+clipped. Instructions, recent dialogue and the question are outside this evidence
+allocation and included in provider answer-input usage.
 
-Both modes admit evidence in selection order, merge overlapping/adjacent spans,
-and present admitted evidence chronologically. The serialized evidence block
-must fit 4,096 `cl100k_base` tokens. Whole candidates that do not fit are skipped;
-the runner never silently clips a source span. This budget excludes system
-instructions, recent dialogue and question, which are included in provider
-answer usage. Large originals can be read by the collector but omitted from the
-answer input; the separate stage metrics make that loss visible.
+## Limits, failures and explicit cleanup
 
-## Limits, receipts and cleanup
+Per question: eight collector rounds, 24 tool calls, 48,000 estimated request
+tokens including completion reservation, 160,000 reported collector/answer
+tokens, 1,000 database operations and 15 minutes per live phase. Validation reads
+count toward the retrieval phase's database limit. Ingest, recall and score each
+have an eight-hour phase deadline. The collector/answer token limit is cumulative
+across recall and score. Each HTTP call has a 180-second bound. Preflight reserves
+serialized-request `cl100k_base` tokens plus maximum completion; provider usage
+is checked again afterwards. This estimate is not exact provider tokenization.
 
-Per question: 8 collector rounds, 24 tool calls, 48,000 estimated request tokens
-including completion reservation, 160,000 reported collector/answer tokens,
-1,000 database operations, and 15 minutes. Each HTTP call has a 180-second bound;
-the whole run has an eight-hour bound. Preflight reserves serialized-request
-`cl100k_base` tokens plus the configured completion maximum. This is a conservative
-application estimate, not the provider's exact tokenizer accounting; reported
-usage is checked again afterwards. No automatic HTTP/model retries occur.
-Cleanup has a separate 30-operation allowance and remains possible after a
-question or run timeout. Failed and uncertain requests have receipts; their
-unavailable billable usage is explicitly unknown.
-
-A pending ownership record is persisted before collection creation. Successful
-writes are read back before collection tools are exposed. Cleanup verifies the
-exact random collection name and run/scope labels, deletes only that collection,
-and confirms HTTP 404. Answer generation starts after cleanup. Cleanup failure
-stops further allocation and leaves the run incomplete.
-
-`lock.json` freezes the cohort, source hashes, configuration, prompts, actual
-installed dependency code, package metadata and tool definitions. Question
-folders hold raw database/model HTTP receipts without authentication headers,
-raw versus delivered tool results, selected/final spans and annotation metrics.
-Hashes and receipts provide local audit consistency, not cryptographic provider
-attestation. Server-managed search/reranker behavior and model nondeterminism are
-not frozen by the dependency lock.
-
-`verify` is offline. It replays ingestion and public SDK tool calls against the
-recorded native responses, checks source equality and metadata/offsets, rebuilds
-collector requests, evidence selection, answer requests and judge inputs, then
-checks counts, verdicts and cleanup. It excludes runtime elapsed time and count
-fetch timestamps from semantic tool-output comparisons. Cache time is replayed
-from recorded request/tool timestamps; verification runs serially with its clock
-restored even on failure. It does not contact providers or declare unrecorded
-requests successful.
+Pending ownership is recorded before create. Incomplete/uncertain ingestion is
+never retried automatically, and ready entries are never overwritten. A failed
+partial ingestion requires inspection and explicit cleanup; this initial runner
+retires the whole corpus on cleanup rather than repairing individual entries.
+Create another corpus to reingest after retirement. Existing ready entries remain
+usable until retirement, subject to the selected run prefix being ready.
 
 ```sh
-node benchmark/longmemeval/run.mjs cleanup --root artifacts/lme-tools --env-file /path/to/evaluation.env
+node benchmark/longmemeval/run.mjs cleanup --root artifacts/lme-corpus --env-file /path/to/evaluation.env
 ```
 
-Explicit cleanup can run after code changes or dataset removal and receives a
-fresh bounded cleanup allowance while retaining cumulative accounting. A
-`.running` directory prevents concurrent CLI operations. After a hard kill,
-confirm the old process is gone before removing that directory and running
-cleanup. The runner does not resume paid evaluation automatically: uncertain
-request outcomes require inspection, and a new evaluation uses a new root.
+Cleanup verifies exact collection names and owner/scope labels, deletes only
+materialized entries and confirms HTTP 404. It works after dataset removal or
+run-setting/code fingerprint changes, has a fresh bounded 30-operation allowance
+per entry/invocation, and retains cumulative receipts/accounting. It leaves local
+manifests, dataset and run evidence intact. Evaluation failures never trigger it.
 
-## Reading results
+One exclusive `.corpus-active` lease serializes ingestion, preparation, recall
+and cleanup on a corpus, preventing deletion during retrieval. Separate corpora
+can be evaluated independently. Scoring and offline verification do not hold this
+lease. `.running` prevents concurrent CLI operations on the same run/root. Leases
+are released on handled failures. After a hard kill, confirm the old process has
+exited before manually removing its stale guard and inspecting pending receipts.
 
-`summary.json` retains the frozen cohort denominator. A completed run counts
-operational failures as incorrect and reports scored/failed counts, per-type
-outcomes and per-model-stage calls, input/output tokens and elapsed HTTP time.
-For incomplete runs, headline `accuracy` is null; provisional correctness over
-the frozen cohort is explicitly named. Token totals are known reported usage,
-with unknown-usage request counts alongside them. Billed cost stays null.
+## Verification and results
 
-Each `evidence.json` reports raw retrieved, model-delivered and final-packed
-coverage. Any overlap with an annotated turn and full-turn coverage are distinct;
-archived annotations and annotations in recent context are separated. Session
-coverage includes recent dialogue. Missing turn annotations yield null rather
-than zero; abstention cases are not scored for evidence coverage. These are
-annotation-coverage proxies, not measurements of all necessary facts or proof
-that the model understood the evidence. Source offsets use UTF-16 code units.
+Each run snapshots the immutable corpus manifest and selected readiness proof,
+and retains the pinned dataset through a hard link (copy fallback across devices).
+Removing the corpus's original local files does not remove these run inputs.
+`verify` replays public `open`, descriptor/read validation and tools against run
+HTTP receipts; it does not replay ingestion or require any live collection. It
+checks source equality, reconstructs collector and answer requests, packing,
+judge inputs, usage and summaries. Cache time is replayed from saved timestamps;
+the serial verifier restores its clock on failure. Runtime elapsed values and
+count fetch timestamps are excluded from semantic tool-output comparison.
 
-Inspect traces to distinguish failed retrieval, oversized delivery, poor evidence
-selection, packing loss and wrong answers despite delivered annotations. Tool
-frequency alone is not a success metric. The test dataset was used during prior
-SillyMemory development, so results would not establish held-out generalization.
+Frozen configuration and judge-rule snapshots remain authoritative even after
+current settings change. Executable SDK/runner/dependency code must still match
+the run's fingerprints; use the recorded checkout/runtime if that code changes.
+Receipts provide local audit consistency, not provider attestation or a frozen
+server implementation. Legacy v1 one-shot artifacts are not adopted as reusable
+corpora; retain their original checkout for verification.
 
-## Provenance and local validation
+`summary.json` separates retrieval completion from scoring completion. A completed
+scored run includes operational failures in the frozen question denominator;
+retrieval-only and incomplete scored runs have null answer accuracy. It reports
+validation versus retrieval resources and per-model-stage calls, input/output
+usage, unknown usage and HTTP time. Ingestion resources remain in the corpus
+state/receipts, outside repeated-run totals. Billed cost remains null.
 
-The existing SillyMemory `feat/memdrive-integration` workflow informed the
-protocol and lifecycle requirements. This is an independent Node.js runner; no
-SillyMemory runtime, Python bridge, private MemDrive prototype or application
-source assembly is imported. The retained `judge-rules.json` contains the
-upstream LongMemEval evaluation instructions adapted for the existing Jev
-protocol; its SHA-256 is pinned in configuration. `LICENSE.upstream` retains the
-LongMemEval MIT notice (Di Wu, 2024).
+Per-question `evidence.json` separates raw retrieved, model-delivered and
+final-packed annotation coverage. Any turn overlap and full-turn coverage are
+distinct, archived and recent-context annotations are separated, missing turn
+annotations yield null, and abstention coverage is not applicable. These are
+coverage proxies, not necessary-fact recall or proof of comprehension. Offsets
+are UTF-16 code units. Previously used development data does not establish
+held-out generalization.
 
+## Provenance and validation
+
+SillyMemory's `feat/memdrive-integration` informed protocol/lifecycle requirements.
+This independently implemented Node.js runner imports no SillyMemory runtime,
+Python bridge or private MemDrive SDK. `judge-rules.json` retains upstream
+LongMemEval evaluation instructions adapted for Jev; its hash is configured and
+frozen per run. `LICENSE.upstream` preserves the MIT notice (Di Wu, 2024).
 Sources: [LongMemEval](https://github.com/xiaowu0162/LongMemEval),
 [pinned dataset](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/tree/98d7416c24c778c2fee6e6f3006e7a073259d48f).
 
-`npm test` includes small synthetic tests for source isolation, public-tool
-execution, budget enforcement, native receipt replay, cleanup and forged-evidence
-rejection. Unit tests and installed-package checks are offline; they establish
-neither live compatibility nor an answer-quality score. Benchmark code, rules,
-datasets and outputs are excluded from the published package.
+`npm test` uses synthetic histories and native HTTP responses to verify source
+isolation, corpus growth/reuse, both modes, retrieval-only execution, explicit
+cleanup, failure accounting and offline replay after deletion. Installed-package
+consumer checks remain offline. Benchmark code, datasets and receipts stay
+outside the published npm package; no live answer-quality claim follows from
+unit or package tests.

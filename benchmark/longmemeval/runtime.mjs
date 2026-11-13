@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile, writeFile, rename, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { LambdaDBClient, HTTPClient } from '@functional-systems/lambdadb';
-import { create } from '@functional-systems/memdrive';
+import { create, open } from '@functional-systems/memdrive';
 import { get_encoding } from 'tiktoken';
 import { createTools } from '@functional-systems/memdrive/tools';
 import { jsonHash, metadataSchema, integer } from './protocol.mjs';
@@ -22,7 +22,8 @@ export function status(error) {
         if (Number.isInteger(value.status ?? value.statusCode)) return value.status ?? value.statusCode;
     }
 }
-export function credentials(env) {
+export function credentials(env, databaseRequired = true) {
+    if (!databaseRequired) return { modelKey: env.LLM_API_KEY, judgeKey: env.TYPESAFE_API_KEY };
     for (const key of ['LAMBDADB_BASE_URL', 'LAMBDADB_PROJECT_NAME', 'LAMBDADB_PROJECT_API_KEY']) assert(env[key]?.trim(), `Missing ${key}`);
     const url = new URL(env.LAMBDADB_BASE_URL);
     assert(url.protocol === 'https:' && !url.username && !url.password && !url.search && !url.hash, 'Expected HTTPS database URL');
@@ -33,8 +34,8 @@ export function credentials(env) {
 }
 
 export class Journal {
-    constructor({ root, config, binding, credentials: keys, state, save, fetcher = fetch, signal, replay = false, onReplayReceipt = () => {} }) {
-        Object.assign(this, { root, config, binding, keys, state, save, fetcher, signal, replay, onReplayReceipt });
+    constructor({ root, config, binding, credentials: keys, state, save, fetcher = fetch, signal, replay = false, onReplayReceipt = () => {}, readOnly = false }) {
+        Object.assign(this, { root, config, binding, keys, state, save, fetcher, signal, replay, onReplayReceipt, readOnly });
     }
     async request({ file, url, body, key, kind, method = 'POST', cleanup = false }) {
         const request = { kind, method, url, body: body ?? null }, requestHash = jsonHash(request);
@@ -110,6 +111,9 @@ export class Journal {
         const prefix = `${baseUrl}/projects/${encodeURIComponent(projectName)}/`;
         const fetcher = async request => {
             assert(request.url.startsWith(prefix), 'Database request escaped the configured project');
+            if (this.readOnly) assert((request.method === 'GET' && /\/collections\/[^/]+$/.test(new URL(request.url).pathname))
+                || (request.method === 'POST' && /\/(query|docs\/(fetch|list))$/.test(new URL(request.url).pathname)),
+                'Evaluation attempted a database mutation');
             if (cleanup) {
                 assert(this.state.cleanupOperations < this.config.limits.cleanupOperations, 'Cleanup operation budget exhausted');
                 this.state.cleanupOperations++;
@@ -130,21 +134,37 @@ export class Journal {
     }
 }
 
-export async function ingest(journal, prepared, entry) {
-    const client = journal.native();
-    const drive = await create({ client, name: entry.collection, metadataSchema, maxConcurrentRequests: 1,
-        description: 'Disposable LongMemEval conversation history.', labels: { 'eval.owner': entry.owner, 'eval.scope': entry.scope },
-        textSearch: { analyzers: ['english'] } }, { signal: journal.signal });
-    const descriptor = await drive.describe({ signal: journal.signal });
+export const storageProfile = () => ({ source: 'longmemeval-original-messages-v1', metadataSchema,
+    embedding: { mode: 'managed', provider: 'openai', model: 'text-embedding-3-small', dimensions: 1536, similarity: 'cosine' },
+    textSearch: { analyzers: ['english'] } });
+
+function validateDescriptor(descriptor, entry, profile) {
+    assert.equal(descriptor.name, entry.collection);
     assert.equal(descriptor.labels['eval.owner'], entry.owner); assert.equal(descriptor.labels['eval.scope'], entry.scope);
-    if (prepared.mems.length) {
-        await drive.remember({ mems: prepared.mems }, { signal: journal.signal });
-        for (let index = 0; index < prepared.mems.length; index += 100) {
-            const expected = prepared.mems.slice(index, index + 100);
-            const read = await drive.read({ ids: expected.map(mem => mem.id) }, { signal: journal.signal });
-            assert.deepEqual(read.mems, expected, 'Stored original readback differs');
-        }
+    assert.deepEqual(descriptor.metadataSchema, profile.metadataSchema, 'Corpus metadata schema differs');
+    assert.deepEqual(descriptor.embedding, profile.embedding, 'Corpus embedding configuration differs');
+    assert.deepEqual(descriptor.textSearch, profile.textSearch, 'Corpus text search configuration differs');
+}
+async function validateOriginals(drive, journal, prepared) {
+    for (let index = 0; index < prepared.mems.length; index += 100) {
+        const expected = prepared.mems.slice(index, index + 100);
+        const read = await drive.read({ ids: expected.map(mem => mem.id) }, { signal: journal.signal });
+        assert.deepEqual(read.mems, expected, 'Stored original readback differs');
     }
+}
+export async function ingest(journal, prepared, entry, profile = storageProfile()) {
+    const drive = await create({ client: journal.native(), name: entry.collection, metadataSchema: profile.metadataSchema, maxConcurrentRequests: 1,
+        description: 'Reusable LongMemEval conversation history.', labels: { 'eval.owner': entry.owner, 'eval.scope': entry.scope },
+        embedding: { mode: 'managed' }, textSearch: profile.textSearch }, { signal: journal.signal });
+    validateDescriptor(await drive.describe({ signal: journal.signal }), entry, profile);
+    if (prepared.mems.length) await drive.remember({ mems: prepared.mems }, { signal: journal.signal });
+    await validateOriginals(drive, journal, prepared);
+    return createTools({ drive }, { signal: journal.signal });
+}
+export async function reuse(journal, prepared, entry, profile = storageProfile()) {
+    const drive = await open({ client: journal.native(), name: entry.collection, maxConcurrentRequests: 1 }, { signal: journal.signal });
+    validateDescriptor(await drive.describe({ signal: journal.signal }), entry, profile);
+    await validateOriginals(drive, journal, prepared);
     return createTools({ drive }, { signal: journal.signal });
 }
 

@@ -9,7 +9,7 @@ export function modelTools(definitions) {
 const unique = spans => [...new Map(spans.map(span => [spanKey(span), span])).values()];
 
 export async function collectEvidence({ mode, tools, prepared, config, countTokens, ask, signal, onTool = async () => {}, now = Date.now }) {
-    assert(['single', 'tools'].includes(mode));
+    assert(['single_pass', 'agentic'].includes(mode));
     const trace = [], retrieved = [], delivered = [];
     let calls = 0;
     const execute = async (name, args, callId) => {
@@ -28,9 +28,9 @@ export async function collectEvidence({ mode, tools, prepared, config, countToke
         trace.push(event); await onTool(event);
         return result;
     };
-    if (mode === 'single') {
+    if (mode === 'single_pass') {
         await execute('memdrive_recall', { requests: [{ query: `User: [Question date: ${prepared.questionTimestamp}]\n${prepared.question}`,
-            limit: config.retrieval.limit }] }, 'single');
+            limit: config.retrieval.limit }] }, 'single_pass');
         assert(trace[0].raw.ok && trace[0].raw.value.results.every(result => !result.error), 'Single-pass recall failed');
         assert(trace[0].delivered.ok, 'Single-pass result exceeds delivery budget');
         return { trace, retrieved: unique(retrieved), delivered: unique(delivered), selected: unique(delivered), rounds: 0 };

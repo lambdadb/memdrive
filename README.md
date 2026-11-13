@@ -249,7 +249,9 @@ for the catalog, branch binding, write opt-in, error outcomes and direct/MCP map
 ## Consumers
 
 The [LongMemEval benchmark](benchmark/longmemeval/README.md) lives in this repository
-and compares one fixed search with model-directed use of the public memory tools.
+and compares `single_pass` search with `agentic` use of the public memory tools.
+It reuses ingested per-question collections across independent retrieval runs;
+answer generation, judging and explicit corpus cleanup are separate stages.
 It owns dataset preparation, evidence selection, answer generation and judging;
 none of these enter the SDK runtime or npm archive. Future suites, including BEAM,
 can live alongside it under `benchmark/`.
