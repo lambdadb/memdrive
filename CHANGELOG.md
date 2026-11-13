@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.0
+
+First stable release of the standalone MemDrive SDK. The public API and storage
+format are unchanged from 0.1.0-rc.1; the LambdaDB TypeScript client remains pinned
+to 0.12.0.
+
+- Provide memory storage, vector and hybrid retrieval, complete-original reads, metadata inspection, branches and portable agent tools.
+- Wait for npm registry metadata to become visible after a successful publication, without retrying publication; verify archive identity and report channel state on reruns.
+- Document stable installation and the `latest`, `rc` and `dev` channels.
+
 ## 0.1.0-rc.1
 
 First release candidate of the standalone MemDrive SDK, backed by the pinned
