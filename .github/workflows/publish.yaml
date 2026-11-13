@@ -1,0 +1,73 @@
+name: Publish development package
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Validate the exact tarball without publishing (use for initial npm bootstrap)
+        type: boolean
+        default: true
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-memdrive-dev
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - name: Verify publishing toolchain
+        run: |
+          node --version
+          npm --version
+          node --input-type=module -e "import {execFileSync} from 'node:child_process'; const [major,minor,patch] = execFileSync('npm',['--version'],{encoding:'utf8'}).trim().split('.').map(Number); if (!(major > 11 || major === 11 && (minor > 5 || minor === 5 && patch >= 1))) throw new Error('npm 11.5.1+ is required for Trusted Publishing');"
+      - name: Validate committed metadata and install dependencies
+        run: |
+          npm run check:version
+          npm ci
+      - name: Lint and typecheck
+        run: |
+          npm run lint
+          npm run typecheck
+      - name: Prepare immutable development version
+        id: version
+        run: node scripts/prepare-dev-package.mjs
+      - name: Validate publication metadata
+        env:
+          MEMDRIVE_PUBLISH_CHANNEL: dev
+        run: node scripts/check-publish.mjs
+      - name: Test
+        run: npm test
+      - name: Validate exact archive and run deployed smoke tests
+        env:
+          LAMBDADB_BASE_URL: ${{ vars.LAMBDADB_BASE_URL }}
+          LAMBDADB_PROJECT_NAME: ${{ vars.LAMBDADB_PROJECT_NAME }}
+          LAMBDADB_PROJECT_API_KEY: ${{ secrets.LAMBDADB_PROJECT_API_KEY }}
+        run: npm run check:package -- --live --output-directory artifacts/release
+      - name: Retain validated archive and manifest
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-${{ steps.version.outputs.version }}-${{ github.sha }}
+          path: artifacts/release/*
+          if-no-files-found: error
+      - name: Publish tested archive through npm Trusted Publishing
+        if: ${{ !inputs.dry_run }}
+        run: node scripts/publish-dev.mjs artifacts/release/npm-pack.json
