@@ -10,3 +10,4 @@
 - Expose branch-aware keyword distributions through `countValues`; retain `describe` as the sole schema inspection API.
 - Add portable memory tools with JSON Schema contracts, effect annotations, branch binding and optional writes under the `tools` export.
 - Add bounded live integration checks, exact-tarball validation and source-linked immutable development versions.
+- Supply the required Bayesian candidate budget when hybrid recall disables reranking.

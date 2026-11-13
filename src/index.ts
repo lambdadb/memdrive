@@ -115,7 +115,7 @@ function recallQuery(request: ValidRecall, schema: MetadataSchema, textSearch: T
         { bool: [{ ...filter, occur: 'filter' },
             { queryString: { query: request.query, defaultField: 'content', skipSyntax: true }, occur: 'must' }] },
     ] } : semantic;
-    return { size: request.limit, query, ...(request.rerank === false ? {} : {
+    return { size: request.limit, query, ...(request.rerank === false ? (textSearch ? { candidateSize: candidates } : {}) : {
         rerank: { provider: 'typesafe', model: 'jev-1.13.0', queryText: context,
             fields: ['content'], candidateSize: candidates, onFailure: 'error' },
     }) };

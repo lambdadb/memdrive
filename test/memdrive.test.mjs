@@ -37,6 +37,7 @@ test('managed recall applies rerank per batch item for vector and hybrid searche
             const knn = textSearch ? body.query.bayesian[0].knn : body.query.knn;
             assert.equal(knn.k, 200); assert.equal(body.size, 10);
             assert.equal(Object.hasOwn(body, 'rerank'), knn.queryText !== 'disabled');
+            assert.equal(body.candidateSize, textSearch && knn.queryText === 'disabled' ? 200 : undefined);
             assert.equal(body.consistentRead, true);
             assert.equal(body.ref.name, 'main');
         }

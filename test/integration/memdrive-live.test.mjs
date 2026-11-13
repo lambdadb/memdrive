@@ -58,6 +58,7 @@ async function withDrive(client, variant, configuration, run) {
 }
 
 function matching(result, id) {
+    assert.equal(result.error, undefined, `Search failed for ${id}: ${JSON.stringify(result.error)}`);
     assert(result.matches.length > 0, `Expected evidence for ${id}`);
     assert(result.matches.every(match => match.memId === id), `Filter escaped ${id}`);
     return result.matches;
