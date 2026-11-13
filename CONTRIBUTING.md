@@ -45,4 +45,4 @@ checks accurately.
 
 ## Versions and releases
 
-See [RELEASING.md](RELEASING.md). Development publication is manually dispatched from `main` and explicitly passes `--tag dev`; the release policy documents npm's initial bootstrap tagging exception. A build or package check is not release authorization.
+See [RELEASING.md](RELEASING.md). Development publication is manually dispatched from `main` and uses only the `dev` channel. A build or package check is not release authorization.

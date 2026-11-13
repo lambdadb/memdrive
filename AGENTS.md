@@ -11,6 +11,6 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before changes and [RELEASING.md](RELEAS
 - Keep the LambdaDB dependency pinned and use its public API. Adapt the SDK deliberately when the native client changes.
 - Keep credentials and personal memory content out of source, logs, fixtures and package archives.
 - Validate changed behavior, public types and the installed package. Distinguish unit tests, package checks and live integration; one does not establish the others.
-- Development publication is explicit and passes `--tag dev`; follow the initial npm bootstrap exception in RELEASING.md. Keep committed versions stable or RC; derive dev versions in disposable publication checkouts. Follow RELEASING.md and do not enable stable/RC publication incidentally.
+- Development publication is explicit and uses the `dev` npm tag only. Keep committed versions stable or RC; derive dev versions in disposable publication checkouts. Follow RELEASING.md and do not enable stable/RC publication incidentally.
 
 Before submission, inspect all changed files against the base and run the applicable commands in CONTRIBUTING.md. Do not commit generated distributions, tarballs, local reports or scratch scripts.
