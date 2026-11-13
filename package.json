@@ -1,7 +1,6 @@
 {
   "name": "@functional-systems/memdrive",
   "version": "0.1.0",
-  "private": true,
   "description": "Source-linked memory storage and retrieval backed by LambdaDB.",
   "type": "module",
   "engines": {
@@ -36,7 +35,8 @@
     "test:types": "tsc -p test/types/tsconfig.json",
     "check:version": "node scripts/version.mjs get",
     "check:package": "npm run build && node scripts/check-package.mjs",
-    "prepublishOnly": "node scripts/check-publish.mjs"
+    "prepublishOnly": "node scripts/check-publish.mjs",
+    "test:live": "npm run build && MEMDRIVE_RUN_LIVE_TESTS=1 node --env-file-if-exists=.env.local --test --test-concurrency=1 test/integration/*-live.test.mjs"
   },
   "dependencies": {
     "@functional-systems/lambdadb": "0.12.0"
@@ -84,5 +84,18 @@
         "default": "./dist/commonjs/tools/index.js"
       }
     }
+  },
+  "author": "Functional Systems, Inc.",
+  "homepage": "https://github.com/lambdadb/memdrive#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lambdadb/memdrive.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lambdadb/memdrive/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "dev"
   }
 }

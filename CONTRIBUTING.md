@@ -4,7 +4,7 @@ MemDrive is a standalone TypeScript SDK backed by the LambdaDB TypeScript client
 
 ## Development workflow
 
-Use Node.js 20.12 or later and npm. Start ordinary work from the latest `origin/main` in a dedicated task worktree, then submit a focused pull request targeting `main`. Squash ordinary pull requests. The bootstrap repository has no remote yet; its dedicated bootstrap worktree is the initial development surface.
+Use Node.js 20.12 or later and npm. Start new work from the latest `origin/main` in a dedicated task worktree, then submit a focused pull request targeting `main`. Continue related work in the existing task branch and worktree. Squash ordinary pull requests.
 
 ```sh
 npm ci
@@ -15,7 +15,7 @@ npm test
 npm run check:package
 ```
 
-`npm test` builds ESM and CommonJS distributions, compiles public TypeScript consumers and executes the unit tests. `check:package` packs the distribution, installs the tarball in an isolated temporary project using the npm cache, and checks ESM, CommonJS, TypeScript and browser consumers. These commands do not call a live database or model. Run `npm ci` first so the offline package check has the pinned dependencies available.
+`npm test` builds ESM and CommonJS distributions, compiles public TypeScript consumers and executes the unit tests. `check:package` packs the distribution, installs the tarball in an isolated temporary project with normal npm registry resolution, and checks ESM, CommonJS, TypeScript and browser consumers. These commands do not call a live database or model. Run `npm ci` first to install the pinned build and validation tools.
 
 ## Source and package boundaries
 
@@ -35,8 +35,14 @@ The LambdaDB dependency is pinned to an exact release. Update it deliberately wi
 
 Add focused tests for distinct correctness risks. Public API changes need type-consumer coverage in addition to runtime checks. Avoid broad captured fixtures, private paths and credentials. Keep experiment outputs under ignored `artifacts/` and describe any live coverage separately.
 
-A passing local suite establishes unit and package behavior only. There is currently no maintained standalone live-integration suite or automated release workflow. Document any unperformed validation accurately.
+A passing local suite establishes unit and package behavior only. `npm run test:live`
+requires Node.js 24 and `LAMBDADB_BASE_URL`, `LAMBDADB_PROJECT_NAME` and
+`LAMBDADB_PROJECT_API_KEY` in the environment or a local `.env.local`. It creates
+and deletes three isolated test collections. Use a dedicated test project;
+missing settings fail rather than silently skipping. The publication workflow
+runs the live suite against the exact installed tarball. Document unperformed
+checks accurately.
 
 ## Versions and releases
 
-See [RELEASING.md](RELEASING.md). The bootstrap package is private and publication is explicitly blocked. A build or package check is not release authorization.
+See [RELEASING.md](RELEASING.md). Development publication is manually dispatched from `main` and uses only the `dev` channel. A build or package check is not release authorization.

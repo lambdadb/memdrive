@@ -1,47 +1,88 @@
 # Releasing MemDrive
 
-## Bootstrap status
+The npm package is `@functional-systems/memdrive`, licensed under Apache-2.0,
+with source at [lambdadb/memdrive](https://github.com/lambdadb/memdrive).
+Only development publication is automated. A maintainer explicitly dispatches
+`publish.yaml` on `main`; ordinary pushes and pull requests do not publish.
+RC/stable automation and GitHub Releases are outside this initial release cycle.
 
-MemDrive is not released. Its package name is `@functional-systems/memdrive` and its license is Apache-2.0. `private: true` and the `prepublishOnly` guard block publication. Do not publish, create release tags or remove these safeguards without the user's authorization.
+## Versions and channels
 
-This repository follows the LambdaDB TypeScript client's main-branch, squash-merge, immutable-version and distribution-channel conventions. It does not copy the native client's publication automation: a remote repository, registry identity, trusted publisher, protected environments and standalone live checks have not been configured here. CI performs local validation only.
+Committed versions are canonical `X.Y.Z` or `X.Y.Z-rc.N` (N starts at 1).
+The initial `0.1.0` identifies the intended release, not an existing stable package.
+`node scripts/version.mjs get` verifies package.json and both lockfile version
+locations; `set VERSION` changes them together without changing dependencies.
+Never commit a development version.
 
-## Version policy
+The workflow checks out its exact dispatch SHA and derives `X.Y.Z-dev.N` only in
+that disposable checkout. N is the number of first-parent commits from the root
+through that SHA, making retries deterministic. Before the committed stable
+version is tagged, its core is the target; after `vX.Y.Z` is tagged and reachable,
+the target becomes `X.Y.(Z+1)`. An RC keeps its core. The published package records
+`memdriveSourceCommit`. History and published versions must remain immutable.
 
-Committed versions use `X.Y.Z` or `X.Y.Z-rc.N`, where `N` starts at 1. A committed stable version describes the intended release and does not mean it has already been published. Keep unreleased status explicit in CHANGELOG.md.
+Development builds use npm dist-tag `dev`, with no Git tag or GitHub Release.
+They never update `latest`. The publication guard rejects stable/RC versions,
+unprepared metadata and other channels. A superseded main SHA or lower dev
+version is skipped. An already published version from the same source is an
+idempotent retry; a different source under that version is a hard failure.
+Never move a published tag, reuse a version or unpublish a failed experiment.
 
-| Version | npm distribution tag | Purpose |
+## GitHub and npm setup
+
+Configure the GitHub Environment `dev` to allow only branch `main`:
+
+| Setting | Kind | Meaning |
 | --- | --- | --- |
-| `X.Y.Z-dev.N` | `dev` | Development builds derived in a disposable publication checkout |
-| `X.Y.Z-rc.N` | `rc` | Explicit release candidates |
-| `X.Y.Z` | `latest` | Authorized stable releases |
+| `LAMBDADB_BASE_URL` | Environment variable | Deployed LambdaDB test endpoint |
+| `LAMBDADB_PROJECT_NAME` | Environment variable | Dedicated smoke-test project |
+| `LAMBDADB_PROJECT_API_KEY` | Environment secret | Project key allowed to create/delete test collections |
 
-Never publish a prerelease to `latest`. Never reuse a published version, move a release tag or overwrite a release asset. A correction requires a new version. Dist-tag changes require explicit authorization.
+Do not use an administrative key or production memory data. The live suite has
+three unique collections, less than 6 KiB of synthetic text, eight managed recalls
+(two with default reranking), two facet requests, one external-vector recall and
+one branch. It has no answer-model calls or retry loop. Each call has a 60-second
+limit and the suite has a ten-minute limit. Cleanup verifies native collection
+not-found responses. Missing configuration or failed cleanup fails publication.
 
-The version is synchronized in `package.json`, `package-lock.json` and the lockfile's root package record. Use:
+Configure npm Trusted Publishing for GitHub organization `lambdadb`, repository
+`memdrive`, workflow filename `publish.yaml`, Environment `dev`, with direct
+`npm publish` allowed. The job runs on GitHub-hosted Ubuntu with Node.js 24 and
+OIDC permission `id-token: write`. npm must be at least 11.5.1 and Node at least
+22.14 for trusted publishing; verify the bundled npm before enabling publication.
+The package repository URL must match the public GitHub source for provenance.
+No long-lived npm token is stored in this workflow.
 
-```sh
-node scripts/version.mjs get
-node scripts/version.mjs set 0.1.0-rc.1
-```
+For a new npm package whose trusted publisher cannot yet be configured, first run
+the workflow with `dry_run=true`. Download its tested tarball and manifest, verify
+the SHA-512 integrity from the manifest, and publish that exact archive from an
+authorized local npm session with `npm publish PATH.tgz --access public --tag dev`.
+This initial local publish does not claim CI provenance. Verify registry version,
+source SHA, archive integrity and dist-tags, then configure the trusted publisher.
+Future publications use OIDC and provenance. Authentication or 2FA may require
+maintainer interaction; do not place tokens in source or artifacts.
 
-The helper rejects inconsistent input files and does not change dependency versions. It deliberately rejects committed development versions. There is no JSR manifest or independent runtime version constant to synchronize.
+## Development release cycle
 
-## Before enabling distribution
+1. Review the exact source commit and merge it into `main`. Use the existing task
+   worktree for preparation; the publication job itself supplies a clean checkout.
+2. Dispatch **Publish development package** on `main`. `dry_run` defaults to true:
+   it validates and retains an archive without publishing. Set it to false only
+   for an authorized publication with npm Trusted Publishing configured.
+3. The workflow validates committed metadata, installs pinned dependencies, lints,
+   typechecks, prepares the dev version and runs the unit/public-type tests.
+4. `check:package --live --output-directory artifacts/release` packs once, checks
+   the archive allowlist, installs it into a clean project with normal registry resolution, verifies ESM,
+   CommonJS, TypeScript and browser consumers, and runs the deployed live tests
+   using that installation. It retains the exact tarball and npm pack manifest
+   only after all checks pass. Artifacts contain no credentials or live data.
+5. Publication checks archive integrity, current main SHA, existing registry
+   versions and dev ordering. It publishes that archive with `--tag dev` and
+   provenance, then verifies registry source SHA, integrity and unchanged `latest`.
+6. Independently install the published exact version and verify public imports.
+   A green workflow start or successful upload alone is not release completion.
 
-Complete a reviewed release-setup change that:
-
-1. Verifies npm ownership and the confirmed package name, Apache-2.0 license and required attribution files.
-2. Configures the actual GitHub repository metadata, npm trusted publisher and protected release environments without repository secrets in source.
-3. Adds maintained standalone live smoke tests for the supported storage and retrieval contracts, with isolated test resources and explicit cost limits.
-4. Defines authorized `dev`, `rc` and stable workflows, including collision-safe development version derivation and exact commit selection. The native client's automatic main-branch development publication is a reference policy, not an active MemDrive feature.
-5. Replaces the bootstrap publication guard with channel and version checks, and removes `private: true` only as part of enabling authorized distribution.
-
-Do not add JSR metadata or additional package registries unless that distribution is requested.
-
-## Release validation
-
-Use a clean dedicated worktree at the reviewed release commit. Inspect the complete diff and run:
+Local validation:
 
 ```sh
 npm ci
@@ -50,10 +91,18 @@ npm run lint
 npm run typecheck
 npm test
 npm run check:package
+npm run test:live
 ```
 
-Run the applicable maintained live checks once those exist. Record the native LambdaDB version, test commands and results, and any unperformed checks. Source inspection, mock/unit tests, clean package installation and live integration are separate evidence.
+The runtime supports Node.js 20.12+, while live/release tooling uses Node.js 24.
+Ordinary CI runs Node.js 20.12 and 24 without credentials. Live tests use the pinned
+LambdaDB client version in package.json; record it and the deployed environment
+in release evidence. Unit, package, deployed integration and registry checks are
+distinct evidence. Never claim an unperformed check passed.
 
-Inspect `npm pack --dry-run --json` and the actual release archive. Confirm that the package contains only the intended distributions, source maps/source files, package metadata, documentation and license notices. No test data, credentials, `.env` files, development scripts or artifacts may ship. Validate the exact archive that will be published, then publish that immutable archive through the authorized workflow. Create the matching immutable release tag and release notes only after successful publication. Verification of registry version and channel must follow publication; a successful workflow start is not sufficient.
+## References
 
-This document defines the intended release contract. No publishing command or automated publisher is operational in the bootstrap repository.
+- [npm Trusted Publishing](https://docs.npmjs.com/trusted-publishers/)
+- [npm provenance](https://docs.npmjs.com/generating-provenance-statements/)
+- [npm dist-tags](https://docs.npmjs.com/adding-dist-tags-to-packages)
+- [GitHub environments](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)

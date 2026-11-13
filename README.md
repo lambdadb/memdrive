@@ -7,10 +7,16 @@ selection, answer generation and presentation. The SDK accepts an initialized
 LambdaDB client; the caller owns connection credentials and transport.
 
 The package is `@functional-systems/memdrive`, licensed under Apache-2.0.
-It is not published yet. It builds ESM and CommonJS with TypeScript declarations
-and supports Node.js 20.12+ and browser bundlers. To try it locally, run `npm ci`,
-`npm run build`, and `npm pack`, then install the resulting tarball in the consumer
-project. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and
+It builds ESM and CommonJS with TypeScript declarations and supports Node.js
+20.12+ and browser bundlers. Development packages use the explicit `dev` channel:
+
+```sh
+npm install @functional-systems/memdrive@dev
+```
+
+Development builds may change before a stable release; pin an exact version for
+reproducibility. To build locally, run `npm ci`, `npm run build`, and `npm pack`,
+then install the resulting tarball in the consumer project. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and
 [RELEASING.md](RELEASING.md) for the release policy.
 
 ```ts
