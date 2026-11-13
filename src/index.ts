@@ -1,11 +1,15 @@
 // Application-facing memory storage and retrieval. No answer assembly lives here.
 import type { Backend, DataBackend, Evidence, VectorEvidence } from './storage.js';
-import type { CreateOptions, OpenOptions, RequestOptions, RecallRequest, TextRecallRequest, RecallResult, BatchRecallResult, MetadataSchema, EmbeddingConfig, TextSearch, AgentModel, ModelRequest, ModelUsage, Usage, Observation, RecordEvent, MemInput, TextMem, ForgetRequest, ConfigureRequest, BranchRequest, CatalogRequest, CatalogResult, ListRequest, MemDrive, DriveData } from './types.js';
-import { createBackend, openBackend, listBackends, validateChunk, publicMatch, sourceMatch, validateVector, vectorMatch } from './storage.js';
+import type {
+    CreateOptions, OpenOptions, RequestOptions, RecallRequest, TextRecallRequest, RecallResult,
+    BatchRecallResult, MetadataSchema, EmbeddingConfig, TextSearch, Usage, Observation, RecordEvent,
+    MemInput, ForgetRequest, ConfigureRequest, BranchRequest, CatalogRequest, CatalogResult,
+    ListRequest, MemDrive, DriveData, CountValuesRequest,
+} from './types.js';
+import { createBackend, openBackend, listBackends, validateChunk, publicMatch, validateVector, vectorMatch } from './storage.js';
 import { buildSearchFilter, validateFilter, matchesFilter } from './filter.js';
 import { MemDriveError, requireInput, operationOptions, checkAbort, abortError } from './errors.js';
-import { runAgent, validateAgent } from './agent.js';
-import { createInspector } from './inspector.js';
+import { createValueCounter } from './values.js';
 
 export type * from './types.js';
 export { MemDriveError } from './errors.js';
@@ -21,29 +25,19 @@ type PreparedRecall = { input: unknown; start: number; error?: never } | { error
 const keys = (value: unknown, allowed: string[]): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
     && Object.keys(value).every(key => allowed.includes(key));
 const nonempty = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
-const modes = ['single_pass', 'agentic'];
 
 function validateOptions<T extends Options>(options: T, creating: boolean): T {
-    requireInput(keys(options, ['client', 'name', 'mode', 'agent', 'maxConcurrentRequests', 'observe', 'record',
+    requireInput(keys(options, ['client', 'name', 'maxConcurrentRequests', 'observe', 'record',
         ...(creating ? ['metadataSchema', 'textSearch', 'embedding', 'labels', 'description'] : ['branch'])]), 'Use the documented MemDrive options.');
     requireInput(creating || options.branch === undefined || (typeof options.branch === 'string'
         && /^[A-Za-z0-9_-]{3,52}$/.test(options.branch)), 'branch must be a valid branch name.');
-    requireInput(modes.includes(options.mode), 'Choose single_pass or agentic as the default mode.');
     if (creating && options.embedding?.mode === 'external')
-        requireInput(options.mode === 'single_pass' && options.textSearch === undefined,
-            'External embeddings support only single_pass retrieval without textSearch.');
+        requireInput(options.textSearch === undefined, 'External embeddings do not support textSearch.');
     const concurrency = options.maxConcurrentRequests ?? 5;
     requireInput(Number.isSafeInteger(concurrency) && concurrency > 0, 'maxConcurrentRequests must be a positive integer.');
     for (const name of ['observe', 'record'] as const)
         requireInput(options[name] === undefined || typeof options[name] === 'function', `${name} must be a callback.`);
-    const { agent } = options;
-    requireInput(options.mode !== 'agentic' || agent, 'Agentic retrieval requires an agent model adapter.');
-    if (agent !== undefined) validateAgent(agent);
-    return { ...options, ...(agent ? { agent: { ...agent, model: {
-        name: agent.model.name, provider: agent.model.provider,
-        ...(agent.model.reasoning === undefined ? {} : { reasoning: structuredClone(agent.model.reasoning) }),
-        respond: (request: ModelRequest, options?: RequestOptions) => agent.model.respond(request, options), checkContext: (request: ModelRequest) => agent.model.checkContext(request),
-    } } } : {}) };
+    return { ...options };
 }
 
 // Separate queues bound logical recalls and database work across all branch views.
@@ -78,18 +72,16 @@ function requestQueue(limit: number): Queue {
 
 function recallInput(request: unknown, schema: MetadataSchema, embedding: EmbeddingConfig): ValidRecall {
     const external = embedding.mode === 'external';
-    requireInput(keys(request, [...(external ? ['queryVector'] : ['query', 'recentDialogue', 'context']), 'mode', 'filter', 'excludeIds', 'limit', 'rerank']),
+    requireInput(keys(request, [...(external ? ['queryVector'] : ['query', 'recentDialogue', 'context']), 'filter', 'excludeIds', 'limit', 'rerank']),
         'Use the documented recall arguments.');
     if (external) {
         validateVector(request.queryVector, embedding);
-        requireInput(request.mode === undefined || request.mode === 'single_pass', 'External embeddings support only single_pass retrieval.');
     } else requireInput(nonempty(request.query) && request.query.trim() !== '*:*', 'query must be nonempty text other than the exact match-all expression *:*.');
     requireInput(request.context === undefined || typeof request.context === 'string', 'context must be text.');
     requireInput(request.recentDialogue === undefined || (Array.isArray(request.recentDialogue)
         && request.recentDialogue.every(message => keys(message, ['role', 'content'])
             && typeof message.role === 'string' && ['user', 'assistant'].includes(message.role) && typeof message.content === 'string')),
     'recentDialogue must contain role-labelled user/assistant text.');
-    requireInput(request.mode === undefined || (typeof request.mode === 'string' && modes.includes(request.mode)), 'Unknown retrieval mode.');
     requireInput(request.rerank === undefined || typeof request.rerank === 'boolean', 'rerank must be a boolean.');
     requireInput(request.excludeIds === undefined || (Array.isArray(request.excludeIds)
         && request.excludeIds.every(nonempty) && new Set(request.excludeIds).size === request.excludeIds.length),
@@ -107,7 +99,7 @@ export function contextualQuery(request: TextRecallRequest): string {
         ...(request.context ? { context: request.context } : {}) });
 }
 
-function singlePassQuery(request: ValidRecall, schema: MetadataSchema, textSearch: TextSearch | undefined, embedding: EmbeddingConfig): QueryBody {
+function recallQuery(request: ValidRecall, schema: MetadataSchema, textSearch: TextSearch | undefined, embedding: EmbeddingConfig): QueryBody {
     if (embedding.mode === 'external') return { size: request.limit, query: { knn: {
         field: 'embedding', queryVector: request.queryVector, k: request.limit,
         filter: buildSearchFilter([request.filter], request.excludeIds ?? [], [], schema),
@@ -158,22 +150,11 @@ function verifyRerank(response: NormalizedResponse, body: QueryBody) {
     if (!same || (!applied && !empty)) throw new MemDriveError('RERANK_FAILED', 'Native reranking was not confirmed.');
 }
 
-function modelUsage(model: AgentModel, response: unknown): ModelUsage {
-    const raw = response as { model?: unknown; usage?: { input_tokens?: unknown; input_tokens_details?: { cached_tokens?: unknown }; output_tokens?: unknown } } | undefined;
-    const value = raw?.usage;
-    const count = (input: unknown) => typeof input === 'number' && Number.isSafeInteger(input) && input >= 0 ? input : null;
-    const inputTokens = count(value?.input_tokens);
-    const cachedInputTokens = count(value?.input_tokens_details?.cached_tokens);
-    return { provider: model.provider, model: typeof raw?.model === 'string' ? raw.model : model.name, calls: 1,
-        inputTokens, cachedInputTokens: inputTokens !== null && cachedInputTokens !== null && cachedInputTokens > inputTokens ? null : cachedInputTokens,
-        outputTokens: count(value?.output_tokens) };
-}
-
 function makeDataHandle(backend: DataBackend, options: Options, queue: Queue, recallQueue: Queue): DriveData {
-    const inspector = createInspector({ describe: options => backend.describe(options), query: (body, options) => backend.query(body, options),
+    const counter = createValueCounter({ describe: options => backend.describe(options), query: (body, options) => backend.query(body, options),
         metadataSchema: () => backend.metadataSchema });
     let generation = backend.generation;
-    const invalidate = () => { generation = backend.generation; inspector.invalidate(); };
+    const invalidate = () => { generation = backend.generation; counter.invalidate(); };
     const inspect = async <T>(operation: () => Promise<T>): Promise<T> => {
         backend.assertActive();
         if (generation !== backend.generation) invalidate();
@@ -185,7 +166,7 @@ function makeDataHandle(backend: DataBackend, options: Options, queue: Queue, re
         finally { invalidate(); }
     };
     const executeRecall = async (input: unknown, start: number, requestIndex?: number, signal?: AbortSignal): Promise<RecallResult> => {
-        const usage: Usage = { elapsedMs: 0, databaseRequests: 0, models: [] };
+        const usage: Usage = { elapsedMs: 0, databaseRequests: 0 };
         const hook = <T extends Observation | RecordEvent>(callback?: ((event: T) => void | Promise<void>)) => async (event: T) => {
             checkAbort(signal);
             await callback?.(requestIndex === undefined ? event : { ...event, requestIndex });
@@ -212,61 +193,20 @@ function makeDataHandle(backend: DataBackend, options: Options, queue: Queue, re
             if (generation !== backend.generation) invalidate();
             const schema = () => backend.metadataSchema;
             const request = recallInput(input, schema(), backend.embedding);
-            const mode = request.mode ?? options.mode;
-            requireInput(mode !== 'agentic' || options.agent, 'Agentic retrieval requires a model adapter.');
-            requireInput(request.rerank !== true || (backend.embedding.mode === 'managed' && mode === 'single_pass'),
-                'rerank: true requires managed embeddings and single_pass retrieval.');
+            requireInput(request.rerank !== true || backend.embedding.mode === 'managed',
+                'rerank: true requires managed embeddings.');
             const query = async (body: QueryBody): Promise<NormalizedResponse> => {
                 const response = await executeDb(options => backend.query(body, options));
                 const mems = await validatedHits(response, request, schema(), options.name, body.size ?? 10, backend.embedding);
                 return { ...response, docs: response.docs.map((hit, i) => ({ ...hit, doc: mems[i]! })) };
             };
-            let mems: Array<Evidence | VectorEvidence>;
-            if (mode === 'single_pass') {
-                const body = singlePassQuery(request, schema(), backend.textSearch, backend.embedding);
-                await record({ phase: 'query', mode, request: structuredClone(body) });
-                const response = await query(body);
-                if (body.rerank) verifyRerank(response, body);
-                mems = response.docs.map(hit => hit.doc);
-                await record({ phase: 'query_result', mode, response: structuredClone(response) });
-                await observe({ type: 'retrieved', ids: mems.map(mem => mem.id), matches: mems.map(publicMatch) });
-                await observe({ type: 'selected', ids: mems.map(mem => mem.id), matches: mems.map(publicMatch), completion: 'single_pass' });
-            } else {
-                const originalModel = options.agent!.model;
-                const model = { ...originalModel, respond: async (modelRequest: ModelRequest) => {
-                    backend.assertActive();
-                    let response;
-                    try {
-                        checkAbort(signal);
-                        response = await originalModel.respond(modelRequest, { signal });
-                        checkAbort(signal); backend.assertActive(); return response;
-                    }
-                    catch (cause) {
-                        const failure = abortError(cause, signal);
-                        if (failure instanceof MemDriveError) throw failure;
-                        throw new MemDriveError('MODEL_ERROR', 'Retrieval model request failed.', { cause: failure });
-                    }
-                    finally {
-                        const next = modelUsage(originalModel, response);
-                        const previous = usage.models.find(item => item.provider === next.provider && item.model === next.model);
-                        if (!previous) usage.models.push(next);
-                        else {
-                            previous.calls++;
-                            for (const key of ['inputTokens', 'cachedInputTokens', 'outputTokens'] as const)
-                                previous[key] = previous[key] === null || next[key] === null ? null : previous[key] + next[key];
-                        }
-                    }
-                } };
-                mems = await runAgent({ request: request as TextRecallRequest, signal, keywordSearch: backend.textSearch !== undefined, agent: { ...options.agent!, model }, limit: request.limit,
-                    query, read: async ids => {
-                        const result = await backend.read({ ids }, executeDb, { signal });
-                        return Promise.all(result.mems.filter(mem => !request.excludeIds?.includes(mem.id)
-                            && matchesFilter(mem, request.filter, schema())).map(mem => sourceMatch(mem as TextMem)));
-                    }, metadataSchema: schema, observe, record, inspector: {
-                        getSchema: () => inspect(() => inspector.getSchema(executeDb, signal)),
-                        countValues: (args, filter) => inspect(() => inspector.countValues(args, filter, executeDb, request.excludeIds, signal)),
-                    } });
-            }
+            const body = recallQuery(request, schema(), backend.textSearch, backend.embedding);
+            await record({ phase: 'query', request: structuredClone(body) });
+            const response = await query(body);
+            if (body.rerank) verifyRerank(response, body);
+            const mems = response.docs.map(hit => hit.doc);
+            await record({ phase: 'query_result', response: structuredClone(response) });
+            await observe({ type: 'retrieved', ids: mems.map(mem => mem.id), matches: mems.map(publicMatch) });
             backend.assertActive(); checkAbort(signal);
             usage.elapsedMs = performance.now() - start;
             return { matches: mems.map(publicMatch), usage };
@@ -284,7 +224,7 @@ function makeDataHandle(backend: DataBackend, options: Options, queue: Queue, re
         try { return { input: structuredClone(input), start }; }
         catch (cause) {
             const error = new MemDriveError('INVALID_INPUT', 'Recall input must be cloneable data.', { cause });
-            error.usage = { elapsedMs: 0, databaseRequests: 0, models: [] };
+            error.usage = { elapsedMs: 0, databaseRequests: 0 };
             return { error };
         }
     };
@@ -294,7 +234,7 @@ function makeDataHandle(backend: DataBackend, options: Options, queue: Queue, re
         catch (cause) {
             // Queue cancellation and executeRecall both reject with MemDriveError.
             const error = cause as MemDriveError;
-            error.usage ??= { elapsedMs: performance.now() - prepared.start, databaseRequests: 0, models: [] };
+            error.usage ??= { elapsedMs: performance.now() - prepared.start, databaseRequests: 0 };
             throw error;
         }
     };
@@ -328,12 +268,20 @@ function makeDataHandle(backend: DataBackend, options: Options, queue: Queue, re
         list: (request?: ListRequest, options?: RequestOptions) => backend.list(request, options),
         embedding: Object.freeze(structuredClone(backend.embedding)),
         recall,
+        async countValues(request: CountValuesRequest, options?: RequestOptions) {
+            const { signal } = operationOptions(options);
+            checkAbort(signal);
+            return inspect(() => counter.countValues(request, operation => queue(async () => {
+                backend.assertActive(); checkAbort(signal);
+                const result = await operation({ signal });
+                backend.assertActive(); checkAbort(signal);
+                return result;
+            }, signal), signal));
+        },
     });
 }
 
 function makeDrive(backend: Backend, options: Options): MemDrive {
-    requireInput(backend.embedding.mode !== 'external' || options.mode === 'single_pass',
-        'External embeddings support only single_pass retrieval.');
     const concurrency = options.maxConcurrentRequests ?? 5;
     const queue = requestQueue(concurrency), recallQueue = requestQueue(concurrency);
     const at = (ref: { branch: string }) => {

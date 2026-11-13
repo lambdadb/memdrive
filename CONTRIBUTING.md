@@ -26,7 +26,7 @@ npm run check:package
 
 The public entry points are the package root, its `types` subpath and `package.json`. Internal modules are not public exports. Tests may import built internal modules to cover implementation invariants, but examples and consumer checks use the public package name.
 
-Preserve the same application-facing contracts for single-pass and agentic retrieval. Keep application-specific source preparation and answer assembly outside the SDK. Preserve error classification, request cancellation, branch and filter boundaries, and batch input/output correspondence when refactoring.
+Keep retrieval as an SDK data operation. Query planning, repeated searches and evidence selection belong to calling applications or agents. Keep application-specific source preparation and answer assembly outside the SDK. Preserve error classification, request cancellation, branch and filter boundaries, and batch input/output correspondence when refactoring.
 
 The LambdaDB dependency is pinned to an exact release. Update it deliberately with relevant API and regression checks. Tooling versions initially follow the native client's lockfile; updating tooling is separate from adopting a new database API.
 

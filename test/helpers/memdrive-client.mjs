@@ -98,10 +98,3 @@ export function memdriveClient() {
     };
     return Object.assign(fixture, { client });
 }
-
-export const modelResponse = (calls, usage) => ({ status: 'completed', model: 'synthetic-model',
-    output: calls.map(([name, args]) => ({ type: 'function_call', call_id: globalThis.crypto.randomUUID(),
-        name, arguments: JSON.stringify(args) })), ...(usage ? { usage } : {}) });
-
-export const modelAdapter = respond => ({ name: 'synthetic-model', provider: 'synthetic',
-    checkContext: () => true, respond });

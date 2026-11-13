@@ -5,7 +5,7 @@ import { create, open, list } from '../dist/esm/index.js';
 import { memdriveClient } from './helpers/memdrive-client.mjs';
 
 const external = { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'client-model-v1' };
-const createOptions = (client, name, options = {}) => ({ client, name, mode: 'single_pass', metadataSchema: {}, ...options });
+const createOptions = (client, name, options = {}) => ({ client, name, metadataSchema: {}, ...options });
 
 test('labels reserve native capacity and descriptors revalidate fresh collection metadata', async () => {
     const f = memdriveClient();
@@ -149,7 +149,7 @@ test('native SDK roundtrips collection and field descriptions without exposing r
     assert.equal(described.description, '');
     assert.equal(Object.hasOwn(described.metadataSchema.role, 'description'), false);
     assert.equal(described.metadataSchema.topic.description, 'Topics mentioned.');
-    assert.deepEqual(await (await open({ client, name: 'sample', mode: 'single_pass' })).describe(), described);
+    assert.deepEqual(await (await open({ client, name: 'sample' })).describe(), described);
     assert.equal(requests[0].body.tags.app, 'sillymemory');
     assert.equal(requests[0].body.tags['memory.embedding'], external.identity);
     assert.equal(requests.find(request => request.method === 'GET' && request.path.endsWith('/collections')).query.size, '3');

@@ -1,13 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { create, open } from '../dist/esm/index.js';
-import { memdriveClient, modelAdapter } from './helpers/memdrive-client.mjs';
+import { memdriveClient } from './helpers/memdrive-client.mjs';
 
 const embedding = { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'application-vector-v1' };
 const vector = Array.from({ length: 64 }, (_, index) => index === 0 ? 1 : 0);
 const schema = { label: { type: 'string' } };
 const createDrive = (fixture, options = {}) => create({ client: fixture.client, name: 'external_test',
-    metadataSchema: schema, mode: 'single_pass', embedding, ...options });
+    metadataSchema: schema, embedding, ...options });
 
 test('external vectors round-trip IDs and metadata through reopen, branch recall and schema configuration', async () => {
     const f = memdriveClient(), events = [];
@@ -30,13 +30,13 @@ test('external vectors round-trip IDs and metadata through reopen, branch recall
     const result = await drive.recall({ queryVector: vector, limit: 3,
         filter: { field: 'metadata.label', op: 'eq', value: 'first' }, excludeIds: ['other'] });
     assert.deepEqual(result.matches, [{ kind: 'mem', memId: 'known', timestamp: input.timestamp, metadata: input.metadata }]);
-    assert.equal(result.usage.databaseRequests, 1); assert.deepEqual(result.usage.models, []);
+    assert.equal(result.usage.databaseRequests, 1); assert.equal(Object.hasOwn(result.usage, 'models'), false);
     const request = f.calls.findLast(call => call.kind === 'query').request;
     assert.deepEqual(request.query.knn.queryVector, vector); assert.equal(request.query.knn.k, 3);
     assert.equal(request.rerank, undefined); assert.equal(request.includeVectors, false);
-    assert.deepEqual(events.map(event => event.matches), [result.matches, result.matches]);
+    assert.deepEqual(events.map(event => event.matches), [result.matches]);
     await drive.branches.create({ name: 'alternate' });
-    const reopened = await open({ client: f.client, name: 'external_test', branch: 'alternate', mode: 'single_pass' });
+    const reopened = await open({ client: f.client, name: 'external_test', branch: 'alternate' });
     assert.deepEqual(reopened.embedding, embedding);
     await reopened.configure({ metadataSchema: { ...schema, group: { type: 'number' } } });
     assert.deepEqual(reopened.at({ branch: 'main' }).embedding, embedding);
@@ -60,7 +60,7 @@ test('invalid embedding configuration and unsupported external creation fail bef
         assert.equal(f.calls.length, 0);
     }
     for (const options of [{ textSearch: { analyzers: ['english'] } },
-        { mode: 'agentic', agent: { model: modelAdapter(async () => assert.fail('Unexpected model call.')) } }]) {
+        { mode: 'agentic' }, { agent: {} }]) {
         const f = memdriveClient();
         await assert.rejects(createDrive(f, options), { code: 'INVALID_INPUT' });
         assert.equal(f.calls.length, 0);
@@ -75,7 +75,7 @@ test('external writes and recalls reject text, malformed vectors and model modes
     for (const value of invalidVectors) {
         await assert.rejects(drive.remember({ mems: [{ embedding: vector }, { embedding: value }] }), { code: 'INVALID_INPUT' });
         await assert.rejects(drive.recall({ queryVector: value }), error => error.code === 'INVALID_INPUT'
-            && error.usage.databaseRequests === 0 && error.usage.models.length === 0);
+            && error.usage.databaseRequests === 0 && !Object.hasOwn(error.usage, 'models'));
     }
     for (const request of [{ query: 'text' }, { queryVector: vector, query: 'mixed' },
         { queryVector: vector, context: 'context' }, { queryVector: vector, recentDialogue: [] },

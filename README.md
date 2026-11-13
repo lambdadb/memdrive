@@ -1,8 +1,9 @@
 # MemDrive
 
 TypeScript memory SDK backed by LambdaDB. Store original memories, retrieve
-relevant evidence with a single search or an agent, and read complete originals.
-Applications own answer generation and presentation. The SDK accepts an initialized
+relevant evidence, inspect metadata distributions, and read complete originals.
+Applications and their agents own query planning, repeated searches, evidence
+selection, answer generation and presentation. The SDK accepts an initialized
 LambdaDB client; the caller owns connection credentials and transport.
 
 The package is `@functional-systems/memdrive`, licensed under Apache-2.0.
@@ -23,7 +24,7 @@ const client = new LambdaDBClient({
 });
 
 const drive = await create({
-    client, name: 'story_memory', mode: 'single_pass',
+    client, name: 'story_memory',
     description: 'Conversation memories for the example application',
     metadataSchema: {
         role: { type: 'string', description: 'Message author role: user or assistant' },
@@ -45,12 +46,13 @@ const { mems } = await drive.read({ ids: [...new Set(matches.map(match => match.
 | Operation | Contract |
 | --- | --- |
 | `create(options, {signal}?)` | Creates one collection and opens a handle. Existing names fail. |
-| `open({client, name, mode, branch?, ...}, {signal}?)` | Validates an existing MemDrive; embedding and analyzers come from storage. |
+| `open({client, name, branch?, ...}, {signal}?)` | Validates an existing MemDrive; embedding and analyzers come from storage. |
 | `list({client, labels?, limit?, cursor?}, {signal}?)` | Returns `{drives, nextCursor?}` for one native collection page. Default limit 10, maximum 100. |
 | `drive.describe({signal}?)` | Fresh `{name, description?, labels, metadataSchema, embedding, textSearch?}`. |
 | `drive.remember({mems}, {signal}?)` | Appends generated IDs or fully replaces supplied IDs. Returns `{ids}` in input order. |
 | `drive.recall(request, {signal}?)` | Returns `{matches, usage}`; no final answer is generated. Default limit 10. |
 | `drive.recall({requests}, {signal}?)` | Returns `{results}` in input order, including individual error/usage entries. |
+| `drive.countValues({fields, filter?, excludeIds?, limit?}, {signal}?)` | Returns keyword value buckets and counts over original memories, with `asOf` and per-field `hasMore`. Default limit 10, maximum 100. |
 | `drive.read({ids}, {signal}?)` | Returns full original `{mems}`; absent IDs are omitted. |
 | `drive.list({limit?, cursor?}, {signal}?)` | Returns original `{mems, nextCursor?}` from one committed physical document page. Default limit 100, maximum 1000. |
 | `drive.forget({ids} or {filter}, {signal}?)` | Removes whole Mems and their chunks. Missing IDs are harmless. |
@@ -71,8 +73,8 @@ Metadata types are `string`, `string[]`, `number`, `boolean`, and `datetime`.
 Drive and metadata-field descriptions are optional strings, up to 255 UTF-16 code units,
 stored in native collection/index descriptions. `configure` preserves omitted
 descriptions; an empty string clears one. Descriptions are returned by `describe`
-and the drive catalog. Agentic `get_schema` exposes the drive description,
-caller labels and field descriptions so the model can inspect their meanings.
+and the drive catalog. `describe()` is the schema inspection API; there is no
+separate agent-specific schema response.
 Only declared metadata is accepted. Filters use explicit `and`/`or` arrays and
 leaves such as `{field:'metadata.role', op:'eq', value:'user'}`. Supported leaf
 operators are `eq`, `neq`, `in`, `exists`, `gt`, `gte`, `lt`, `lte`; ranges apply
@@ -94,48 +96,38 @@ Managed stores use native `text-embedding-3-small` embeddings. At creation,
 omitting `embedding` and passing `embedding: { mode: 'managed' }` are equivalent.
 The managed model settings are fixed; `open` recovers them from storage. Supplying
 `textSearch.analyzers` enables hybrid retrieval; omission uses vector retrieval.
-Managed `single_pass` uses native Jev reranking by default in both cases.
+Managed text retrieval uses native Jev reranking by default in both cases.
 `recall` accepts an optional boolean `rerank`, including on each item of a batch:
 
-| Effective recall mode | Omitted | `false` | `true` |
+| Embedding configuration | Omitted | `false` | `true` |
 | --- | --- | --- | --- |
-| Managed `single_pass` | Enabled | Disabled | Enabled |
-| External `single_pass` | Disabled | Disabled | Rejected |
-| `agentic` | Disabled | Disabled | Rejected |
+| Managed | Enabled | Disabled | Enabled |
+| External | Disabled | Disabled | Rejected |
 
 ```js
 await drive.recall({ query: 'When is the meeting?', rerank: false });
 ```
 
 This is a per-request execution option, not a stored setting or a
-`create`/`open`/`configure` option. The effective mode is the recall's `mode`
-override or the handle default. Disabling reranking preserves the existing
+`create`/`open`/`configure` option. Disabling reranking preserves the existing
 KNN `k`, filters and result limit; results retain search order.
-Unsupported combinations fail before database or model requests.
+Unsupported combinations fail before database requests.
 
-`agentic` requires
-an `agent.model` adapter and exposes the SDK's search, schema/distribution,
-original-read, and final-ID reporting tools. Application-specific optional
-instructions and answer budgets belong to the caller. The SDK returns selected
-evidence; the caller assembles the final answer input.
+Each `recall` performs one native search request. There is no retrieval `mode`,
+internal model adapter, prompt, evidence-selection step or model loop. A caller
+can issue multiple queries in a batch, inspect the returned matches, call `read`
+for complete originals and search again. Optional text `context` and
+`recentDialogue` still become part of the embedding/rerank query without an internal agent
+call. The caller owns their relevance and size; the native 8 KiB query bound is
+validated without silent truncation. `usage` reports `elapsedMs` and
+`databaseRequests`; MemDrive does not report caller model token usage.
 
-The adapter contract is exported as `AgentModel`. It provides `name`, `provider`,
-`respond(request, {signal}?)`, and `checkContext(request)`, with optional `reasoning`.
-The wire format currently follows the OpenAI Responses API: requests contain
-function tools and conversation items; successful responses must have
-`status: 'completed'` and an `output` array containing function calls with
-`type`, `call_id`, `name`, and JSON-string `arguments`. Other providers need an
-adapter to this format. Optional response `usage` supplies token accounting.
-Its fields are `input_tokens`, `input_tokens_details.cached_tokens`, and
-`output_tokens`; unavailable or invalid counts become `null` in public usage.
-`checkContext` returns `false` or throws to stop an oversized request; no context
-is silently truncated. Provider SDKs and credentials are not bundled.
-
-Optional `observe` and `record` callbacks expose retrieval diagnostics. Use
-`observe.matches[].memId` for canonical caller IDs; `observe.ids` contains internal
-physical evidence IDs, distinct from the short aliases shown to the agent.
-`record` includes request/response bodies and memory text, so callers control
-whether and where to retain those events.
+Optional `observe` and `record` callbacks expose retrieval diagnostics.
+`observe` emits one `retrieved` event for each successful recall; there is no
+selection event. Use `observe.matches[].memId` for canonical caller IDs;
+`observe.ids` contains internal physical evidence IDs. `record` emits `query`
+and `query_result` events, including bodies and memory text. Batch callbacks
+include `requestIndex`. Callers control whether and where to retain these events.
 
 Managed text uses the current 800-code-point splitter, Unicode-aware with UTF-16
 source offsets and no overlap. Short full Mems store `content` once. Long Mems
@@ -152,7 +144,7 @@ embedding: { mode: 'external', dimensions: 768,
 
 Remember `{id?, embedding, timestamp?, metadata?}` and recall with
 `{queryVector, filter?, excludeIds?, limit?}`. Text, chunking, keyword search,
-reranking and agentic mode are unavailable for this mode. Read/list/matches
+and reranking are unavailable for external embeddings. Read/list/matches
 return references and metadata without vectors or source text. The caller owns
 embedding identity compatibility and reconstruction of the local original.
 
@@ -163,9 +155,9 @@ sequential. Failure details distinguish `completedIds`, `uncertainIds`, and
 `notAttemptedIds`. A multi-request remember is not atomic; do not blindly retry
 the entire operation. The SDK does not serialize different writes or retry them.
 
-Cancellation is a separate options argument and never enters stored/model JSON.
-It removes queued recalls and propagates to native requests and the model adapter's
-`respond(request, {signal})`. Cancellation does not undo accepted writes.
+Cancellation is a separate options argument and never enters stored JSON.
+It removes queued requests and propagates to native requests. Cancellation does
+not undo accepted writes.
 Recalls share a default concurrency bound of five across branch views; the
 caller may configure it. Batch request count is not artificially capped by the
 SDK; a hosted MCP wrapper can impose its own exposed tool limit.
@@ -175,11 +167,50 @@ after incompatible layout changes. MemDrive uses LambdaDB SDK 0.12.0. Build
 artifacts are generated with `npm run build`; browser applications bundle the
 public package entry point with their own build tools.
 
+## Metadata distributions
+
+Use `describe()` for field declarations and `countValues()` for stored values:
+
+```ts
+const { metadataSchema } = await drive.describe();
+const distribution = await drive.countValues({
+    fields: ['metadata.role', 'metadata.tags'],
+    filter: { field: 'timestamp', op: 'gte', value: '2026-01-01T00:00:00Z' },
+    excludeIds: ['message-to-exclude'],
+    limit: 10,
+});
+// distribution.values['metadata.role']:
+// { buckets: [{ value: 'user', count: 12 }], hasMore: false }
+// distribution.asOf: ISO 8601 UTC fetch time
+```
+
+Countable fields are `id` and declared `string`/`string[]` metadata fields.
+Each request accepts one to five distinct fields, matching the native facet limit. Numeric, boolean and datetime fields can
+filter the population but cannot be aggregated. Counts include each original
+Mem once, regardless of its chunk count; obsolete chunk slots do not contribute.
+An array may place a Mem in multiple buckets, so bucket sums are not the number
+of memories. The active branch, filter and excluded IDs determine the population.
+
+Value results are cached for 60 seconds per data handle; schema validation is
+cached for five minutes internally. `describe()` itself remains a fresh lookup.
+SDK mutations invalidate local counts across views of the same drive. Writes
+through another independent handle or client may remain invisible in cached
+counts until expiration. `asOf` is the result fetch time, not a database snapshot
+identifier. `hasMore` is `true` when another bucket is observed, `false` when the
+response is complete, and `null` when the native 100-bucket bound leaves
+completeness unknown.
+
+A hosted MCP service can expose these SDK operations and supply tool descriptions
+and protocol handling. The service or calling agent owns orchestration; MemDrive
+has no model-specific tool schemas, short evidence aliases or finish/report tool.
+
 ## Consumers
 
 The prototype was exercised by BEAM, LongMemEval and SillyMemory integrations.
 Those applications and evaluation runners remain outside this SDK repository;
 their existing local copies have not been switched to the standalone package.
-Each caller owns dataset interpretation, recent-context partition, provider
-adapters and final prompt assembly. SDK unit and package checks do not establish
+Each caller owns dataset interpretation, recent-context partition, search
+orchestration and final prompt assembly. The standalone API no longer accepts
+`mode` or `agent`; consumers of the earlier prototype must remove those options
+and move any agent loop to the application. SDK unit and package checks do not establish
 benchmark answer quality or live service compatibility.

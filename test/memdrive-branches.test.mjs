@@ -3,12 +3,11 @@ import assert from 'node:assert/strict';
 import { LambdaDBClient, HTTPClient } from '@functional-systems/lambdadb';
 import * as memdrive from '../dist/esm/index.js';
 import { createBackend, publicMatch, sourceMatch } from '../dist/esm/storage.js';
-import { memdriveClient, modelAdapter, modelResponse } from './helpers/memdrive-client.mjs';
+import { memdriveClient } from './helpers/memdrive-client.mjs';
 
 const schema = { topic: { type: 'string' } };
 const mem = (content, id = 'same') => ({ id, content, metadata: { topic: content } });
-const create = (f, options = {}) => memdrive.create({ client: f.client, name: 'branches_test', metadataSchema: schema, mode: 'single_pass', ...options });
-const lastOutput = request => JSON.parse(request.input.findLast(item => item.type === 'function_call_output').output);
+const create = (f, options = {}) => memdrive.create({ client: f.client, name: 'branches_test', metadataSchema: schema, ...options });
 
 test('branch data is independent, opening selects existing data, and administration stays collection-scoped', async () => {
     const f = memdriveClient(), drive = await create(f);
@@ -18,7 +17,7 @@ test('branch data is independent, opening selects existing data, and administrat
     assert.equal(details.name, 'alternate'); assert(details.createdAt instanceof Date);
     assert.deepEqual((await drive.branches.list()).map(item => item.name), ['main', 'alternate']);
     const alternate = drive.at({ branch: 'alternate' });
-    assert.deepEqual(Object.keys(alternate).sort(), ['embedding', 'forget', 'list', 'read', 'recall', 'remember']);
+    assert.deepEqual(Object.keys(alternate).sort(), ['countValues', 'embedding', 'forget', 'list', 'read', 'recall', 'remember']);
     await alternate.remember({ mems: [mem('x'.repeat(1700))] });
     await alternate.remember({ mems: [mem('alternate')] });
     assert.deepEqual((await drive.read({ ids: ['same'] })).mems, [mem('original')]);
@@ -27,9 +26,9 @@ test('branch data is independent, opening selects existing data, and administrat
         .filter(doc => doc.kind === 'chunk' && !Object.hasOwn(doc, 'content')).length, 3);
     assert.deepEqual((await drive.recall({ query: 'topic' })).matches, [publicMatch(await sourceMatch(mem('original')))]);
     assert.deepEqual((await alternate.recall({ query: 'topic' })).matches, [publicMatch(await sourceMatch(mem('alternate')))]);
-    const opened = await memdrive.open({ client: f.client, name: 'branches_test', branch: 'alternate', mode: 'single_pass' });
+    const opened = await memdrive.open({ client: f.client, name: 'branches_test', branch: 'alternate' });
     assert.deepEqual((await opened.recall({ query: 'topic' })).matches, [publicMatch(await sourceMatch(mem('alternate')))]);
-    await assert.rejects(memdrive.open({ client: f.client, name: 'branches_test', branch: 'missing', mode: 'single_pass' }), { code: 'BRANCH_NOT_FOUND' });
+    await assert.rejects(memdrive.open({ client: f.client, name: 'branches_test', branch: 'missing' }), { code: 'BRANCH_NOT_FOUND' });
     await opened.configure({ metadataSchema: { ...schema, label: { type: 'string' } } });
     // The new view shares this root's schema after collection-wide configuration.
     await opened.at({ branch: 'main' }).remember({ mems: [{ ...mem('updated'), metadata: { topic: 'updated', label: 'shared' } }] });
@@ -68,107 +67,6 @@ test('branch input errors and native missing/conflict errors never fall back or 
     await drive.branches.create({ name: 'alternate' });
     await assert.rejects(stale.recall({ query: 'topic' }), { code: 'BRANCH_INVALIDATED' });
     await drive.at({ branch: 'alternate' }).remember({ mems: [mem('replacement')] });
-});
-
-test('all views share the recall request queue while agent evidence and filters remain branch-local', async () => {
-    const f = memdriveClient();
-    const requests = [];
-    const agent = { model: modelAdapter(async request => {
-        requests.push(request);
-        if (!request.input.some(item => item.type === 'function_call_output'))
-            return modelResponse([['search_semantic', { query: 'topic' }]]);
-        const shown = lastOutput(request).new_evidence;
-        assert.equal(shown.length, 1); assert.equal(shown[0].id, 'e1');
-        return modelResponse([['report_helpful_ids', { ids: ['e1'] }]]);
-    }) };
-    const drive = await create(f, { agent, maxConcurrentRequests: 2 });
-    await drive.branches.create({ name: 'alternate' });
-    const alternate = drive.at({ branch: 'alternate' });
-    await drive.remember({ mems: [mem('main')] });
-    await alternate.remember({ mems: [mem('alternate')] });
-    let active = 0, peak = 0;
-    f.search = async (_request, docs) => {
-        active++; peak = Math.max(peak, active);
-        await new Promise(resolve => setTimeout(resolve, 2)); active--;
-        return docs;
-    };
-    const results = await Promise.all(Array.from({ length: 6 }, (_, i) => (i % 2 ? alternate : drive).recall({
-        query: 'topic', mode: 'agentic', filter: { field: 'metadata.topic', op: 'eq', value: i % 2 ? 'alternate' : 'main' },
-    })));
-    assert.equal(peak, 2);
-    assert.deepEqual(results.map(result => result.matches[0].content), ['main', 'alternate', 'main', 'alternate', 'main', 'alternate']);
-    assert(f.calls.filter(call => call.kind === 'query').every(call => JSON.stringify(call.request.query).includes('metadata.topic')));
-    assert(requests.every(request => request.tools.every(tool => !tool.name.includes('branch'))));
-});
-
-test('count caches are branch-local and refresh after sibling writes and schema changes between model steps', async () => {
-    const f = memdriveClient(), observed = [];
-    let mutate = false, drive;
-    const agent = { model: modelAdapter(async request => {
-        const outputs = request.input.filter(item => item.type === 'function_call_output');
-        if (!outputs.length) return modelResponse([['count_values', { fields: ['metadata.topic'] }]]);
-        observed.push(lastOutput(request));
-        if (mutate && outputs.length === 1) {
-            await drive.configure({ metadataSchema: { ...schema, label: { type: 'string' } } });
-            await drive.at({ branch: 'alternate' }).remember({ mems: [{ id: 'new', content: 'new', metadata: { label: 'fresh' } }] });
-            return modelResponse([['count_values', { fields: ['metadata.label'] }]]);
-        }
-        return modelResponse([['report_helpful_ids', { ids: [] }]]);
-    }) };
-    drive = await create(f, { mode: 'agentic', agent });
-    await drive.branches.create({ name: 'alternate' });
-    const alternate = drive.at({ branch: 'alternate' });
-    await drive.remember({ mems: [mem('main')] });
-    await alternate.remember({ mems: [mem('alternate')] });
-    f.search = (request, docs) => ({ docs: [], facets: Object.fromEntries(Object.keys(request.facets).map(field => [field, {
-        buckets: docs.filter(doc => doc.metadata?.[field.slice(9)] !== undefined).map(doc => ({ value: doc.metadata[field.slice(9)], count: 1 })),
-    }])) });
-    await drive.recall({ query: 'counts' });
-    await alternate.recall({ query: 'counts' });
-    const count = f.calls.filter(call => call.kind === 'query').length;
-    await alternate.recall({ query: 'counts' });
-    assert.equal(f.calls.filter(call => call.kind === 'query').length, count);
-    assert.equal(observed[0].values['metadata.topic'].buckets[0].value, 'main');
-    assert.equal(observed[1].values['metadata.topic'].buckets[0].value, 'alternate');
-    mutate = true;
-    await alternate.recall({ query: 'counts' });
-    assert.deepEqual(observed.at(-1).values['metadata.label'].buckets, [{ value: 'fresh', count: 1 }]);
-    assert(f.calls.filter(call => call.kind === 'query' && call.request.facets['metadata.label'])
-        .every(call => call.request.ref.name === 'alternate'));
-    f.filterDelete = (request, docs) => {
-        assert.equal(request.branch, 'alternate');
-        assert.equal(request.filter.queryString.defaultField, 'metadata.label');
-        return docs.filter(doc => doc.metadata?.label === 'fresh').map(doc => doc.id);
-    };
-    await alternate.forget({ filter: { field: 'metadata.label', op: 'eq', value: 'fresh' } });
-    assert([...f.collections.get('branches_test').branches.get('alternate').docs.values()]
-        .every(doc => doc.memId !== 'new'));
-});
-
-test('a sibling write settling after a count load invalidates that cached population', async () => {
-    const f = memdriveClient(), counts = [];
-    const agent = { model: modelAdapter(async request => {
-        if (!request.input.some(item => item.type === 'function_call_output'))
-            return modelResponse([['count_values', { fields: ['metadata.topic'] }]]);
-        counts.push(lastOutput(request).values['metadata.topic'].buckets[0].value);
-        return modelResponse([['report_helpful_ids', { ids: [] }]]);
-    }) };
-    const drive = await create(f, { mode: 'agentic', agent });
-    await drive.branches.create({ name: 'alternate' });
-    const reader = drive.at({ branch: 'alternate' }), writer = drive.at({ branch: 'alternate' });
-    await writer.remember({ mems: [mem('before')] });
-    f.search = (_request, docs) => ({ docs: [], facets: { 'metadata.topic': {
-        buckets: docs.map(doc => ({ value: doc.metadata.topic, count: 1 })),
-    } } });
-    let entered, release;
-    const pending = new Promise(resolve => { entered = resolve; });
-    f.beforeUpsert = () => { entered(); return new Promise(resolve => { release = resolve; }); };
-    const write = writer.remember({ mems: [mem('after')] });
-    await pending;
-    try { await reader.recall({ query: 'counts' }); }
-    finally { release(); await write; }
-    await reader.recall({ query: 'counts' });
-    assert.deepEqual(counts, ['before', 'after']);
 });
 
 test('deleting and recreating a branch stops later write batches and preserves accepted-write details', async () => {
@@ -234,4 +132,24 @@ test('native SDK serializes branch management and data refs without network call
         { size: 1, ref: { kind: 'branch', name: 'alternate' }, consistentRead: true, includeVectors: false });
     assert.equal(requests.find(item => item.path.endsWith('/docs/delete')).body.branch, 'alternate');
     assert(requests.some(item => item.method === 'DELETE' && item.path.endsWith('/branches/alternate')));
+});
+
+test('branch-local filters remain isolated across concurrent recalls sharing the request bound', async () => {
+    const f = memdriveClient(), drive = await create(f, { maxConcurrentRequests: 2 });
+    await drive.branches.create({ name: 'alternate' });
+    const alternate = drive.at({ branch: 'alternate' });
+    await drive.remember({ mems: [mem('main')] });
+    await alternate.remember({ mems: [mem('alternate')] });
+    let active = 0, peak = 0;
+    f.search = async (_request, docs) => {
+        active++; peak = Math.max(peak, active);
+        await new Promise(resolve => setTimeout(resolve, 2)); active--;
+        return docs;
+    };
+    const results = await Promise.all(Array.from({ length: 6 }, (_, index) => (index % 2 ? alternate : drive).recall({
+        query: 'topic', filter: { field: 'metadata.topic', op: 'eq', value: index % 2 ? 'alternate' : 'main' },
+    })));
+    assert.equal(peak, 2);
+    assert.deepEqual(results.map(result => result.matches[0].content), ['main', 'alternate', 'main', 'alternate', 'main', 'alternate']);
+    assert(f.calls.filter(call => call.kind === 'query').every(call => JSON.stringify(call.request.query).includes('metadata.topic')));
 });

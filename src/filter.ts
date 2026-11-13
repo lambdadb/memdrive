@@ -187,15 +187,3 @@ export function matchesFilter(mem: {id: string; timestamp?: string | undefined; 
     };
     return visit(filter);
 }
-
-const scalar = { anyOf: [{ type: 'string' }, { type: 'number' }, { type: 'boolean' }] };
-export const filterJsonSchema = {
-    $ref: '#/$defs/filter',
-    $defs: { filter: { anyOf: [
-        { type: 'object', properties: { and: { type: 'array', minItems: 1, items: { $ref: '#/$defs/filter' } } }, required: ['and'], additionalProperties: false },
-        { type: 'object', properties: { or: { type: 'array', minItems: 1, items: { $ref: '#/$defs/filter' } } }, required: ['or'], additionalProperties: false },
-        { type: 'object', properties: { field: { type: 'string' }, op: { enum: ['eq', 'neq', 'gt', 'gte', 'lt', 'lte'] }, value: scalar }, required: ['field', 'op', 'value'], additionalProperties: false },
-        { type: 'object', properties: { field: { type: 'string' }, op: { const: 'in' }, value: { type: 'array', minItems: 1, items: scalar } }, required: ['field', 'op', 'value'], additionalProperties: false },
-        { type: 'object', properties: { field: { type: 'string' }, op: { const: 'exists' }, value: { type: 'boolean' } }, required: ['field', 'op', 'value'], additionalProperties: false },
-    ] } },
-};

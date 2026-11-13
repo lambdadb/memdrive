@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { create, MemDriveError } from '../dist/esm/index.js';
-import { memdriveClient, modelAdapter, modelResponse } from './helpers/memdrive-client.mjs';
+import { memdriveClient } from './helpers/memdrive-client.mjs';
 
 const gate = () => {
     let open;
@@ -10,7 +10,7 @@ const gate = () => {
 };
 const setup = async options => {
     const fixture = memdriveClient();
-    const drive = await create({ client: fixture.client, name: 'batch_test', metadataSchema: {}, mode: 'single_pass', ...options });
+    const drive = await create({ client: fixture.client, name: 'batch_test', metadataSchema: {}, ...options });
     return { fixture, drive };
 };
 
@@ -62,7 +62,7 @@ test('partial failures have safe serializable errors and independent usage while
     assert.deepEqual(result.results.map(item => item.error?.code ?? 'ok'),
         ['ok', 'INVALID_INPUT', 'DATABASE_ERROR', 'INVALID_INPUT', 'ok']);
     assert.deepEqual(result.results.map(item => item.usage.databaseRequests), [1, 0, 1, 0, 1]);
-    assert(result.results.every(item => item.usage.models.length === 0));
+    assert(result.results.every(item => !Object.hasOwn(item.usage, 'models')));
     assert.deepEqual(result.results[2].error, { code: 'DATABASE_ERROR', message: 'MemDrive query failed.', status: 503 });
     const encoded = JSON.stringify(result);
     for (const text of ['private backend detail', 'private-token', 'cause', 'stack', 'details']) assert(!encoded.includes(text));
@@ -72,7 +72,7 @@ test('partial failures have safe serializable errors and independent usage while
         && error.code === 'INVALID_INPUT' && error.usage.databaseRequests === 0);
 });
 
-test('invalid outer batch envelopes reject before database or model work', async () => {
+test('invalid outer batch envelopes reject before database work', async () => {
     const { fixture: f, drive } = await setup();
     const before = f.calls.length;
     for (const request of [{ requests: [] }, { requests: null }, { requests: {} },
@@ -110,52 +110,22 @@ test('queued inputs are detached and an invalidated branch cannot dispatch queue
     assert.equal(invalidated.results[0].usage.databaseRequests, 0);
 });
 
-test('agent batches bound model calls and isolate histories, evidence aliases, callbacks and usage', async () => {
-    const started = [gate(), gate(), gate()], releases = [gate(), gate(), gate()];
-    const events = [], records = [], finalEvidence = [];
-    let active = 0, peak = 0;
-    const agent = { model: modelAdapter(async request => {
-        const question = JSON.parse(request.input[0].content).question;
-        const index = Number(question);
-        active++; peak = Math.max(peak, active);
-        try {
-            const outputs = request.input.filter(item => item.type === 'function_call_output');
-            if (!outputs.length) {
-                assert.equal(request.input.length, 1);
-                started[index].open(); await releases[index].promise;
-                return modelResponse([['search_semantic', { query: question }]], { input_tokens: 10, output_tokens: 2 });
-            }
-            assert.equal(outputs.length, 1);
-            const shown = JSON.parse(outputs[0].output).new_evidence;
-            assert.equal(shown.length, 1); assert.equal(shown[0].id, 'e1');
-            assert.equal(shown[0].content, question);
-            finalEvidence.push(question);
-            return modelResponse([['report_helpful_ids', { ids: ['e1'] }]], { input_tokens: 20, output_tokens: 3 });
-        } finally { active--; }
-    }) };
-    const { fixture: f, drive } = await setup({ mode: 'agentic', agent, maxConcurrentRequests: 2,
-        observe: event => events.push(event), record: event => records.push(event) });
-    await drive.remember({ mems: ['0', '1', '2'].map(id => ({ id, content: id })) });
+test('batch callbacks identify each request while singles omit the batch index', async () => {
+    const events = [], records = [];
+    const { fixture: f, drive } = await setup({
+        observe: event => events.push(event), record: event => records.push(event),
+    });
+    await drive.remember({ mems: ['a', 'b'].map(id => ({ id, content: id })) });
     f.search = (request, docs) => docs.filter(doc => doc.memId === request.query.knn.queryText);
-    const batch = drive.recall({ requests: [{ query: '0' }, { query: '1' }, { query: '2' }] });
-    await Promise.all([started[0].promise, started[1].promise]);
-    assert.equal(active, 2); assert.equal(f.calls.filter(call => call.kind === 'query').length, 0);
-    releases[1].open(); await started[2].promise;
-    releases[2].open(); releases[0].open();
-    const { results } = await batch;
-    assert.equal(peak, 2); assert.equal(finalEvidence[0], '1');
-    assert.deepEqual(results.map(result => result.matches[0].memId), ['0', '1', '2']);
-    for (const result of results) {
-        assert.equal(result.usage.databaseRequests, 1);
-        assert.equal(result.usage.models[0].calls, 2);
-        assert.equal(result.usage.models[0].inputTokens, 30);
-    }
-    assert(events.every(event => [0, 1, 2].includes(event.requestIndex)));
-    assert(records.every(event => [0, 1, 2].includes(event.requestIndex)));
-    assert.deepEqual(events.filter(event => event.type === 'selected').sort((a, b) => a.requestIndex - b.requestIndex)
-        .map(event => event.matches[0].memId), ['0', '1', '2']);
+    const { results } = await drive.recall({ requests: [{ query: 'a' }, { query: 'b' }] });
+    assert.deepEqual(events.sort((a, b) => a.requestIndex - b.requestIndex).map(event => ({
+        index: event.requestIndex, type: event.type, memId: event.matches[0].memId,
+    })), [{ index: 0, type: 'retrieved', memId: 'a' }, { index: 1, type: 'retrieved', memId: 'b' }]);
+    assert(records.every(event => [0, 1].includes(event.requestIndex) && !Object.hasOwn(event, 'mode')));
+    assert.deepEqual([...new Set(records.map(event => event.phase))].sort(), ['query', 'query_result']);
+    assert(results.every(result => result.usage.databaseRequests === 1));
     events.length = 0; records.length = 0;
-    await drive.recall({ query: '0' });
+    await drive.recall({ query: 'a' });
     assert(events.every(event => !Object.hasOwn(event, 'requestIndex')));
     assert(records.every(event => !Object.hasOwn(event, 'requestIndex')));
 });

@@ -1,4 +1,4 @@
-import { create, open, type AgentModel, type Filter, type Match, type MemInput } from '@functional-systems/memdrive';
+import { create, open, type Filter, type Match, type MemInput } from '@functional-systems/memdrive';
 import type { MetadataSchema } from '@functional-systems/memdrive/types';
 import { LambdaDBClient } from '@functional-systems/lambdadb';
 
@@ -13,7 +13,7 @@ const filter: Filter = { and: [
     { field: 'timestamp', op: 'lte', value: '2026-12-31T23:59:59Z' },
 ] };
 const signal = new AbortController().signal;
-const drive = await create({ client, name: 'sample', mode: 'single_pass', metadataSchema,
+const drive = await create({ client, name: 'sample', metadataSchema,
     textSearch: { analyzers: ['english'] }, embedding: { mode: 'managed' }, labels: { app: 'sample' } });
 await drive.remember({ mems: [{ content: 'Piano practice is on Friday.', metadata: { tags: ['music'] } }] }, { signal });
 const one = await drive.recall({ query: 'When is practice?', filter, rerank: false }, { signal });
@@ -44,17 +44,24 @@ await branch.recall({ query: 'When?' });
 // @ts-expect-error A branch data handle cannot destroy the collection.
 await branch.destroy();
 
-const model: AgentModel = {
-    name: 'caller-model', provider: 'caller',
-    checkContext: request => request.input.length < 100,
-    respond: async (request, options) => {
-        void [request.tools, options?.signal];
-        return { status: 'completed', output: [{ type: 'function_call', call_id: '1',
-            name: 'report_helpful_ids', arguments: '{"ids":[]}' }] };
-    },
-};
-await open({ client, name: 'sample', mode: 'agentic', agent: { model, maxSteps: 3 } });
-const external = await create({ client, name: 'vectors', mode: 'single_pass', metadataSchema: {},
+const descriptor = await drive.describe();
+const declaredFields: MetadataSchema = descriptor.metadataSchema;
+const distribution = await branch.countValues({ fields: ['metadata.tags'], filter, excludeIds: ['excluded'], limit: 5 }, { signal });
+const fetchedAt: string = distribution.asOf;
+const more: boolean | null = distribution.values['metadata.tags'].hasMore;
+const count: number = distribution.values['metadata.tags'].buckets[0].count;
+void [declaredFields, fetchedAt, more, count];
+// @ts-expect-error Retrieval mode is no longer part of recall.
+await drive.recall({ query: 'text', mode: 'agentic' });
+// @ts-expect-error Model adapters belong to the caller.
+await open({ client, name: 'sample', agent: {} });
+// @ts-expect-error Schema inspection uses describe, not a second API.
+await drive.getSchema();
+// @ts-expect-error Count requests require explicit fields.
+await drive.countValues({});
+// @ts-expect-error Counts accept a structured filter.
+await drive.countValues({ fields: ['id'], filter: 'id:*' });
+const external = await create({ client, name: 'vectors', metadataSchema: {},
     embedding: { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'test-v1' } });
 await external.remember({ mems: [{ id: 'vector-1', embedding: Array(64).fill(1) }] });
 await external.recall({ queryVector: Array(64).fill(1), rerank: false });
@@ -68,9 +75,9 @@ await drive.recall({ query: 'text', queryVector: [1] });
 // @ts-expect-error Vector retrieval cannot enable text reranking.
 await external.recall({ queryVector: [1], rerank: true });
 // @ts-expect-error Reranking is a per-recall option.
-await open({ client, name: 'sample', mode: 'single_pass', rerank: true });
+await open({ client, name: 'sample', rerank: true });
 // @ts-expect-error Creation requires an explicit metadata declaration.
-await create({ client, name: 'sample', mode: 'single_pass' });
+await create({ client, name: 'sample' });
 // @ts-expect-error Configure requires at least one changed setting.
 await drive.configure({});
 // @ts-expect-error Forget selects by IDs or filter, never both.

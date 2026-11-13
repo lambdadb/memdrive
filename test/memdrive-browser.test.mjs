@@ -13,15 +13,15 @@ test('browser bundle executes managed and supplied-vector storage without Node g
             globalThis.smoke = async () => {
                 const f = memdriveClient();
                 const embedding = { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'test-space' };
-                const drive = await create({ client: f.client, name: 'external', mode: 'single_pass',
+                const drive = await create({ client: f.client, name: 'external',
                     metadataSchema: { source: { type: 'string' } }, embedding });
                 const vector = Array.from({ length: 64 }, (_, i) => i + 1);
                 await drive.remember({ mems: ['one', 'two'].map(id => ({ id, embedding: vector, metadata: { source: id } })) });
-                const reopened = await open({ client: f.client, name: 'external', mode: 'single_pass' });
+                const reopened = await open({ client: f.client, name: 'external' });
                 f.search = (_request, docs) => docs;
                 const recall = await reopened.recall({ queryVector: vector });
                 const read = await reopened.read({ ids: ['one', 'two'] });
-                const managed = await create({ client: f.client, name: 'managed', mode: 'single_pass', metadataSchema: {}, embedding: { mode: 'managed' } });
+                const managed = await create({ client: f.client, name: 'managed', metadataSchema: {}, embedding: { mode: 'managed' } });
                 await managed.remember({ mems: [{ id: 'short', content: 'A short original.' }, { id: 'long', content: 'x'.repeat(900) }] });
                 const originals = await managed.read({ ids: ['short', 'long'] });
                 f.search = (_request, docs) => docs.filter(doc => doc.memId === 'short');

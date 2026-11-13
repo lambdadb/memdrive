@@ -29,7 +29,6 @@ export type EmbeddingOptions = {
     mode: 'managed';
 } | ExternalEmbedding;
 export type EmbeddingConfig = ManagedEmbedding | ExternalEmbedding;
-export type RetrievalMode = 'single_pass' | 'agentic';
 export interface MemAttributes {
     timestamp?: string | undefined;
     metadata?: Metadata | undefined;
@@ -111,7 +110,6 @@ export interface RecallOptions {
 export interface TextRecallRequest extends RecallOptions {
     query: string;
     queryVector?: never;
-    mode?: RetrievalMode | undefined;
     context?: string | undefined;
     recentDialogue?: Array<{
         role: 'user' | 'assistant';
@@ -121,24 +119,14 @@ export interface TextRecallRequest extends RecallOptions {
 export interface VectorRecallRequest extends Omit<RecallOptions, 'rerank'> {
     queryVector: number[];
     query?: never;
-    mode?: 'single_pass' | undefined;
     rerank?: false | undefined;
     context?: never;
     recentDialogue?: never;
 }
 export type RecallRequest = TextRecallRequest | VectorRecallRequest;
-export interface ModelUsage {
-    provider: string;
-    model: string;
-    calls: number;
-    inputTokens: number | null;
-    cachedInputTokens: number | null;
-    outputTokens: number | null;
-}
 export interface Usage {
     elapsedMs: number;
     databaseRequests: number;
-    models: ModelUsage[];
 }
 export interface RecallResult {
     matches: Match[];
@@ -155,46 +143,11 @@ export interface RecallFailure {
 export interface BatchRecallResult {
     results: Array<RecallResult | RecallFailure>;
 }
-export interface ToolDefinition {
-    type: 'function';
-    name: string;
-    description: string;
-    strict: false;
-    parameters: Record<string, unknown>;
-}
-/** Model adapter boundary using the Responses API tool-call wire shape. */
-export interface ModelRequest {
-    model: string;
-    store: false;
-    input: Record<string, unknown>[];
-    reasoning?: Record<string, unknown> | undefined;
-    include: string[];
-    instructions?: string | undefined;
-    tools: ToolDefinition[];
-    parallel_tool_calls: true;
-    tool_choice: 'required' | {
-        type: 'function';
-        name: string;
-    };
-}
-export interface AgentModel {
-    name: string;
-    provider: string;
-    reasoning?: Record<string, unknown> | undefined;
-    respond(request: ModelRequest, options?: RequestOptions): Promise<unknown>;
-    checkContext(request: ModelRequest): boolean | void | Promise<boolean | void>;
-}
-export interface AgentOptions {
-    model: AgentModel;
-    instructions?: string | undefined;
-    maxSteps?: number | undefined;
-}
 export interface Observation {
-    type: 'retrieved' | 'selected';
-    /** Diagnostic physical evidence IDs, not canonical memId values or agent aliases. */
+    type: 'retrieved';
+    /** Diagnostic physical evidence IDs, not canonical memId values. */
     ids: string[];
     matches: Match[];
-    completion?: 'single_pass' | 'forced' | 'voluntary' | undefined;
     requestIndex?: number | undefined;
 }
 export type RecordEvent = Record<string, unknown> & {
@@ -202,8 +155,6 @@ export type RecordEvent = Record<string, unknown> & {
     requestIndex?: number | undefined;
 };
 export interface RuntimeOptions {
-    mode: RetrievalMode;
-    agent?: AgentOptions | undefined;
     maxConcurrentRequests?: number | undefined;
     observe?: ((event: Observation) => void | Promise<void>) | undefined;
     record?: ((event: RecordEvent) => void | Promise<void>) | undefined;
@@ -269,6 +220,24 @@ export interface BranchRequest {
     } | undefined;
 }
 export type Branch = Awaited<ReturnType<ReturnType<LambdaDBClient['collection']>['branches']['create']>>['branch'];
+/** Counts distinct keyword values across original memories, not chunks. */
+export interface CountValuesRequest {
+    /** One to five distinct keyword fields, matching the native facet limit. */
+    fields: string[];
+    filter?: Filter | undefined;
+    excludeIds?: string[] | undefined;
+    /** Values per field: defaults to 10, maximum 100. */
+    limit?: number | undefined;
+}
+export interface CountValuesResult {
+    values: Record<string, {
+        buckets: Array<{ value: string; count: number }>;
+        /** Null when the native bucket limit prevents determining completeness. */
+        hasMore: boolean | null;
+    }>;
+    /** Time the cached result was fetched, in ISO 8601 UTC. */
+    asOf: string;
+}
 export interface DriveData {
     readonly embedding: Readonly<EmbeddingConfig>;
     remember(request: {
@@ -282,6 +251,7 @@ export interface DriveData {
         mems: Mem[];
     }>;
     list(request?: ListRequest, options?: RequestOptions): Promise<ListResult>;
+    countValues(request: CountValuesRequest, options?: RequestOptions): Promise<CountValuesResult>;
     forget(request: ForgetRequest, options?: RequestOptions): Promise<void>;
     recall(request: RecallRequest, options?: RequestOptions): Promise<RecallResult>;
     recall(request: {
