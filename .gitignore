@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.tshy-build/
+.tshy/
+artifacts/
+.env
+.env.*
+*.tgz
+*.tsbuildinfo
+.eslintcache
+.DS_Store
