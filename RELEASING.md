@@ -21,8 +21,9 @@ version is tagged, its core is the target; after `vX.Y.Z` is tagged and reachabl
 the target becomes `X.Y.(Z+1)`. An RC keeps its core. The published package records
 `memdriveSourceCommit`. History and published versions must remain immutable.
 
-Development builds use npm dist-tag `dev`, with no Git tag or GitHub Release.
-They never update `latest`. The publication guard rejects stable/RC versions,
+Development builds publish with `--tag dev`, with no Git tag or GitHub Release.
+After initial bootstrap, automated dev publications preserve the existing `latest`
+tag. The publication guard rejects stable/RC versions,
 unprepared metadata and other channels. A superseded main SHA or lower dev
 version is skipped. An already published version from the same source is an
 idempotent retry; a different source under that version is a hard failure.
@@ -57,8 +58,17 @@ For a new npm package whose trusted publisher cannot yet be configured, first ru
 the workflow with `dry_run=true`. Download its tested tarball and manifest, verify
 the SHA-512 integrity from the manifest, and publish that exact archive from an
 authorized local npm session with `npm publish PATH.tgz --access public --tag dev`.
-This initial local publish does not claim CI provenance. Verify registry version,
-source SHA, archive integrity and dist-tags, then configure the trusted publisher.
+This initial local publish does not claim CI provenance. npm may assign both
+`dev` and `latest` on a package's first publication despite `--tag dev`, as
+[reported and confirmed in npm/cli#8490](https://github.com/npm/cli/issues/8490).
+MemDrive's first `0.1.0-dev.5` publication received both tags; removing `latest`
+was rejected by the registry with HTTP 400. Do not treat that tag as evidence of
+a stable release. Install explicitly with `@dev` or an exact prerelease version,
+for example `@functional-systems/memdrive@0.1.0-dev.5`.
+
+Verify registry version, source SHA, archive integrity and both dist-tags, then
+configure the trusted publisher. Subsequent dev publications must preserve the
+existing `latest` pointer, including when it still identifies the bootstrap build.
 Future publications use OIDC and provenance. Authentication or 2FA may require
 maintainer interaction; do not place tokens in source or artifacts.
 
