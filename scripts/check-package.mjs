@@ -32,7 +32,7 @@ try {
             `Unexpected package file: ${path}`);
     writeFileSync(join(temporary, 'package.json'), JSON.stringify({ private: true, type: 'module' }));
     // A clean CI cache may contain tarballs without registry metadata. Allow normal registry resolution.
-    run('npm', ['install', '--prefer-offline', '--ignore-scripts', '--no-audit', '--no-fund', join(temporary, archive.filename)]);
+    run('npm', ['install', '--prefer-offline', '--ignore-scripts', '--no-audit', '--no-fund', join(temporary, archive.filename), `tiktoken@${pkg.devDependencies.tiktoken}`]);
     const installed = JSON.parse(run(process.execPath, ['-e', `console.log(JSON.stringify(require(${JSON.stringify(`${pkg.name}/package.json`)})))`]));
     assert.equal(installed.name, pkg.name, 'Installed package name differs');
     assert.equal(installed.version, pkg.version, 'Installed package version differs');
@@ -54,6 +54,13 @@ try {
             resolveDir: temporary, sourcefile: 'consumer.js' },
         bundle: true, platform: 'browser', format: 'esm', target: 'es2022', write: false,
     });
+    // Exercise the benchmark consumer against the installed archive, not this checkout's self-reference.
+    cpSync(join(root, 'benchmark/longmemeval'), join(temporary, 'benchmark/longmemeval'), { recursive: true });
+    mkdirSync(join(temporary, 'test/helpers'), { recursive: true });
+    copyFileSync(join(root, 'test/longmemeval.test.mjs'), join(temporary, 'test/longmemeval.test.mjs'));
+    for (const file of ['memdrive-client.mjs', 'longmemeval-http.mjs'])
+        copyFileSync(join(root, 'test/helpers', file), join(temporary, 'test/helpers', file));
+    run(process.execPath, ['--test', 'test/longmemeval.test.mjs']);
     if (live) {
         cpSync(join(root, 'test/integration'), join(temporary, 'test/integration'), { recursive: true });
         const files = readdirSync(join(temporary, 'test/integration')).filter(file => file.endsWith('-live.test.mjs'));

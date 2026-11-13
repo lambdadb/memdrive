@@ -248,14 +248,16 @@ for the catalog, branch binding, write opt-in, error outcomes and direct/MCP map
 
 ## Consumers
 
-The prototype was exercised by BEAM, LongMemEval and SillyMemory integrations.
-Those applications and evaluation runners remain outside this SDK repository;
-their existing local copies have not been switched to the standalone package.
-Each caller owns dataset interpretation, recent-context partition, search
-orchestration and final prompt assembly. The standalone API no longer accepts
-`mode` or `agent`; consumers of the earlier prototype must remove those options
-and move any agent loop to the application. SDK unit and package checks do not establish
-benchmark answer quality or live service compatibility.
+The [LongMemEval benchmark](benchmark/longmemeval/README.md) lives in this repository
+and compares one fixed search with model-directed use of the public memory tools.
+It owns dataset preparation, evidence selection, answer generation and judging;
+none of these enter the SDK runtime or npm archive. Future suites, including BEAM,
+can live alongside it under `benchmark/`.
+
+SillyMemory and earlier BEAM/LongMemEval prototypes are separate consumers. Their
+historical results do not establish the standalone package's answer quality.
+Applications own recent-context partitioning, agent loops and final prompt assembly.
+SDK unit and package checks do not establish benchmark quality or live compatibility.
 
 ## Development
 

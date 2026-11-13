@@ -28,7 +28,7 @@
     }
   },
   "scripts": {
-    "lint": "eslint --max-warnings=0 src",
+    "lint": "eslint --max-warnings=0 src benchmark",
     "typecheck": "tsc --noEmit",
     "build": "tshy",
     "test": "npm run build && npm run test:types && node --test test/*.test.mjs",
@@ -36,7 +36,8 @@
     "check:version": "node scripts/version.mjs get",
     "check:package": "npm run build && node scripts/check-package.mjs",
     "prepublishOnly": "node scripts/check-publish.mjs",
-    "test:live": "npm run build && MEMDRIVE_RUN_LIVE_TESTS=1 node --env-file-if-exists=.env.local --test --test-concurrency=1 test/integration/*-live.test.mjs"
+    "test:live": "npm run build && MEMDRIVE_RUN_LIVE_TESTS=1 node --env-file-if-exists=.env.local --test --test-concurrency=1 test/integration/*-live.test.mjs",
+    "benchmark:longmemeval": "node benchmark/longmemeval/run.mjs"
   },
   "dependencies": {
     "@functional-systems/lambdadb": "0.12.0"
@@ -47,6 +48,7 @@
     "esbuild": "0.28.2",
     "eslint": "9.32.0",
     "globals": "15.15.0",
+    "tiktoken": "1.0.22",
     "tshy": "2.0.1",
     "typescript": "5.8.3",
     "typescript-eslint": "8.38.0"
