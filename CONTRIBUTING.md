@@ -45,4 +45,4 @@ checks accurately.
 
 ## Versions and releases
 
-See [RELEASING.md](RELEASING.md). Development publication is manually dispatched from `main` and uses only the `dev` channel. A build or package check is not release authorization.
+See [RELEASING.md](RELEASING.md). Main pushes publish dev builds when the committed version is tagged on origin; otherwise they verify the intended release against production. Authorized GitHub Releases publish RC or stable versions. A local build or package check is not release authorization.

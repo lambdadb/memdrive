@@ -95,7 +95,6 @@
     "url": "https://github.com/lambdadb/memdrive/issues"
   },
   "publishConfig": {
-    "access": "public",
-    "tag": "dev"
+    "access": "public"
   }
 }
