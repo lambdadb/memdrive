@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { prepareDevPackage } from '../scripts/prepare-dev-package.mjs';
 import { checkPublish } from '../scripts/check-publish.mjs';
 import { selectReleaseMode } from '../scripts/select-release-mode.mjs';
-import { publicationDecision, checkArchive, publishPackage } from '../scripts/publish-package.mjs';
+import { publicationDecision, checkArchive, publishPackage, waitForPublication } from '../scripts/publish-package.mjs';
 import { setVersion, compareVersions, latestStableTag } from '../scripts/version.mjs';
 
 function fixture(t, version = '0.1.0') {
@@ -148,4 +148,52 @@ test('archive validation binds the retained bytes and embedded source identity b
     assert.throws(() => checkArchive(manifestPath, { ...pkg, memdriveSourceCommit: 'f'.repeat(40) }), /Packed memdriveSourceCommit/);
     writeFileSync(tarball, 'changed archive');
     assert.throws(() => checkArchive(manifestPath, pkg), /differs from validated archive/);
+});
+
+const verification = () => {
+    const pkg = { name: '@functional-systems/memdrive', version: '0.1.0-rc.1', memdriveSourceCommit: 'a'.repeat(40) };
+    const request = { pkg, distTag: 'rc', integrity: 'sha512-fixture', previousLatest: '0.0.1' };
+    const visible = { versions: { [pkg.version]: { ...pkg, dist: { integrity: request.integrity } } },
+        'dist-tags': { latest: request.previousLatest, rc: pkg.version } };
+    return { request, visible };
+};
+
+test('publication verification waits for the version and channel to become visible using read-only checks', async () => {
+    const { request, visible } = verification();
+    const snapshots = [{}, { ...visible, 'dist-tags': { latest: request.previousLatest } }, visible];
+    let elapsed = 0, reads = 0;
+    const result = await waitForPublication(request, {
+        read: async () => snapshots[reads++], now: () => elapsed,
+        wait: async delay => { assert.equal(delay, 5_000); elapsed += delay; },
+    });
+    assert.deepEqual(result, { channelVersion: request.pkg.version, superseded: false });
+    assert.equal(reads, 3); assert.equal(elapsed, 10_000);
+});
+
+test('publication verification times out after five minutes and never waits on a real mismatch', async () => {
+    const { request, visible } = verification();
+    let elapsed = 0, reads = 0;
+    await assert.rejects(waitForPublication(request, {
+        read: async () => { reads++; return {}; }, now: () => elapsed, wait: async delay => { elapsed += delay; },
+    }), /Timed out after 5 minutes.*No publication was retried/);
+    assert.equal(reads, 60); assert.equal(elapsed, 300_000);
+    const badSource = structuredClone(visible); badSource.versions[request.pkg.version].memdriveSourceCommit = 'b'.repeat(40);
+    const badArchive = structuredClone(visible); badArchive.versions[request.pkg.version].dist.integrity = 'sha512-different';
+    const badLatest = structuredClone(visible); badLatest['dist-tags'].latest = '9.9.9';
+    for (const [snapshot, message] of [[badSource, /source SHA differs/], [badArchive, /archive differs/], [badLatest, /changed the latest tag/]])
+        await assert.rejects(waitForPublication(request, { read: async () => snapshot,
+            wait: async () => assert.fail('A real mismatch must not be retried'), now: () => 0 }), message);
+});
+
+test('already published retries verify the archive and report a channel that has advanced without changing it', async () => {
+    const { request, visible } = verification();
+    visible['dist-tags'].rc = '0.1.0-rc.2';
+    const result = await waitForPublication({ ...request, alreadyPublished: true }, {
+        read: async () => visible, wait: async () => assert.fail('A newer channel is not pending processing'), now: () => 0,
+    });
+    assert.deepEqual(result, { channelVersion: '0.1.0-rc.2', superseded: true });
+    visible.versions[request.pkg.version].dist.integrity = 'sha512-different';
+    await assert.rejects(waitForPublication({ ...request, alreadyPublished: true }, {
+        read: async () => visible, wait: async () => assert.fail('Must verify existing archive'), now: () => 0,
+    }), /archive differs/);
 });
