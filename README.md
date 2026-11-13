@@ -8,15 +8,16 @@ LambdaDB client; the caller owns connection credentials and transport.
 
 The package is `@functional-systems/memdrive`, licensed under Apache-2.0.
 It builds ESM and CommonJS with TypeScript declarations and supports Node.js
-20.12+ and browser bundlers. Install this release candidate and the LambdaDB client
+20.12+ and browser bundlers. Install this stable release and the LambdaDB client
 used to initialize it:
 
 ```sh
-npm install @functional-systems/memdrive@0.1.0-rc.1 @functional-systems/lambdadb@0.12.0
+npm install @functional-systems/memdrive@0.1.0 @functional-systems/lambdadb@0.12.0
 ```
 
-Release candidates may change before a stable release. Use `@rc` to follow release
-candidates, `@dev` for development builds, or an exact version for reproducibility.
+An unqualified install follows the stable `latest` channel. Use `@rc` to follow
+release candidates, `@dev` for development builds, or an exact version for
+reproducibility.
 To build locally, run `npm ci`, `npm run build`, and `npm pack`, then install the
 resulting tarball in the consumer project. See [CONTRIBUTING.md](CONTRIBUTING.md)
 for development and
@@ -171,8 +172,7 @@ Recalls share a default concurrency bound of five across branch views; the
 caller may configure it. Batch request count is not artificially capped by the
 SDK; a hosted MCP wrapper can impose its own exposed tool limit.
 
-The development format stays `mems-v0` until release. Recreate disposable stores
-after incompatible layout changes. MemDrive uses LambdaDB SDK 0.12.0. Build
+The storage format is `mems-v0`. MemDrive uses LambdaDB SDK 0.12.0. Build
 artifacts are generated with `npm run build`; browser applications bundle the
 public package entry point with their own build tools.
 
