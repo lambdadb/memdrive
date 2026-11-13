@@ -104,7 +104,12 @@ a clean project, verifies ESM, CommonJS, TypeScript and browser consumers, and
 runs live tests against that installed archive. It retains the tarball and npm
 pack manifest only after validation succeeds. Publication checks the retained
 SHA-512 digest and embedded source identity, then verifies registry integrity,
-source SHA and the selected dist-tag after publishing with provenance.
+source SHA and the selected dist-tag after publishing with provenance. npm can
+acknowledge publication before registry metadata is visible; verification polls
+read-only metadata every five seconds for up to five minutes and never retries
+publication. Source, archive or unexpected `latest` changes fail immediately.
+Reruns validate an existing version and report when its channel has advanced,
+without moving the tag.
 
 The live suite creates three isolated collections containing less than 6 KiB of
 synthetic text. It performs eight managed recalls (two with default reranking),
