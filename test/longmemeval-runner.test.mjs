@@ -24,7 +24,8 @@ test('reusable corpus grows once, serves both retrieval modes and verifies after
         try {
             const corpus = path.join(base, 'corpus'); await mkdir(corpus); await writeFile(path.join(corpus, 'dataset.json'), bytes);
             const { manifest, rows } = await initialize(corpus, config); assert.equal(manifest.ids.length, 2);
-            const wire = nativeFixture(); let modelCalls = 0, clock = originalNow();
+            // Receipt and cache timestamps must share the virtual clock, regardless of the real wall clock.
+            const wire = nativeFixture(); let modelCalls = 0, clock = Date.parse('2020-01-01T00:00:00Z'), emptySelection = false;
             const fetcher = async (url, options) => {
                 if (url.startsWith(keys.database)) return wire.fetcher(url, options);
                 modelCalls++;
@@ -32,7 +33,8 @@ test('reusable corpus grows once, serves both retrieval modes and verifies after
                 if (url === config.judge.endpoint) return new Response(JSON.stringify({ model: request.model,
                     answers: { correct: { type: 'noul', noul: 0.9 } }, usage: { input_tokens: 10 } }), { status: 200 });
                 let message = { role: 'assistant', content: 'cedar' }, finish_reason = 'stop';
-                if (request.tools) {
+                if (request.tools && emptySelection) message.content = JSON.stringify({ evidence: [] });
+                else if (request.tools) {
                     const outputs = request.messages.filter(message => message.role === 'tool');
                     const tool = outputs.find(message => JSON.parse(message.content).value?.results);
                     if (!tool) {
@@ -78,6 +80,15 @@ test('reusable corpus grows once, serves both retrieval modes and verifies after
             assert(wire.requests.slice(beforeReuse).every(r => r.method !== 'DELETE' && !r.pathname.endsWith('/collections') && !r.pathname.endsWith('/docs/upsert')));
             assert.equal(wire.collections.size, 2);
             assert.deepEqual(await verify(baseline), baselineResult); assert.deepEqual(await verify(agent), agentResult); assert.equal(Date.now, originalNow);
+            const empty = path.join(base, 'empty'); await prepare(empty, corpus, 'agentic', 1);
+            emptySelection = true;
+            const emptyResult = await recall(empty, { ...keys, judgeKey: undefined }, { fetcher });
+            emptySelection = false;
+            assert.equal(emptyResult.retrieval.databaseOperations, 0);
+            assert.equal(emptyResult.models.collector.calls, 1);
+            assert.equal(emptyResult.models.answer, undefined); assert.equal(emptyResult.models.judge, undefined);
+            assert.deepEqual(await readJSON(path.join(empty, 'questions', hash(first.question_id), 'tools.json')), []);
+            assert.deepEqual(await verify(empty), emptyResult);
             await lease(corpus, async () => { await assert.rejects(cleanupCorpus(corpus, keys, { fetcher }), { code: 'EEXIST' }); });
             assert.equal(wire.collections.size, 2);
             // A changed expected original fails validation, does not run retrieval, and leaves the corpus intact.
@@ -103,7 +114,7 @@ test('reusable corpus grows once, serves both retrieval modes and verifies after
             await rm(path.join(corpus, 'dataset.json')); await rm(path.join(corpus, 'corpus.json'));
             config.model.model = 'different-current-setting'; config.prompts.answer = 'different-current-prompt'; config.rulesSha256 = 'not-the-run-rules';
             const beforeScore = wire.requests.length;
-            for (const root of [baseline, agent]) {
+            for (const root of [baseline, agent, empty]) {
                 const result = await score(root, { modelKey: keys.modelKey, judgeKey: keys.judgeKey }, { fetcher });
                 assert.equal(result.accuracy, 1); assert.equal(result.scoringComplete, true);
                 assert.deepEqual(await verify(root), result); assert.equal(Date.now, originalNow);

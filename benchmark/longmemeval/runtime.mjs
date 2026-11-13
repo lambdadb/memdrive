@@ -48,7 +48,7 @@ export class Journal {
         }
         assert(!this.replay, 'Missing recorded request during offline replay');
         assert(key?.trim(), `Missing ${kind} credential`);
-        const startedAt = new Date().toISOString();
+        const startedAt = new Date(Date.now()).toISOString();
         await atomic(file, { binding: this.binding, requestHash, request, startedAt, status: 'pending' });
         const started = performance.now();
         const signal = cleanup ? AbortSignal.timeout(this.config.limits.requestSeconds * 1000)
@@ -65,7 +65,7 @@ export class Journal {
             assert(![this.keys.databaseKey, this.keys.modelKey, this.keys.judgeKey].filter(Boolean).some(secret => raw.includes(secret)),
                 'Service response contained a credential; raw body was not saved');
             receipt = { binding: this.binding, requestHash, request, startedAt, status: 'complete', httpStatus: response.status,
-                raw, milliseconds: performance.now() - started };
+                raw, completedAt: Date.now(), milliseconds: performance.now() - started };
             await atomic(file, receipt);
         } catch {
             await atomic(file, { binding: this.binding, requestHash, request, startedAt, status: dispatched ? 'uncertain' : 'aborted',

@@ -159,6 +159,7 @@ export async function recall(root, keys, { fetcher = fetch, signal } = {}) {
                     q.validationOperations = q.databaseOperations; q.validationMilliseconds = performance.now() - started;
                     q.phase = 'collect'; await save(); retrievalStarted = performance.now();
                     const events = [];
+                    await atomic(path.join(qroot, 'tools.json'), events);
                     const collected = await collectEvidence({ mode: lock.mode, tools, prepared, config, countTokens, signal: questionSignal,
                         ask: (request, round) => journal.model('collector', request, `collector-${round}.json`),
                         onTool: async event => { events.push(event); await atomic(path.join(qroot, 'tools.json'), events); } });
@@ -221,6 +222,7 @@ function validateReceipt(receipt, binding) {
     if (receipt.status === 'complete') {
         assert(Number.isInteger(receipt.httpStatus)); assert.equal(typeof receipt.raw, 'string');
         assert(Number.isFinite(receipt.milliseconds) && receipt.milliseconds >= 0);
+        assert(integer(receipt.completedAt));
     }
 }
 export async function verify(root) {
@@ -278,7 +280,7 @@ export async function verify(root) {
                 assert.equal(jsonHash([replayKeys.database, replayKeys.project]), state.connection);
                 const replayState = { databaseOperations: 0, cleanupOperations: 0, receiptNumber: 0, modelTokens: 0, models: {} };
                 const journal = new Journal({ root: qroot, config, binding, credentials: replayKeys, state: replayState,
-                    save: async () => {}, replay: true, readOnly: true, onReplayReceipt: receipt => { clock = Math.max(clock, Date.parse(receipt.startedAt) + receipt.milliseconds); }, fetcher: async () => { throw new Error('Offline verification attempted network'); } });
+                    save: async () => {}, replay: true, readOnly: true, onReplayReceipt: receipt => { clock = receipt.completedAt; }, fetcher: async () => { throw new Error('Offline verification attempted network'); } });
                 const originalNow = Date.now;
                 let clock = Date.parse(firstReceipt.startedAt);
                 Date.now = () => clock;
