@@ -8,15 +8,18 @@ LambdaDB client; the caller owns connection credentials and transport.
 
 The package is `@functional-systems/memdrive`, licensed under Apache-2.0.
 It builds ESM and CommonJS with TypeScript declarations and supports Node.js
-20.12+ and browser bundlers. Development packages use the explicit `dev` channel:
+20.12+ and browser bundlers. Install this release candidate and the LambdaDB client
+used to initialize it:
 
 ```sh
-npm install @functional-systems/memdrive@dev
+npm install @functional-systems/memdrive@0.1.0-rc.1 @functional-systems/lambdadb@0.12.0
 ```
 
-Development builds may change before a stable release; pin an exact version for
-reproducibility. To build locally, run `npm ci`, `npm run build`, and `npm pack`,
-then install the resulting tarball in the consumer project. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and
+Release candidates may change before a stable release. Use `@rc` to follow release
+candidates, `@dev` for development builds, or an exact version for reproducibility.
+To build locally, run `npm ci`, `npm run build`, and `npm pack`, then install the
+resulting tarball in the consumer project. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for development and
 [RELEASING.md](RELEASING.md) for the release policy.
 
 ```ts

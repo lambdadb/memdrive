@@ -1,13 +1,14 @@
 # Changelog
 
-## 0.1.0 — Unreleased
+## 0.1.0-rc.1
 
-- Extract the MemDrive prototype into a standalone TypeScript SDK backed by LambdaDB 0.12.0.
-- Preserve memory storage, retrieval, source reading, filtering, schema inspection, batch operations and branches.
-- Add ESM, CommonJS and TypeScript distribution checks with a browser-compatible runtime boundary.
-- Establish main-branch development and release conventions. Tagged-version main pushes publish dev builds; untagged versions verify against production, and authorized GitHub Releases publish RC/stable versions.
-- Remove internal agent orchestration and retrieval modes; callers own repeated searches and evidence selection.
-- Expose branch-aware keyword distributions through `countValues`; retain `describe` as the sole schema inspection API.
-- Add portable memory tools with JSON Schema contracts, effect annotations, branch binding and optional writes under the `tools` export.
-- Add bounded live integration checks, exact-tarball validation and source-linked immutable development versions.
+First release candidate of the standalone MemDrive SDK, backed by the pinned
+LambdaDB TypeScript client 0.12.0.
+
+- Store original memories with automatic text chunking, or store caller-provided embeddings and metadata.
+- Retrieve evidence through vector or hybrid search with optional native reranking; support structured metadata filters, exclusions and ordered batch results.
+- Read complete originals, inspect schema descriptions and keyword distributions, and manage memories and branches.
+- Expose portable agent tools through `@functional-systems/memdrive/tools`, with JSON Schema contracts, branch binding and optional writes. Applications own search orchestration and answer generation.
+- Support ESM, CommonJS and TypeScript consumers on Node.js 20.12+ and browser bundlers.
+- Validate installed release archives with bounded live integration checks and publish immutable versions with source identity through npm Trusted Publishing.
 - Supply the required Bayesian candidate budget when hybrid recall disables reranking.
