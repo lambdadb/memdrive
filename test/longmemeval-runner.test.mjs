@@ -61,6 +61,9 @@ test('reusable corpus grows once, serves both retrieval modes and verifies after
             assert.equal(wire.requests.filter(r => r.pathname.endsWith('/collections') && r.method === 'POST').length, 2);
             assert.equal(wire.requests.filter(r => r.pathname.endsWith('/docs/upsert')).length, 2);
             assert.deepEqual((await readJSON(path.join(corpus, 'corpus.json'))), manifest);
+            // Native descriptors need not preserve creation-time metadata field ordering.
+            for (const stored of wire.collections.values())
+                stored.metadata.indexConfigs = Object.fromEntries(Object.entries(stored.metadata.indexConfigs).reverse());
             assert.throws(() => compatible({ ...manifest, storage: {} }, rows, config), /storage/);
             assert.throws(() => compatible(manifest, rows, { ...config, retrieval: { ...config.retrieval, recentMessagesIncludingQuestion: 3 } }), /originals/);
             const baseline = path.join(base, 'baseline'), agent = path.join(base, 'agent');

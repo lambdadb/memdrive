@@ -1,6 +1,16 @@
 import assert from 'node:assert/strict';
 import { context, resultSpans, selectEvidence, spanKey } from './protocol.mjs';
 
+export function canonicalToolDefinitions(definitions) {
+    const visit = value => {
+        if (Array.isArray(value)) return value.map(visit);
+        if (!value || typeof value !== 'object') return value;
+        return Object.fromEntries(Object.entries(value).map(([key, item]) => [key,
+            key === 'enum' && Array.isArray(item) ? item.map(visit).sort((a, b) => JSON.stringify(a) < JSON.stringify(b) ? -1 : JSON.stringify(a) > JSON.stringify(b) ? 1 : 0) : visit(item)]));
+    };
+    return definitions.map(tool => ({ ...tool, inputSchema: visit(tool.inputSchema), outputSchema: visit(tool.outputSchema) }));
+}
+
 export function modelTools(definitions) {
     assert(definitions.every(tool => tool.annotations.readOnlyHint && !tool.annotations.destructiveHint), 'Only read-only tools are allowed');
     return definitions.map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description,

@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs, parseEnv } from 'node:util';
 import { get_encoding } from 'tiktoken';
 import { createTools } from '@functional-systems/memdrive/tools';
-import { collectEvidence } from './agent.mjs';
+import { collectEvidence, canonicalToolDefinitions } from './agent.mjs';
 import { prepareCase, metadataSchema, hash, jsonHash, packEvidence, evidenceMetrics, judgeRequest, verdict, integer } from './protocol.mjs';
 import { atomic, readJSON, exists, credentials, Journal, reuse } from './runtime.mjs';
 import { dataset as loadDataset, questionPath, newUsage, lease, initialize, proof, ingestCorpus, cleanupCorpus } from './corpus.mjs';
@@ -23,7 +23,7 @@ export async function frozenTools() {
             model: 'text-embedding-3-small', dimensions: 1536, similarity: 'cosine' }, textSearch: { analyzers: ['english'] } }),
         recall: async () => { throw new Error('Definition-only handle'); },
     } });
-    return registry.definitions;
+    return canonicalToolDefinitions(registry.definitions);
 }
 async function treeFiles(directory) {
     const result = [];
@@ -155,12 +155,13 @@ export async function recall(root, keys, { fetcher = fetch, signal } = {}) {
                 const started = performance.now(); let retrievalStarted;
                 try {
                     const tools = await reuse(journal, prepared, q.entry, corpusProof.manifest.storage);
-                    assert.deepEqual(tools.definitions, lock.tools, 'Live tools differ from prepared definitions');
+                    assert.deepEqual(canonicalToolDefinitions(tools.definitions), lock.tools, 'Live tools differ from prepared definitions');
                     q.validationOperations = q.databaseOperations; q.validationMilliseconds = performance.now() - started;
                     q.phase = 'collect'; await save(); retrievalStarted = performance.now();
                     const events = [];
                     await atomic(path.join(qroot, 'tools.json'), events);
-                    const collected = await collectEvidence({ mode: lock.mode, tools, prepared, config, countTokens, signal: questionSignal,
+                    const collected = await collectEvidence({ mode: lock.mode,
+                        tools: { definitions: lock.tools, execute: (...args) => tools.execute(...args) }, prepared, config, countTokens, signal: questionSignal,
                         ask: (request, round) => journal.model('collector', request, `collector-${round}.json`),
                         onTool: async event => { events.push(event); await atomic(path.join(qroot, 'tools.json'), events); } });
                     const packed = packEvidence(prepared, collected.selected, config, countTokens);
@@ -287,7 +288,7 @@ export async function verify(root) {
                 try {
                 const registry = await reuse(journal, prepared, q.entry, corpusProof.manifest.storage);
                 assert.equal(replayState.databaseOperations, q.validationOperations, 'Validation operation count differs');
-                assert.deepEqual(registry.definitions, lock.tools);
+                assert.deepEqual(canonicalToolDefinitions(registry.definitions), lock.tools);
                 const semantic = result => {
                     const copy = structuredClone(result);
                     if (copy.ok) {

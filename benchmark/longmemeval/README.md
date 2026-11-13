@@ -66,6 +66,9 @@ node benchmark/longmemeval/run.mjs verify --root artifacts/lme-agent-1
 sorted IDs, a smoke cohort rather than a stratified or held-out sample. Both
 modes with the same limit use the same IDs. Each run freezes its own settings,
 prompts, judge rules, executable/runtime fingerprints and public tool definitions.
+Only JSON Schema enum ordering is canonicalized, because native metadata field
+order can vary. Actual enum values and other array ordering must still match;
+collector requests use the frozen definitions and execute the public tools.
 To change settings, edit `config.json` and prepare a new run directory against the
 same corpus. Existing runs continue to use their frozen settings.
 

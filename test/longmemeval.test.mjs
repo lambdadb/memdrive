@@ -8,7 +8,7 @@ import { create } from '@functional-systems/memdrive';
 import { createTools } from '@functional-systems/memdrive/tools';
 import { memdriveClient } from './helpers/memdrive-client.mjs';
 import { prepareCase, timestamp, metadataSchema, packEvidence, evidenceMetrics, validateSpan, jsonHash } from '../benchmark/longmemeval/protocol.mjs';
-import { collectEvidence } from '../benchmark/longmemeval/agent.mjs';
+import { collectEvidence, canonicalToolDefinitions } from '../benchmark/longmemeval/agent.mjs';
 import { Journal, ingest, reuse, cleanup, readJSON } from '../benchmark/longmemeval/runtime.mjs';
 const config = JSON.parse(await readFile(new URL('../benchmark/longmemeval/config.json', import.meta.url)));
 
@@ -22,6 +22,17 @@ async function toolsFor(prepared) {
 const response = (content, calls) => ({ choices: [{ finish_reason: calls ? 'tool_calls' : 'stop',
     message: { role: 'assistant', content, ...(calls ? { tool_calls: calls } : {}) } }] });
 const call = (id, name, args) => ({ id, type: 'function', function: { name, arguments: JSON.stringify(args) } });
+
+test('tool schema comparison ignores only enum ordering and retains actual schema changes', () => {
+    const definitions = [{ name: 'test', inputSchema: { enum: ['b', 'a'], oneOf: [{ const: 2 }, { const: 1 }] }, outputSchema: {} }];
+    const reordered = structuredClone(definitions); reordered[0].inputSchema.enum.reverse();
+    assert.deepEqual(canonicalToolDefinitions(reordered), canonicalToolDefinitions(definitions));
+    reordered[0].inputSchema.enum.push('c');
+    assert.throws(() => assert.deepEqual(canonicalToolDefinitions(reordered), canonicalToolDefinitions(definitions)));
+    const alternatives = structuredClone(definitions); alternatives[0].inputSchema.oneOf.reverse();
+    assert.throws(() => assert.deepEqual(canonicalToolDefinitions(alternatives), canonicalToolDefinitions(definitions)));
+    assert.deepEqual(definitions[0].inputSchema.enum, ['b', 'a']);
+});
 
 test('source adaptation keeps literal text, pairs and dates while excluding answer annotations', () => {
     const input = row(), prepared = prepareCase(input, config);
