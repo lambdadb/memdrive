@@ -37,9 +37,13 @@ export interface CreateToolsOptions {
     branch?: string;
     /** Include remember and forget. Defaults to false. This is not authorization. */
     writable?: boolean;
+    /** Use stable session-local memory aliases. Read-only registries only; defaults to false. */
+    shortIds?: boolean;
 }
 export interface MemoryTools {
     /** Returns detached tool definitions that callers may adapt without changing execution. */
     readonly definitions: ToolDefinition[];
+    /** Host-only: resolve a returned alias to the stored ID. Identity when shortIds is false. */
+    resolveId(id: string): string;
     execute(name: string, args: unknown, options?: RequestOptions): Promise<ToolResult>;
 }

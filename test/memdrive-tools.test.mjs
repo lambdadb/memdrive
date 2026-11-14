@@ -247,3 +247,96 @@ test('write errors preserve reconciliation IDs while raw exceptions and internal
     for (const encoded of [JSON.stringify(result), JSON.stringify(unknown)])
         for (const text of ['private-token', 'stack', 'cause', 'credential']) assert.equal(encoded.includes(text), false);
 });
+
+test('short IDs are stable, session-local, detached and restricted to memory-ID fields', async () => {
+    const { f, drive } = await setup();
+    await drive.remember({ mems: [{ id: 'long-original', content: 'm1 is literal text', metadata: { role: 'm1', tags: ['long-original'] } },
+        { id: 'm1', content: 'An actual ID can resemble an alias.' }] });
+    const tools = await createTools({ drive, shortIds: true });
+    const recalled = await tools.execute('memdrive_recall', { requests: [{ query: 'm1' }] });
+    const matches = recalled.value.results[0].matches;
+    assert.deepEqual(matches.map(item => item.memId), ['m1', 'm2']);
+    assert.equal(matches[0].content, 'm1 is literal text'); assert.equal(matches[0].metadata.role, 'm1');
+    assert.equal(tools.resolveId('m1'), 'long-original'); assert.equal(tools.resolveId('m2'), 'm1');
+    conforms(validators(tools).get('memdrive_recall').output, recalled);
+    const args = { ids: ['m2', 'm1'] };
+    const read = await tools.execute('memdrive_read', args);
+    assert.deepEqual(args, { ids: ['m2', 'm1'] });
+    assert.deepEqual(read.value.mems.map(mem => mem.id), ['m2', 'm1']);
+    read.value.mems[1].metadata.tags.push('modified');
+    assert.deepEqual((await drive.read({ ids: ['long-original'] })).mems[0].metadata.tags, ['long-original']);
+    const listed = await tools.execute('memdrive_list', { limit: 1 });
+    assert.equal(listed.value.mems[0].id, 'm1');
+    const next = await tools.execute('memdrive_list', { limit: 1, cursor: listed.value.nextCursor });
+    assert.equal(next.value.mems[0].id, 'm2');
+    assert.equal((await tools.execute('memdrive_read', { ids: ['long-original'] })).error.code, 'INVALID_INPUT');
+    const other = await createTools({ drive, shortIds: true });
+    assert.throws(() => other.resolveId('m1'), error => error.code === 'INVALID_INPUT');
+    const ordinary = await createTools({ drive });
+    assert.equal(ordinary.resolveId('long-original'), 'long-original');
+    assert.equal((await ordinary.execute('memdrive_read', { ids: ['long-original'] })).value.mems[0].id, 'long-original');
+    const before = f.calls.length;
+    await assert.rejects(createTools({ drive, shortIds: true, writable: true }), error => error.code === 'INVALID_INPUT');
+    assert.equal(f.calls.length, before);
+});
+
+test('short IDs translate nested filters, exclusions and only ID facet values', async () => {
+    const { f, drive } = await setup();
+    await drive.remember({ mems: [{ id: 'first-original', content: 'one' }, { id: 'second-original', content: 'two' }] });
+    const tools = await createTools({ drive, shortIds: true });
+    await tools.execute('memdrive_recall', { requests: [{ query: 'initial' }] });
+    const filter = { and: [{ field: 'id', op: 'eq', value: 'm1' }, { or: [
+        { field: 'id', op: 'neq', value: 'm2' }, { field: 'id', op: 'in', value: ['m1', 'm2'] },
+        { field: 'id', op: 'exists', value: true }, { field: 'metadata.role', op: 'eq', value: 'm1' }] }] };
+    const args = { requests: [{ query: 'm1', excludeIds: ['m2'], filter }] };
+    const original = structuredClone(args);
+    assert.equal((await tools.execute('memdrive_recall', args)).ok, true);
+    assert.deepEqual(args, original);
+    const native = f.calls.filter(call => call.kind === 'query').at(-1).request;
+    const leaves = []; const visit = node => {
+        if (!node || typeof node !== 'object') return;
+        if (node.queryString) leaves.push(node.queryString);
+        for (const child of Object.values(node)) visit(child);
+    };
+    visit(native.query);
+    assert(leaves.some(leaf => leaf.defaultField === 'memId' && leaf.query === '"first-original"'));
+    assert(leaves.some(leaf => leaf.defaultField === 'memId' && leaf.query === '"second-original"'));
+    assert(leaves.some(leaf => leaf.defaultField === 'metadata.role' && leaf.query === '"m1"'));
+    f.search = () => ({ docs: [], facets: { memId: { buckets: [{ value: 'second-original', count: 2 }] },
+        'metadata.role': { buckets: [{ value: 'm2', count: 1 }] } } });
+    const counted = await tools.execute('memdrive_count_values', { fields: ['id', 'metadata.role'], excludeIds: ['m1'], filter });
+    assert.equal(counted.ok, true, JSON.stringify(counted));
+    assert.equal(counted.value.values.id.buckets[0].value, 'm2');
+    assert.equal(counted.value.values['metadata.role'].buckets[0].value, 'm2');
+    conforms(validators(tools).get('memdrive_count_values').output, counted);
+    const before = f.calls.length;
+    for (const [name, input] of [['memdrive_read', { ids: ['m99'] }], ['memdrive_count_values', { fields: ['id'], filter: { field: 'id', op: 'eq', value: 'm99' } }]])
+        assert.equal((await tools.execute(name, input)).error.code, 'INVALID_INPUT');
+    assert.equal(f.calls.length, before);
+    const cycle = { and: [] }; cycle.and.push(cycle);
+    const invalid = await tools.execute('memdrive_recall', { requests: [{ query: 'q', filter: cycle }] });
+    assert.equal(invalid.value.results[0].error.code, 'INVALID_INPUT');
+    assert.equal(f.calls.length, before);
+});
+
+test('unknown short IDs preserve recall slots, diagnostics indices and cancellation precedence', async () => {
+    const recorded = [], observed = [];
+    const { f, drive } = await setup({ record: event => recorded.push(event), observe: event => observed.push(event) });
+    await drive.remember({ mems: [{ id: 'original', content: 'evidence' }] });
+    const tools = await createTools({ drive, shortIds: true });
+    const result = await tools.execute('memdrive_recall', { requests: [{ query: 'first' },
+        { query: 'invalid', excludeIds: ['m99'] }, { query: 'last' }] });
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.value.results.map(item => item.error?.code ?? item.matches[0].memId), ['m1', 'INVALID_INPUT', 'm1']);
+    assert.deepEqual(result.value.results.map(item => item.usage.databaseRequests), [1, 0, 1]);
+    assert.deepEqual(recorded.filter(event => event.phase === 'query').map(event => event.requestIndex), [0, 2]);
+    assert.deepEqual(observed.map(event => event.requestIndex).sort(), [0, 2]);
+    assert.equal(f.calls.filter(call => call.kind === 'query').length, 2);
+    const shared = { query: 'q', filter: { field: 'id', op: 'eq', value: 'm1' } };
+    const repeated = await tools.execute('memdrive_recall', { requests: [shared, shared] });
+    assert(repeated.value.results.every(item => !item.error));
+    const controller = new AbortController(); controller.abort();
+    const aborted = await tools.execute('memdrive_recall', { requests: [{ query: 'q', excludeIds: ['m99'] }] }, { signal: controller.signal });
+    assert.equal(aborted.error.code, 'ABORTED');
+    assert.equal(f.calls.filter(call => call.kind === 'query').length, 4);
+});

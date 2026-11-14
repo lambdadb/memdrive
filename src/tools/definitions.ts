@@ -73,12 +73,14 @@ function resultSchema(value: JsonSchema): JsonSchema {
 }
 
 /** Common definitions for direct tool calling and MCP; no provider wire format. */
-export function toolDefinitions(descriptor: DriveDescriptor, writable = false): ToolDefinition[] {
+export function toolDefinitions(descriptor: DriveDescriptor, writable = false, shortIds = false): ToolDefinition[] {
     const external = descriptor.embedding.mode === 'external';
     const vector = array({ type: 'number' }, { minItems: descriptor.embedding.dimensions,
         maxItems: descriptor.embedding.dimensions, description: 'Caller-supplied embedding in this drive\'s vector space. Do not invent vector coordinates.' });
     const filter: JsonSchema = { $ref: '#/$defs/filter', description: 'Narrow by id, timestamp or declared metadata. Use explicit and/or arrays. Array eq/in test membership; neq requires a stored value and excludes matching elements. Discover fields with memdrive_describe.' };
-    const exclusions = array(id, { uniqueItems: true, description: 'Exclude each canonical Mem ID and all of its chunks. This excludes whole memories, not only previously seen chunks; do not use temporary aliases.' });
+    const exclusions = array(id, { uniqueItems: true, description: shortIds
+        ? 'Exclude each returned session memory ID and all of its chunks, not only previously seen excerpts.'
+        : 'Exclude each canonical Mem ID and all of its chunks. This excludes whole memories, not only previously seen chunks; do not use temporary aliases.' });
     const request = object({
         ...(external ? { queryVector: vector } : {
             query: { type: 'string', minLength: 1, description: 'Question or search terms. Cannot be the exact match-all expression *:*. Query and constructed context each have an 8 KiB native limit.' },
@@ -103,7 +105,10 @@ export function toolDefinitions(descriptor: DriveDescriptor, writable = false): 
         .filter(([, field]) => field.type === 'string' || field.type === 'string[]').map(([name]) => `metadata.${name}`)];
     const define = (name: ToolName, title: string, description: string, input: JsonSchema, output: JsonSchema,
         hasFilter = false, write: 'remember' | 'forget' | false = false): ToolDefinition => ({
-        name, title, description,
+        name, title, description: shortIds && name !== 'memdrive_describe'
+            ? description.replaceAll('canonical ', '').replaceAll('Canonical ', '')
+                + ' Memory IDs are session aliases (m1, m2, ...). Reuse only returned aliases; raw IDs and invented aliases are rejected.'
+            : description,
         inputSchema: { $schema: dialect, ...input, ...(hasFilter ? { $defs: { filter: filterDefinition(descriptor.metadataSchema) } } : {}) },
         outputSchema: resultSchema(output),
         annotations: { readOnlyHint: !write, destructiveHint: !!write, idempotentHint: write !== 'remember', openWorldHint: false },
@@ -118,7 +123,8 @@ export function toolDefinitions(descriptor: DriveDescriptor, writable = false): 
         define('memdrive_read', 'Read original memories', external
             ? 'Read canonical memory references and metadata by ID. External-vector memories return neither source text nor vectors; the caller owns source reconstruction. Missing IDs are omitted.'
             : 'Read complete originals by canonical Mem ID when an excerpt needs surrounding context. Use memId from search results; kind mem already contains the complete original and needs no additional read. Missing IDs are omitted and originals are not truncated.',
-        object({ ids: ids('Canonical Mem IDs to read, usually matches[].memId from memdrive_recall.') }, ['ids']),
+        object({ ids: ids(shortIds ? 'Returned session memory IDs to read, usually matches[].memId from memdrive_recall.'
+            : 'Canonical Mem IDs to read, usually matches[].memId from memdrive_recall.') }, ['ids']),
         object({ mems: array(mem) }, ['mems'])),
         define('memdrive_describe', 'Describe memory drive',
             'Inspect the drive description, labels, declared metadata fields and their meanings, embedding configuration and text-search analyzers. Use this before constructing unfamiliar metadata filters or choosing fields to count. This is a fresh schema lookup, not a list of stored memories or metadata values.',

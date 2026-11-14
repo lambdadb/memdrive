@@ -68,12 +68,46 @@ facet limits. They count original memories once rather than counting chunks.
 An array may contribute to several buckets. Counts can be cached for 60 seconds;
 `asOf` is the fetch time, and `hasMore: null` means completeness is unknown.
 
+## Optional session-local short IDs
+
+`createTools({ drive, shortIds: true })` uses `m1`, `m2`, ... in memory-ID fields
+of read-only tool results. IDs are assigned on first return and remain stable for
+that registry's lifetime. Keep the same registry for a conversation; a new
+registry starts a new mapping. Concurrent calls assign aliases in completion
+order. This option cannot be combined with `writable: true`.
+
+In this mode, `read.ids`, `excludeIds`, and `id` filter values (`eq`, `neq`, `in`)
+accept only aliases previously returned by that registry. Unknown aliases and
+raw IDs are rejected without a database request. An invalid recall item does
+not prevent valid siblings from running or change their diagnostic indices.
+Actual stored IDs that resemble aliases have no special meaning: the session
+mapping always determines what `m1` refers to.
+
+Only memory-ID fields change: recall `memId`, read/list `id`, and `id` count
+buckets. Content, metadata, scores, offsets, descriptors and pagination cursors
+are unchanged. The underlying drive continues to accept and return canonical
+IDs. Host code can recover them without exposing the map to the model:
+
+```ts
+const tools = await createTools({ drive, shortIds: true });
+const result = await tools.execute('memdrive_recall', {
+  requests: [{ query: 'Where did I leave the keys?' }],
+});
+// Resolve a returned alias before storing an application citation.
+// For example, if a successful result returned m1:
+const canonicalId = tools.resolveId('m1');
+```
+
+`resolveId` throws `INVALID_INPUT` for an unknown alias. With the default
+`shortIds: false`, it returns its argument unchanged. The mapping is local
+memory, is never persisted by the SDK, and lives until the registry is released.
+
 ## Evidence and writes
 
 A match with `kind: 'mem'` is already complete; `kind: 'chunk'` contains an excerpt
-with UTF-16 offsets. Pass its canonical `memId` to `memdrive_read` for surrounding
-context. There are no short aliases, session-specific evidence tables, automatic
-deduplication or finish/report tools. Callers retain earlier results and decide
+with UTF-16 offsets. Pass its returned `memId` (canonical by default, a session
+alias with `shortIds`) to `memdrive_read` for surrounding context. There are no session-specific evidence tables, automatic deduplication
+or finish/report tools. Callers retain earlier results and decide
 whether more retrieval is useful. `excludeIds` excludes whole memories and all
 their chunks, so it is not equivalent to hiding only previously seen excerpts.
 

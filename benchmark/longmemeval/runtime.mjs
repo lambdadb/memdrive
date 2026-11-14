@@ -163,13 +163,13 @@ export async function ingest(journal, prepared, entry, profile = storageProfile(
     for (let index = 0; index < prepared.mems.length; index += 20)
         await drive.remember({ mems: prepared.mems.slice(index, index + 20) }, { signal: journal.signal });
     await validateOriginals(drive, journal, prepared);
-    return createTools({ drive }, { signal: journal.signal });
+    return createTools({ drive, shortIds: journal.config.shortIds ?? false }, { signal: journal.signal });
 }
 export async function reuse(journal, prepared, entry, profile = storageProfile()) {
     const drive = await open({ client: journal.native(), name: entry.collection, maxConcurrentRequests: 1 }, { signal: journal.signal });
     validateDescriptor(await drive.describe({ signal: journal.signal }), entry, profile);
     await validateOriginals(drive, journal, prepared);
-    return createTools({ drive }, { signal: journal.signal });
+    return createTools({ drive, shortIds: journal.config.shortIds ?? false }, { signal: journal.signal });
 }
 
 export async function cleanup(journal, entry) {

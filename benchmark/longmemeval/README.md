@@ -238,3 +238,15 @@ cleanup, failure accounting and offline replay after deletion. Installed-package
 consumer checks remain offline. Benchmark code, datasets and receipts stay
 outside the published npm package; no live answer-quality claim follows from
 unit or package tests.
+
+### Short memory IDs
+
+The run-only `shortIds` setting defaults to `false`. Set it to `true` before
+preparing a run to use the SDK's read-only session aliases. It does not change
+corpus identity or require ingestion. Frozen tool definitions explain the ID
+protocol; all other collector settings and source text remain unchanged.
+Model-facing tool receipts retain aliases, while the host-only `resolveId`
+method converts retrieved and selected spans back to canonical IDs before
+source validation, coverage measurement and final packing. Offline replay
+recreates the same session mapping from native receipts. Keep the matching
+runner and SDK revision for each historical run.

@@ -13,11 +13,11 @@ import { Journal, ingest, reuse, cleanup, readJSON } from '../benchmark/longmeme
 const config = JSON.parse(await readFile(new URL('../benchmark/longmemeval/config.json', import.meta.url)));
 
 const textCount = text => text.length;
-async function toolsFor(prepared) {
+async function toolsFor(prepared, shortIds = false) {
     const fixture = memdriveClient(); fixture.search = (_request, docs) => docs;
     const drive = await create({ client: fixture.client, name: 'benchmark_test', metadataSchema, textSearch: { analyzers: ['english'] } });
     await drive.remember({ mems: prepared.mems });
-    return createTools({ drive });
+    return createTools({ drive, shortIds });
 }
 const response = (text, calls) => ({ status: 'completed', output: calls
     ?? [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] }] });
@@ -43,6 +43,25 @@ test('source adaptation keeps literal text, pairs and dates while excluding answ
     assert.throws(() => timestamp('2023/02/29 (Wed) 10:00'));
     assert.throws(() => timestamp('2024/02/29 (Thu) 24:00'));
     assert.equal(timestamp('2024/02/29 (Thu) 23:00'), '2024-02-29T23:00:00.000Z');
+});
+
+test('short-ID public tools keep model traces compact and evidence canonical', async () => {
+    const prepared = prepareCase(row(), config), tools = await toolsFor(prepared, true);
+    let round = 0;
+    const collected = await collectEvidence({ mode: 'agentic', tools, prepared, config, countTokens: textCount,
+        ask: async request => {
+            if (round++ === 0) return response(null, [call('search', 'memdrive_recall', { requests: [{ query: 'key' }] })]);
+            const result = JSON.parse(request.input.at(-1).output);
+            if (round === 2) {
+                assert.equal(result.value.results[0].matches[0].memId, 'm1');
+                return response(null, [call('read', 'memdrive_read', { ids: ['m1'] })]);
+            }
+            assert.equal(result.value.mems[0].id, 'm1');
+            return response(JSON.stringify({ evidence: [{ memId: 'm1' }] }));
+        } });
+    assert.equal(collected.trace[0].raw.value.results[0].matches[0].memId, 'm1');
+    assert.equal(collected.selected[0].memId, prepared.mems[0].id);
+    assert.equal(packEvidence(prepared, collected.selected, config, textCount).spans[0].memId, prepared.mems[0].id);
 });
 
 test('public tools collect only delivered source spans and pack them within a common budget', async () => {

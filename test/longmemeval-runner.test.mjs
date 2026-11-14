@@ -78,6 +78,7 @@ test('reusable corpus grows once, serves both retrieval modes and verifies after
             assert.throws(() => compatible(manifest, rows, { ...config, retrieval: { ...config.retrieval, recentMessagesIncludingQuestion: 3 } }), /originals/);
             const baseline = path.join(base, 'baseline'), agent = path.join(base, 'agent');
             await prepare(baseline, corpus, 'single_pass', 1);
+            config.shortIds = true;
             config.model.model = 'new-agent-model'; config.prompts.answer += ' A different reader policy.';
             await prepare(agent, corpus, 'agentic', 1);
             const beforeReuse = wire.requests.length;

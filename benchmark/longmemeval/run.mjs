@@ -17,8 +17,8 @@ const repository = path.resolve(directory, '../..');
 export const config = await readJSON(path.join(directory, 'config.json'));
 const rulesText = await readFile(path.join(directory, 'judge-rules.json'), 'utf8');
 
-export async function frozenTools() {
-    const registry = await createTools({ drive: {
+export async function frozenTools(profile = config) {
+    const registry = await createTools({ shortIds: profile.shortIds ?? false, drive: {
         describe: async () => ({ name: 'benchmark', labels: {}, metadataSchema, embedding: { mode: 'managed', provider: 'openai',
             model: 'text-embedding-3-small', dimensions: 1536, similarity: 'cosine' }, textSearch: { analyzers: ['english'] } }),
         recall: async () => { throw new Error('Definition-only handle'); },
@@ -76,7 +76,7 @@ async function checked(root) {
     const executable = files => Object.fromEntries(Object.entries(files).filter(([name]) =>
         !name.startsWith('benchmark/') || /\.mjs$/.test(name)));
     assert.deepEqual(executable(current), executable(lock.sources), 'Executable code changed; use the original checkout/runtime');
-    assert.deepEqual(await frozenTools(), lock.tools); assert.equal(hash(lock.rulesText), profile.rulesSha256);
+    assert.deepEqual(await frozenTools(profile), lock.tools); assert.equal(hash(lock.rulesText), profile.rulesSha256);
     const corpusProof = await readJSON(path.join(root, 'corpus-proof.json'));
     assert.equal(jsonHash(corpusProof), lock.corpus.proofSha256);
     const rows = await loadDataset(root, profile.dataset);
@@ -161,7 +161,7 @@ export async function recall(root, keys, { fetcher = fetch, signal } = {}) {
                     const events = [];
                     await atomic(path.join(qroot, 'tools.json'), events);
                     const collected = await collectEvidence({ mode: lock.mode,
-                        tools: { definitions: lock.tools, execute: (...args) => tools.execute(...args) }, prepared, config, countTokens, signal: questionSignal,
+                        tools: { definitions: lock.tools, resolveId: tools.resolveId, execute: (...args) => tools.execute(...args) }, prepared, config, countTokens, signal: questionSignal,
                         ask: (request, round) => journal.model('collector', request, `collector-${round}.json`),
                         onTool: async event => { events.push(event); await atomic(path.join(qroot, 'tools.json'), events); } });
                     const packed = packEvidence(prepared, collected.selected, config, countTokens);
@@ -301,7 +301,7 @@ export async function verify(root) {
                 let at = 0;
                 const replayed = await collectEvidence({ mode: lock.mode, prepared, config, countTokens,
                     now: () => events[at]?.startedAt,
-                    tools: { definitions: lock.tools, execute: async (name, args) => {
+                    tools: { definitions: lock.tools, resolveId: registry.resolveId, execute: async (name, args) => {
                         const event = events[at++]; assert(event); assert.equal(event.name, name); assert.deepEqual(event.args, args);
                         assert(integer(event.startedAt)); clock = event.startedAt;
                         const actual = await registry.execute(name, args);
