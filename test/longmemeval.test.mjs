@@ -7,17 +7,17 @@ import path from 'node:path';
 import { create } from '@functional-systems/memdrive';
 import { createTools } from '@functional-systems/memdrive/tools';
 import { memdriveClient } from './helpers/memdrive-client.mjs';
-import { prepareCase, timestamp, metadataSchema, packEvidence, evidenceMetrics, validateSpan, jsonHash } from '../benchmark/longmemeval/protocol.mjs';
+import { prepareCase, timestamp, metadataSchema, packEvidence, evidenceMetrics, validateSpan, resultSpans, jsonHash } from '../benchmark/longmemeval/protocol.mjs';
 import { collectEvidence, canonicalToolDefinitions } from '../benchmark/longmemeval/agent.mjs';
 import { Journal, ingest, reuse, cleanup, readJSON } from '../benchmark/longmemeval/runtime.mjs';
 const config = JSON.parse(await readFile(new URL('../benchmark/longmemeval/config.json', import.meta.url)));
 
 const textCount = text => text.length;
-async function toolsFor(prepared, shortIds = false) {
+async function toolsFor(prepared, shortIds = false, evidenceIds = false) {
     const fixture = memdriveClient(); fixture.search = (_request, docs) => docs;
     const drive = await create({ client: fixture.client, name: 'benchmark_test', metadataSchema, textSearch: { analyzers: ['english'] } });
     await drive.remember({ mems: prepared.mems });
-    return createTools({ drive, shortIds });
+    return createTools({ drive, shortIds, evidenceIds });
 }
 const response = (text, calls) => ({ status: 'completed', output: calls
     ?? [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] }] });
@@ -62,6 +62,35 @@ test('short-ID public tools keep model traces compact and evidence canonical', a
     assert.equal(collected.trace[0].raw.value.results[0].matches[0].memId, 'm1');
     assert.equal(collected.selected[0].memId, prepared.mems[0].id);
     assert.equal(packEvidence(prepared, collected.selected, config, textCount).spans[0].memId, prepared.mems[0].id);
+});
+
+test('evidence references resolve delivered spans and reject unknown or undelivered selections', async () => {
+    const prepared = prepareCase(row(), config), profile = { ...config, shortIds: true, evidenceIds: true };
+    const tools = await toolsFor(prepared, true, true);
+    let round = 0;
+    const collected = await collectEvidence({ mode: 'agentic', tools, prepared, config: profile, countTokens: textCount,
+        ask: async request => {
+            assert.equal(request.input[0].content, config.prompts.collectEvidenceIds);
+            if (round++ === 0) return response(null, [call('search', 'memdrive_recall', { requests: [{ query: 'key' }] })]);
+            if (round === 2) {
+                assert.equal(JSON.parse(request.input.at(-1).output).value.results[0].matches[0].evidenceId, 'e1');
+                return response(null, [call('read', 'memdrive_read', { ids: ['m1'] })]);
+            }
+            assert.equal(JSON.parse(request.input.at(-1).output).value.mems[0].evidenceId, 'e1');
+            return response('{"evidence":["e1"]}');
+        } });
+    assert.equal(collected.selected[0].memId, prepared.mems[0].id);
+    assert.throws(() => resultSpans('memdrive_read', { ok: true, value: { mems: [{ ...prepared.mems[0], evidenceId: 'unexpected' }] } }, prepared), /differs/);
+    for (const id of ['e1', 'e99']) {
+        const hidden = await toolsFor(prepared, false, true); let callNumber = 0;
+        await assert.rejects(collectEvidence({ mode: 'agentic', tools: hidden, prepared,
+            config: { ...profile, limits: { ...profile.limits, toolResultTokens: 1 } }, countTokens: textCount,
+            ask: async request => {
+                if (callNumber++ === 0) return response(null, [call('read', 'memdrive_read', { ids: [prepared.mems[0].id] })]);
+                assert.equal(JSON.parse(request.input.at(-1).output).error.code, 'BENCHMARK_RESULT_LIMIT');
+                return response(JSON.stringify({ evidence: [id] }));
+            } }), /not delivered|evidence ID/);
+    }
 });
 
 test('public tools collect only delivered source spans and pack them within a common budget', async () => {

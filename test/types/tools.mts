@@ -31,3 +31,13 @@ await createTools({ drive, model: {} });
 await createTools({ drive, shortIds: 'true' });
 // @ts-expect-error Resolving an ID accepts a string, not a tool response.
 compact.resolveId({ memId: 'm1' });
+
+const evidenceTools = await createTools({ drive, evidenceIds: true });
+const reference = evidenceTools.resolveEvidence('e1');
+const sourceId: string = reference.memId;
+if ('start' in reference) { const offset: number = reference.start; void offset; }
+void sourceId;
+// @ts-expect-error Evidence IDs are an explicit boolean option.
+await createTools({ drive, evidenceIds: 'yes' });
+// @ts-expect-error Evidence resolution accepts a returned string ID.
+evidenceTools.resolveEvidence({ evidenceId: 'e1' });

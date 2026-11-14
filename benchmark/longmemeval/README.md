@@ -250,3 +250,15 @@ method converts retrieved and selected spans back to canonical IDs before
 source validation, coverage measurement and final packing. Offline replay
 recreates the same session mapping from native receipts. Keep the matching
 runner and SDK revision for each historical run.
+
+### Evidence references
+
+The independent run-only `evidenceIds` setting defaults to `false`. With it
+enabled, the frozen `collectEvidenceIds` prompt requests `{"evidence":["e1"]}`
+instead of memory IDs and offsets. Public tool outputs preserve all source fields
+and add SDK session references. The host resolves each selection to canonical
+spans and requires an exact match among delivered evidence; references allocated
+by an oversized, undelivered result are insufficient. Final packing, answer
+assembly and judging remain separate and unchanged. Native receipt replay
+recreates the reference registry and verifies the original selection. Neither
+repeated-body suppression nor automatic search exclusions are enabled.

@@ -340,3 +340,70 @@ test('unknown short IDs preserve recall slots, diagnostics indices and cancellat
     assert.equal(aborted.error.code, 'ABORTED');
     assert.equal(f.calls.filter(call => call.kind === 'query').length, 4);
 });
+
+test('evidence IDs identify exact canonical spans across recall/read/list without changing memory inputs', async () => {
+    const { drive } = await setup();
+    const original = { id: 'canonical', content: 'abcdef', metadata: { role: 'user', tags: ['x'] } };
+    await drive.remember({ mems: [original] });
+    const tools = await createTools({ drive, shortIds: true, evidenceIds: true });
+    const recalled = await tools.execute('memdrive_recall', { requests: [{ query: 'first' }, { query: 'second' }] });
+    assert.deepEqual(recalled.value.results.map(result => result.matches[0].evidenceId), ['e1', 'e1']);
+    assert.equal(recalled.value.results[0].matches[0].memId, 'm1');
+    const reference = tools.resolveEvidence('e1'); assert.deepEqual(reference, { memId: 'canonical', start: 0, end: 6 });
+    reference.start = 4; assert.equal(tools.resolveEvidence('e1').start, 0);
+    for (const [name, args] of [['memdrive_read', { ids: ['m1'] }], ['memdrive_list', {}]]) {
+        const result = await tools.execute(name, args);
+        conforms(validators(tools).get(name).output, result);
+        assert.equal(result.value.mems[0].evidenceId, 'e1'); assert.equal(result.value.mems[0].content, original.content);
+    }
+    assert.equal((await tools.execute('memdrive_read', { ids: ['e1'] })).error.code, 'INVALID_INPUT');
+    assert.throws(() => tools.resolveEvidence('e99'), error => error.code === 'INVALID_INPUT');
+    const other = await createTools({ drive, evidenceIds: true });
+    assert.throws(() => other.resolveEvidence('e1'), error => error.code === 'INVALID_INPUT');
+    const listed = await other.execute('memdrive_list', {});
+    assert.equal(listed.value.mems[0].id, 'canonical'); assert.equal(listed.value.mems[0].evidenceId, 'e1');
+    const ordinary = await createTools({ drive });
+    assert.throws(() => ordinary.resolveEvidence('e1'), error => error.code === 'INVALID_INPUT');
+    assert.equal((await ordinary.execute('memdrive_list', {})).value.mems[0].evidenceId, undefined);
+    await assert.rejects(createTools({ drive, evidenceIds: true, writable: true }), error => error.code === 'INVALID_INPUT');
+    await drive.remember({ mems: [{ ...original, content: 'ABCDEF' }] });
+    assert.equal((await tools.execute('memdrive_read', { ids: ['m1'] })).error.code, 'INVALID_RESULT');
+    assert.deepEqual(tools.resolveEvidence('e1'), { memId: 'canonical', start: 0, end: 6 });
+});
+
+test('evidence conflicts fail per recall item, preserve siblings and never allocate failed references', async () => {
+    const { drive } = await setup();
+    const usage = { elapsedMs: 1, databaseRequests: 1 };
+    const span = { kind: 'chunk', memId: 'source', start: 0, end: 3, content: 'abc', metadata: { role: 'user', tags: ['x'] } };
+    let results = [{ matches: [span], usage }];
+    const handle = { ...drive, recall: async () => ({ results }) };
+    const tools = await createTools({ drive: handle, evidenceIds: true });
+    assert.equal((await tools.execute('memdrive_recall', { requests: [{ query: 'q' }] })).value.results[0].matches[0].evidenceId, 'e1');
+    results = [{ matches: [{ ...span, metadata: { tags: ['x'], role: 'user' } }], usage },
+        { matches: [{ ...span, start: 3, end: 6, content: 'def' }, { ...span, content: 'xyz' }], usage },
+        { matches: [{ ...span, start: 3, end: 6, content: 'def' }], usage }];
+    const output = await tools.execute('memdrive_recall', { requests: [{ query: 'one' }, { query: 'two' }, { query: 'three' }] });
+    assert.deepEqual(output.value.results.map(item => item.error?.code ?? item.matches[0].evidenceId), ['e1', 'INVALID_RESULT', 'e2']);
+    assert.deepEqual(output.value.results.map(item => item.usage), [usage, usage, usage]);
+    assert.deepEqual(tools.resolveEvidence('e2'), { memId: 'source', start: 3, end: 6 });
+    assert.equal(results[0].matches[0].evidenceId, undefined, 'Underlying results remain detached');
+    conforms(validators(tools).get('memdrive_recall').output, output);
+    for (const changed of [{ ...span, timestamp: '2025-01-01T00:00:00Z' }, { ...span, metadata: { role: 'assistant' } }]) {
+        results = [{ matches: [changed], usage }];
+        assert.equal((await tools.execute('memdrive_recall', { requests: [{ query: 'q' }] })).value.results[0].error.code, 'INVALID_RESULT');
+    }
+});
+
+test('external-vector evidence references never invent source offsets or text', async () => {
+    const { drive } = await setup({ embedding: { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'fixture-v1' } });
+    const embedding = [1, ...Array(63).fill(0)];
+    await drive.remember({ mems: [{ id: 'vector', embedding, metadata: { role: 'user' } }] });
+    const tools = await createTools({ drive, evidenceIds: true });
+    const recalled = await tools.execute('memdrive_recall', { requests: [{ queryVector: embedding }] });
+    assert.deepEqual(recalled.value.results[0].matches[0], { kind: 'mem', memId: 'vector', metadata: { role: 'user' }, evidenceId: 'e1' });
+    assert.deepEqual(tools.resolveEvidence('e1'), { memId: 'vector' });
+    const read = await tools.execute('memdrive_read', { ids: ['vector'] });
+    assert.deepEqual(read.value.mems[0], { id: 'vector', metadata: { role: 'user' }, evidenceId: 'e1' });
+    conforms(validators(tools).get('memdrive_recall').output, recalled);
+    conforms(validators(tools).get('memdrive_read').output, read);
+});

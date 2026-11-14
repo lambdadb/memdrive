@@ -73,7 +73,7 @@ function resultSchema(value: JsonSchema): JsonSchema {
 }
 
 /** Common definitions for direct tool calling and MCP; no provider wire format. */
-export function toolDefinitions(descriptor: DriveDescriptor, writable = false, shortIds = false): ToolDefinition[] {
+export function toolDefinitions(descriptor: DriveDescriptor, writable = false, shortIds = false, evidenceIds = false): ToolDefinition[] {
     const external = descriptor.embedding.mode === 'external';
     const vector = array({ type: 'number' }, { minItems: descriptor.embedding.dimensions,
         maxItems: descriptor.embedding.dimensions, description: 'Caller-supplied embedding in this drive\'s vector space. Do not invent vector coordinates.' });
@@ -93,22 +93,25 @@ export function toolDefinitions(descriptor: DriveDescriptor, writable = false, s
         rerank: external ? { const: false, description: 'External vectors do not support reranking; omit or pass false.' }
             : { type: 'boolean', description: 'Use native reranking; default true. False preserves native search order.' },
     }, [external ? 'queryVector' : 'query']);
+    const evidence = evidenceIds ? { evidenceId: string('Session evidence reference (e1, e2, ...); use for citations, not memory-ID inputs.') } : {};
+    const evidenceRequired = evidenceIds ? ['evidenceId'] : [];
     const match = external
-        ? object({ kind: { const: 'mem' }, memId: id, ...attributes }, ['kind', 'memId'])
+        ? object({ kind: { const: 'mem' }, memId: id, ...attributes, ...evidence }, ['kind', 'memId', ...evidenceRequired])
         : object({ kind: { type: 'string', enum: ['mem', 'chunk'] }, memId: id, content: string(),
-            start: { type: 'integer', minimum: 0 }, end: { type: 'integer', minimum: 1 }, ...attributes },
-        ['kind', 'memId', 'content', 'start', 'end']);
-    const mem = object({ id, ...(!external ? { content: string() } : {}), ...attributes }, external ? ['id'] : ['id', 'content']);
+            start: { type: 'integer', minimum: 0 }, end: { type: 'integer', minimum: 1 }, ...attributes, ...evidence },
+        ['kind', 'memId', 'content', 'start', 'end', ...evidenceRequired]);
+    const mem = object({ id, ...(!external ? { content: string() } : {}), ...attributes, ...evidence }, [...(external ? ['id'] : ['id', 'content']), ...evidenceRequired]);
     const recallResult = { anyOf: [object({ matches: array(match), usage }, ['matches', 'usage']),
         object({ error: object({ code: string(), message: string(), status: { type: 'integer' } }, ['code', 'message']), usage }, ['error', 'usage'])] };
     const countable = ['id', ...Object.entries(descriptor.metadataSchema)
         .filter(([, field]) => field.type === 'string' || field.type === 'string[]').map(([name]) => `metadata.${name}`)];
     const define = (name: ToolName, title: string, description: string, input: JsonSchema, output: JsonSchema,
         hasFilter = false, write: 'remember' | 'forget' | false = false): ToolDefinition => ({
-        name, title, description: shortIds && name !== 'memdrive_describe'
+        name, title, description: (shortIds && name !== 'memdrive_describe'
             ? description.replaceAll('canonical ', '').replaceAll('Canonical ', '')
                 + ' Memory IDs are session aliases (m1, m2, ...). Reuse only returned aliases; raw IDs and invented aliases are rejected.'
-            : description,
+            : description) + (evidenceIds && ['memdrive_recall', 'memdrive_read', 'memdrive_list'].includes(name)
+                ? ' evidenceId identifies this exact returned evidence; reuse it for citations. Memory-ID inputs still use memId/id.' : ''),
         inputSchema: { $schema: dialect, ...input, ...(hasFilter ? { $defs: { filter: filterDefinition(descriptor.metadataSchema) } } : {}) },
         outputSchema: resultSchema(output),
         annotations: { readOnlyHint: !write, destructiveHint: !!write, idempotentHint: write !== 'remember', openWorldHint: false },

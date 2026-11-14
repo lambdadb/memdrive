@@ -31,6 +31,8 @@ export interface ToolError {
 }
 /** Identical JSON data for direct function calls and MCP structured/text results. */
 export type ToolResult = { ok: true; value: Record<string, unknown> } | { ok: false; error: ToolError };
+/** Canonical source identity; external-vector references have no text offsets. */
+export type EvidenceReference = { memId: string; start: number; end: number } | { memId: string };
 export interface CreateToolsOptions {
     drive: MemDrive;
     /** Omit to use the supplied handle's branch. Model arguments cannot change it. */
@@ -39,11 +41,15 @@ export interface CreateToolsOptions {
     writable?: boolean;
     /** Use stable session-local memory aliases. Read-only registries only; defaults to false. */
     shortIds?: boolean;
+    /** Add session-local evidence references to returned spans/originals. Read-only only. */
+    evidenceIds?: boolean;
 }
 export interface MemoryTools {
     /** Returns detached tool definitions that callers may adapt without changing execution. */
     readonly definitions: ToolDefinition[];
     /** Host-only: resolve a returned alias to the stored ID. Identity when shortIds is false. */
     resolveId(id: string): string;
+    /** Host-only: resolve returned evidence to its canonical source; throws for unknown/disabled IDs. */
+    resolveEvidence(id: string): EvidenceReference;
     execute(name: string, args: unknown, options?: RequestOptions): Promise<ToolResult>;
 }

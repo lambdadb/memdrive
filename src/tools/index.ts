@@ -1,6 +1,7 @@
 import { MemDriveError } from '../index.js';
 import type { CountValuesRequest, ForgetRequest, ListRequest, MemInput, RecallRequest, RequestOptions } from '../types.js';
 import { toolDefinitions } from './definitions.js';
+import { evidenceIds as createEvidenceIds } from './evidence-ids.js';
 import { shortIds as createShortIds } from './short-ids.js';
 import type { CreateToolsOptions, MemoryTools, ToolError, ToolResult } from './types.js';
 
@@ -34,22 +35,28 @@ function errorResult(cause: unknown): ToolResult {
 
 /** Bind portable tools to an already authorized drive; no model or MCP runtime. */
 export async function createTools(configuration: CreateToolsOptions, options: RequestOptions = {}): Promise<MemoryTools> {
-    requireInput(object(configuration) && Object.keys(configuration).every(key => ['drive', 'branch', 'writable', 'shortIds'].includes(key)),
-        'Use drive, optional branch, writable and shortIds to create memory tools.');
+    requireInput(object(configuration) && Object.keys(configuration).every(key => ['drive', 'branch', 'writable', 'shortIds', 'evidenceIds'].includes(key)),
+        'Use drive, optional branch, writable, shortIds and evidenceIds to create memory tools.');
     requireInput(configuration.writable === undefined || typeof configuration.writable === 'boolean', 'writable must be a boolean.');
     requireInput(configuration.shortIds === undefined || typeof configuration.shortIds === 'boolean', 'shortIds must be a boolean.');
-    const { drive, branch, writable = false, shortIds = false } = configuration;
-    requireInput(!shortIds || !writable, 'shortIds requires read-only memory tools.');
+    requireInput(configuration.evidenceIds === undefined || typeof configuration.evidenceIds === 'boolean', 'evidenceIds must be a boolean.');
+    const { drive, branch, writable = false, shortIds = false, evidenceIds = false } = configuration;
+    requireInput(!(shortIds || evidenceIds) || !writable, 'Session IDs require read-only memory tools.');
     requireInput(drive && typeof drive.describe === 'function' && typeof drive.recall === 'function', 'Provide a MemDrive handle.');
     const data = branch === undefined ? drive : drive.at({ branch });
     const descriptor = await drive.describe(options);
     checkAbort(options);
-    const definitions = toolDefinitions(descriptor, writable, shortIds);
+    const definitions = toolDefinitions(descriptor, writable, shortIds, evidenceIds);
     const ids = shortIds ? createShortIds() : undefined;
+    const evidence = evidenceIds ? createEvidenceIds(descriptor.embedding.mode === 'external') : undefined;
     const enabled = new Set(definitions.map(tool => tool.name));
     return Object.freeze({
         get definitions() { return structuredClone(definitions); },
         resolveId: (id: string) => ids ? ids.resolve(id) : id,
+        resolveEvidence: (id: string) => {
+            if (!evidence) throw new MemDriveError('INVALID_INPUT', 'Evidence IDs are disabled for this tool session.');
+            return evidence.resolve(id);
+        },
         async execute(name: string, input: unknown, requestOptions: RequestOptions = {}): Promise<ToolResult> {
             try {
                 requireInput(object(requestOptions) && Object.keys(requestOptions).every(key => key === 'signal'), 'Operation options accept only signal.');
@@ -117,6 +124,7 @@ export async function createTools(configuration: CreateToolsOptions, options: Re
                 // Preserve settled SDK outcomes, including completed items in a canceled batch.
                 // SDK outputs are JSON data. Every transport receives the same detached value.
                 const detached = structuredClone(value);
+                evidence?.output(name, detached);
                 ids?.output(name, detached);
                 return { ok: true, value: detached };
             } catch (cause) {

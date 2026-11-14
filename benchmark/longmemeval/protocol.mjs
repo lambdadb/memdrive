@@ -67,32 +67,42 @@ export function validateSpan(span, prepared) {
         timestamp: span.timestamp, metadata: span.metadata };
 }
 
-export function resultSpans(name, result, prepared, resolveId = id => id) {
+export function resultSpans(name, result, prepared, resolveId = id => id, resolveEvidence) {
     if (!result.ok) return [];
+    const checkReference = (id, span) => {
+        if (resolveEvidence) assert.deepEqual(resolveEvidence(id), { memId: span.memId, start: span.start, end: span.end });
+        return span;
+    };
     if (name === 'memdrive_recall') return result.value.results.flatMap(item => item.error ? []
         : item.matches.map(match => {
             assert(['mem', 'chunk'].includes(match.kind));
             const span = validateSpan({ ...match, memId: resolveId(match.memId) }, prepared);
             assert.equal(match.kind, span.start === 0 && span.end === prepared.mems.find(mem => mem.id === span.memId).content.length
                 ? 'mem' : 'chunk');
-            return span;
+            return checkReference(match.evidenceId, span);
         }));
     if (name === 'memdrive_read' || name === 'memdrive_list') return result.value.mems.map(mem => {
-        mem = { ...mem, id: resolveId(mem.id) };
+        const { evidenceId, ...source } = mem;
+        mem = { ...(resolveEvidence ? source : mem), id: resolveId(mem.id) };
         const original = prepared.mems.find(source => source.id === mem.id);
         assert.deepEqual(mem, original, 'Read original differs from source');
-        return validateSpan({ memId: mem.id, start: 0, end: mem.content.length, ...mem }, prepared);
+        return checkReference(evidenceId, validateSpan({ memId: mem.id, start: 0, end: mem.content.length, ...mem }, prepared));
     });
     return [];
 }
 
-export function selectEvidence(selection, available, resolveId = id => id) {
+export function selectEvidence(selection, available, resolveId = id => id, resolveEvidence) {
     assert(selection && Object.keys(selection).length === 1 && Array.isArray(selection.evidence), 'Expected evidence selection JSON');
     const byKey = new Map(available.map(span => [spanKey(span), span]));
     const selected = [], seen = new Set();
     for (let ref of selection.evidence) {
-        assert(ref && Object.keys(ref).every(key => ['memId', 'start', 'end'].includes(key)));
-        ref = { ...ref, memId: resolveId(ref.memId) };
+        if (resolveEvidence) {
+            assert.equal(typeof ref, 'string', 'Select returned evidence IDs');
+            ref = resolveEvidence(ref);
+        } else {
+            assert(ref && Object.keys(ref).every(key => ['memId', 'start', 'end'].includes(key)));
+            ref = { ...ref, memId: resolveId(ref.memId) };
+        }
         let span;
         if (Object.keys(ref).length === 1 && typeof ref.memId === 'string') {
             // Full originals are distinguishable from excerpts by their original length in metadata-free refs below.

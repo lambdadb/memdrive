@@ -102,6 +102,41 @@ const canonicalId = tools.resolveId('m1');
 `shortIds: false`, it returns its argument unchanged. The mapping is local
 memory, is never persisted by the SDK, and lives until the registry is released.
 
+## Optional evidence references
+
+`createTools({ drive, evidenceIds: true })` adds an `evidenceId` such as `e1` to
+recall matches and read/list originals. This independent read-only option can be
+combined with `shortIds: true`. It preserves every existing result field and
+never suppresses repeated bodies, excludes prior results or chooses evidence.
+Memory-ID inputs still use `memId`/`id`; an evidence ID is not a memory ID.
+
+A registry assigns one stable reference for each canonical memory and exact
+UTF-16 span. Complete originals use `0..content.length`, so the same full span
+from recall and read/list shares a reference. Different spans get different IDs.
+External-vector references identify only the canonical memory: no text or offsets
+are invented. Host code resolves references independently of a model protocol:
+
+```ts
+const tools = await createTools({ drive, shortIds: true, evidenceIds: true });
+// After a tool result returns evidenceId: 'e1':
+const source = tools.resolveEvidence('e1'); // Canonical memId, plus start/end for text.
+```
+
+The resolver returns detached data and throws `INVALID_INPUT` for unknown IDs or
+when evidence IDs are disabled. References are session-local and identify
+previously observed evidence, not a verified current database snapshot. A later
+result with the same identity but different content, timestamp or metadata fails
+with `INVALID_RESULT`; metadata key order is ignored. Recall failures stay in
+their original request slot while valid siblings remain available. Old
+references are never rebound to changed source data. Start a new session after
+an intentional source update. The registry retains source signatures until it
+is released.
+
+The caller owns model delivery and selection. Creating a reference in a raw tool
+result does not establish that the model received it: applications that cap or
+omit results must track delivered references before accepting citations. No
+finish/report tool or model loop is added by this option.
+
 ## Evidence and writes
 
 A match with `kind: 'mem'` is already complete; `kind: 'chunk'` contains an excerpt
