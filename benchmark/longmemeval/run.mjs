@@ -7,8 +7,9 @@ import { parseArgs, parseEnv } from 'node:util';
 import { get_encoding } from 'tiktoken';
 import { createTools } from '@functional-systems/memdrive/tools';
 import { collectEvidence, canonicalToolDefinitions } from './agent.mjs';
+import { sdkCollector } from './sdk-agent.mjs';
 import { prepareCase, metadataSchema, hash, jsonHash, packEvidence, evidenceMetrics, judgeRequest, verdict, integer } from './protocol.mjs';
-import { atomic, readJSON, exists, credentials, Journal, reuse } from './runtime.mjs';
+import { atomic, readJSON, exists, credentials, Journal, reuse, reuseDrive } from './runtime.mjs';
 import { dataset as loadDataset, questionPath, newUsage, lease, initialize, proof, ingestCorpus, cleanupCorpus } from './corpus.mjs';
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
@@ -154,16 +155,25 @@ export async function recall(root, keys, { fetcher = fetch, signal } = {}) {
                 const journal = new Journal({ root: qroot, config, binding, credentials: keys, state: q, save, fetcher, signal: questionSignal, readOnly: true });
                 const started = performance.now(); let retrievalStarted;
                 try {
-                    const tools = await reuse(journal, prepared, q.entry, corpusProof.manifest.storage);
-                    assert.deepEqual(canonicalToolDefinitions(tools.definitions), lock.tools, 'Live tools differ from prepared definitions');
-                    q.validationOperations = q.databaseOperations; q.validationMilliseconds = performance.now() - started;
-                    q.phase = 'collect'; await save(); retrievalStarted = performance.now();
+                    const sdk = lock.mode === 'agentic' && config.collectorImplementation === 'sdk';
                     const events = [];
                     await atomic(path.join(qroot, 'tools.json'), events);
-                    const collected = await collectEvidence({ mode: lock.mode,
-                        tools: { definitions: lock.tools, resolveId: tools.resolveId, resolveEvidence: tools.resolveEvidence, execute: (...args) => tools.execute(...args) }, prepared, config, countTokens, signal: questionSignal,
-                        ask: (request, round) => journal.model('collector', request, `collector-${round}.json`),
-                        onTool: async event => { events.push(event); await atomic(path.join(qroot, 'tools.json'), events); } });
+                    const collectOptions = { prepared, config, countTokens, signal: questionSignal,
+                        ask: (request, round, signal) => journal.model('collector', request, `collector-${round}.json`, signal),
+                        onTool: async event => { events.push(event); await atomic(path.join(qroot, 'tools.json'), events); } };
+                    let collect;
+                    if (sdk) collect = await sdkCollector({ ...collectOptions, definitions: lock.tools,
+                        drive: await reuseDrive(journal, prepared, q.entry, corpusProof.manifest.storage),
+                        onOutcome: outcome => atomic(path.join(qroot, 'orchestration.json'), outcome) });
+                    else {
+                        const tools = await reuse(journal, prepared, q.entry, corpusProof.manifest.storage);
+                        assert.deepEqual(canonicalToolDefinitions(tools.definitions), lock.tools, 'Live tools differ from prepared definitions');
+                        collect = () => collectEvidence({ ...collectOptions, mode: lock.mode,
+                            tools: { definitions: lock.tools, resolveId: tools.resolveId, resolveEvidence: tools.resolveEvidence, execute: (...args) => tools.execute(...args) } });
+                    }
+                    q.validationOperations = q.databaseOperations; q.validationMilliseconds = performance.now() - started;
+                    q.phase = 'collect'; await save(); retrievalStarted = performance.now();
+                    const collected = await collect();
                     const packed = packEvidence(prepared, collected.selected, config, countTokens);
                     await atomic(path.join(qroot, 'evidence.json'), { collected, packed,
                         metrics: evidenceMetrics(rows.get(id), prepared, { retrieved: collected.retrieved, delivered: collected.delivered, packed: packed.spans }) });
@@ -287,9 +297,7 @@ export async function verify(root) {
                 let clock = Date.parse(firstReceipt.startedAt);
                 Date.now = () => clock;
                 try {
-                const registry = await reuse(journal, prepared, q.entry, corpusProof.manifest.storage);
-                assert.equal(replayState.databaseOperations, q.validationOperations, 'Validation operation count differs');
-                assert.deepEqual(canonicalToolDefinitions(registry.definitions), lock.tools);
+                const sdk = lock.mode === 'agentic' && config.collectorImplementation === 'sdk';
                 const semantic = result => {
                     const copy = structuredClone(result);
                     if (copy.ok) {
@@ -299,19 +307,39 @@ export async function verify(root) {
                     return copy;
                 };
                 let at = 0;
-                const replayed = await collectEvidence({ mode: lock.mode, prepared, config, countTokens,
+                const ask = async (request, round) => {
+                    const receipt = modelReceipts.get(`collector-${round}.json`); assert(receipt);
+                    assert.equal(receipt.status, 'complete'); assert.equal(receipt.httpStatus, 200);
+                    assert.deepEqual(receipt.request.body, request); return JSON.parse(receipt.raw);
+                };
+                let collect;
+                if (sdk) collect = await sdkCollector({ prepared, config, countTokens, definitions: lock.tools, ask,
+                    drive: await reuseDrive(journal, prepared, q.entry, corpusProof.manifest.storage),
                     now: () => events[at]?.startedAt,
-                    tools: { definitions: lock.tools, resolveId: registry.resolveId, resolveEvidence: registry.resolveEvidence, execute: async (name, args) => {
-                        const event = events[at++]; assert(event); assert.equal(event.name, name); assert.deepEqual(event.args, args);
-                        assert(integer(event.startedAt)); clock = event.startedAt;
-                        const actual = await registry.execute(name, args);
-                        assert.deepEqual(semantic(actual), semantic(event.raw), 'Tool result differs from native receipt replay');
-                        return event.raw;
-                    } }, ask: async (request, round) => {
-                        const receipt = modelReceipts.get(`collector-${round}.json`); assert(receipt);
-                        assert.equal(receipt.status, 'complete'); assert.equal(receipt.httpStatus, 200);
-                        assert.deepEqual(receipt.request.body, request); return JSON.parse(receipt.raw);
-                    } });
+                    beforeTool: call => { const event = events[at]; assert(event); assert.equal(call.name, event.name);
+                        assert.deepEqual(call.arguments, event.args); assert(integer(event.startedAt)); clock = event.startedAt; },
+                    replayTool: entry => { const saved = events[at++];
+                        assert.deepEqual(semantic(entry.raw), semantic(saved.raw));
+                        assert.deepEqual(semantic(entry.delivered), semantic(saved.delivered)); return saved; },
+                    onOutcome: async outcome => { const saved = await readJSON(path.join(qroot, 'orchestration.json'));
+                        const stable = value => ({ ...value, usage: { ...value.usage, elapsedMs: 0 } });
+                        assert.deepEqual(stable(outcome), stable(saved)); },
+                });
+                else {
+                    const registry = await reuse(journal, prepared, q.entry, corpusProof.manifest.storage);
+                    assert.deepEqual(canonicalToolDefinitions(registry.definitions), lock.tools);
+                    collect = () => collectEvidence({ mode: lock.mode, prepared, config, countTokens, ask,
+                        now: () => events[at]?.startedAt,
+                        tools: { definitions: lock.tools, resolveId: registry.resolveId, resolveEvidence: registry.resolveEvidence, execute: async (name, args) => {
+                            const event = events[at++]; assert(event); assert.equal(event.name, name); assert.deepEqual(event.args, args);
+                            assert(integer(event.startedAt)); clock = event.startedAt;
+                            const actual = await registry.execute(name, args);
+                            assert.deepEqual(semantic(actual), semantic(event.raw), 'Tool result differs from native receipt replay');
+                            return event.raw;
+                        } } });
+                }
+                assert.equal(replayState.databaseOperations, q.validationOperations, 'Validation operation count differs');
+                const replayed = await collect();
                 assert.equal(at, events.length); assert.deepEqual(replayed, saved.collected); assert.deepEqual(events, replayed.trace);
                 assert.equal(replayState.receiptNumber, q.receiptNumber, 'Unused or missing database receipts');
                 const packed = packEvidence(prepared, replayed.selected, config, countTokens);

@@ -283,5 +283,34 @@ test('aborted attempts record nondispatched receipts without counter gaps', asyn
         assert.equal(q.receiptNumber, q.databaseOperations);
         assert.equal((await readJSON(path.join(root, 'answer.json'))).status, 'aborted');
         assert.equal((await readJSON(path.join(root, 'database/1.json'))).status, 'aborted');
+        journal.signal = undefined;
+        await assert.rejects(journal.model('collector', { max_output_tokens: 1 }, 'collector-0.json', controller.signal));
+        assert.equal(dispatched, 0);
+        assert.equal((await readJSON(path.join(root, 'collector-0.json'))).status, 'aborted');
     } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('SDK collector adapter preserves known usage on malformed output and forwards cancellation', async () => {
+    const { sdkCollector } = await import('../benchmark/longmemeval/sdk-agent.mjs');
+    const prepared = prepareCase(row(), config), fixture = memdriveClient();
+    const drive = await create({ client: fixture.client, name: 'adapter_test', metadataSchema });
+    await drive.remember({ mems: prepared.mems });
+    const definitions = canonicalToolDefinitions((await createTools({ drive, shortIds: true, evidenceIds: true })).definitions);
+    const profile = { ...config, shortIds: true, evidenceIds: true };
+    let outcome;
+    const collect = await sdkCollector({ drive, prepared, config: profile, definitions, countTokens: () => 1,
+        ask: async (_request, _round, signal) => { assert(signal instanceof AbortSignal);
+            return { ...response('invalid JSON'), usage: { input_tokens: 7, output_tokens: 3 } }; },
+        onOutcome: value => { outcome = value; } });
+    await assert.rejects(collect(), /SDK retrieval stopped/);
+    assert.equal(outcome.completion.status, 'failed'); assert.equal(outcome.usage.unknownUsageCalls, 0);
+    assert.equal(outcome.usage.inputTokens, 7); assert.equal(outcome.usage.outputTokens, 3);
+    const controller = new AbortController(); let forwarded;
+    const cancelled = await sdkCollector({ drive, prepared, config: profile, definitions, countTokens: () => 1,
+        signal: controller.signal, ask: async (_request, _round, signal) => {
+            forwarded = signal; controller.abort(); signal.throwIfAborted();
+        }, onOutcome: value => { outcome = value; } });
+    await assert.rejects(cancelled(), /SDK retrieval stopped/);
+    assert.equal(forwarded.aborted, true); assert.equal(outcome.completion.status, 'aborted');
+    assert.equal(outcome.usage.modelCalls, 1); assert.equal(outcome.usage.unknownUsageCalls, 1);
 });

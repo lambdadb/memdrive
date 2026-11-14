@@ -262,3 +262,15 @@ by an oversized, undelivered result are insufficient. Final packing, answer
 assembly and judging remain separate and unchanged. Native receipt replay
 recreates the reference registry and verifies the original selection. Neither
 repeated-body suppression nor automatic search exclusions are enabled.
+
+### SDK orchestration comparison
+
+The frozen run config can set `collectorImplementation: "sdk"` together with
+`shortIds: true` and `evidenceIds: true` for agentic runs. The default remains the
+external benchmark collector. The SDK path uses the public `retriever` subpath;
+`sdk-agent.mjs` owns Responses transport, application context and raw receipts.
+It keeps the same evidence-only prompt and separate answer stage. Each question
+also saves `orchestration.json` with the SDK completion and accounting. Native
+Journal counts remain authoritative for HTTP operations; SDK data-call counts
+measure a different boundary. `verify` replays the SDK loop offline, including
+canonical source validation, delivered evidence and frozen provider requests.

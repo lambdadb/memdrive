@@ -37,7 +37,7 @@ export class Journal {
     constructor({ root, config, binding, credentials: keys, state, save, fetcher = fetch, signal, replay = false, onReplayReceipt = () => {}, readOnly = false }) {
         Object.assign(this, { root, config, binding, keys, state, save, fetcher, signal, replay, onReplayReceipt, readOnly });
     }
-    async request({ file, url, body, key, kind, method = 'POST', cleanup = false }) {
+    async request({ file, url, body, key, kind, method = 'POST', cleanup = false, signal: callerSignal }) {
         const request = { kind, method, url, body: body ?? null }, requestHash = jsonHash(request);
         if (await exists(file)) {
             const receipt = await readJSON(file);
@@ -52,7 +52,7 @@ export class Journal {
         await atomic(file, { binding: this.binding, requestHash, request, startedAt, status: 'pending' });
         const started = performance.now();
         const signal = cleanup ? AbortSignal.timeout(this.config.limits.requestSeconds * 1000)
-            : AbortSignal.any([this.signal, AbortSignal.timeout(this.config.limits.requestSeconds * 1000)].filter(Boolean));
+            : AbortSignal.any([this.signal, callerSignal, AbortSignal.timeout(this.config.limits.requestSeconds * 1000)].filter(Boolean));
         let receipt, dispatched = false;
         try {
             signal.throwIfAborted();
@@ -74,7 +74,7 @@ export class Journal {
         }
         return receipt;
     }
-    async model(kind, request, filename) {
+    async model(kind, request, filename, signal) {
         assert(['collector', 'answer', 'judge'].includes(kind));
         const isJudge = kind === 'judge', file = path.join(this.root, filename);
         if (!isJudge && !await exists(file)) {
@@ -90,7 +90,7 @@ export class Journal {
         usage.calls++; usage.unknownUsageCalls++; await this.save();
         const receipt = await this.request({ file, url: isJudge ? this.config.judge.endpoint
             : kind === 'collector' ? this.config.collectorEndpoint : this.config.modelEndpoint,
-            body: request, key: isJudge ? this.keys.judgeKey : this.keys.modelKey, kind });
+            body: request, key: isJudge ? this.keys.judgeKey : this.keys.modelKey, kind, signal });
         usage.milliseconds += receipt.milliseconds;
         await this.save();
         assert.equal(receipt.httpStatus, 200, `${kind} service returned HTTP ${receipt.httpStatus}`);
@@ -127,7 +127,7 @@ export class Journal {
             await this.save();
             const receipt = await this.request({ file: path.join(this.root, `database/${number}.json`), url: request.url,
                 method: request.method, body: request.body ? JSON.parse(await request.text()) : undefined,
-                key: projectApiKey, kind: 'database', cleanup });
+                key: projectApiKey, kind: 'database', cleanup, signal: request.signal });
             return new Response(receipt.raw, { status: receipt.httpStatus, headers: { 'content-type': 'application/json' } });
         };
         return new LambdaDBClient({ baseUrl, projectName, projectApiKey, retryConfig: { strategy: 'none' },
@@ -165,10 +165,14 @@ export async function ingest(journal, prepared, entry, profile = storageProfile(
     await validateOriginals(drive, journal, prepared);
     return createTools({ drive, shortIds: journal.config.shortIds ?? false, evidenceIds: journal.config.evidenceIds ?? false }, { signal: journal.signal });
 }
-export async function reuse(journal, prepared, entry, profile = storageProfile()) {
+export async function reuseDrive(journal, prepared, entry, profile = storageProfile()) {
     const drive = await open({ client: journal.native(), name: entry.collection, maxConcurrentRequests: 1 }, { signal: journal.signal });
     validateDescriptor(await drive.describe({ signal: journal.signal }), entry, profile);
     await validateOriginals(drive, journal, prepared);
+    return drive;
+}
+export async function reuse(journal, prepared, entry, profile = storageProfile()) {
+    const drive = await reuseDrive(journal, prepared, entry, profile);
     return createTools({ drive, shortIds: journal.config.shortIds ?? false, evidenceIds: journal.config.evidenceIds ?? false }, { signal: journal.signal });
 }
 

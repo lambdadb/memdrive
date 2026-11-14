@@ -2,8 +2,9 @@
 
 TypeScript memory SDK backed by LambdaDB. Store original memories, retrieve
 relevant evidence, inspect metadata distributions, and read complete originals.
-Applications and their agents own query planning, repeated searches, evidence
-selection, answer generation and presentation. The SDK accepts an initialized
+Base recall is a single data operation. Optional SDK orchestration can plan searches
+and select evidence using an injected model adapter. Applications own answer
+generation and presentation. The SDK accepts an initialized
 LambdaDB client; the caller owns connection credentials and transport.
 
 The package is `@functional-systems/memdrive`, licensed under Apache-2.0.
@@ -235,8 +236,8 @@ response is complete, and `null` when the native 100-bucket bound leaves
 completeness unknown.
 
 A hosted MCP service can expose these SDK operations and supply tool descriptions
-and protocol handling. The service or calling agent owns orchestration; MemDrive
-has no model-specific tool schemas, short evidence aliases or finish/report tool.
+and protocol handling. A service can use basic tools or the optional retriever
+for orchestration. MemDrive bundles no provider client, MCP server or finish/report tool.
 
 ## Agent tools
 
@@ -246,19 +247,40 @@ and output definitions, descriptions, effect annotations and SDK execution. It
 contains no internal agent loop or MCP server. See [the tool contract](docs/tools.md)
 for the catalog, branch binding, write opt-in, error outcomes and direct/MCP mapping.
 
+## Optional retrieval orchestration
+
+```ts
+import { createRetriever } from '@functional-systems/memdrive/retriever';
+
+const retriever = await createRetriever({ drive }); // single_pass by default
+const result = await retriever.recall({ query: 'What did we agree?', limit: 10 });
+
+// Agentic retrieval requires a host-owned, provider-neutral model adapter.
+const agentic = await createRetriever({ drive, strategy: 'agentic',
+    agent: { model, countTokens } });
+const evidence = await agentic.recall({ query: 'What changed?', limit: 10 }, { signal });
+if (evidence.completion.status === 'completed') useEvidence(evidence.matches);
+```
+
+The optional loop returns canonical source evidence, never a final answer. Its
+single high-level tool is available as `agentic.tools`; basic `createTools`
+continues to expose individual operations. See [the adapter and budget contract](docs/tools.md#optional-retriever)
+for model state, scope, cancellation and incomplete outcomes.
+
 ## Consumers
 
 The [LongMemEval benchmark](benchmark/longmemeval/README.md) lives in this repository
 and compares `single_pass` search with `agentic` use of the public memory tools.
 It reuses ingested per-question collections across independent retrieval runs;
 answer generation, judging and explicit corpus cleanup are separate stages.
-It owns dataset preparation, evidence selection, answer generation and judging;
-none of these enter the SDK runtime or npm archive. Future suites, including BEAM,
+It owns dataset preparation, provider adapters, answer generation and judging;
+these remain outside the SDK runtime and npm archive. It can compare its external
+collector with the same public SDK retriever. Future suites, including BEAM,
 can live alongside it under `benchmark/`.
 
 SillyMemory and earlier BEAM/LongMemEval prototypes are separate consumers. Their
 historical results do not establish the standalone package's answer quality.
-Applications own recent-context partitioning, agent loops and final prompt assembly.
+Applications own recent-context partitioning, model transport and final prompt assembly.
 SDK unit and package checks do not establish benchmark quality or live compatibility.
 
 ## Development

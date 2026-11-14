@@ -94,6 +94,15 @@ test('reusable corpus grows once, serves both retrieval modes and verifies after
             assert(wire.requests.slice(beforeReuse).every(r => r.method !== 'DELETE' && !r.pathname.endsWith('/collections') && !r.pathname.endsWith('/docs/upsert')));
             assert.equal(wire.collections.size, 2);
             assert.deepEqual(await verify(baseline), baselineResult); assert.deepEqual(await verify(agent), agentResult); assert.equal(Date.now, originalNow);
+            config.collectorImplementation = 'sdk';
+            const sdkAgent = path.join(base, 'sdk-agent'); await prepare(sdkAgent, corpus, 'agentic', 1);
+            Date.now = () => clock;
+            const sdkResult = await recall(sdkAgent, { ...keys, judgeKey: undefined }, { fetcher }); Date.now = originalNow;
+            assert.equal(sdkResult.failed, 0); assert.equal(sdkResult.models.collector.calls, agentResult.models.collector.calls);
+            assert.deepEqual(await verify(sdkAgent), sdkResult);
+            const sdkOutcome = await readJSON(path.join(sdkAgent, 'questions', hash(first.question_id), 'orchestration.json'));
+            assert.equal(sdkOutcome.completion.status, 'completed'); assert.equal(sdkOutcome.usage.databaseRequests, null);
+            assert.equal(sdkOutcome.usage.modelCalls, sdkResult.models.collector.calls);
             const empty = path.join(base, 'empty'); await prepare(empty, corpus, 'agentic', 1);
             emptySelection = true;
             const emptyResult = await recall(empty, { ...keys, judgeKey: undefined }, { fetcher });
@@ -128,7 +137,7 @@ test('reusable corpus grows once, serves both retrieval modes and verifies after
             await rm(path.join(corpus, 'dataset.json')); await rm(path.join(corpus, 'corpus.json'));
             config.model.model = 'different-current-setting'; config.prompts.answer = 'different-current-prompt'; config.rulesSha256 = 'not-the-run-rules';
             const beforeScore = wire.requests.length;
-            for (const root of [baseline, agent, empty]) {
+            for (const root of [baseline, agent, sdkAgent, empty]) {
                 const result = await score(root, { modelKey: keys.modelKey, judgeKey: keys.judgeKey }, { fetcher });
                 assert.equal(result.accuracy, 1); assert.equal(result.scoringComplete, true);
                 assert.deepEqual(await verify(root), result); assert.equal(Date.now, originalNow);

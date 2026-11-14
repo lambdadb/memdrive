@@ -230,3 +230,68 @@ results, exercise branch binding, writable selection, batch correspondence,
 partial failures and cancellation, and compare direct/MCP result packaging.
 Package checks exercise ESM, CommonJS, public TypeScript types and browser bundles.
 Simulated envelope equality is not a live MCP transport or model-quality test.
+
+## Optional retriever
+
+`createRetriever` from `@functional-systems/memdrive/retriever` offers the same
+retrieval through `.recall(request, {signal})` and `.tools.execute('memdrive_recall',
+request, {signal})`. It defaults to `single_pass`, which invokes one base recall
+without creating a model session. Base `drive.recall` and the basic tools above
+remain unchanged. The high-level tool accepts **one SDK recall request**, not the
+basic `{requests: [...]}` batch. Do not register both tools under the same name.
+Strategy, adapter, guidance and budgets are host configuration, never model input.
+
+For `strategy: 'agentic'`, provide `agent.model`, `agent.countTokens` and optional
+`agent.instructions` / `agent.limits`. Managed text memories are required; an
+external-vector drive is rejected because the SDK cannot generate query vectors.
+Each recall creates an isolated read-only tool session with short memory and
+evidence IDs. The model can search, read, list, describe and count values, then
+select delivered evidence IDs. The result contains canonical `matches`,
+`completion` and `usage`. The caller's `limit` bounds the final selection;
+individual searches retain their own request limits. There is no automatic
+fallback to unselected candidates, duplicate suppression or answer generation.
+
+The adapter implements `createSession({request, instructions, tools})`, returning
+`prepare(replies)`. Both are strictly local: no network calls. `prepare` returns
+`{inputTokens, respond({signal, maxOutputTokens})}`. Estimate **the entire provider
+request**, including instructions, tool schemas, history and opaque state;
+reservation is only as conservative as this estimate. `respond` performs one
+provider call and returns `{status, usage, calls?}` or
+`{status, usage, evidenceIds?}`. Each call has `{id, name, arguments}`; replies have
+`{id, name, result}`. IDs must be unique within the retrieval. Preserve provider
+conversation/reasoning state in the adapter, and pass the supplied signal to its
+transport. Return `status: 'incomplete'` with known usage when parsing a completed
+provider response fails. Network failures may throw and are counted as unknown
+usage. No provider package is included in MemDrive.
+
+Defaults are 8 model rounds, 24 tool calls, 120 data calls, 48,000 context tokens,
+160,000 total model tokens, 4,096 output tokens per call, 16,000 tokens per delivered
+tool result and 900,000 milliseconds. Each recall batch item counts as one data
+call; read/list/count/describe count as one each. These are **not native database
+HTTP limits**. `countTokens` measures the complete serialized tool result; an
+oversized result is replaced by an explicit size-limit error, never truncated.
+The SDK reserves estimated input plus maximum output before dispatch and checks
+reported usage afterward; it cannot undo provider overuse. Adapters must honor
+cancellation and output bounds. Synchronous adapter work cannot be preempted.
+Async model, tool and record-hook waits are bounded by the retrieval signal.
+
+`completion.status` is `completed`, `budget_exhausted`, `aborted` or `failed`.
+Noncompleted outcomes contain no matches and an explicit reason, preserving
+usage already observed. Invalid caller requests reject before model work.
+`usage` reports model calls, known input/output tokens, unknown-usage calls,
+tool/data calls and elapsed milliseconds. `databaseRequests` is null after any
+primitive without exact native request accounting; `knownRecallDatabaseRequests`
+retains the subtotal from completed base recall results. Initialization performs
+one `describe` before retrieval timing and is outside per-recall usage. A native
+transport hook can impose a separate hard HTTP budget.
+
+The original caller filter and exclusions constrain every internal search/count
+and every original exposed through read/list; the supplied drive fixes the
+branch. Scope uses the SDK's filter semantics. Browsing can return an empty page
+with a continuation cursor after filtering. Read/list may physically fetch
+excluded originals before filtering. This is retrieval selection, **not an
+authorization boundary**: authorize the underlying drive separately. Underlying
+drive/native diagnostics may contain data outside this selection. Optional
+retriever `record` events are detached and scoped; tool events include host-only
+canonical source mappings for audit, including oversized results that were not
+delivered. Only actually delivered evidence is eligible for final selection.
