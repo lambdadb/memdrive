@@ -10,6 +10,7 @@ test('browser bundle executes managed and supplied-vector storage without Node g
         stdin: { resolveDir: fileURLToPath(new URL('..', import.meta.url)), contents: `
             import { create, open } from './dist/esm/index.js';
             import { createTools } from './dist/esm/tools/index.js';
+            import { createRetriever } from './dist/esm/retriever/index.js';
             import { memdriveClient } from './test/helpers/memdrive-client.mjs';
             globalThis.smoke = async () => {
                 const f = memdriveClient();
@@ -29,8 +30,19 @@ test('browser bundle executes managed and supplied-vector storage without Node g
                 const unranked = await managed.recall({ query: 'short original', rerank: false });
                 const tools = await createTools({ drive: managed });
                 const toolRead = await tools.execute('memdrive_read', { ids: ['short'] });
-                return JSON.stringify({ embedding: reopened.embedding, recall, read, originals, unranked, toolRead,
-                    rerankSent: Object.hasOwn(f.calls.findLast(call => call.kind === 'query').request, 'rerank'),
+                const rerankSent = Object.hasOwn(f.calls.findLast(call => call.kind === 'query').request, 'rerank');
+                const agentSettings = {
+                    countTokens: text => text.length, model: { createSession() { let round = 0; return { prepare() {
+                        return { inputTokens: 10, respond: async () => ({ status: 'completed', usage: { inputTokens: 10, outputTokens: 10 },
+                            ...(round++ === 0 ? { calls: [{ id: 'search', name: 'memdrive_recall', arguments: { requests: [{ query: 'short' }] } }] } : { evidenceIds: ['e1'] }) }) };
+                    } }; } },
+                };
+                const retriever = await createRetriever({ drive: managed, strategy: 'agentic', agent: agentSettings });
+                const retrieval = await retriever.recall({ query: 'short' });
+                const configured = await createTools({ drive: managed, retrieval: { strategy: 'agentic', agent: agentSettings } });
+                const batchRetrieval = await configured.execute('memdrive_recall', { requests: [{ query: 'short' }] });
+                return JSON.stringify({ batchRetrieval, retrieval, embedding: reopened.embedding, recall, read, originals, unranked, toolRead,
+                    rerankSent,
                     writes: f.calls.filter(call => call.kind === 'upsert').map(call => ({ name: call.name, count: call.request.docs.length })) });
             };`, loader: 'js' }, bundle: true, platform: 'browser', format: 'iife', write: false });
     const context = createContext({ crypto: webcrypto, TextEncoder, TextDecoder,
@@ -45,6 +57,11 @@ test('browser bundle executes managed and supplied-vector storage without Node g
     assert.deepEqual(actual.read.mems, ['one', 'two'].map(id => ({ id, metadata: { source: id } })));
     assert.deepEqual(actual.originals.mems, [{ id: 'short', content: 'A short original.' }, { id: 'long', content: 'x'.repeat(900) }]);
     assert.equal(actual.rerankSent, false);
+    assert.equal(actual.retrieval.completion.status, 'completed');
+    assert.equal(actual.retrieval.matches[0].memId, 'short');
+    assert.equal(actual.retrieval.usage.modelCalls, 2);
+    assert.equal(actual.batchRetrieval.value.results[0].completion.status, 'completed');
+    assert.equal(actual.batchRetrieval.value.results[0].matches[0].memId, 'short');
     assert.equal(actual.unranked.matches.length, 1);
     assert.equal(actual.unranked.matches[0].memId, 'short');
     assert.deepEqual(actual.toolRead, { ok: true, value: { mems: [{ id: 'short', content: 'A short original.' }] } });

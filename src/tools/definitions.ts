@@ -73,12 +73,14 @@ function resultSchema(value: JsonSchema): JsonSchema {
 }
 
 /** Common definitions for direct tool calling and MCP; no provider wire format. */
-export function toolDefinitions(descriptor: DriveDescriptor, writable = false): ToolDefinition[] {
+export function toolDefinitions(descriptor: DriveDescriptor, writable = false, shortIds = false, evidenceIds = false, retrieval = false): ToolDefinition[] {
     const external = descriptor.embedding.mode === 'external';
     const vector = array({ type: 'number' }, { minItems: descriptor.embedding.dimensions,
         maxItems: descriptor.embedding.dimensions, description: 'Caller-supplied embedding in this drive\'s vector space. Do not invent vector coordinates.' });
     const filter: JsonSchema = { $ref: '#/$defs/filter', description: 'Narrow by id, timestamp or declared metadata. Use explicit and/or arrays. Array eq/in test membership; neq requires a stored value and excludes matching elements. Discover fields with memdrive_describe.' };
-    const exclusions = array(id, { uniqueItems: true, description: 'Exclude each canonical Mem ID and all of its chunks. This excludes whole memories, not only previously seen chunks; do not use temporary aliases.' });
+    const exclusions = array(id, { uniqueItems: true, description: shortIds
+        ? 'Exclude each returned session memory ID and all of its chunks, not only previously seen excerpts.'
+        : 'Exclude each canonical Mem ID and all of its chunks. This excludes whole memories, not only previously seen chunks; do not use temporary aliases.' });
     const request = object({
         ...(external ? { queryVector: vector } : {
             query: { type: 'string', minLength: 1, description: 'Question or search terms. Cannot be the exact match-all expression *:*. Query and constructed context each have an 8 KiB native limit.' },
@@ -91,25 +93,41 @@ export function toolDefinitions(descriptor: DriveDescriptor, writable = false): 
         rerank: external ? { const: false, description: 'External vectors do not support reranking; omit or pass false.' }
             : { type: 'boolean', description: 'Use native reranking; default true. False preserves native search order.' },
     }, [external ? 'queryVector' : 'query']);
+    const evidence = evidenceIds ? { evidenceId: string('Session evidence reference (e1, e2, ...); use for citations, not memory-ID inputs.') } : {};
+    const evidenceRequired = evidenceIds ? ['evidenceId'] : [];
     const match = external
-        ? object({ kind: { const: 'mem' }, memId: id, ...attributes }, ['kind', 'memId'])
+        ? object({ kind: { const: 'mem' }, memId: id, ...attributes, ...evidence }, ['kind', 'memId', ...evidenceRequired])
         : object({ kind: { type: 'string', enum: ['mem', 'chunk'] }, memId: id, content: string(),
-            start: { type: 'integer', minimum: 0 }, end: { type: 'integer', minimum: 1 }, ...attributes },
-        ['kind', 'memId', 'content', 'start', 'end']);
-    const mem = object({ id, ...(!external ? { content: string() } : {}), ...attributes }, external ? ['id'] : ['id', 'content']);
-    const recallResult = { anyOf: [object({ matches: array(match), usage }, ['matches', 'usage']),
-        object({ error: object({ code: string(), message: string(), status: { type: 'integer' } }, ['code', 'message']), usage }, ['error', 'usage'])] };
+            start: { type: 'integer', minimum: 0 }, end: { type: 'integer', minimum: 1 }, ...attributes, ...evidence },
+        ['kind', 'memId', 'content', 'start', 'end', ...evidenceRequired]);
+    const mem = object({ id, ...(!external ? { content: string() } : {}), ...attributes, ...evidence }, [...(external ? ['id'] : ['id', 'content']), ...evidenceRequired]);
+    const completion = object({ status: { enum: ['completed', 'budget_exhausted', 'aborted', 'failed'] }, reason: string() }, ['status']);
+    const counts = Object.fromEntries(['knownRecallDatabaseRequests', 'dataCalls', 'toolCalls', 'modelCalls', 'inputTokens', 'outputTokens', 'unknownUsageCalls']
+        .map(key => [key, { type: 'integer', minimum: 0 }]));
+    const retrievalUsage = object({ elapsedMs: { type: 'number', minimum: 0 }, databaseRequests: { type: ['integer', 'null'], minimum: 0 }, ...counts },
+        ['elapsedMs', 'databaseRequests', ...Object.keys(counts)]);
+    const resultUsage = retrieval ? retrievalUsage : usage;
+    const completionFields = retrieval ? { completion } : {};
+    const requiredCompletion = retrieval ? ['completion'] : [];
+    const recallResult = { anyOf: [object({ matches: array(match), usage: resultUsage, ...completionFields }, ['matches', 'usage', ...requiredCompletion]),
+        object({ error: object({ code: string(), message: string(), status: { type: 'integer' } }, ['code', 'message']), usage: resultUsage, ...completionFields }, ['error', 'usage', ...requiredCompletion])] };
     const countable = ['id', ...Object.entries(descriptor.metadataSchema)
         .filter(([, field]) => field.type === 'string' || field.type === 'string[]').map(([name]) => `metadata.${name}`)];
     const define = (name: ToolName, title: string, description: string, input: JsonSchema, output: JsonSchema,
         hasFilter = false, write: 'remember' | 'forget' | false = false): ToolDefinition => ({
-        name, title, description,
+        name, title, description: (shortIds && name !== 'memdrive_describe'
+            ? description.replaceAll('canonical ', '').replaceAll('Canonical ', '')
+                + ' Memory IDs are session aliases (m1, m2, ...). Reuse only returned aliases; raw IDs and invented aliases are rejected.'
+            : description) + (evidenceIds && ['memdrive_recall', 'memdrive_read', 'memdrive_list'].includes(name)
+                ? ' evidenceId identifies this exact returned evidence; reuse it for citations. Memory-ID inputs still use memId/id.' : ''),
         inputSchema: { $schema: dialect, ...input, ...(hasFilter ? { $defs: { filter: filterDefinition(descriptor.metadataSchema) } } : {}) },
         outputSchema: resultSchema(output),
         annotations: { readOnlyHint: !write, destructiveHint: !!write, idempotentHint: write !== 'remember', openWorldHint: false },
     });
     const definitions = [
-        define('memdrive_recall', 'Search memories', external
+        define('memdrive_recall', 'Search memories', retrieval
+            ? 'Retrieve source evidence for 1 to 5 independent requests using the host-configured strategy. Requests run concurrently with isolated per-request budgets. Results preserve input order. Check each completion.status; incomplete retrieval returns no fallback matches. Model and strategy settings cannot be changed through tool arguments.'
+            : external
             ? 'Search this drive with caller-supplied vectors; submit one to five independent requests, returned in input order. Results contain canonical memId values and metadata, without vectors or source text; the caller reconstructs originals. Inspect per-request errors and refine the supplied query when more evidence is needed.'
             : `Search stored memories for evidence relevant to one to five questions using ${descriptor.textSearch ? 'hybrid keyword and vector' : 'vector'} retrieval, with native reranking enabled by default. Independent requests run concurrently and results retain input order; kind mem is a complete original, while kind chunk is an excerpt with UTF-16 start/end offsets and memId identifies the original for memdrive_read. When evidence is missing, query the missing facts or narrow filters; results are not an answer and previous searches are not automatically excluded.`,
         object({ requests: array(request, { minItems: 1, maxItems: 5,
@@ -118,7 +136,8 @@ export function toolDefinitions(descriptor: DriveDescriptor, writable = false): 
         define('memdrive_read', 'Read original memories', external
             ? 'Read canonical memory references and metadata by ID. External-vector memories return neither source text nor vectors; the caller owns source reconstruction. Missing IDs are omitted.'
             : 'Read complete originals by canonical Mem ID when an excerpt needs surrounding context. Use memId from search results; kind mem already contains the complete original and needs no additional read. Missing IDs are omitted and originals are not truncated.',
-        object({ ids: ids('Canonical Mem IDs to read, usually matches[].memId from memdrive_recall.') }, ['ids']),
+        object({ ids: ids(shortIds ? 'Returned session memory IDs to read, usually matches[].memId from memdrive_recall.'
+            : 'Canonical Mem IDs to read, usually matches[].memId from memdrive_recall.') }, ['ids']),
         object({ mems: array(mem) }, ['mems'])),
         define('memdrive_describe', 'Describe memory drive',
             'Inspect the drive description, labels, declared metadata fields and their meanings, embedding configuration and text-search analyzers. Use this before constructing unfamiliar metadata filters or choosing fields to count. This is a fresh schema lookup, not a list of stored memories or metadata values.',

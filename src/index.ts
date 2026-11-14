@@ -6,9 +6,11 @@ import type {
     MemInput, ForgetRequest, ConfigureRequest, BranchRequest, CatalogRequest, CatalogResult,
     ListRequest, MemDrive, DriveData, CountValuesRequest,
 } from './types.js';
-import { createBackend, openBackend, listBackends, validateChunk, publicMatch, validateVector, vectorMatch } from './storage.js';
-import { buildSearchFilter, validateFilter, matchesFilter } from './filter.js';
+import { createBackend, openBackend, listBackends, validateChunk, publicMatch, vectorMatch } from './storage.js';
+import { buildSearchFilter, matchesFilter } from './filter.js';
 import { MemDriveError, requireInput, operationOptions, checkAbort, abortError } from './errors.js';
+import { recallInput, textRecallQuery } from './recall-input.js';
+import type { ValidRecall } from './recall-input.js';
 import { createValueCounter } from './values.js';
 
 export type * from './types.js';
@@ -19,12 +21,10 @@ type Queue = <T>(operation: () => Promise<T>, signal?: AbortSignal) => Promise<T
 type QueryBody = Parameters<DataBackend['query']>[0];
 type NativeResponse = Awaited<ReturnType<DataBackend['query']>>;
 type NormalizedResponse = Omit<NativeResponse, 'docs'> & { docs: Array<Omit<NativeResponse['docs'][number], 'doc'> & { doc: Evidence | VectorEvidence }> };
-type ValidRecall = RecallRequest & { limit: number };
 type PreparedRecall = { input: unknown; start: number; error?: never } | { error: MemDriveError; input?: never; start?: never };
 
 const keys = (value: unknown, allowed: string[]): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
     && Object.keys(value).every(key => allowed.includes(key));
-const nonempty = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
 
 function validateOptions<T extends Options>(options: T, creating: boolean): T {
     requireInput(keys(options, ['client', 'name', 'maxConcurrentRequests', 'observe', 'record',
@@ -70,44 +70,14 @@ function requestQueue(limit: number): Queue {
     });
 }
 
-function recallInput(request: unknown, schema: MetadataSchema, embedding: EmbeddingConfig): ValidRecall {
-    const external = embedding.mode === 'external';
-    requireInput(keys(request, [...(external ? ['queryVector'] : ['query', 'recentDialogue', 'context']), 'filter', 'excludeIds', 'limit', 'rerank']),
-        'Use the documented recall arguments.');
-    if (external) {
-        validateVector(request.queryVector, embedding);
-    } else requireInput(nonempty(request.query) && request.query.trim() !== '*:*', 'query must be nonempty text other than the exact match-all expression *:*.');
-    requireInput(request.context === undefined || typeof request.context === 'string', 'context must be text.');
-    requireInput(request.recentDialogue === undefined || (Array.isArray(request.recentDialogue)
-        && request.recentDialogue.every(message => keys(message, ['role', 'content'])
-            && typeof message.role === 'string' && ['user', 'assistant'].includes(message.role) && typeof message.content === 'string')),
-    'recentDialogue must contain role-labelled user/assistant text.');
-    requireInput(request.rerank === undefined || typeof request.rerank === 'boolean', 'rerank must be a boolean.');
-    requireInput(request.excludeIds === undefined || (Array.isArray(request.excludeIds)
-        && request.excludeIds.every(nonempty) && new Set(request.excludeIds).size === request.excludeIds.length),
-    'excludeIds must contain distinct canonical IDs.');
-    const limit = request.limit ?? 10;
-    requireInput(typeof limit === 'number' && Number.isSafeInteger(limit) && limit >= 1 && limit <= 1000, 'limit must be between 1 and 1000.');
-    validateFilter(request.filter, schema);
-    return { ...structuredClone(request), limit } as ValidRecall;
-}
-
-export function contextualQuery(request: TextRecallRequest): string {
-    if (!request.recentDialogue?.length && !request.context) return request.query;
-    return JSON.stringify({ question: request.query,
-        ...(request.recentDialogue?.length ? { recent_dialogue: request.recentDialogue } : {}),
-        ...(request.context ? { context: request.context } : {}) });
-}
+export { contextualQuery } from './recall-input.js';
 
 function recallQuery(request: ValidRecall, schema: MetadataSchema, textSearch: TextSearch | undefined, embedding: EmbeddingConfig): QueryBody {
     if (embedding.mode === 'external') return { size: request.limit, query: { knn: {
         field: 'embedding', queryVector: request.queryVector, k: request.limit,
         filter: buildSearchFilter([request.filter], request.excludeIds ?? [], [], schema),
     } } };
-    const context = contextualQuery(request as TextRecallRequest);
-    // Native text-query input bound, not a silent SDK context truncation policy.
-    requireInput(new TextEncoder().encode(request.query).length <= 8192 && new TextEncoder().encode(context).length <= 8192,
-        'The contextual search query exceeds the native 8 KiB limit.');
+    const context = textRecallQuery(request as TextRecallRequest);
     const filter = buildSearchFilter([request.filter], request.excludeIds ?? [], [], schema);
     const candidates = Math.max(200, request.limit);
     const semantic = { knn: { field: 'embedding', queryText: context, k: candidates, filter } };

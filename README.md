@@ -2,8 +2,9 @@
 
 TypeScript memory SDK backed by LambdaDB. Store original memories, retrieve
 relevant evidence, inspect metadata distributions, and read complete originals.
-Applications and their agents own query planning, repeated searches, evidence
-selection, answer generation and presentation. The SDK accepts an initialized
+Base recall is a single data operation. Optional SDK orchestration can plan searches
+and select evidence using an injected model adapter. Applications own answer
+generation and presentation. The SDK accepts an initialized
 LambdaDB client; the caller owns connection credentials and transport.
 
 The package is `@functional-systems/memdrive`, licensed under Apache-2.0.
@@ -235,27 +236,55 @@ response is complete, and `null` when the native 100-bucket bound leaves
 completeness unknown.
 
 A hosted MCP service can expose these SDK operations and supply tool descriptions
-and protocol handling. The service or calling agent owns orchestration; MemDrive
-has no model-specific tool schemas, short evidence aliases or finish/report tool.
+and protocol handling. A service can use basic tools or the optional retriever
+for orchestration. MemDrive bundles no provider client, MCP server or finish/report tool.
 
 ## Agent tools
 
 Import `createTools` from `@functional-systems/memdrive/tools` to expose portable
 memory operations to a calling agent. The common layer provides JSON Schema input
 and output definitions, descriptions, effect annotations and SDK execution. It
-contains no internal agent loop or MCP server. See [the tool contract](docs/tools.md)
+defaults to primitive SDK operations. Optional retrieval configuration delegates
+planning and evidence selection to the SDK retriever; no model client or MCP
+server is bundled. See [the tool contract](docs/tools.md)
 for the catalog, branch binding, write opt-in, error outcomes and direct/MCP mapping.
+
+## Optional retrieval orchestration
+
+```ts
+import { createRetriever } from '@functional-systems/memdrive/retriever';
+
+const retriever = await createRetriever({ drive }); // single_pass by default
+const result = await retriever.recall({ query: 'What did we agree?', limit: 10 });
+
+// Agentic retrieval requires a host-owned, provider-neutral model adapter.
+const agentic = await createRetriever({ drive, strategy: 'agentic',
+    agent: { model, countTokens } });
+const evidence = await agentic.recall({ query: 'What changed?', limit: 10 }, { signal });
+if (evidence.completion.status === 'completed') useEvidence(evidence.matches);
+```
+
+The optional loop returns canonical source evidence, never a final answer.
+Configure `createTools({ drive, retrieval: { strategy: 'agentic', agent: { model, countTokens } } })`
+to use it behind the existing `memdrive_recall` tool. The full tool inventory and
+`{requests: [...]}` batch input stay unchanged. See [the adapter and budget contract](docs/tools.md#optional-retriever)
+for model state, scope, cancellation and incomplete outcomes.
 
 ## Consumers
 
-The prototype was exercised by BEAM, LongMemEval and SillyMemory integrations.
-Those applications and evaluation runners remain outside this SDK repository;
-their existing local copies have not been switched to the standalone package.
-Each caller owns dataset interpretation, recent-context partition, search
-orchestration and final prompt assembly. The standalone API no longer accepts
-`mode` or `agent`; consumers of the earlier prototype must remove those options
-and move any agent loop to the application. SDK unit and package checks do not establish
-benchmark answer quality or live service compatibility.
+The [LongMemEval benchmark](benchmark/longmemeval/README.md) lives in this repository
+and compares `single_pass` search with `agentic` use of the public memory tools.
+It reuses ingested per-question collections across independent retrieval runs;
+answer generation, judging and explicit corpus cleanup are separate stages.
+It owns dataset preparation, provider adapters, answer generation and judging;
+these remain outside the SDK runtime and npm archive. It can compare its external
+collector with the same public SDK retriever. Future suites, including BEAM,
+can live alongside it under `benchmark/`.
+
+SillyMemory and earlier BEAM/LongMemEval prototypes are separate consumers. Their
+historical results do not establish the standalone package's answer quality.
+Applications own recent-context partitioning, model transport and final prompt assembly.
+SDK unit and package checks do not establish benchmark quality or live compatibility.
 
 ## Development
 

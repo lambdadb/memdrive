@@ -54,7 +54,7 @@ expressions, and SDK validation remains authoritative for dates, byte limits,
 vector values and other semantic constraints. No silent coercion or null-to-omit
 conversion is performed. Input is detached before asynchronous execution.
 
-Recall uses the SDK's existing vector or hybrid pipeline and native reranking
+By default, recall uses the SDK's existing vector or hybrid pipeline and native reranking
 settings. It does not add a query-rewriting model, select evidence or execute a
 second search. The tool's five-request bound is separate from the SDK's uncapped
 batch length; SDK concurrency remains shared across branch views.
@@ -68,12 +68,27 @@ facet limits. They count original memories once rather than counting chunks.
 An array may contribute to several buckets. Counts can be cached for 60 seconds;
 `asOf` is the fetch time, and `hasMore: null` means completeness is unknown.
 
+## Canonical source identifiers
+
+Public `createTools` inputs and results always use canonical stored memory IDs.
+Returned text matches retain their UTF-16 offsets, content, timestamp and metadata.
+The public registry exposes only `definitions` and `execute`; it has no alias
+options or resolver methods. A real stored ID such as `m1` remains an ordinary
+canonical ID. Writable tools use the same canonical-ID contract.
+
+The optional agentic retriever uses short memory/evidence references internally
+for its injected model session. Those references are resolved before returning
+selected evidence to the caller. They are visible to the model adapter and
+host audit events, not public memory-tool results. The adapter's
+`ModelTurn.evidenceIds` field belongs to that internal model protocol; it does not
+add an ID mode to public tools. Unknown or undelivered selections fail. There is
+no duplicate-body suppression or automatic exclusion.
+
 ## Evidence and writes
 
 A match with `kind: 'mem'` is already complete; `kind: 'chunk'` contains an excerpt
-with UTF-16 offsets. Pass its canonical `memId` to `memdrive_read` for surrounding
-context. There are no short aliases, session-specific evidence tables, automatic
-deduplication or finish/report tools. Callers retain earlier results and decide
+with UTF-16 offsets. Pass its canonical `memId` to `memdrive_read` for surrounding context. There are no session-specific evidence tables, automatic deduplication
+or finish/report tools. Callers retain earlier results and decide
 whether more retrieval is useful. `excludeIds` excludes whole memories and all
 their chunks, so it is not equivalent to hiding only previously seen excerpts.
 
@@ -161,3 +176,89 @@ results, exercise branch binding, writable selection, batch correspondence,
 partial failures and cancellation, and compare direct/MCP result packaging.
 Package checks exercise ESM, CommonJS, public TypeScript types and browser bundles.
 Simulated envelope equality is not a live MCP transport or model-quality test.
+
+## Optional retriever
+
+`createRetriever` from `@functional-systems/memdrive/retriever` provides direct
+`.recall(request, {signal})`. It defaults to `single_pass`, which invokes one base
+recall without creating a model session. To configure recall within the standard
+tool catalog, use the host-owned `retrieval` option:
+
+```ts
+const tools = await createTools({ drive, branch: 'main',
+    retrieval: { strategy: 'agentic', agent: { model, countTokens } } });
+const result = await tools.execute('memdrive_recall', {
+    requests: [{ query: 'What changed?', limit: 10 }, { query: 'What was agreed?' }],
+}, { signal });
+```
+
+The tool inventory and all input schemas stay unchanged: recall accepts 1–5
+requests, while read/list/describe/count and optional writable tools remain
+available. Only configured recall execution/output changes. Each result slot
+includes `completion` and orchestration `usage`; invalid requests retain an
+`error` slot with explicit zero work, and independent siblings still execute.
+Requests run concurrently in input order, with isolated model sessions, evidence
+registries and per-request budgets. A failed/canceled retrieval has no fallback
+matches. Native accounting may be unknown (`null`). Returned canonical IDs work
+with the same registry's read/count/filter operations. Enabling retrieval does
+not remove writable tools or change their input/output IDs.
+
+Omitting `retrieval` preserves basic execution and output schemas exactly. Base
+`drive.recall` is unchanged. Internal agent tools always use primitive recall;
+configuration does not recursively invoke another agent. Strategy, adapter,
+guidance and budgets are snapshotted host configuration, never model arguments.
+
+For `strategy: 'agentic'`, provide `agent.model`, `agent.countTokens` and optional
+`agent.instructions` / `agent.limits`. Managed text memories are required; an
+external-vector drive is rejected because the SDK cannot generate query vectors.
+Each recall creates an isolated read-only tool session with short memory and
+evidence IDs. The model can search, read, list, describe and count values, then
+select delivered evidence IDs. The result contains canonical `matches`,
+`completion` and `usage`. The caller's `limit` bounds the final selection;
+individual searches retain their own request limits. There is no automatic
+fallback to unselected candidates, duplicate suppression or answer generation.
+
+The adapter implements `createSession({request, instructions, tools})`, returning
+`prepare(replies)`. Both are strictly local: no network calls. `prepare` returns
+`{inputTokens, respond({signal, maxOutputTokens})}`. Estimate **the entire provider
+request**, including instructions, tool schemas, history and opaque state;
+reservation is only as conservative as this estimate. `respond` performs one
+provider call and returns `{status, usage, calls?}` or
+`{status, usage, evidenceIds?}`. Each call has `{id, name, arguments}`; replies have
+`{id, name, result}`. IDs must be unique within the retrieval. Preserve provider
+conversation/reasoning state in the adapter, and pass the supplied signal to its
+transport. Return `status: 'incomplete'` with known usage when parsing a completed
+provider response fails. Network failures may throw and are counted as unknown
+usage. No provider package is included in MemDrive.
+
+Defaults are 8 model rounds, 24 tool calls, 120 data calls, 48,000 context tokens,
+160,000 total model tokens, 4,096 output tokens per call, 16,000 tokens per delivered
+tool result and 900,000 milliseconds. Each recall batch item counts as one data
+call; read/list/count/describe count as one each. These are **not native database
+HTTP limits**. `countTokens` measures the complete serialized tool result; an
+oversized result is replaced by an explicit size-limit error, never truncated.
+The SDK reserves estimated input plus maximum output before dispatch and checks
+reported usage afterward; it cannot undo provider overuse. Adapters must honor
+cancellation and output bounds. Synchronous adapter work cannot be preempted.
+Async model, tool and record-hook waits are bounded by the retrieval signal.
+
+`completion.status` is `completed`, `budget_exhausted`, `aborted` or `failed`.
+Noncompleted outcomes contain no matches and an explicit reason, preserving
+usage already observed. Invalid caller requests reject before model work.
+`usage` reports model calls, known input/output tokens, unknown-usage calls,
+tool/data calls and elapsed milliseconds. `databaseRequests` is null after any
+primitive without exact native request accounting; `knownRecallDatabaseRequests`
+retains the subtotal from completed base recall results. Initialization performs
+one `describe` before retrieval timing and is outside per-recall usage. A native
+transport hook can impose a separate hard HTTP budget.
+
+The original caller filter and exclusions constrain every internal search/count
+and every original exposed through read/list; the supplied drive fixes the
+branch. Scope uses the SDK's filter semantics. Browsing can return an empty page
+with a continuation cursor after filtering. Read/list may physically fetch
+excluded originals before filtering. This is retrieval selection, **not an
+authorization boundary**: authorize the underlying drive separately. Underlying
+drive/native diagnostics may contain data outside this selection. Optional
+retriever `record` events are detached and scoped; tool events include host-only
+canonical source mappings for audit, including oversized results that were not
+delivered. Only actually delivered evidence is eligible for final selection.

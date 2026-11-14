@@ -6,6 +6,7 @@ export default [
     { ignores: ['dist/**', 'artifacts/**', 'node_modules/**'] },
     js.configs.recommended,
     ...tseslint.configs.recommended,
+    { files: ['benchmark/**/*.mjs'], languageOptions: { globals: globals.node } },
     {
         files: ['src/**/*.ts'],
         languageOptions: { globals: globals.browser },

@@ -24,3 +24,13 @@ await createTools({ drive, writable: 'yes' });
 await createTools({ drive, branch: { name: 'main' } });
 // @ts-expect-error The common tool layer does not configure model clients.
 await createTools({ drive, model: {} });
+// @ts-expect-error Model-session ID options are not public configuration.
+await createTools({ drive, shortIds: false });
+// @ts-expect-error Evidence references are internal to agentic model sessions.
+await createTools({ drive, evidenceIds: true });
+// @ts-expect-error Public tools expose canonical IDs and no alias resolver.
+tools.resolveId('m1');
+// @ts-expect-error Public tools expose canonical spans and no evidence resolver.
+tools.resolveEvidence('e1');
+// @ts-expect-error Internal reference types are not public exports.
+import type { EvidenceReference } from '@functional-systems/memdrive/tools';
