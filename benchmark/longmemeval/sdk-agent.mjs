@@ -5,10 +5,24 @@ import { context, resultSpans, spanKey, validateSpan } from './protocol.mjs';
 
 const unique = spans => [...new Map(spans.map(span => [spanKey(span), span])).values()];
 
+// Freeze the model-visible contract through the public adapter boundary, without data/provider calls.
+export async function sdkDefinitions(drive) {
+    let definitions;
+    const retriever = await createRetriever({ drive, strategy: 'agentic', agent: { countTokens: () => 0,
+        model: { createSession({ tools }) { definitions = canonicalToolDefinitions(tools);
+            return { prepare: () => ({ inputTokens: 0, respond: async () => ({ status: 'completed', evidenceIds: [],
+                usage: { inputTokens: 0, outputTokens: 0 } }) }) };
+        } },
+    } });
+    const outcome = await retriever.recall({ query: 'Inspect the model tool contract.' });
+    assert.equal(outcome.completion.status, 'completed'); assert(definitions);
+    return definitions;
+}
+
 // Provider transport, application context and audit validation stay outside the SDK.
 export async function sdkCollector({ drive, prepared, config, definitions, countTokens, ask, signal,
     onTool = async () => {}, onOutcome = async () => {}, now = Date.now, beforeTool = () => {}, replayTool }) {
-    assert(config.shortIds && config.evidenceIds && config.collectorTransport === 'openai-responses');
+    assert.equal(config.collectorTransport, 'openai-responses');
     const trace = [], retrieved = [], delivered = [], recorded = new Map();
     let startedAt, rounds = 0;
     const retriever = await createRetriever({ drive, strategy: 'agentic', agent: {

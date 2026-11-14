@@ -1,5 +1,5 @@
 import { MemDriveError } from '../errors.js';
-import type { EvidenceReference } from './types.js';
+import type { EvidenceReference } from './internal-types.js';
 
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical)

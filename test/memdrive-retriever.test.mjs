@@ -203,39 +203,32 @@ test('configured tools retain the catalog, branch and batch contract with concur
         return { status: 'completed', usage, ...selected('e1') };
     } }; } }; } };
     const ordinary = await createTools({ drive });
-    const tools = await createTools({ drive, branch: 'alternate', shortIds: true, evidenceIds: true,
+    const tools = await createTools({ drive, branch: 'alternate',
         retrieval: { strategy: 'agentic', agent: agentOptions(model) } });
     assert.deepEqual(tools.definitions.map(x => x.name), ordinary.definitions.map(x => x.name));
     const plainConfigured = await createTools({ drive, retrieval: { strategy: 'single_pass' } });
     assert.deepEqual(plainConfigured.definitions.map(x => x.inputSchema), ordinary.definitions.map(x => x.inputSchema));
     const result = await tools.execute('memdrive_recall', { requests: [{ query: 'first' }, { query: '' },
-        { query: 'unknown', excludeIds: ['m99'] }, { query: 'last' }] });
+        { query: 'unknown', excludeIds: [null] }, { query: 'last' }] });
     assert.equal(result.ok, true); assert.equal(entered, 2, 'Inner primitive tools must not recurse into orchestration');
     assert.deepEqual(result.value.results.map(x => x.completion.status), ['completed', 'failed', 'failed', 'completed']);
     assert.deepEqual(result.value.results.filter(x => x.matches).map(x => x.matches[0].content), ['branch evidence', 'branch evidence']);
     assert.equal(result.value.results[1].usage.modelCalls, 0); assert.equal(result.value.results[1].usage.databaseRequests, 0);
-    assert.equal(result.value.results[2].error.code, 'INVALID_INPUT'); assert.match(result.value.results[2].error.message, /returned/);
-    assert.equal(tools.resolveId(result.value.results[0].matches[0].memId), 'original');
-    assert.equal(tools.resolveEvidence(result.value.results[0].matches[0].evidenceId).memId, 'original');
+    assert.equal(result.value.results[2].error.code, 'INVALID_INPUT'); assert.match(result.value.results[2].error.message, /canonical/);
+    assert.equal(result.value.results[0].matches[0].memId, 'original');
+    assert.equal('evidenceId' in result.value.results[0].matches[0], false);
+    assert.equal('resolveId' in tools, false); assert.equal('resolveEvidence' in tools, false);
     assert(new Ajv2020({ strict: false }).compile(tools.definitions[0].outputSchema)(result));
-    assert.equal((await tools.execute('memdrive_read', { ids: ['m1'] })).value.mems[0].content, 'branch evidence');
+    assert.equal((await tools.execute('memdrive_read', { ids: ['original'] })).value.mems[0].content, 'branch evidence');
 });
 
-test('configured recall preserves writable inventory and evidence conflict completion', async () => {
+test('configured recall preserves writable inventory', async () => {
     const { drive } = await setup();
     const writable = await createTools({ drive, writable: true, retrieval: { strategy: 'single_pass' } });
     assert.equal(writable.definitions.length, 7);
     assert.equal((await writable.execute('memdrive_remember', { mems: [{ id: 'new', content: 'new text' }] })).ok, true);
     assert.equal((await writable.execute('memdrive_forget', { ids: ['new'] })).ok, true);
-    await assert.rejects(createTools({ drive, writable: true, shortIds: true, retrieval: {} }), { code: 'INVALID_INPUT' });
-    const tools = await createTools({ drive, evidenceIds: true, retrieval: { strategy: 'single_pass' } });
-    await tools.execute('memdrive_recall', { requests: [{ query: 'q' }] });
-    await drive.remember({ mems: [{ id: 'original', content: 'maple' }] });
-    const conflict = await tools.execute('memdrive_recall', { requests: [{ query: 'q' }] });
-    assert.equal(conflict.value.results[0].error.code, 'INVALID_RESULT');
-    assert.equal(conflict.value.results[0].completion.status, 'failed');
-    assert.equal(conflict.value.results[0].usage.databaseRequests, 1);
-    assert(new Ajv2020({ strict: false }).compile(tools.definitions[0].outputSchema)(conflict));
+
 });
 
 test('configured batch retains completed and canceled slots and nullable usage', async () => {
@@ -280,4 +273,23 @@ test('configured agent describe refreshes metadata and construction snapshots ho
     const result = await tools.execute('memdrive_recall', { requests: [{ query: 'q' }] });
     assert.equal(result.value.results[0].completion.status, 'completed');
     assert.equal(model.calls, 2); assert.equal(describes, 2); assert.equal(model.inputs[0].instructions, 'frozen');
+});
+
+test('public tools reject alias settings and expose only canonical IDs without resolvers', async () => {
+    const { drive, fixture } = await setup(), before = fixture.calls.length;
+    for (const name of ['shortIds', 'evidenceIds']) for (const value of [false, true])
+        await assert.rejects(createTools({ drive, [name]: value }), { code: 'INVALID_INPUT' });
+    assert.equal(fixture.calls.length, before, 'Removed options reject before database work');
+    for (const options of [{}, { writable: true }, { retrieval: { strategy: 'agentic', agent: agentOptions(scripted([search(), selected('e1')])) } }]) {
+        const tools = await createTools({ drive, ...options });
+        assert.deepEqual(Object.keys(tools).sort(), ['definitions', 'execute']);
+        assert.equal(JSON.stringify(tools.definitions).includes('evidenceId'), false);
+        assert.equal(JSON.stringify(tools.definitions).includes('session aliases'), false);
+        const result = await tools.execute('memdrive_recall', { requests: [{ query: 'q' }] });
+        assert.equal(result.value.results[0].matches[0].memId, 'original');
+        assert.equal('evidenceId' in result.value.results[0].matches[0], false);
+        const read = await tools.execute('memdrive_read', { ids: ['original'] });
+        assert.equal(read.value.mems[0].id, 'original'); assert.equal('evidenceId' in read.value.mems[0], false);
+    }
+    await assert.rejects(import('@functional-systems/memdrive/tools/factory'), { code: 'ERR_PACKAGE_PATH_NOT_EXPORTED' });
 });

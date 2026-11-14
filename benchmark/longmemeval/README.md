@@ -239,38 +239,33 @@ consumer checks remain offline. Benchmark code, datasets and receipts stay
 outside the published npm package; no live answer-quality claim follows from
 unit or package tests.
 
-### Short memory IDs
+### External and SDK collector boundaries
 
-The run-only `shortIds` setting defaults to `false`. Set it to `true` before
-preparing a run to use the SDK's read-only session aliases. It does not change
-corpus identity or require ingestion. Frozen tool definitions explain the ID
-protocol; all other collector settings and source text remain unchanged.
-Model-facing tool receipts retain aliases, while the host-only `resolveId`
-method converts retrieved and selected spans back to canonical IDs before
-source validation, coverage measurement and final packing. Offline replay
-recreates the same session mapping from native receipts. Keep the matching
-runner and SDK revision for each historical run.
+`collectorImplementation: "benchmark"` is the default external collector. It
+consumes canonical IDs and exact spans from public `createTools` and selects
+`{"evidence":[{"memId":"...","start":0,"end":123}]}`. Public tools expose no
+alias settings or resolvers. The removed `shortIds`/`evidenceIds` run keys are
+rejected even when false; historical runs require their retained runtime snapshot.
+Dataset/corpus identity is unchanged and existing ready collections are reusable.
 
-### Evidence references
+Set frozen `collectorImplementation: "sdk"` for agentic runs to use the public
+retriever. Its model adapter receives internal m/e reference tools and selects
+`{"evidence":["e1"]}`. Public selected evidence remains canonical. Preparation
+freezes those internal model definitions using a local empty-selection adapter
+probe through the public API; it performs no data or provider request. Live
+collection and offline replay compare the actual supplied model definitions with
+that frozen contract. `single_pass` always freezes canonical public tools,
+regardless of the collector implementation setting.
 
-The independent run-only `evidenceIds` setting defaults to `false`. With it
-enabled, the frozen `collectEvidenceIds` prompt requests `{"evidence":["e1"]}`
-instead of memory IDs and offsets. Public tool outputs preserve all source fields
-and add SDK session references. The host resolves each selection to canonical
-spans and requires an exact match among delivered evidence; references allocated
-by an oversized, undelivered result are insufficient. Final packing, answer
-assembly and judging remain separate and unchanged. Native receipt replay
-recreates the reference registry and verifies the original selection. Neither
-repeated-body suppression nor automatic search exclusions are enabled.
-
-### SDK orchestration comparison
-
-The frozen run config can set `collectorImplementation: "sdk"` together with
-`shortIds: true` and `evidenceIds: true` for agentic runs. The default remains the
-external benchmark collector. The SDK path uses the public `retriever` subpath;
 `sdk-agent.mjs` owns Responses transport, application context and raw receipts.
-It keeps the same evidence-only prompt and separate answer stage. Each question
-also saves `orchestration.json` with the SDK completion and accounting. Native
-Journal counts remain authoritative for HTTP operations; SDK data-call counts
-measure a different boundary. `verify` replays the SDK loop offline, including
-canonical source validation, delivered evidence and frozen provider requests.
+Canonical source auditing uses host record events from the public retriever;
+benchmark code imports no SDK internal modules. `orchestration.json` records
+completion/accounting, while native Journal counts remain authoritative for HTTP
+operations. Evidence packing, answering and judging stay separate. Oversized
+undelivered references are not eligible for selection.
+
+The external collector and SDK collector now differ in ID representation and
+selection protocol as well as loop ownership. A comparison does not isolate
+orchestration overhead. Earlier fixed-trace alias experiments and live results
+remain historical evidence, replayable with their exact source snapshots; this
+boundary cleanup does not establish a new performance or quality result.

@@ -68,80 +68,26 @@ facet limits. They count original memories once rather than counting chunks.
 An array may contribute to several buckets. Counts can be cached for 60 seconds;
 `asOf` is the fetch time, and `hasMore: null` means completeness is unknown.
 
-## Optional session-local short IDs
+## Canonical source identifiers
 
-`createTools({ drive, shortIds: true })` uses `m1`, `m2`, ... in memory-ID fields
-of read-only tool results. IDs are assigned on first return and remain stable for
-that registry's lifetime. Keep the same registry for a conversation; a new
-registry starts a new mapping. Concurrent calls assign aliases in completion
-order. This option cannot be combined with `writable: true`.
+Public `createTools` inputs and results always use canonical stored memory IDs.
+Returned text matches retain their UTF-16 offsets, content, timestamp and metadata.
+The public registry exposes only `definitions` and `execute`; it has no alias
+options or resolver methods. A real stored ID such as `m1` remains an ordinary
+canonical ID. Writable tools use the same canonical-ID contract.
 
-In this mode, `read.ids`, `excludeIds`, and `id` filter values (`eq`, `neq`, `in`)
-accept only aliases previously returned by that registry. Unknown aliases and
-raw IDs are rejected without a database request. An invalid recall item does
-not prevent valid siblings from running or change their diagnostic indices.
-Actual stored IDs that resemble aliases have no special meaning: the session
-mapping always determines what `m1` refers to.
-
-Only memory-ID fields change: recall `memId`, read/list `id`, and `id` count
-buckets. Content, metadata, scores, offsets, descriptors and pagination cursors
-are unchanged. The underlying drive continues to accept and return canonical
-IDs. Host code can recover them without exposing the map to the model:
-
-```ts
-const tools = await createTools({ drive, shortIds: true });
-const result = await tools.execute('memdrive_recall', {
-  requests: [{ query: 'Where did I leave the keys?' }],
-});
-// Resolve a returned alias before storing an application citation.
-// For example, if a successful result returned m1:
-const canonicalId = tools.resolveId('m1');
-```
-
-`resolveId` throws `INVALID_INPUT` for an unknown alias. With the default
-`shortIds: false`, it returns its argument unchanged. The mapping is local
-memory, is never persisted by the SDK, and lives until the registry is released.
-
-## Optional evidence references
-
-`createTools({ drive, evidenceIds: true })` adds an `evidenceId` such as `e1` to
-recall matches and read/list originals. This independent read-only option can be
-combined with `shortIds: true`. It preserves every existing result field and
-never suppresses repeated bodies, excludes prior results or chooses evidence.
-Memory-ID inputs still use `memId`/`id`; an evidence ID is not a memory ID.
-
-A registry assigns one stable reference for each canonical memory and exact
-UTF-16 span. Complete originals use `0..content.length`, so the same full span
-from recall and read/list shares a reference. Different spans get different IDs.
-External-vector references identify only the canonical memory: no text or offsets
-are invented. Host code resolves references independently of a model protocol:
-
-```ts
-const tools = await createTools({ drive, shortIds: true, evidenceIds: true });
-// After a tool result returns evidenceId: 'e1':
-const source = tools.resolveEvidence('e1'); // Canonical memId, plus start/end for text.
-```
-
-The resolver returns detached data and throws `INVALID_INPUT` for unknown IDs or
-when evidence IDs are disabled. References are session-local and identify
-previously observed evidence, not a verified current database snapshot. A later
-result with the same identity but different content, timestamp or metadata fails
-with `INVALID_RESULT`; metadata key order is ignored. Recall failures stay in
-their original request slot while valid siblings remain available. Old
-references are never rebound to changed source data. Start a new session after
-an intentional source update. The registry retains source signatures until it
-is released.
-
-The caller owns model delivery and selection. Creating a reference in a raw tool
-result does not establish that the model received it: applications that cap or
-omit results must track delivered references before accepting citations. No
-finish/report tool or model loop is added by this option.
+The optional agentic retriever uses short memory/evidence references internally
+for its injected model session. Those references are resolved before returning
+selected evidence to the caller. They are visible to the model adapter and
+host audit events, not public memory-tool results. The adapter's
+`ModelTurn.evidenceIds` field belongs to that internal model protocol; it does not
+add an ID mode to public tools. Unknown or undelivered selections fail. There is
+no duplicate-body suppression or automatic exclusion.
 
 ## Evidence and writes
 
 A match with `kind: 'mem'` is already complete; `kind: 'chunk'` contains an excerpt
-with UTF-16 offsets. Pass its returned `memId` (canonical by default, a session
-alias with `shortIds`) to `memdrive_read` for surrounding context. There are no session-specific evidence tables, automatic deduplication
+with UTF-16 offsets. Pass its canonical `memId` to `memdrive_read` for surrounding context. There are no session-specific evidence tables, automatic deduplication
 or finish/report tools. Callers retain earlier results and decide
 whether more retrieval is useful. `excludeIds` excludes whole memories and all
 their chunks, so it is not equivalent to hiding only previously seen excerpts.
@@ -253,10 +199,9 @@ includes `completion` and orchestration `usage`; invalid requests retain an
 `error` slot with explicit zero work, and independent siblings still execute.
 Requests run concurrently in input order, with isolated model sessions, evidence
 registries and per-request budgets. A failed/canceled retrieval has no fallback
-matches. Native accounting may be unknown (`null`). Outer tool-session aliases
-are applied after canonical retrieval, so returned references work with the same
-registry's read/count/filter operations. Existing read-only restrictions on
-aliases still apply; enabling retrieval does not silently remove writable tools.
+matches. Native accounting may be unknown (`null`). Returned canonical IDs work
+with the same registry's read/count/filter operations. Enabling retrieval does
+not remove writable tools or change their input/output IDs.
 
 Omitting `retrieval` preserves basic execution and output schemas exactly. Base
 `drive.recall` is unchanged. Internal agent tools always use primitive recall;

@@ -7,7 +7,7 @@ import { parseArgs, parseEnv } from 'node:util';
 import { get_encoding } from 'tiktoken';
 import { createTools } from '@functional-systems/memdrive/tools';
 import { collectEvidence, canonicalToolDefinitions } from './agent.mjs';
-import { sdkCollector } from './sdk-agent.mjs';
+import { sdkCollector, sdkDefinitions } from './sdk-agent.mjs';
 import { prepareCase, metadataSchema, hash, jsonHash, packEvidence, evidenceMetrics, judgeRequest, verdict, integer } from './protocol.mjs';
 import { atomic, readJSON, exists, credentials, Journal, reuse, reuseDrive } from './runtime.mjs';
 import { dataset as loadDataset, questionPath, newUsage, lease, initialize, proof, ingestCorpus, cleanupCorpus } from './corpus.mjs';
@@ -18,13 +18,17 @@ const repository = path.resolve(directory, '../..');
 export const config = await readJSON(path.join(directory, 'config.json'));
 const rulesText = await readFile(path.join(directory, 'judge-rules.json'), 'utf8');
 
-export async function frozenTools(profile = config) {
-    const registry = await createTools({ shortIds: profile.shortIds ?? false, evidenceIds: profile.evidenceIds ?? false, drive: {
+export async function frozenTools(profile = config, mode = 'agentic') {
+    assert(!Object.hasOwn(profile, 'shortIds') && !Object.hasOwn(profile, 'evidenceIds'),
+        'Legacy alias settings require their matching historical runtime.');
+    const drive = {
         describe: async () => ({ name: 'benchmark', labels: {}, metadataSchema, embedding: { mode: 'managed', provider: 'openai',
             model: 'text-embedding-3-small', dimensions: 1536, similarity: 'cosine' }, textSearch: { analyzers: ['english'] } }),
         recall: async () => { throw new Error('Definition-only handle'); },
-    } });
-    return canonicalToolDefinitions(registry.definitions);
+    };
+    if (mode === 'agentic' && profile.collectorImplementation === 'sdk') return sdkDefinitions(drive);
+    assert(['benchmark', 'sdk'].includes(profile.collectorImplementation));
+    return canonicalToolDefinitions((await createTools({ drive })).definitions);
 }
 async function treeFiles(directory) {
     const result = [];
@@ -57,7 +61,7 @@ export async function prepare(root, corpusRoot, mode, limit) {
         const ids = corpusProof.manifest.ids.slice(0, limit);
         const lock = { protocol: config.protocol, mode, ids, config, rulesText,
             corpus: { path: canonical, proofSha256: jsonHash(corpusProof) },
-            package: await readJSON(path.join(repository, 'package.json')), sources: await fingerprints(), tools: await frozenTools(),
+            package: await readJSON(path.join(repository, 'package.json')), sources: await fingerprints(), tools: await frozenTools(config, mode),
             inputs: Object.fromEntries(ids.map(id => [id, jsonHash(prepareCase(rows.get(id), config))])) };
         const target = path.join(root, 'dataset.json'); assert(!await exists(target), 'Use a new run directory');
         try { await link(path.join(canonical, 'dataset.json'), target); }
@@ -77,7 +81,7 @@ async function checked(root) {
     const executable = files => Object.fromEntries(Object.entries(files).filter(([name]) =>
         !name.startsWith('benchmark/') || /\.mjs$/.test(name)));
     assert.deepEqual(executable(current), executable(lock.sources), 'Executable code changed; use the original checkout/runtime');
-    assert.deepEqual(await frozenTools(profile), lock.tools); assert.equal(hash(lock.rulesText), profile.rulesSha256);
+    assert.deepEqual(await frozenTools(profile, lock.mode), lock.tools); assert.equal(hash(lock.rulesText), profile.rulesSha256);
     const corpusProof = await readJSON(path.join(root, 'corpus-proof.json'));
     assert.equal(jsonHash(corpusProof), lock.corpus.proofSha256);
     const rows = await loadDataset(root, profile.dataset);
@@ -169,7 +173,7 @@ export async function recall(root, keys, { fetcher = fetch, signal } = {}) {
                         const tools = await reuse(journal, prepared, q.entry, corpusProof.manifest.storage);
                         assert.deepEqual(canonicalToolDefinitions(tools.definitions), lock.tools, 'Live tools differ from prepared definitions');
                         collect = () => collectEvidence({ ...collectOptions, mode: lock.mode,
-                            tools: { definitions: lock.tools, resolveId: tools.resolveId, resolveEvidence: tools.resolveEvidence, execute: (...args) => tools.execute(...args) } });
+                            tools: { definitions: lock.tools, execute: (...args) => tools.execute(...args) } });
                     }
                     q.validationOperations = q.databaseOperations; q.validationMilliseconds = performance.now() - started;
                     q.phase = 'collect'; await save(); retrievalStarted = performance.now();
@@ -330,7 +334,7 @@ export async function verify(root) {
                     assert.deepEqual(canonicalToolDefinitions(registry.definitions), lock.tools);
                     collect = () => collectEvidence({ mode: lock.mode, prepared, config, countTokens, ask,
                         now: () => events[at]?.startedAt,
-                        tools: { definitions: lock.tools, resolveId: registry.resolveId, resolveEvidence: registry.resolveEvidence, execute: async (name, args) => {
+                        tools: { definitions: lock.tools, execute: async (name, args) => {
                             const event = events[at++]; assert(event); assert.equal(event.name, name); assert.deepEqual(event.args, args);
                             assert(integer(event.startedAt)); clock = event.startedAt;
                             const actual = await registry.execute(name, args);

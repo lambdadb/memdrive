@@ -91,18 +91,12 @@ export function resultSpans(name, result, prepared, resolveId = id => id, resolv
     return [];
 }
 
-export function selectEvidence(selection, available, resolveId = id => id, resolveEvidence) {
+export function selectEvidence(selection, available) {
     assert(selection && Object.keys(selection).length === 1 && Array.isArray(selection.evidence), 'Expected evidence selection JSON');
     const byKey = new Map(available.map(span => [spanKey(span), span]));
     const selected = [], seen = new Set();
-    for (let ref of selection.evidence) {
-        if (resolveEvidence) {
-            assert.equal(typeof ref, 'string', 'Select returned evidence IDs');
-            ref = resolveEvidence(ref);
-        } else {
-            assert(ref && Object.keys(ref).every(key => ['memId', 'start', 'end'].includes(key)));
-            ref = { ...ref, memId: resolveId(ref.memId) };
-        }
+    for (const ref of selection.evidence) {
+        assert(ref && Object.keys(ref).every(key => ['memId', 'start', 'end'].includes(key)));
         let span;
         if (Object.keys(ref).length === 1 && typeof ref.memId === 'string') {
             // Full originals are distinguishable from excerpts by their original length in metadata-free refs below.

@@ -45,7 +45,7 @@ test('reusable corpus grows once, serves both retrieval modes and verifies after
                         finish_reason = 'tool_calls';
                     } else {
                         const match = JSON.parse(tool.output).value.results[0].matches[0];
-                        message.content = JSON.stringify({ evidence: [match.evidenceId] });
+                        message.content = JSON.stringify({ evidence: [match.evidenceId ?? { memId: match.memId, start: match.start, end: match.end }] });
                     }
                 }
                 if (request.tools) {
@@ -78,7 +78,6 @@ test('reusable corpus grows once, serves both retrieval modes and verifies after
             assert.throws(() => compatible(manifest, rows, { ...config, retrieval: { ...config.retrieval, recentMessagesIncludingQuestion: 3 } }), /originals/);
             const baseline = path.join(base, 'baseline'), agent = path.join(base, 'agent');
             await prepare(baseline, corpus, 'single_pass', 1);
-            config.shortIds = true; config.evidenceIds = true;
             config.model.model = 'new-agent-model'; config.prompts.answer += ' A different reader policy.';
             await prepare(agent, corpus, 'agentic', 1);
             const beforeReuse = wire.requests.length;
@@ -103,6 +102,14 @@ test('reusable corpus grows once, serves both retrieval modes and verifies after
             const sdkOutcome = await readJSON(path.join(sdkAgent, 'questions', hash(first.question_id), 'orchestration.json'));
             assert.equal(sdkOutcome.completion.status, 'completed'); assert.equal(sdkOutcome.usage.databaseRequests, null);
             assert.equal(sdkOutcome.usage.modelCalls, sdkResult.models.collector.calls);
+            const sdkSingle = path.join(base, 'sdk-single'); await prepare(sdkSingle, corpus, 'single_pass', 1);
+            const beforeSingleModels = modelCalls;
+            const sdkSingleResult = await recall(sdkSingle, databaseKeys, { fetcher });
+            assert.equal(sdkSingleResult.failed, 0); assert.equal(modelCalls, beforeSingleModels);
+            assert.deepEqual(await verify(sdkSingle), sdkSingleResult);
+            config.shortIds = false;
+            await assert.rejects(prepare(path.join(base, 'obsolete-flags'), corpus, 'agentic', 1), /historical runtime/);
+            delete config.shortIds;
             const empty = path.join(base, 'empty'); await prepare(empty, corpus, 'agentic', 1);
             emptySelection = true;
             const emptyResult = await recall(empty, { ...keys, judgeKey: undefined }, { fetcher });
@@ -137,7 +144,7 @@ test('reusable corpus grows once, serves both retrieval modes and verifies after
             await rm(path.join(corpus, 'dataset.json')); await rm(path.join(corpus, 'corpus.json'));
             config.model.model = 'different-current-setting'; config.prompts.answer = 'different-current-prompt'; config.rulesSha256 = 'not-the-run-rules';
             const beforeScore = wire.requests.length;
-            for (const root of [baseline, agent, sdkAgent, empty]) {
+            for (const root of [baseline, agent, sdkAgent, sdkSingle, empty]) {
                 const result = await score(root, { modelKey: keys.modelKey, judgeKey: keys.judgeKey }, { fetcher });
                 assert.equal(result.accuracy, 1); assert.equal(result.scoringComplete, true);
                 assert.deepEqual(await verify(root), result); assert.equal(Date.now, originalNow);

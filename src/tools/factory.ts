@@ -5,8 +5,8 @@ import type { CountValuesRequest, ForgetRequest, ListRequest, MemInput, RecallRe
 import { toolDefinitions } from './definitions.js';
 import { evidenceIds as createEvidenceIds } from './evidence-ids.js';
 import { shortIds as createShortIds } from './short-ids.js';
-import type { CreateToolsOptions, MemoryTools, ToolError, ToolResult } from './types.js';
-
+import type { ToolError, ToolResult } from './types.js';
+import type { InternalToolsOptions, InternalMemoryTools } from './internal-types.js';
 
 const object = (value: unknown): value is Record<string, unknown> => value !== null
     && typeof value === 'object' && !Array.isArray(value)
@@ -35,8 +35,8 @@ function errorResult(cause: unknown): ToolResult {
 }
 
 /** Shared primitive factory. Internal retrieval sessions never provide configureRecall. */
-export async function createMemoryTools(configuration: CreateToolsOptions, options: RequestOptions = {},
-    configureRecall?: (drive: MemDrive) => Promise<Retriever>): Promise<MemoryTools> {
+export async function createMemoryTools(configuration: InternalToolsOptions, options: RequestOptions = {},
+    configureRecall?: (drive: MemDrive) => Promise<Retriever>): Promise<InternalMemoryTools> {
     requireInput(object(configuration) && Object.keys(configuration).every(key => ['drive', 'branch', 'writable', 'shortIds', 'evidenceIds', 'retrieval'].includes(key)),
         'Use drive, optional branch, writable, shortIds evidenceIds and optional retrieval to create memory tools.');
     requireInput(configuration.writable === undefined || typeof configuration.writable === 'boolean', 'writable must be a boolean.');

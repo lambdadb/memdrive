@@ -27,7 +27,7 @@ export async function collectEvidence({ mode, tools, prepared, config, countToke
         signal?.throwIfAborted();
         const startedAt = now();
         const raw = await tools.execute(name, args, { signal });
-        const spans = resultSpans(name, raw, prepared, tools.resolveId, config.evidenceIds ? tools.resolveEvidence : undefined).map(span => ({ ...span,
+        const spans = resultSpans(name, raw, prepared).map(span => ({ ...span,
             ...(['memdrive_read', 'memdrive_list'].includes(name) ? { fullOriginal: true } : {}) }));
         retrieved.push(...spans);
         const tooLarge = countTokens(JSON.stringify(raw)) > config.limits.toolResultTokens;
@@ -46,7 +46,7 @@ export async function collectEvidence({ mode, tools, prepared, config, countToke
         return { trace, retrieved: unique(retrieved), delivered: unique(delivered), selected: unique(delivered), rounds: 0 };
     }
     assert.equal(config.collectorTransport, 'openai-responses');
-    const input = [{ role: 'system', content: config.evidenceIds ? config.prompts.collectEvidenceIds : config.prompts.collect },
+    const input = [{ role: 'system', content: config.prompts.collect },
         { role: 'user', content: JSON.stringify(context(prepared)) }];
     const definitions = modelTools(tools.definitions), ids = new Set();
     for (let round = 0; round < config.limits.rounds; round++) {
@@ -65,7 +65,7 @@ export async function collectEvidence({ mode, tools, prepared, config, countToke
             assert(messages.length && messages.every(item => item.role === 'assistant' && item.status === 'completed'
                 && Array.isArray(item.content) && item.content.every(part => part.type === 'output_text')), 'Collector did not return final text');
             const text = messages.flatMap(item => item.content.map(part => part.text)).join('');
-            const selected = selectEvidence(JSON.parse(text), delivered, tools.resolveId, config.evidenceIds ? tools.resolveEvidence : undefined);
+            const selected = selectEvidence(JSON.parse(text), delivered);
             return { trace, retrieved: unique(retrieved), delivered: unique(delivered), selected, rounds: round + 1 };
         }
         assert(calls + toolCalls.length <= config.limits.toolCalls, 'Tool-call budget exhausted');

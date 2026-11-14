@@ -6,9 +6,6 @@ const client = new LambdaDBClient({ baseUrl: 'https://example.invalid', projectN
 const drive = await create({ client, name: 'sample', metadataSchema: {} });
 const tools: MemoryTools = await createTools({ drive, branch: 'main', writable: true });
 const definitions: ToolDefinition[] = tools.definitions;
-const compact: MemoryTools = await createTools({ drive, shortIds: true });
-const canonicalId: string = compact.resolveId('m1');
-void canonicalId;
 const result: ToolResult = await tools.execute('memdrive_recall', { requests: [{ query: 'A question' }] });
 if (result.ok) {
     const value: Record<string, unknown> = result.value;
@@ -27,17 +24,13 @@ await createTools({ drive, writable: 'yes' });
 await createTools({ drive, branch: { name: 'main' } });
 // @ts-expect-error The common tool layer does not configure model clients.
 await createTools({ drive, model: {} });
-// @ts-expect-error Session IDs are an explicit boolean option.
-await createTools({ drive, shortIds: 'true' });
-// @ts-expect-error Resolving an ID accepts a string, not a tool response.
-compact.resolveId({ memId: 'm1' });
-
-const evidenceTools = await createTools({ drive, evidenceIds: true });
-const reference = evidenceTools.resolveEvidence('e1');
-const sourceId: string = reference.memId;
-if ('start' in reference) { const offset: number = reference.start; void offset; }
-void sourceId;
-// @ts-expect-error Evidence IDs are an explicit boolean option.
-await createTools({ drive, evidenceIds: 'yes' });
-// @ts-expect-error Evidence resolution accepts a returned string ID.
-evidenceTools.resolveEvidence({ evidenceId: 'e1' });
+// @ts-expect-error Model-session ID options are not public configuration.
+await createTools({ drive, shortIds: false });
+// @ts-expect-error Evidence references are internal to agentic model sessions.
+await createTools({ drive, evidenceIds: true });
+// @ts-expect-error Public tools expose canonical IDs and no alias resolver.
+tools.resolveId('m1');
+// @ts-expect-error Public tools expose canonical spans and no evidence resolver.
+tools.resolveEvidence('e1');
+// @ts-expect-error Internal reference types are not public exports.
+import type { EvidenceReference } from '@functional-systems/memdrive/tools';

@@ -163,7 +163,7 @@ export async function ingest(journal, prepared, entry, profile = storageProfile(
     for (let index = 0; index < prepared.mems.length; index += 20)
         await drive.remember({ mems: prepared.mems.slice(index, index + 20) }, { signal: journal.signal });
     await validateOriginals(drive, journal, prepared);
-    return createTools({ drive, shortIds: journal.config.shortIds ?? false, evidenceIds: journal.config.evidenceIds ?? false }, { signal: journal.signal });
+    return createTools({ drive }, { signal: journal.signal });
 }
 export async function reuseDrive(journal, prepared, entry, profile = storageProfile()) {
     const drive = await open({ client: journal.native(), name: entry.collection, maxConcurrentRequests: 1 }, { signal: journal.signal });
@@ -173,7 +173,7 @@ export async function reuseDrive(journal, prepared, entry, profile = storageProf
 }
 export async function reuse(journal, prepared, entry, profile = storageProfile()) {
     const drive = await reuseDrive(journal, prepared, entry, profile);
-    return createTools({ drive, shortIds: journal.config.shortIds ?? false, evidenceIds: journal.config.evidenceIds ?? false }, { signal: journal.signal });
+    return createTools({ drive }, { signal: journal.signal });
 }
 
 export async function cleanup(journal, entry) {
