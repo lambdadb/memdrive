@@ -47,7 +47,8 @@ export function evidenceIds(external: boolean) {
                 try { attach(item.matches, false); return item; }
                 catch (cause) {
                     if (!(cause instanceof MemDriveError)) throw cause;
-                    return { error: { code: cause.code, message: cause.message }, usage: item.usage };
+                    return { error: { code: cause.code, message: cause.message }, usage: item.usage,
+                        ...(item.completion === undefined ? {} : { completion: { status: 'failed', reason: cause.code } }) };
                 }
             });
         } else if ((name === 'memdrive_read' || name === 'memdrive_list') && Array.isArray(value.mems)) attach(value.mems, true);

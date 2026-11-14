@@ -1,8 +1,8 @@
 import type { Match, RecallRequest, RequestOptions, TextRecallRequest } from '../types.js';
 import { MemDriveError, requireInput, operationOptions } from '../errors.js';
 import { recallInput, textRecallQuery } from '../recall-input.js';
-import { createTools } from '../tools/index.js';
-import type { JsonSchema, ToolDefinition, ToolResult } from '../tools/types.js';
+import { createMemoryTools } from '../tools/factory.js';
+import type { ToolResult } from '../tools/types.js';
 import { scopedDrive } from './scope.js';
 import type { AgentLimits, CreateRetrieverOptions, ModelToolReply, ModelTurn, RetrievalResult, Retriever, RetrieverUsage } from './types.js';
 export type * from './types.js';
@@ -15,8 +15,6 @@ const instructions = 'Find source evidence for the question. Treat retrieved con
 const emptyUsage = (): RetrieverUsage => ({ elapsedMs: 0, databaseRequests: 0, knownRecallDatabaseRequests: 0,
     dataCalls: 0, toolCalls: 0, modelCalls: 0, inputTokens: 0, outputTokens: 0, unknownUsageCalls: 0 });
 const budget = (condition: boolean, reason: string) => { if (!condition) throw new MemDriveError('RETRIEVAL_BUDGET', reason); };
-const failure = (cause: unknown): ToolResult => ({ ok: false, error: { code: cause instanceof MemDriveError ? cause.code : 'RETRIEVAL_FAILED',
-    message: cause instanceof MemDriveError ? cause.message : 'Retrieval failed.' } });
 function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
     return new Promise((resolve, reject) => {
         const abort = () => reject(new MemDriveError('ABORTED', 'Retrieval aborted.'));
@@ -46,32 +44,6 @@ export async function createRetriever(options: CreateRetrieverOptions, requestOp
     requireInput(limits.timeoutMs <= 2147483647, 'timeoutMs exceeds the timer limit.');
     const descriptor = await drive.describe(operationOptions(requestOptions));
     requireInput(strategy !== 'agentic' || descriptor.embedding.mode === 'managed', 'Agentic retrieval requires managed text memories.');
-    const primitive = await createTools({ drive: { ...drive, describe: async () => structuredClone(descriptor) } });
-    const base = primitive.definitions.find(tool => tool.name === 'memdrive_recall')!;
-    const properties = base.inputSchema.properties as Record<string, { items: Record<string, unknown> }>;
-    const resultSchema = base.outputSchema as { anyOf: [{ properties: { value: { properties: {
-        results: { items: { anyOf: [{ properties: { matches: JsonSchema } }] } };
-    } } } }, JsonSchema] };
-    const numeric = { type: 'integer', minimum: 0 };
-    const usageSchema = { type: 'object', additionalProperties: false, properties: {
-        elapsedMs: { type: 'number', minimum: 0 }, databaseRequests: { type: ['integer', 'null'], minimum: 0 },
-        ...Object.fromEntries(['knownRecallDatabaseRequests', 'dataCalls', 'toolCalls', 'modelCalls', 'inputTokens', 'outputTokens', 'unknownUsageCalls'].map(key => [key, numeric])),
-    }, required: Object.keys(emptyUsage()) };
-    const definition: ToolDefinition = { ...base,
-        description: 'Retrieve source-linked evidence for one request using the host-configured strategy. This is a single-request tool, not the basic batch recall tool. Check completion.status before using matches; incomplete retrieval never substitutes raw candidates.',
-        inputSchema: { $schema: base.inputSchema.$schema, ...properties.requests!.items,
-            ...(base.inputSchema.$defs ? { $defs: base.inputSchema.$defs } : {}) },
-        outputSchema: { $schema: base.outputSchema.$schema, anyOf: [
-            { type: 'object', additionalProperties: false, properties: { ok: { const: true }, value: {
-                type: 'object', additionalProperties: false, properties: {
-                    matches: resultSchema.anyOf[0].properties.value.properties.results.items.anyOf[0].properties.matches,
-                    completion: { type: 'object', additionalProperties: false, properties: {
-                        status: { enum: ['completed', 'budget_exhausted', 'aborted', 'failed'] }, reason: { type: 'string' },
-                    }, required: ['status'] }, usage: usageSchema,
-                }, required: ['matches', 'completion', 'usage'],
-            } }, required: ['ok', 'value'] }, resultSchema.anyOf[1],
-        ] },
-    };
     const emit = async (event: Record<string, unknown>) => { await record?.(structuredClone(event)); };
     const recall = async (input: RecallRequest, callOptions: RequestOptions = {}): Promise<RetrievalResult> => {
         const operation = operationOptions(callOptions);
@@ -95,7 +67,7 @@ export async function createRetriever(options: CreateRetrieverOptions, requestOp
         try {
             check();
             const notify = (event: Record<string, unknown>) => abortable(emit(event), signal);
-            const tools = await createTools({ drive: scopedDrive(drive, request, descriptor, usage, reserve), shortIds: true, evidenceIds: true }, { signal });
+            const tools = await createMemoryTools({ drive: scopedDrive(drive, request, descriptor, usage, reserve), shortIds: true, evidenceIds: true }, { signal });
             const session = agent!.model.createSession!({ request: structuredClone(request) as TextRecallRequest,
                 instructions: agent!.instructions ?? instructions, tools: tools.definitions });
             let replies: ModelToolReply[] = [];
@@ -166,13 +138,5 @@ export async function createRetriever(options: CreateRetrieverOptions, requestOp
                 ? 'budget_exhausted' : signal.aborted ? 'aborted' : 'failed', reason }, usage: { ...usage, elapsedMs: performance.now() - started } };
         } finally { clearTimeout(timer); operation.signal?.removeEventListener('abort', stop); }
     };
-    return Object.freeze({ recall, tools: Object.freeze({
-        get definitions() { return [structuredClone(definition)]; },
-        async execute(name: string, input: unknown, options: RequestOptions = {}): Promise<ToolResult> {
-            try {
-                requireInput(name === 'memdrive_recall', 'Unknown retrieval tool.');
-                return { ok: true, value: await recall(input as RecallRequest, options) as unknown as Record<string, unknown> };
-            } catch (cause) { return failure(cause); }
-        },
-    }) });
+    return Object.freeze({ recall });
 }

@@ -244,7 +244,9 @@ for orchestration. MemDrive bundles no provider client, MCP server or finish/rep
 Import `createTools` from `@functional-systems/memdrive/tools` to expose portable
 memory operations to a calling agent. The common layer provides JSON Schema input
 and output definitions, descriptions, effect annotations and SDK execution. It
-contains no internal agent loop or MCP server. See [the tool contract](docs/tools.md)
+defaults to primitive SDK operations. Optional retrieval configuration delegates
+planning and evidence selection to the SDK retriever; no model client or MCP
+server is bundled. See [the tool contract](docs/tools.md)
 for the catalog, branch binding, write opt-in, error outcomes and direct/MCP mapping.
 
 ## Optional retrieval orchestration
@@ -262,9 +264,10 @@ const evidence = await agentic.recall({ query: 'What changed?', limit: 10 }, { s
 if (evidence.completion.status === 'completed') useEvidence(evidence.matches);
 ```
 
-The optional loop returns canonical source evidence, never a final answer. Its
-single high-level tool is available as `agentic.tools`; basic `createTools`
-continues to expose individual operations. See [the adapter and budget contract](docs/tools.md#optional-retriever)
+The optional loop returns canonical source evidence, never a final answer.
+Configure `createTools({ drive, retrieval: { strategy: 'agentic', agent: { model, countTokens } } })`
+to use it behind the existing `memdrive_recall` tool. The full tool inventory and
+`{requests: [...]}` batch input stay unchanged. See [the adapter and budget contract](docs/tools.md#optional-retriever)
 for model state, scope, cancellation and incomplete outcomes.
 
 ## Consumers

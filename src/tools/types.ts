@@ -1,4 +1,5 @@
 import type { MemDrive, RequestOptions } from '../types.js';
+import type { CreateRetrieverOptions } from '../retriever/types.js';
 
 /** Portable JSON Schema; transport adapters may rename the containing field. */
 export type JsonSchema = Record<string, unknown>;
@@ -35,6 +36,8 @@ export type ToolResult = { ok: true; value: Record<string, unknown> } | { ok: fa
 export type EvidenceReference = { memId: string; start: number; end: number } | { memId: string };
 export interface CreateToolsOptions {
     drive: MemDrive;
+    /** Configure only recall orchestration; tool inventory and batch input stay unchanged. */
+    retrieval?: Omit<CreateRetrieverOptions, 'drive'>;
     /** Omit to use the supplied handle's branch. Model arguments cannot change it. */
     branch?: string;
     /** Include remember and forget. Defaults to false. This is not authorization. */

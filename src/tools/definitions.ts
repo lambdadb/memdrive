@@ -73,7 +73,7 @@ function resultSchema(value: JsonSchema): JsonSchema {
 }
 
 /** Common definitions for direct tool calling and MCP; no provider wire format. */
-export function toolDefinitions(descriptor: DriveDescriptor, writable = false, shortIds = false, evidenceIds = false): ToolDefinition[] {
+export function toolDefinitions(descriptor: DriveDescriptor, writable = false, shortIds = false, evidenceIds = false, retrieval = false): ToolDefinition[] {
     const external = descriptor.embedding.mode === 'external';
     const vector = array({ type: 'number' }, { minItems: descriptor.embedding.dimensions,
         maxItems: descriptor.embedding.dimensions, description: 'Caller-supplied embedding in this drive\'s vector space. Do not invent vector coordinates.' });
@@ -101,8 +101,16 @@ export function toolDefinitions(descriptor: DriveDescriptor, writable = false, s
             start: { type: 'integer', minimum: 0 }, end: { type: 'integer', minimum: 1 }, ...attributes, ...evidence },
         ['kind', 'memId', 'content', 'start', 'end', ...evidenceRequired]);
     const mem = object({ id, ...(!external ? { content: string() } : {}), ...attributes, ...evidence }, [...(external ? ['id'] : ['id', 'content']), ...evidenceRequired]);
-    const recallResult = { anyOf: [object({ matches: array(match), usage }, ['matches', 'usage']),
-        object({ error: object({ code: string(), message: string(), status: { type: 'integer' } }, ['code', 'message']), usage }, ['error', 'usage'])] };
+    const completion = object({ status: { enum: ['completed', 'budget_exhausted', 'aborted', 'failed'] }, reason: string() }, ['status']);
+    const counts = Object.fromEntries(['knownRecallDatabaseRequests', 'dataCalls', 'toolCalls', 'modelCalls', 'inputTokens', 'outputTokens', 'unknownUsageCalls']
+        .map(key => [key, { type: 'integer', minimum: 0 }]));
+    const retrievalUsage = object({ elapsedMs: { type: 'number', minimum: 0 }, databaseRequests: { type: ['integer', 'null'], minimum: 0 }, ...counts },
+        ['elapsedMs', 'databaseRequests', ...Object.keys(counts)]);
+    const resultUsage = retrieval ? retrievalUsage : usage;
+    const completionFields = retrieval ? { completion } : {};
+    const requiredCompletion = retrieval ? ['completion'] : [];
+    const recallResult = { anyOf: [object({ matches: array(match), usage: resultUsage, ...completionFields }, ['matches', 'usage', ...requiredCompletion]),
+        object({ error: object({ code: string(), message: string(), status: { type: 'integer' } }, ['code', 'message']), usage: resultUsage, ...completionFields }, ['error', 'usage', ...requiredCompletion])] };
     const countable = ['id', ...Object.entries(descriptor.metadataSchema)
         .filter(([, field]) => field.type === 'string' || field.type === 'string[]').map(([name]) => `metadata.${name}`)];
     const define = (name: ToolName, title: string, description: string, input: JsonSchema, output: JsonSchema,
@@ -117,7 +125,9 @@ export function toolDefinitions(descriptor: DriveDescriptor, writable = false, s
         annotations: { readOnlyHint: !write, destructiveHint: !!write, idempotentHint: write !== 'remember', openWorldHint: false },
     });
     const definitions = [
-        define('memdrive_recall', 'Search memories', external
+        define('memdrive_recall', 'Search memories', retrieval
+            ? 'Retrieve source evidence for 1 to 5 independent requests using the host-configured strategy. Requests run concurrently with isolated per-request budgets. Results preserve input order. Check each completion.status; incomplete retrieval returns no fallback matches. Model and strategy settings cannot be changed through tool arguments.'
+            : external
             ? 'Search this drive with caller-supplied vectors; submit one to five independent requests, returned in input order. Results contain canonical memId values and metadata, without vectors or source text; the caller reconstructs originals. Inspect per-request errors and refine the supplied query when more evidence is needed.'
             : `Search stored memories for evidence relevant to one to five questions using ${descriptor.textSearch ? 'hybrid keyword and vector' : 'vector'} retrieval, with native reranking enabled by default. Independent requests run concurrently and results retain input order; kind mem is a complete original, while kind chunk is an excerpt with UTF-16 start/end offsets and memId identifies the original for memdrive_read. When evidence is missing, query the missing facts or narrow filters; results are not an answer and previous searches are not automatically excluded.`,
         object({ requests: array(request, { minItems: 1, maxItems: 5,

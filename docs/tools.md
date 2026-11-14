@@ -54,7 +54,7 @@ expressions, and SDK validation remains authoritative for dates, byte limits,
 vector values and other semantic constraints. No silent coercion or null-to-omit
 conversion is performed. Input is detached before asynchronous execution.
 
-Recall uses the SDK's existing vector or hybrid pipeline and native reranking
+By default, recall uses the SDK's existing vector or hybrid pipeline and native reranking
 settings. It does not add a query-rewriting model, select evidence or execute a
 second search. The tool's five-request bound is separate from the SDK's uncapped
 batch length; SDK concurrency remains shared across branch views.
@@ -233,13 +233,35 @@ Simulated envelope equality is not a live MCP transport or model-quality test.
 
 ## Optional retriever
 
-`createRetriever` from `@functional-systems/memdrive/retriever` offers the same
-retrieval through `.recall(request, {signal})` and `.tools.execute('memdrive_recall',
-request, {signal})`. It defaults to `single_pass`, which invokes one base recall
-without creating a model session. Base `drive.recall` and the basic tools above
-remain unchanged. The high-level tool accepts **one SDK recall request**, not the
-basic `{requests: [...]}` batch. Do not register both tools under the same name.
-Strategy, adapter, guidance and budgets are host configuration, never model input.
+`createRetriever` from `@functional-systems/memdrive/retriever` provides direct
+`.recall(request, {signal})`. It defaults to `single_pass`, which invokes one base
+recall without creating a model session. To configure recall within the standard
+tool catalog, use the host-owned `retrieval` option:
+
+```ts
+const tools = await createTools({ drive, branch: 'main',
+    retrieval: { strategy: 'agentic', agent: { model, countTokens } } });
+const result = await tools.execute('memdrive_recall', {
+    requests: [{ query: 'What changed?', limit: 10 }, { query: 'What was agreed?' }],
+}, { signal });
+```
+
+The tool inventory and all input schemas stay unchanged: recall accepts 1–5
+requests, while read/list/describe/count and optional writable tools remain
+available. Only configured recall execution/output changes. Each result slot
+includes `completion` and orchestration `usage`; invalid requests retain an
+`error` slot with explicit zero work, and independent siblings still execute.
+Requests run concurrently in input order, with isolated model sessions, evidence
+registries and per-request budgets. A failed/canceled retrieval has no fallback
+matches. Native accounting may be unknown (`null`). Outer tool-session aliases
+are applied after canonical retrieval, so returned references work with the same
+registry's read/count/filter operations. Existing read-only restrictions on
+aliases still apply; enabling retrieval does not silently remove writable tools.
+
+Omitting `retrieval` preserves basic execution and output schemas exactly. Base
+`drive.recall` is unchanged. Internal agent tools always use primitive recall;
+configuration does not recursively invoke another agent. Strategy, adapter,
+guidance and budgets are snapshotted host configuration, never model arguments.
 
 For `strategy: 'agentic'`, provide `agent.model`, `agent.countTokens` and optional
 `agent.instructions` / `agent.limits`. Managed text memories are required; an

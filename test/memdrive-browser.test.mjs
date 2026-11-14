@@ -31,14 +31,17 @@ test('browser bundle executes managed and supplied-vector storage without Node g
                 const tools = await createTools({ drive: managed });
                 const toolRead = await tools.execute('memdrive_read', { ids: ['short'] });
                 const rerankSent = Object.hasOwn(f.calls.findLast(call => call.kind === 'query').request, 'rerank');
-                const retriever = await createRetriever({ drive: managed, strategy: 'agentic', agent: {
+                const agentSettings = {
                     countTokens: text => text.length, model: { createSession() { let round = 0; return { prepare() {
                         return { inputTokens: 10, respond: async () => ({ status: 'completed', usage: { inputTokens: 10, outputTokens: 10 },
                             ...(round++ === 0 ? { calls: [{ id: 'search', name: 'memdrive_recall', arguments: { requests: [{ query: 'short' }] } }] } : { evidenceIds: ['e1'] }) }) };
                     } }; } },
-                } });
+                };
+                const retriever = await createRetriever({ drive: managed, strategy: 'agentic', agent: agentSettings });
                 const retrieval = await retriever.recall({ query: 'short' });
-                return JSON.stringify({ retrieval, embedding: reopened.embedding, recall, read, originals, unranked, toolRead,
+                const configured = await createTools({ drive: managed, retrieval: { strategy: 'agentic', agent: agentSettings } });
+                const batchRetrieval = await configured.execute('memdrive_recall', { requests: [{ query: 'short' }] });
+                return JSON.stringify({ batchRetrieval, retrieval, embedding: reopened.embedding, recall, read, originals, unranked, toolRead,
                     rerankSent,
                     writes: f.calls.filter(call => call.kind === 'upsert').map(call => ({ name: call.name, count: call.request.docs.length })) });
             };`, loader: 'js' }, bundle: true, platform: 'browser', format: 'iife', write: false });
@@ -57,6 +60,8 @@ test('browser bundle executes managed and supplied-vector storage without Node g
     assert.equal(actual.retrieval.completion.status, 'completed');
     assert.equal(actual.retrieval.matches[0].memId, 'short');
     assert.equal(actual.retrieval.usage.modelCalls, 2);
+    assert.equal(actual.batchRetrieval.value.results[0].completion.status, 'completed');
+    assert.equal(actual.batchRetrieval.value.results[0].matches[0].memId, 'short');
     assert.equal(actual.unranked.matches.length, 1);
     assert.equal(actual.unranked.matches[0].memId, 'short');
     assert.deepEqual(actual.toolRead, { ok: true, value: { mems: [{ id: 'short', content: 'A short original.' }] } });

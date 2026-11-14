@@ -65,9 +65,4 @@ export interface CreateRetrieverOptions {
 }
 export interface Retriever {
     recall(request: RecallRequest, options?: RequestOptions): Promise<RetrievalResult>;
-    /** One high-level single-request tool; do not register with the basic batch tool of the same name. */
-    readonly tools: {
-        readonly definitions: ToolDefinition[];
-        execute(name: string, input: unknown, options?: RequestOptions): Promise<ToolResult>;
-    };
 }

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import Ajv2020 from 'ajv/dist/2020.js';
 import { create, open } from '@functional-systems/memdrive';
+import { createTools } from '@functional-systems/memdrive/tools';
 import { createRetriever } from '@functional-systems/memdrive/retriever';
 import { memdriveClient } from './helpers/memdrive-client.mjs';
 const usage = { inputTokens: 100, outputTokens: 10 };
@@ -31,18 +32,19 @@ function scripted(steps, overrides = {}) {
 }
 const agentOptions = (model, extra = {}) => ({ model, countTokens: text => text.length, ...extra });
 
-test('retriever defaults to one data recall and its portable tool calls the same path', async () => {
+test('retriever defaults to one data recall and configured batch tools use the same path', async () => {
     const { drive, fixture } = await setup(); const model = scripted([]);
     const retriever = await createRetriever({ drive, agent: agentOptions(model) });
     const direct = await retriever.recall({ query: 'cedar' });
-    const tool = await retriever.tools.execute('memdrive_recall', { query: 'cedar' });
-    assert.equal(direct.completion.status, 'completed'); assert.deepEqual(direct.matches, tool.value.matches);
+    const tools = await createTools({ drive, retrieval: { strategy: 'single_pass', agent: agentOptions(model) } });
+    const tool = await tools.execute('memdrive_recall', { requests: [{ query: 'cedar' }] });
+    assert.equal(direct.completion.status, 'completed'); assert.deepEqual(direct.matches, tool.value.results[0].matches);
     assert.equal(model.calls, 0); assert.equal(fixture.calls.filter(c => c.kind === 'query').length, 2);
-    const schema = retriever.tools.definitions[0]; const ajv = new Ajv2020({ strict: false });
-    assert(ajv.compile(schema.inputSchema)({ query: 'cedar' }));
-    assert.equal(ajv.compile(schema.inputSchema)({ requests: [{ query: 'cedar' }] }), false);
+    const schema = tools.definitions[0]; const ajv = new Ajv2020({ strict: false });
+    assert.equal(ajv.compile(schema.inputSchema)({ query: 'cedar' }), false);
+    assert(ajv.compile(schema.inputSchema)({ requests: [{ query: 'cedar' }] }));
     assert(ajv.compile(schema.outputSchema)(tool));
-    assert.equal((await retriever.tools.execute('memdrive_recall', { query: '' })).error.code, 'INVALID_INPUT');
+    assert.equal((await tools.execute('memdrive_recall', { requests: [{ query: '' }] })).value.results[0].error.code, 'INVALID_INPUT');
 });
 
 test('agent selects only delivered canonical evidence and retains invalid batch siblings', async () => {
@@ -190,4 +192,92 @@ test('model adapter cannot mutate caller scope or final selection limit', async 
     assert.equal(result.completion.status, 'failed'); assert.deepEqual(result.matches, []);
     assert.equal(request.limit, 1); assert.deepEqual(request.excludeIds, ['excluded']);
     await assert.rejects(createRetriever({ drive, strategy: 'agentic', agent: agentOptions({ createSession: 1 }) }), { code: 'INVALID_INPUT' });
+});
+
+test('configured tools retain the catalog, branch and batch contract with concurrent isolated sessions', { timeout: 10000 }, async () => {
+    const { drive } = await setup(); await drive.branches.create({ name: 'alternate' });
+    await drive.at({ branch: 'alternate' }).remember({ mems: [{ id: 'original', content: 'branch evidence' }] });
+    let entered = 0, release; const both = new Promise(resolve => { release = resolve; });
+    const model = { createSession() { let round = 0; return { prepare() { return { inputTokens: 10, respond: async () => {
+        if (round++ === 0) { if (++entered === 2) release(); await both; return { status: 'completed', usage, ...search() }; }
+        return { status: 'completed', usage, ...selected('e1') };
+    } }; } }; } };
+    const ordinary = await createTools({ drive });
+    const tools = await createTools({ drive, branch: 'alternate', shortIds: true, evidenceIds: true,
+        retrieval: { strategy: 'agentic', agent: agentOptions(model) } });
+    assert.deepEqual(tools.definitions.map(x => x.name), ordinary.definitions.map(x => x.name));
+    const plainConfigured = await createTools({ drive, retrieval: { strategy: 'single_pass' } });
+    assert.deepEqual(plainConfigured.definitions.map(x => x.inputSchema), ordinary.definitions.map(x => x.inputSchema));
+    const result = await tools.execute('memdrive_recall', { requests: [{ query: 'first' }, { query: '' },
+        { query: 'unknown', excludeIds: ['m99'] }, { query: 'last' }] });
+    assert.equal(result.ok, true); assert.equal(entered, 2, 'Inner primitive tools must not recurse into orchestration');
+    assert.deepEqual(result.value.results.map(x => x.completion.status), ['completed', 'failed', 'failed', 'completed']);
+    assert.deepEqual(result.value.results.filter(x => x.matches).map(x => x.matches[0].content), ['branch evidence', 'branch evidence']);
+    assert.equal(result.value.results[1].usage.modelCalls, 0); assert.equal(result.value.results[1].usage.databaseRequests, 0);
+    assert.equal(result.value.results[2].error.code, 'INVALID_INPUT'); assert.match(result.value.results[2].error.message, /returned/);
+    assert.equal(tools.resolveId(result.value.results[0].matches[0].memId), 'original');
+    assert.equal(tools.resolveEvidence(result.value.results[0].matches[0].evidenceId).memId, 'original');
+    assert(new Ajv2020({ strict: false }).compile(tools.definitions[0].outputSchema)(result));
+    assert.equal((await tools.execute('memdrive_read', { ids: ['m1'] })).value.mems[0].content, 'branch evidence');
+});
+
+test('configured recall preserves writable inventory and evidence conflict completion', async () => {
+    const { drive } = await setup();
+    const writable = await createTools({ drive, writable: true, retrieval: { strategy: 'single_pass' } });
+    assert.equal(writable.definitions.length, 7);
+    assert.equal((await writable.execute('memdrive_remember', { mems: [{ id: 'new', content: 'new text' }] })).ok, true);
+    assert.equal((await writable.execute('memdrive_forget', { ids: ['new'] })).ok, true);
+    await assert.rejects(createTools({ drive, writable: true, shortIds: true, retrieval: {} }), { code: 'INVALID_INPUT' });
+    const tools = await createTools({ drive, evidenceIds: true, retrieval: { strategy: 'single_pass' } });
+    await tools.execute('memdrive_recall', { requests: [{ query: 'q' }] });
+    await drive.remember({ mems: [{ id: 'original', content: 'maple' }] });
+    const conflict = await tools.execute('memdrive_recall', { requests: [{ query: 'q' }] });
+    assert.equal(conflict.value.results[0].error.code, 'INVALID_RESULT');
+    assert.equal(conflict.value.results[0].completion.status, 'failed');
+    assert.equal(conflict.value.results[0].usage.databaseRequests, 1);
+    assert(new Ajv2020({ strict: false }).compile(tools.definitions[0].outputSchema)(conflict));
+});
+
+test('configured batch retains completed and canceled slots and nullable usage', async () => {
+    const { drive } = await setup(), controller = new AbortController();
+    const model = { createSession({ request }) { let round = 0; return { prepare() { return { inputTokens: 10, respond: async ({ signal }) => {
+        if (request.query === 'cancel') { await new Promise(() => {}); signal.throwIfAborted(); }
+        return { status: 'completed', usage, ...(round++ === 0 ? { calls: [call('list', 'memdrive_list', {})] } : selected('e1')) };
+    } }; } }; } };
+    const tools = await createTools({ drive, retrieval: { strategy: 'agentic', agent: agentOptions(model), record: event => {
+        // Cancel only after the successful selection has settled through its microtasks.
+        if (event.phase === 'selection') setImmediate(() => controller.abort());
+    } } });
+    const result = await tools.execute('memdrive_recall', { requests: [{ query: 'complete' }, { query: 'cancel' }, { query: '' }] }, { signal: controller.signal });
+    assert.deepEqual(result.value.results.map(x => x.completion.status), ['completed', 'aborted', 'failed']);
+    assert.equal(result.value.results[0].usage.databaseRequests, null);
+    assert.equal(result.value.results[1].usage.unknownUsageCalls, 1);
+    assert(new Ajv2020({ strict: false }).compile(tools.definitions[0].outputSchema)(result));
+    const single = await setup(), stopped = new AbortController();
+    single.fixture.search = async () => { stopped.abort(); throw new DOMException('Stopped', 'AbortError'); };
+    const basic = await createTools({ drive: single.drive, retrieval: { strategy: 'single_pass' } });
+    const canceled = await basic.execute('memdrive_recall', { requests: [{ query: 'q' }] }, { signal: stopped.signal });
+    assert.equal(canceled.value.results[0].completion.status, 'aborted');
+    assert.equal(canceled.value.results[0].usage.databaseRequests, 1);
+});
+
+test('configured agent describe refreshes metadata and construction snapshots host settings', async () => {
+    const { drive } = await setup(); let describes = 0, release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const wrapped = { ...drive, describe: async options => {
+        describes++; const descriptor = await drive.describe(options);
+        if (describes === 1) await gate;
+        return { ...descriptor, description: 'version-' + describes };
+    } };
+    const model = scripted([{ calls: [call('describe', 'memdrive_describe', {})] }, replies => {
+        assert.equal(replies[0].result.value.description, 'version-2'); return selected();
+    }]);
+    const retrieval = { strategy: 'agentic', agent: agentOptions(model, { limits: { rounds: 2 }, instructions: 'frozen' }) };
+    const pending = createTools({ drive: wrapped, retrieval });
+    retrieval.strategy = 'single_pass'; retrieval.agent.limits.rounds = 1;
+    retrieval.agent.instructions = 'changed'; model.createSession = () => { throw new Error('Changed factory'); };
+    release(); const tools = await pending;
+    const result = await tools.execute('memdrive_recall', { requests: [{ query: 'q' }] });
+    assert.equal(result.value.results[0].completion.status, 'completed');
+    assert.equal(model.calls, 2); assert.equal(describes, 2); assert.equal(model.inputs[0].instructions, 'frozen');
 });
