@@ -1,6 +1,6 @@
 import { checkAbort, databaseError, MemDriveError, nativeRequest } from './errors.js';
 
-type CreatedRef = { kind: 'fork' | 'checkpoint'; name: string; branchSource?: boolean };
+type CreatedRef = { kind: 'fork' | 'checkpoint'; name: string };
 
 const rejected = new Set([400, 401, 403, 404, 409, 422, 429]);
 
@@ -21,13 +21,6 @@ export async function createRef<T>(pending: Set<string>, ref: CreatedRef, signal
         if (!rejected.has(error.status ?? 0)) throw unconfirmed(cause);
         pending.delete(key);
         if (error.status === 409) error.code = kind === 'fork' ? 'BRANCH_CONFLICT' : 'CHECKPOINT_CONFLICT';
-        if (kind === 'checkpoint' && ref.branchSource && error.status === 400 && cause instanceof Error
-            && cause.message.trim() === 'Source must have a snapshot') {
-            const cold = new MemDriveError('CHECKPOINT_NOT_READY',
-                'The branch has no committed snapshot yet. Retry after LambdaDB commits its first write.', { cause });
-            cold.status = 400;
-            throw cold;
-        }
         throw error;
     }
     if (signal?.aborted || !valid(result)) throw unconfirmed();

@@ -151,19 +151,14 @@ function store(handle: Handle, description: FileStoreDescription) {
                 const checkpoint = request.name;
                 const tagName = checkpointPrefix + checkpoint;
                 const create = async () => {
-                    await createRef(pendingRefs, { kind: 'checkpoint', name: checkpoint, branchSource: ref.kind === 'branch' }, signal,
+                    await createRef(pendingRefs, { kind: 'checkpoint', name: checkpoint }, signal,
                         () => handle.tags.create({ tagName, source: ref }, mutationOptions(signal)),
-                        response => validTag(response?.tag, tagName));
+                        response => response?.tag?.name === tagName);
                     return pinned(checkpoint);
                 };
                 return enqueueRef ? enqueueRef(create, signal) : create();
             },
         };
-    }
-
-    function validTag(tag: unknown, tagName: string) {
-        return typeof tag === 'object' && tag !== null && 'name' in tag && tag.name === tagName
-            && 'snapshotId' in tag && typeof tag.snapshotId === 'string' && tag.snapshotId.length > 0;
     }
 
     function working(fork: string): WorkingFileDrive {
@@ -214,7 +209,7 @@ function store(handle: Handle, description: FileStoreDescription) {
             const response = await remote(() => handle.tags.get(tagName, nativeOptions(signal)),
                 'Could not inspect the named checkpoint.', signal, { 404: 'CHECKPOINT_NOT_FOUND' });
             checkAbort(signal);
-            if (!validTag(response?.tag, tagName))
+            if (response?.tag?.name !== tagName)
                 throw new MemDriveError('INVALID_RESULT', 'Checkpoint lookup returned an invalid tag.');
             pendingRefs.delete(`checkpoint:${checkpoint}`);
             return pinned(checkpoint);

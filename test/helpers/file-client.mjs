@@ -17,7 +17,7 @@ export function fileClient() {
             const docsAt = branch => (state().branches.get(branch) ?? fail(404, 'Branch missing')).docs;
             const sourceDocs = ref => ref.kind === 'tag'
                 ? (state().tags.get(ref.name) ?? fail(404, 'Checkpoint missing')).docs : docsAt(ref.name);
-            const snapshot = ref => new Map(structuredClone([...sourceDocs(ref)]));
+            const copyView = ref => new Map(structuredClone([...sourceDocs(ref)]));
             const response = (docs, fields) => ({ isDocsInline: true, total: docs.length, docs: docs.map(doc => ({
                 collection: name, score: 0.8, doc: structuredClone(fields?.include
                     ? Object.fromEntries(fields.include.filter(key => Object.hasOwn(doc, key)).map(key => [key, doc[key]]))
@@ -29,7 +29,7 @@ export function fileClient() {
                     async create({ branchName, source }, options) {
                         calls.push({ kind: 'branch-create', request: { branchName, source }, retries: options?.retries });
                         if (state().branches.has(branchName)) fail(409, 'Branch already exists');
-                        state().branches.set(branchName, { docs: snapshot(source) });
+                        state().branches.set(branchName, { docs: copyView(source) });
                         return { branch: { name: branchName } };
                     },
                     async list() {
@@ -41,9 +41,8 @@ export function fileClient() {
                         calls.push({ kind: 'tag-create', request: { tagName, source }, retries: options?.retries });
                         await fixture.beforeTagCreate?.(tagName, source);
                         if (state().tags.has(tagName)) fail(409, 'Tag already exists');
-                        if (source.kind === 'branch' && !sourceDocs(source).size) fail(400, 'Source must have a snapshot');
-                        const tag = { name: tagName, snapshotId: 'snapshot-' + tagName };
-                        state().tags.set(tagName, { tag, docs: snapshot(source) });
+                        const tag = { name: tagName };
+                        state().tags.set(tagName, { tag, docs: copyView(source) });
                         await fixture.afterTagCreate?.(tag);
                         return { tag };
                     },

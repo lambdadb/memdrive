@@ -785,18 +785,19 @@ test('checkpoint names are store-scoped and absent or invalid lookups are not ca
     const fixture = fileClient();
     const { client } = fixture;
     const main = await create({ client, name: 'workspace' });
-    await assert.rejects(main.checkpoint({ name: 'saved' }), { code: 'CHECKPOINT_NOT_READY', status: 400 });
-    fixture.beforeTagCreate = () => { throw Object.assign(new Error('Different bad request'), { statusCode: 400 }); };
-    await assert.rejects(main.checkpoint({ name: 'saved' }), { code: 'DATABASE_ERROR', status: 400 });
+    const work = await main.fork({ name: 'research' });
+    const nativeError = Object.assign(new Error('Source is temporarily unavailable'), { statusCode: 400 });
+    fixture.beforeTagCreate = () => { throw nativeError; };
+    await assert.rejects(work.checkpoint({ name: 'saved' }), { code: 'DATABASE_ERROR', status: 400, cause: nativeError });
+    assert.equal(fixture.calls.filter(call => call.kind === 'tag-create').length, 1);
     fixture.beforeTagCreate = undefined;
     await assert.rejects(open({ client, name: 'workspace', at: { fork: 'saved', checkpoint: 'saved' } }), { code: 'INVALID_INPUT' });
     await assert.rejects(open({ client, name: 'workspace', at: { checkpoint: 'x'.repeat(42) } }), { code: 'INVALID_INPUT' });
     await assert.rejects(open({ client, name: 'workspace', at: { checkpoint: 'saved' } }), { code: 'CHECKPOINT_NOT_FOUND' });
-    fixture.getTag = () => ({ tag: { name: 'checkpoint-saved' } });
+    fixture.getTag = () => ({ tag: { name: 'checkpoint-unrelated' } });
     await assert.rejects(open({ client, name: 'workspace', at: { checkpoint: 'saved' } }), { code: 'INVALID_RESULT' });
     fixture.getTag = undefined;
 
-    const work = await main.fork({ name: 'research' });
     await work.write(request('/file.txt'));
     const saved = await work.checkpoint({ name: 'saved' });
     assert.strictEqual(await open({ client, name: 'workspace', at: { checkpoint: 'saved' } }), saved);
