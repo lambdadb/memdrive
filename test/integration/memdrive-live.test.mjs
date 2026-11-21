@@ -38,6 +38,7 @@ test('live file store writes, searches, lists and reopens a fresh fork with veri
     try {
         const main = await MemDrive.create({ client, name, metadataSchema: { topic: { type: 'string' } } }, options());
         assert.equal('write' in main, false);
+        assert.equal('diff' in main, false);
         assert.deepEqual(await main.list({}, options()), { files: [], prefixes: [], consistency: 'eventual' });
         const fork = await main.fork({ name: 'research' }, options());
         const path = '/notes/한글 "draft":*?.md';
@@ -48,6 +49,9 @@ test('live file store writes, searches, lists and reopens a fresh fork with veri
             { op: 'create', path: '/notes/sub/also "draft":*?.txt', content: '' },
         ], options());
         const reopened = await MemDrive.open({ client: new LambdaDBClient(connection), name, at: { fork: 'research' } }, options());
+        const additions = [original, empty, nested].map(({ fileId, path }) => ({ op: 'create', fileId, path }))
+            .sort((a, b) => a.fileId.localeCompare(b.fileId));
+        assert.deepEqual(await reopened.diff(options()), additions);
         const listStartedAt = Date.now();
         let listed = await reopened.list({ prefix: '/notes/' }, options());
         t.diagnostic(`Initial list observed ${listed.files.length} file(s).`);
@@ -121,9 +125,12 @@ test('live file store writes, searches, lists and reopens a fresh fork with veri
         assert.notDeepEqual(newIds, oldIds);
         const changedResults = await reopened.search({ query: 'Updated fixture', rerank: false }, options());
         assert.deepEqual(changedResults.hits, [{ ...changed, range: { start: 0, end: changed.content.length } }]);
+        assert.deepEqual(await reopened.diff(options()), additions.map(change =>
+            change.fileId === changed.fileId ? { ...change, path: changed.path } : change));
         assert.deepEqual(await reopened.write({ op: 'delete', fileId: changed.fileId }, options()), { fileId: changed.fileId });
         assert.equal(await reopened.read({ fileId: changed.fileId }, options()), null);
         assert.equal(await reopened.read({ path: changed.path }, options()), null);
+        assert.deepEqual(await reopened.diff(options()), additions.filter(change => change.fileId !== changed.fileId));
         assert.equal((await native.docs.fetch({ ...branchRead, ids: newIds }, options())).docs.length, 0);
         assert.deepEqual(await reopened.write({ op: 'delete', fileId: changed.fileId }, options()), { fileId: changed.fileId });
     } catch (error) {

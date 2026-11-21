@@ -19,6 +19,11 @@ export function pathQuery(paths: string[]) {
     ] };
 }
 
+// Use only IDs already validated against the SDK's generated ASCII format.
+export const afterId = (id: string | undefined) => id === undefined ? [] : [
+    { queryString: { query: `{${id} TO *}`, defaultField: 'id' }, occur: 'filter' },
+];
+
 export async function fetchOriginals(handle: Handle, name: string, branch: string, fileIds: string[], signal?: AbortSignal) {
     if (!fileIds.length) return new Map<string, Record<string, unknown>>();
     let response;

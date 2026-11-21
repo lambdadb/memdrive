@@ -32,7 +32,7 @@ export function fileClient() {
                         return { branches: [...state().branches.keys()].map(name => ({ name })) };
                     },
                 },
-                async query(request) {
+                async query(request, options) {
                     calls.push({ kind: 'query', request: structuredClone(request) });
                     const source = [...docsAt(request.ref.name).values()];
                     if (request.query.bayesian) {
@@ -47,6 +47,16 @@ export function fileClient() {
                         return native;
                     }
                     const [kind, path, exclude] = request.query.bool;
+                    if (path.queryString?.defaultField === 'changed') {
+                        const overridden = await fixture.diffPage?.(request, options);
+                        if (overridden !== undefined) return overridden;
+                        const kinds = kind.bool.map(clause => JSON.parse(clause.queryString.query));
+                        const after = exclude && /^\{(.+) TO \*\}$/.exec(exclude.queryString.query)?.[1];
+                        const docs = source.filter(doc => kinds.includes(doc.kind) && doc.changed === true
+                            && (after === undefined || doc.id > after));
+                        docs.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+                        return response(docs.slice(0, request.size), request.fields);
+                    }
                     if (path.queryString?.defaultField === 'id') {
                         const regex = clause => new RegExp(`^${clause.queryString.query.slice(1, -1)}$`);
                         const owned = regex(path);

@@ -127,7 +127,7 @@ function store(handle: Handle, description: FileStoreDescription) {
         const drive: WorkingFileDrive = Object.freeze({
             name, at: Object.freeze({ kind: 'fork' as const, name: fork }), read: reader(branch), search: searcher(branch),
             list: fileLister(handle, name, branch, metadataSchema), describe,
-            write: workingWriter(handle, name, branch, metadataSchema),
+            ...workingWriter(handle, name, branch, metadataSchema),
         });
         forks.set(fork, drive);
         return drive;
