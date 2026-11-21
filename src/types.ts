@@ -13,12 +13,36 @@ export interface OpenFileStoreOptions extends ConnectionOptions {
     at?: { fork: string } | undefined;
 }
 
-export interface DriveFile {
+export interface FileListEntry {
     fileId: string;
     modifiedAt: string;
     path: string;
-    content: string;
     metadata?: Metadata | undefined;
+}
+
+export interface DriveFile extends FileListEntry {
+    content: string;
+}
+
+export type ListFilesRequest = {
+    prefix?: string | undefined;
+    nameContains?: string | undefined;
+    delimiter?: '/' | undefined;
+    limit?: number | undefined;
+    cursor?: never;
+} | {
+    cursor: string;
+    prefix?: never;
+    nameContains?: never;
+    delimiter?: never;
+    limit?: never;
+};
+
+export interface ListFilesResult {
+    files: FileListEntry[];
+    prefixes: string[];
+    consistency: 'eventual';
+    cursor?: string | undefined;
 }
 
 export type ReadFileRequest = { fileId: string; path?: never } | { path: string; fileId?: never };
@@ -31,6 +55,7 @@ export interface CreateFileRequest {
 
 interface FileView {
     readonly name: string;
+    list(request?: ListFilesRequest, options?: RequestOptions): Promise<ListFilesResult>;
     describe(options?: RequestOptions): Promise<FileStoreDescription>;
     search(request: SearchFilesRequest, options?: RequestOptions): Promise<SearchFilesResult>;
     read(request: ReadFileRequest, options?: RequestOptions): Promise<DriveFile | null>;

@@ -218,3 +218,127 @@ test('a large file publishes its original only after all chunk requests succeed'
     const retried = await fork.write(request('/large.txt', content));
     assert.equal((await fork.read({ fileId: retried.fileId })).content, content);
 });
+
+test('lists matching file metadata and globally deduplicated prefixes across native pages', async () => {
+    const fixture = fileClient();
+    fixture.listPageSize = 2;
+    const main = await create({ client: fixture.client, name: 'workspace', metadataSchema: { topic: { type: 'string' } } });
+    const work = await main.fork({ name: 'research' });
+    const alternate = await main.fork({ name: 'alternate' });
+    const [root, direct] = await work.write([
+        request('/Root.txt', 'include no body'),
+        { ...request('/notes/B [x]*?.md'), metadata: { topic: 'synthetic' } },
+        request('/notes/archive/alpha.txt'),
+        request('/notes/archive/"quoted"/sample.txt'),
+        request('/notes/Alpha.txt'),
+        request('/notes/archive/B [x]*?.txt'),
+        request('/notesish/B [x]*?.txt'),
+    ]);
+    await alternate.write(request('/alternate.txt'));
+    assert.deepEqual(await main.list(), { files: [], prefixes: [], consistency: 'eventual' });
+    assert.deepEqual((await alternate.list()).files.map(file => file.path), ['/alternate.txt']);
+    const rootPage = await work.list({ delimiter: '/', limit: 2 });
+    assert.deepEqual(rootPage.files, [{ fileId: root.fileId, path: root.path, modifiedAt: root.modifiedAt }]);
+    assert.deepEqual(rootPage.prefixes, ['/notes/']);
+    const last = await work.list({ cursor: rootPage.cursor });
+    assert.deepEqual(last, { files: [], prefixes: ['/notesish/'], consistency: 'eventual' });
+    assert.deepEqual(await work.list({ cursor: rootPage.cursor }), last);
+    assert.deepEqual((await work.list({ prefix: '/notes/', delimiter: '/' })).prefixes, ['/notes/archive/']);
+
+    const filtered = await work.list({ prefix: '/notes/', nameContains: 'B [x]*?', delimiter: '/' });
+    assert.deepEqual(filtered, { files: [{ fileId: direct.fileId, path: direct.path, modifiedAt: direct.modifiedAt,
+        metadata: { topic: 'synthetic' } }], prefixes: ['/notes/archive/'], consistency: 'eventual' });
+    assert.deepEqual((await work.list({ prefix: '/notes/Al', nameContains: 'txt' })).files.map(file => file.path), ['/notes/Alpha.txt']);
+    assert.deepEqual((await work.list({ prefix: '/notes/archive/"quoted"/' })).files.map(file => file.path),
+        ['/notes/archive/"quoted"/sample.txt']);
+    const quotedListing = fixture.calls.findLast(call => call.kind === 'list').request;
+    assert.equal(quotedListing.filter.bool[1].queryString.query, '"/notes/archive/"');
+    assert.deepEqual((await work.list({ prefix: '/notes/arch', nameContains: 'archive' })).files, []);
+    assert.deepEqual((await work.list({ prefix: '/notes/', nameContains: 'alpha' })).files.map(file => file.path), ['/notes/archive/alpha.txt']);
+
+    const lists = fixture.calls.filter(call => call.kind === 'list');
+    assert(lists.some(({ request }) => request.pageToken !== undefined));
+    for (const { request } of lists) {
+        assert.equal('consistentRead' in request, false);
+        assert.equal(request.includeVectors, false);
+        assert.deepEqual(request.fields.include, ['id', 'kind', 'fileId', 'path', 'modifiedAt', 'metadata']);
+        assert.equal(request.filter.bool[0].queryString.query, '"file"');
+    }
+});
+
+test('listing continuation freezes groups and cloned metadata, including a repeatable last page', async t => {
+    const fixture = fileClient();
+    fixture.listPageSize = 1;
+    const { client, collections, calls } = fixture;
+    const main = await create({ client, name: 'workspace', metadataSchema: { note: { type: 'string' } } });
+    const work = await main.fork({ name: 'research' });
+    const [first, second] = await work.write([
+        { ...request('/a.txt'), metadata: { note: 'before a' } },
+        { ...request('/b.txt'), metadata: { note: 'before b' } },
+        request('/group/c.txt'),
+    ]);
+    const page = await work.list({ delimiter: '/', limit: 1 });
+    assert.deepEqual(page.files.map(file => file.fileId), [first.fileId]);
+    page.files[0].metadata.note = 'caller mutation';
+    const state = collections.get('workspace').branches.get('fork-research').docs;
+    state.delete(`file:${second.fileId}`);
+    await work.write({ ...request('/b2.txt'), metadata: { note: 'after' } });
+    const listedBefore = calls.filter(call => call.kind === 'list').length;
+    const next = await work.list({ cursor: page.cursor });
+    assert.deepEqual(next.files, [{ fileId: second.fileId, path: '/b.txt', modifiedAt: second.modifiedAt, metadata: { note: 'before b' } }]);
+    next.files[0].metadata.note = 'caller mutation';
+    assert.equal((await work.list({ cursor: page.cursor })).files[0].metadata.note, 'before b');
+    const final = await work.list({ cursor: next.cursor });
+    assert.deepEqual(final, { files: [], prefixes: ['/group/'], consistency: 'eventual' });
+    assert.deepEqual(await work.list({ cursor: next.cursor }), final);
+    assert.equal(calls.filter(call => call.kind === 'list').length, listedBefore);
+
+    await assert.rejects(work.list({ cursor: page.cursor, limit: 2 }), { code: 'INVALID_INPUT' });
+    await assert.rejects(main.list({ cursor: page.cursor }), { code: 'LIST_CURSOR_UNAVAILABLE' });
+    await assert.rejects((await main.fork({ name: 'alternate' })).list({ cursor: page.cursor }), { code: 'LIST_CURSOR_UNAVAILABLE' });
+    const restarted = await open({ client: { ...client }, name: 'workspace', at: { fork: 'research' } });
+    await assert.rejects(restarted.list({ cursor: page.cursor }), { code: 'LIST_CURSOR_UNAVAILABLE' });
+    assert.deepEqual((await work.list()).files.map(file => file.path), ['/a.txt', '/b2.txt', '/group/c.txt']);
+
+    const now = Date.now();
+    t.mock.method(Date, 'now', () => now + 5 * 60 * 1000 + 1);
+    await assert.rejects(work.list({ cursor: page.cursor }), { code: 'LIST_CURSOR_UNAVAILABLE' });
+});
+
+test('listing fails closed for invalid input, aborts, nonprogress, and scan overflow', async () => {
+    const fixture = fileClient();
+    const main = await create({ client: fixture.client, name: 'workspace' });
+    const work = await main.fork({ name: 'research' });
+    const [file] = await work.write([request('/foo/a.txt')]);
+    for (const options of [{ prefix: 'relative' }, { prefix: '/foo//bar' }, { prefix: '/foo/../bar' },
+        { nameContains: '\uD800' }, { delimiter: '!' }, { limit: 0 }, { limit: 1001 }]) {
+        await assert.rejects(work.list(options), { code: 'INVALID_INPUT' });
+    }
+    await assert.rejects(work.list({ cursor: 'invalid' }), { code: 'LIST_CURSOR_UNAVAILABLE' });
+    const ctrl = new AbortController();
+    ctrl.abort();
+    await assert.rejects(work.list({}, { signal: ctrl.signal }), { code: 'ABORTED' });
+    assert.equal(fixture.calls.filter(call => call.kind === 'list').length, 0);
+
+    const rows = [{ collection: 'workspace', doc: { ...file, kind: 'file', id: `file:${file.fileId}` } }];
+    fixture.listPage = () => ({ isDocsInline: true, docs: rows, nextPageToken: 'repeated' });
+    await assert.rejects(work.list(), { code: 'INVALID_RESULT' });
+    fixture.listPage = ({ pageToken }) => pageToken === undefined
+        ? { isDocsInline: true, docs: [], nextPageToken: 'empty' }
+        : { isDocsInline: true, docs: rows };
+    assert.deepEqual((await work.list()).files.map(item => item.fileId), [file.fileId]);
+
+    const background = new AbortController();
+    fixture.listPage = () => {
+        background.abort();
+        return { isDocsInline: true, docs: [] };
+    };
+    await assert.rejects(work.list({}, { signal: background.signal }), { code: 'ABORTED' });
+    assert.strictEqual(fixture.calls.at(-1).signal, background.signal);
+
+    fixture.listPage = ({ pageToken }) => ({
+        isDocsInline: true, docs: Array.from({ length: 500 }, () => rows[0]),
+        nextPageToken: String(Number(pageToken ?? 0) + 1),
+    });
+    await assert.rejects(work.list(), { code: 'LIST_SCAN_LIMIT' });
+});

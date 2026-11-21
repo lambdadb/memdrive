@@ -1,5 +1,5 @@
 import type { LambdaDBClient } from '@functional-systems/lambdadb';
-import { create, open, type DriveFile, type SearchFilesResult, type FileDrive, type OpenFileStoreOptions } from '@functional-systems/memdrive';
+import { create, open, type DriveFile, type SearchFilesResult, type ListFilesResult, type FileDrive, type OpenFileStoreOptions } from '@functional-systems/memdrive';
 
 export async function fileConsumer(client: LambdaDBClient, options: OpenFileStoreOptions) {
     const main = await create({ client, name: 'workspace' });
@@ -9,6 +9,12 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     const file: DriveFile | null = await reopened.read({ fileId: created.fileId });
     const batch: DriveFile[] = await reopened.write([{ op: 'create', path: '/batch.txt', content: 'Batch' }]);
     await reopened.read({ paths: batch.map(item => item.path) });
+    const listed: ListFilesResult = await reopened.list({ prefix: '/notes/', delimiter: '/', limit: 2 });
+    if (listed.cursor) await reopened.list({ cursor: listed.cursor });
+    // @ts-expect-error A continuation inherits its original options.
+    await reopened.list({ cursor: 'opaque', prefix: '/other/' });
+    // @ts-expect-error Listing returns file metadata without original content.
+    listed.files[0]?.content;
     const ranked: SearchFilesResult = await reopened.search({ query: 'Task context', rerank: { onFailure: 'returnOriginal' } });
     ranked.hits[0]?.range?.start;
     const selected: FileDrive = await open(options);
