@@ -1,6 +1,6 @@
 # Contributing
 
-MemDrive is a standalone TypeScript SDK backed by the LambdaDB TypeScript client. It provides memory storage and retrieval; applications own answer generation and presentation.
+MemDrive is a standalone TypeScript SDK backed by the LambdaDB TypeScript client. It provides file storage and retrieval; applications own answer generation and presentation.
 
 ## Development workflow
 

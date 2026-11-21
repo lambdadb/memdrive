@@ -113,7 +113,8 @@ without moving the tag.
 
 The live suite creates one isolated collection and forks main. It writes two
 short synthetic originals, verifies reads by path and file ID through a reopened
-fork, and checks main isolation and duplicate path rejection. Requests have
+fork, and checks main isolation and duplicate path rejection. It exercises managed
+embeddings and searches with and without native reranking. Requests have
 60-second limits. Cleanup verifies a native not-found response. Missing settings
 or failed cleanup fail the run. Record the pinned LambdaDB client version and
 test environment. Unit tests, installed-package checks, live integration and
