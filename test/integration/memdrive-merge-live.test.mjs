@@ -82,7 +82,7 @@ test('live public merge publishes immutable views and resumes one interrupted re
                     fault.applied++;
             }
             if (fault?.kind === 'terminal' && collection !== name && response.status === 202
-                && body?.docs?.some(doc => doc.kind === 'merge-result-v1' && doc.requestId === fault.requestId) && !fault.dropped) {
+                && body?.docs?.some(doc => doc.kind === 'merge-result-v1' && doc.status === 'published') && !fault.dropped) {
                 fault.dropped++;
                 // The server accepted the terminal record. Only the reply is lost.
                 throw new Error('Synthetic transport loss after an actual HTTP 202');
@@ -217,7 +217,7 @@ test('live public merge publishes immutable views and resumes one interrupted re
 
         phase = 'Resume the same request while preserving later working edits';
         await work.write({ op: 'update', fileId: moved.fileId, content: later }, options());
-        const terminal = { kind: 'terminal', requestId: second.requestId, dropped: 0 };
+        const terminal = { kind: 'terminal', dropped: 0 };
         fault = terminal;
         let resumed;
         try { resumed = await (await freshFork('source')).merge(second, options()); }
