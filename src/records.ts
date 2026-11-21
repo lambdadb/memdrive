@@ -46,7 +46,7 @@ export function decodeFile(doc: Record<string, unknown>, schema: MetadataSchema)
     return { ...entry, content: doc.body, ...(metadata === undefined ? {} : { metadata }) };
 }
 
-async function contentHash(content: string): Promise<string> {
+export async function contentHash(content: string): Promise<string> {
     const hash = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', encoder.encode(content)));
     return [...hash].map(byte => byte.toString(16).padStart(2, '0')).join('');
 }

@@ -10,7 +10,13 @@ type BranchRef = Extract<ViewRef, { kind: 'branch' }>;
 type SourceQueue = <T>(operation: () => Promise<T>, signal?: AbortSignal) => Promise<T>;
 type Candidate = NonNullable<ReturnType<typeof netChange>>;
 const confirmedCapture = Symbol('confirmed merge capture');
-type MergeSource = Readonly<TagRef & { [confirmedCapture]: true }>;
+export type MergeSource = Readonly<TagRef & { [confirmedCapture]: string }>;
+
+// A durable caller can reconstruct the capability only after verifying the
+// operation's binding to a previously confirmed, retained capture.
+export function confirmedMergeSource(handle: Handle, name: string): MergeSource {
+    return Object.freeze({ kind: 'tag', name, [confirmedCapture]: handle.collectionName });
+}
 
 // Keep batches of full originals smaller than projected queries. The native
 // client can hydrate larger responses from its download URL.
@@ -25,7 +31,7 @@ export function captureMergeSource(handle: Handle, source: BranchRef, tagName: s
         await createRef(pendingRefs, { kind: 'merge source', name: tagName }, signal,
             () => handle.tags.create({ tagName, source: branch }, mutationOptions(signal)),
             response => response?.tag?.name === tagName);
-        return Object.freeze({ kind: 'tag', name: tagName, [confirmedCapture]: true as const });
+        return confirmedMergeSource(handle, tagName);
     }, signal);
 }
 
@@ -55,13 +61,12 @@ async function loadTargets(handle: Handle, name: string, source: TagRef, schema:
 
 /**
  * Resolve publishedMain in the main publication queue and keep ownership
- * through application. Recovering a source after restart requires a durable
- * binding that proves capture at the intended boundary. A tag lookup alone
- * cannot prove when a request with an uncertain result captured the fork.
+ * through application. For restart recovery, consume the
+ * confirmed source returned by the durable capture journal.
  */
 export async function prepareMerge(handle: Handle, name: string, capture: MergeSource, publishedMain: TagRef,
     schema: MetadataSchema, signal?: AbortSignal) {
-    if (capture[confirmedCapture] !== true || publishedMain.kind !== 'tag')
+    if (capture[confirmedCapture] !== name || handle.collectionName !== name || publishedMain.kind !== 'tag')
         throw new MemDriveError('INVALID_INPUT', 'Preparing a merge requires a confirmed source capture and the published main tag.');
     const source: TagRef = { kind: 'tag', name: capture.name };
     const main: TagRef = { kind: 'tag', name: publishedMain.name };

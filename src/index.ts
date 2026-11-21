@@ -165,7 +165,7 @@ function store(handle: Handle, description: FileStoreDescription) {
         const existing = forks.get(fork);
         if (existing) return existing;
         const branch = forkPrefix + fork;
-        const { enqueueRef, ...writer } = workingWriter(handle, name, branch, metadataSchema);
+        const { enqueueRef, enqueueCapture: _enqueueCapture, ...writer } = workingWriter(handle, name, branch, metadataSchema);
         const drive: WorkingFileDrive = Object.freeze({
             ...view(branchRef(branch), enqueueRef), at: Object.freeze({ kind: 'fork' as const, name: fork }), ...writer,
         });
