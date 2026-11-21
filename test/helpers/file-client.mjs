@@ -87,7 +87,10 @@ export function fileClient() {
                         if (request.sort?.[0]?.id === 'asc') selected.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
                         return response(selected.slice(0, request.size), request.fields);
                     }
-                    const paths = (path.bool ?? [path]).map(clause => JSON.parse(clause.queryString.query));
+                    const overridden = await fixture.pathLookup?.(request, options);
+                    if (overridden !== undefined) return overridden;
+                    const paths = (path.bool ?? [path]).map(({ queryString }) =>
+                        queryString.skipSyntax ? queryString.query : JSON.parse(queryString.query));
                     const docs = source.filter(doc => doc.kind === JSON.parse(kind.queryString.query) && paths.includes(doc.path)).slice(0, request.size);
                     return response(docs, request.fields);
                 },
