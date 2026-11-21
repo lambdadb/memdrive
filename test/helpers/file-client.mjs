@@ -15,7 +15,7 @@ export function fileClient() {
         collection(name) {
             const state = () => collections.get(name) ?? fail(404, 'Collection missing');
             const docsAt = branch => (state().branches.get(branch) ?? fail(404, 'Branch missing')).docs;
-            const response = (docs, fields) => ({ isDocsInline: true, docs: docs.map(doc => ({
+            const response = (docs, fields) => ({ isDocsInline: true, total: docs.length, docs: docs.map(doc => ({
                 collection: name, score: 0.8, doc: structuredClone(fields?.include
                     ? Object.fromEntries(fields.include.filter(key => Object.hasOwn(doc, key)).map(key => [key, doc[key]]))
                     : doc),
@@ -46,7 +46,17 @@ export function fileClient() {
                         };
                         return native;
                     }
-                    const [kind, path] = request.query.bool;
+                    const [kind, path, exclude] = request.query.bool;
+                    if (path.queryString?.defaultField === 'id') {
+                        const regex = clause => new RegExp(`^${clause.queryString.query.slice(1, -1)}$`);
+                        const owned = regex(path);
+                        const keep = exclude?.occur === 'must_not' ? regex(exclude) : undefined;
+                        const after = exclude?.occur === 'filter' ? /^\{(.+) TO \*\}$/.exec(exclude.queryString.query)?.[1] : undefined;
+                        const selected = source.filter(doc => doc.kind === JSON.parse(kind.queryString.query)
+                            && owned.test(doc.id) && !keep?.test(doc.id) && (after === undefined || doc.id > after));
+                        if (request.sort?.[0]?.id === 'asc') selected.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+                        return response(selected.slice(0, request.size), request.fields);
+                    }
                     const paths = (path.bool ?? [path]).map(clause => JSON.parse(clause.queryString.query));
                     const docs = source.filter(doc => doc.kind === JSON.parse(kind.queryString.query) && paths.includes(doc.path)).slice(0, request.size);
                     return response(docs, request.fields);
@@ -70,13 +80,28 @@ export function fileClient() {
                     async fetch(request) {
                         calls.push({ kind: 'fetch', request: structuredClone(request) });
                         const docs = docsAt(request.ref.name);
-                        return response(request.ids.map(id => docs.get(id)).filter(Boolean), request.fields);
+                        const override = await fixture.beforeFetch?.(request, docs);
+                        return override ?? response(request.ids.map(id => docs.get(id)).filter(Boolean), request.fields);
                     },
-                    async upsert(request) {
-                        calls.push({ kind: 'upsert', request: structuredClone(request) });
+                    async upsert(request, options) {
+                        calls.push({ kind: 'upsert', request: structuredClone(request), retries: options?.retries });
                         await fixture.beforeUpsert?.(request);
                         const docs = docsAt(request.branch);
                         for (const doc of request.docs) docs.set(doc.id, structuredClone(doc));
+                        await fixture.afterUpsert?.(request, docs);
+                    },
+                    async update(request, options) {
+                        calls.push({ kind: 'update', request: structuredClone(request), retries: options?.retries });
+                        const docs = docsAt(request.branch);
+                        if (request.docs.some(doc => !docs.has(doc.id))) fail(400, 'Update target missing');
+                        for (const doc of request.docs) docs.set(doc.id, { ...docs.get(doc.id), ...structuredClone(doc) });
+                    },
+                    async delete(request, options) {
+                        calls.push({ kind: 'delete', request: structuredClone(request), retries: options?.retries });
+                        const docs = docsAt(request.branch);
+                        await fixture.beforeDelete?.(request, docs);
+                        for (const id of request.ids) docs.delete(id);
+                        await fixture.afterDelete?.(request, docs);
                     },
                 },
             };

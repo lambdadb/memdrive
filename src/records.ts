@@ -51,15 +51,43 @@ async function contentHash(content: string): Promise<string> {
     return [...hash].map(byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
-export async function fileRecords(request: CreateFileRequest, schema: MetadataSchema) {
+export const validText = (value: unknown): value is string => typeof value === 'string' && !/\p{Surrogate}/u.test(value);
+
+export async function createRecords(request: CreateFileRequest, schema: MetadataSchema) {
     requireInput(keysOnly(request, ['op', 'path', 'content', 'metadata']) && request.op === 'create',
-        'Write requires a create operation with path and original text.');
+        'Create requires a path and original text.');
     const { path, content } = request;
     requirePath(path);
-    requireInput(typeof content === 'string' && !/\p{Surrogate}/u.test(content), 'File content must be UTF-8 text.');
+    requireInput(validText(content), 'File content must be UTF-8 text.');
     const metadata = metadataValues(request.metadata, schema);
-    const fileId = globalThis.crypto.randomUUID();
-    const modifiedAt = new Date().toISOString();
+    const file: DriveFile = { fileId: globalThis.crypto.randomUUID(), path, modifiedAt: new Date().toISOString(), content,
+        ...(metadata === undefined ? {} : { metadata }) };
+    return fileRecords(file);
+}
+
+export type FileBaseline = { version: string; path: string; fingerprint: string };
+
+export function baselineOf(doc: Record<string, unknown>): FileBaseline | undefined {
+    if (doc.baseline === undefined) return undefined;
+    if (!isObject(doc.baseline) || typeof doc.baseline.version !== 'string' || !doc.baseline.version
+        || !validPath(doc.baseline.path) || typeof doc.baseline.fingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(doc.baseline.fingerprint))
+        throw new MemDriveError('INVALID_RESULT', 'Read returned invalid file baseline data.');
+    return { version: doc.baseline.version, path: doc.baseline.path, fingerprint: doc.baseline.fingerprint };
+}
+
+export const metadataKey = (metadata: DriveFile['metadata']) => metadata === undefined ? null : Object.entries(metadata).sort();
+export const fingerprintOf = (file: DriveFile) => contentHash(JSON.stringify([file.path, metadataKey(file.metadata), file.content]));
+
+type FileTracking = {
+    revision: string;
+    generation?: string | undefined;
+    baseline?: FileBaseline | undefined;
+    fingerprint: string;
+    version?: string | undefined;
+};
+
+export function fileOriginal(file: DriveFile, tracking?: FileTracking) {
+    const { fileId, path, content, modifiedAt, metadata } = file;
     const parts = path.slice(1).split('/');
     const fileName = parts.pop()!;
     const ancestorPaths = ['/'];
@@ -68,8 +96,20 @@ export async function fileRecords(request: CreateFileRequest, schema: MetadataSc
         ancestor += part + '/';
         ancestorPaths.push(ancestor);
     }
-    const shared = { fileId, path, fileName, ancestorPaths, modifiedAt, ...(metadata === undefined ? {} : { metadata }) };
-    const original = { id: originalId(fileId), kind: 'file', ...shared, body: content, changed: true };
+    const { revision } = tracking ?? {};
+    const shared = { fileId, path, fileName, ancestorPaths, modifiedAt, ...(metadata === undefined ? {} : { metadata }),
+        ...(revision === undefined ? {} : { revision }) };
+    return { id: originalId(fileId), kind: 'file' as const, ...shared, body: content,
+        changed: !tracking?.baseline || tracking.fingerprint !== tracking.baseline.fingerprint, ...tracking };
+}
+
+export async function fileRecords(file: DriveFile, tracking?: FileTracking) {
+    const { content, fileId } = file;
+    const original = fileOriginal(file, tracking);
+    const { path, fileName, ancestorPaths, modifiedAt, metadata, revision } = original;
+    const generation = tracking?.generation;
+    const shared = { fileId, path, fileName, ancestorPaths, modifiedAt,
+        ...(metadata === undefined ? {} : { metadata }), ...(revision === undefined ? {} : { revision }) };
     const originalBytes = bytes(original);
     requireInput(originalBytes <= 5 * 1024 * 1024, 'The file original exceeds the native 5 MiB document limit.');
     const spans = chunkSpans(content).filter(span => span.text.trim());
@@ -79,9 +119,11 @@ export async function fileRecords(request: CreateFileRequest, schema: MetadataSc
         const hash = hashes[index]!;
         const occurrence = occurrences.get(hash) ?? 0;
         occurrences.set(hash, occurrence + 1);
-        return { id: `chunk:${fileId}:${hash}:${occurrence}`, kind: 'chunk', ...shared, content: text, start, end };
+        // Legacy and new creates keep their established IDs. Each replacement
+        // gets a new suffix so delayed cleanup cannot delete a later generation.
+        const suffix = generation === undefined ? '' : `:${generation}`;
+        return { id: `chunk:${fileId}:${hash}:${occurrence}${suffix}`, kind: 'chunk' as const, ...shared, content: text, start, end };
     });
-    const file: DriveFile = { fileId, path, modifiedAt, content, ...(metadata === undefined ? {} : { metadata }) };
     // Large files stage their chunks before making the original visible.
     const chunkRecords = chunks.map(doc => ({ doc, inputBytes: encoder.encode(doc.content).length, wireBytes: bytes(doc) + 1 }));
     requireInput(chunkRecords.every(record => record.wireBytes - 1 <= 5 * 1024 * 1024), 'A chunk exceeds the native 5 MiB document limit.');

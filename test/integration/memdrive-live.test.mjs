@@ -97,6 +97,35 @@ test('live file store writes, searches, lists and reopens a fresh fork with veri
         const fused = await reopened.search({ query: 'synthetic note', limit: 4, rerank: false }, options());
         assert.equal(fused.reranked, false);
         assert.deepEqual(fused.hits, ranked.hits);
+
+        const native = client.collection(name);
+        const branchRead = { ref: { kind: 'branch', name: 'fork-research' }, consistentRead: true };
+        const chunkIds = async () => (await native.query({ ...branchRead, size: 10, fields: { include: ['id'] },
+            query: { queryString: { query: '"chunk"', defaultField: 'kind' } } }, options())).docs.map(hit => hit.doc.id);
+        const oldIds = await chunkIds();
+        assert.equal(oldIds.length, 1);
+        const moved = await reopened.write({ op: 'update', fileId: original.fileId, newPath: '/archive/synthetic.md' }, options());
+        assert.equal(moved.content, original.content);
+        assert.deepEqual(moved.metadata, original.metadata);
+        assert.equal(await reopened.read({ path }, options()), null);
+        assert.deepEqual(await reopened.read({ path: moved.path }, options()), moved);
+        assert.deepEqual(await chunkIds(), oldIds);
+        const changed = await reopened.write({ op: 'update', fileId: moved.fileId, metadata: {},
+            edits: [{ oldText: 'Synthetic note', newText: 'Updated fixture' }] }, options());
+        assert.equal(changed.content, content.replace('Synthetic note', 'Updated fixture'));
+        assert.equal(Object.hasOwn(changed, 'metadata'), false);
+        assert.deepEqual(await reopened.read({ fileId: changed.fileId }, options()), changed);
+        assert.equal((await native.docs.fetch({ ...branchRead, ids: oldIds }, options())).docs.length, 0);
+        const newIds = await chunkIds();
+        assert.equal(newIds.length, 1);
+        assert.notDeepEqual(newIds, oldIds);
+        const changedResults = await reopened.search({ query: 'Updated fixture', rerank: false }, options());
+        assert.deepEqual(changedResults.hits, [{ ...changed, range: { start: 0, end: changed.content.length } }]);
+        assert.deepEqual(await reopened.write({ op: 'delete', fileId: changed.fileId }, options()), { fileId: changed.fileId });
+        assert.equal(await reopened.read({ fileId: changed.fileId }, options()), null);
+        assert.equal(await reopened.read({ path: changed.path }, options()), null);
+        assert.equal((await native.docs.fetch({ ...branchRead, ids: newIds }, options())).docs.length, 0);
+        assert.deepEqual(await reopened.write({ op: 'delete', fileId: changed.fileId }, options()), { fileId: changed.fileId });
     } catch (error) {
         collision = error?.code === 'STORE_EXISTS';
         failure = safeFailure('File store smoke', error);
