@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createRetriever } from '@functional-systems/memdrive/retriever';
+import { createRetriever } from 'memdrive-memory-baseline/retriever';
 import { canonicalToolDefinitions, modelTools } from './agent.mjs';
 import { context, resultSpans, spanKey, validateSpan } from './protocol.mjs';
 

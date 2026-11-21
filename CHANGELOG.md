@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Replace the memory SDK entry points with a file SDK for fresh stores, read-only main, and working forks.
+- Create text files on a fork and read exact originals by full path or stable file ID.
+- Pin the LongMemEval runner to the historical memory SDK as a development dependency.
+
 ## 0.1.0
 
 First stable release of the standalone MemDrive SDK. The public API and storage

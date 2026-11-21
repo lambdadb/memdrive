@@ -111,13 +111,12 @@ publication. Source, archive or unexpected `latest` changes fail immediately.
 Reruns validate an existing version and report when its channel has advanced,
 without moving the tag.
 
-The live suite creates three isolated collections containing less than 6 KiB of
-synthetic text. It performs eight managed recalls (two with default reranking),
-two facet requests, one external-vector recall and one branch operation, with no
-answer-model calls or retry loop. Calls have 60-second limits and the suite has a
-ten-minute limit. Cleanup verifies native not-found responses. Missing settings
+The live suite creates one isolated collection and forks main. It writes two
+short synthetic originals, verifies reads by path and file ID through a reopened
+fork, and checks main isolation and duplicate path rejection. Requests have
+60-second limits. Cleanup verifies a native not-found response. Missing settings
 or failed cleanup fail the run. Record the pinned LambdaDB client version and
-test environment; unit tests, installed-package checks, live integration and
+test environment. Unit tests, installed-package checks, live integration and
 registry verification establish different facts.
 
 ## GitHub and npm configuration

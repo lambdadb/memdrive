@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import { readFile, writeFile, rename, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { LambdaDBClient, HTTPClient } from '@functional-systems/lambdadb';
-import { create, open } from '@functional-systems/memdrive';
+import { create, open } from 'memdrive-memory-baseline';
 import { get_encoding } from 'tiktoken';
-import { createTools } from '@functional-systems/memdrive/tools';
+import { createTools } from 'memdrive-memory-baseline/tools';
 import { jsonHash, metadataSchema, integer } from './protocol.mjs';
 
 export const readJSON = async file => JSON.parse(await readFile(file, 'utf8'));

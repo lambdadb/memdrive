@@ -1,7 +1,9 @@
 # Benchmarks
 
-Repository-owned evaluations consume MemDrive's public package APIs. They are
-Node.js development tools, outside `src/` and the published npm archive.
+Repository-owned evaluations are Node.js development tools outside `src/` and
+the published npm archive. LongMemEval uses the public API of the historical
+memory SDK, pinned to `@functional-systems/memdrive@0.1.1-dev.2` as the
+development-only `memdrive-memory-baseline` alias.
 
 - [LongMemEval](longmemeval/README.md): reusable per-question corpora, `single_pass` retrieval and `agentic` memory
   tools, followed by optional answer generation and judging stages.

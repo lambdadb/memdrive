@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs, parseEnv } from 'node:util';
 import { get_encoding } from 'tiktoken';
-import { createTools } from '@functional-systems/memdrive/tools';
+import { createTools } from 'memdrive-memory-baseline/tools';
 import { collectEvidence, canonicalToolDefinitions } from './agent.mjs';
 import { sdkCollector, sdkDefinitions } from './sdk-agent.mjs';
 import { prepareCase, metadataSchema, hash, jsonHash, packEvidence, evidenceMetrics, judgeRequest, verdict, integer } from './protocol.mjs';
@@ -43,7 +43,7 @@ export async function fingerprints() {
     const files = [path.join(repository, 'package.json'), path.join(repository, 'package-lock.json')];
     for (const folder of ['src', 'dist/esm', 'benchmark/longmemeval']) files.push(...await treeFiles(path.join(repository, folder)));
     // Fingerprint actual installed runtime code as well as the dependency lock.
-    for (const name of ['@functional-systems/lambdadb', 'tiktoken', 'zod']) {
+    for (const name of ['memdrive-memory-baseline', '@functional-systems/lambdadb', 'tiktoken', 'zod']) {
         const packageRoot = path.join(repository, 'node_modules', name);
         files.push(...await treeFiles(packageRoot));
     }

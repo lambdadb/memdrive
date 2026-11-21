@@ -1,5 +1,9 @@
 # LongMemEval-S with MemDrive
 
+This benchmark evaluates the historical memory SDK. It uses
+`@functional-systems/memdrive@0.1.1-dev.2` through the development-only
+`memdrive-memory-baseline` alias.
+
 Ingest a reusable corpus once, then run independent retrieval experiments against
 it. Each LongMemEval question retains its own isolated history collection; no
 question can search another question's memories. Successful, failed and aborted

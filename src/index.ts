@@ -1,293 +1,256 @@
-// Application-facing memory storage and retrieval. No answer assembly lives here.
-import type { Backend, DataBackend, Evidence, VectorEvidence } from './storage.js';
-import type {
-    CreateOptions, OpenOptions, RequestOptions, RecallRequest, TextRecallRequest, RecallResult,
-    BatchRecallResult, MetadataSchema, EmbeddingConfig, TextSearch, Usage, Observation, RecordEvent,
-    MemInput, ForgetRequest, ConfigureRequest, BranchRequest, CatalogRequest, CatalogResult,
-    ListRequest, MemDrive, DriveData, CountValuesRequest,
-} from './types.js';
-import { createBackend, openBackend, listBackends, validateChunk, publicMatch, vectorMatch } from './storage.js';
-import { buildSearchFilter, matchesFilter } from './filter.js';
-import { MemDriveError, requireInput, operationOptions, checkAbort, abortError } from './errors.js';
-import { recallInput, textRecallQuery } from './recall-input.js';
-import type { ValidRecall } from './recall-input.js';
-import { createValueCounter } from './values.js';
-
+import type { ConnectionOptions, RequestOptions } from './types.js';
+import type { CreateFileRequest, DriveFile, FileDrive, MainFileDrive, OpenFileStoreOptions, ReadFileRequest, WorkingFileDrive } from './types.js';
+import { checkAbort, databaseError, MemDriveError, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
 export type * from './types.js';
 export { MemDriveError } from './errors.js';
 
-type Options = (CreateOptions | OpenOptions) & { branch?: string | undefined; embedding?: CreateOptions['embedding']; textSearch?: TextSearch | undefined };
-type Queue = <T>(operation: () => Promise<T>, signal?: AbortSignal) => Promise<T>;
-type QueryBody = Parameters<DataBackend['query']>[0];
-type NativeResponse = Awaited<ReturnType<DataBackend['query']>>;
-type NormalizedResponse = Omit<NativeResponse, 'docs'> & { docs: Array<Omit<NativeResponse['docs'][number], 'doc'> & { doc: Evidence | VectorEvidence }> };
-type PreparedRecall = { input: unknown; start: number; error?: never } | { error: MemDriveError; input?: never; start?: never };
+type Handle = ReturnType<ConnectionOptions['client']['collection']>;
+type Client = ConnectionOptions['client'];
 
-const keys = (value: unknown, allowed: string[]): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
-    && Object.keys(value).every(key => allowed.includes(key));
+const main = 'main';
+const prefix = 'fork-';
+const formatTag = 'memdrive.format';
+// Development stores can be recreated after an incompatible layout change.
+const format = 'files-v0';
+const encoder = new TextEncoder();
+const maxDocumentBytes = 5 * 1024 * 1024;
+const fileIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const indexes = {
+    kind: { type: 'keyword' },
+    path: { type: 'keyword' },
+    fileName: { type: 'keyword' },
+    ancestorPaths: { type: 'keyword' },
+    changed: { type: 'boolean' },
+} as const;
 
-function validateOptions<T extends Options>(options: T, creating: boolean): T {
-    requireInput(keys(options, ['client', 'name', 'maxConcurrentRequests', 'observe', 'record',
-        ...(creating ? ['metadataSchema', 'textSearch', 'embedding', 'labels', 'description'] : ['branch'])]), 'Use the documented MemDrive options.');
-    requireInput(creating || options.branch === undefined || (typeof options.branch === 'string'
-        && /^[A-Za-z0-9_-]{3,52}$/.test(options.branch)), 'branch must be a valid branch name.');
-    if (creating && options.embedding?.mode === 'external')
-        requireInput(options.textSearch === undefined, 'External embeddings do not support textSearch.');
-    const concurrency = options.maxConcurrentRequests ?? 5;
-    requireInput(Number.isSafeInteger(concurrency) && concurrency > 0, 'maxConcurrentRequests must be a positive integer.');
-    for (const name of ['observe', 'record'] as const)
-        requireInput(options[name] === undefined || typeof options[name] === 'function', `${name} must be a callback.`);
-    return { ...options };
+const clients = new WeakMap<Client, Map<string, Store>>();
+const isObject = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object'
+    && !Array.isArray(value) && [Object.prototype, null].includes(Object.getPrototypeOf(value));
+const quote = (value: string) => JSON.stringify(value);
+const keysOnly = (value: unknown, keys: string[]): value is Record<string, unknown> =>
+    isObject(value) && Object.keys(value).every(key => keys.includes(key));
+const validName = (name: unknown, maxLength = 52): name is string =>
+    typeof name === 'string' && name.length >= 3 && name.length <= maxLength && /^[A-Za-z0-9_-]+$/.test(name);
+const validFileId = (value: unknown): value is string => typeof value === 'string' && fileIdPattern.test(value);
+const validPath = (value: unknown): value is string => typeof value === 'string' && value.startsWith('/')
+    && !/[\\\p{Cc}\p{Surrogate}]/u.test(value) && encoder.encode(value).length <= 4096
+    && value.slice(1).split('/').every(part => part !== '' && part !== '.' && part !== '..');
+const originalId = (fileId: string) => `file:${fileId}`;
+
+function validateConnection(options: unknown, keys: string[]): asserts options is ConnectionOptions {
+    requireInput(keysOnly(options, keys) && options.client !== null && typeof options.client === 'object'
+        && 'collection' in options.client && typeof options.client.collection === 'function',
+    'Provide a LambdaDB client and documented file store options.');
+    requireInput(validName(options.name), 'Store name must be 3–52 letters, digits, underscores or hyphens.');
 }
 
-// Separate queues bound logical recalls and database work across all branch views.
-function requestQueue(limit: number): Queue {
-    let active = 0;
-    const waiting: Array<{ start(): void }> = [];
-    return <T>(operation: () => Promise<T>, signal?: AbortSignal) => new Promise<T>((resolve, reject) => {
-        try { checkAbort(signal); } catch (error) { reject(error); return; }
-        const entry = { start() {
-            signal?.removeEventListener('abort', cancel);
-            active++;
-            Promise.resolve().then(() => { checkAbort(signal); return operation(); }).then(resolve, reject).finally(() => {
-                active--;
-                waiting.shift()?.start();
-            });
-        } };
-        const cancel = () => {
-            const index = waiting.indexOf(entry);
-            if (index < 0) return;
-            waiting.splice(index, 1);
-            signal?.removeEventListener('abort', cancel);
-            reject(abortError(undefined, signal));
-        };
-        if (active < limit) entry.start();
-        else {
-            waiting.push(entry);
-            signal?.addEventListener('abort', cancel, { once: true });
-            if (signal?.aborted) cancel();
-        }
-    });
+function requirePath(path: unknown): asserts path is string {
+    requireInput(validPath(path), 'File path must be an absolute slash-separated path of at most 4096 UTF-8 bytes without empty, dot or dot-dot components, backslashes or control characters.');
 }
 
-export { contextualQuery } from './recall-input.js';
-
-function recallQuery(request: ValidRecall, schema: MetadataSchema, textSearch: TextSearch | undefined, embedding: EmbeddingConfig): QueryBody {
-    if (embedding.mode === 'external') return { size: request.limit, query: { knn: {
-        field: 'embedding', queryVector: request.queryVector, k: request.limit,
-        filter: buildSearchFilter([request.filter], request.excludeIds ?? [], [], schema),
-    } } };
-    const context = textRecallQuery(request as TextRecallRequest);
-    const filter = buildSearchFilter([request.filter], request.excludeIds ?? [], [], schema);
-    const candidates = Math.max(200, request.limit);
-    const semantic = { knn: { field: 'embedding', queryText: context, k: candidates, filter } };
-    const query = textSearch ? { bayesian: [semantic,
-        { bool: [{ ...filter, occur: 'filter' },
-            { queryString: { query: request.query, defaultField: 'content', skipSyntax: true }, occur: 'must' }] },
-    ] } : semantic;
-    return { size: request.limit, query, ...(request.rerank === false ? (textSearch ? { candidateSize: candidates } : {}) : {
-        rerank: { provider: 'typesafe', model: 'jev-1.13.0', queryText: context,
-            fields: ['content'], candidateSize: candidates, onFailure: 'error' },
-    }) };
-}
-
-async function validatedHits(response: NativeResponse, request: ValidRecall, schema: MetadataSchema, name: string, max: number, embedding: EmbeddingConfig): Promise<Array<Evidence | VectorEvidence>> {
-    if (response?.isDocsInline === false || !Array.isArray(response?.docs) || response.docs.length > max)
-        throw new MemDriveError('INVALID_RESULT', 'Search returned an invalid document envelope.');
-    const seen = new Set<string>();
-    return Promise.all(response.docs.map(async hit => {
-        if (hit.collection !== undefined && hit.collection !== name)
-            throw new MemDriveError('INVALID_RESULT', 'Search returned a different collection.');
-        let mem;
-        try { mem = await (embedding.mode === 'external' ? vectorMatch(hit.doc, schema) : validateChunk(hit.doc, schema)); }
-        catch (cause) { throw new MemDriveError('INVALID_RESULT', 'Search returned invalid Mem evidence.', { cause }); }
-        if (seen.has(mem.id) || request.excludeIds?.includes(mem.memId) || !matchesFilter({ ...mem, id: mem.memId }, request.filter, schema))
-            throw new MemDriveError('INVALID_RESULT', 'Search returned duplicate, excluded or filtered-out evidence.');
-        seen.add(mem.id);
-        return mem;
-    }));
-}
-
-function verifyRerank(response: NormalizedResponse, body: QueryBody) {
-    const result = response.rerank;
-    const same = result?.provider === body.rerank!.provider && result?.model === body.rerank!.model;
-    const applied = result?.status === 'applied' && Number.isSafeInteger(result.candidateCount)
-        && result.scoredCount === result.candidateCount && result.candidateCount !== undefined && result.candidateCount >= response.docs.length
-        && result.candidateCount <= body.rerank!.candidateSize!
-        && response.docs.every(hit => typeof hit.score === 'number' && Number.isFinite(hit.score) && hit.score >= 0 && hit.score <= 1);
-    const empty = result?.status === 'skipped' && result.reason === 'noCandidates'
-        && result.candidateCount === 0 && result.scoredCount === 0 && response.docs.length === 0;
-    if (!same || (!applied && !empty)) throw new MemDriveError('RERANK_FAILED', 'Native reranking was not confirmed.');
-}
-
-function makeDataHandle(backend: DataBackend, options: Options, queue: Queue, recallQueue: Queue): DriveData {
-    const counter = createValueCounter({ describe: options => backend.describe(options), query: (body, options) => backend.query(body, options),
-        metadataSchema: () => backend.metadataSchema });
-    let generation = backend.generation;
-    const invalidate = () => { generation = backend.generation; counter.invalidate(); };
-    const inspect = async <T>(operation: () => Promise<T>): Promise<T> => {
-        backend.assertActive();
-        if (generation !== backend.generation) invalidate();
-        try { const result = await operation(); backend.assertActive(); return result; }
-        finally { if (generation !== backend.generation) invalidate(); }
-    };
-    const mutation = async <T>(operation: () => Promise<T>): Promise<T> => {
-        try { return await operation(); }
-        finally { invalidate(); }
-    };
-    const executeRecall = async (input: unknown, start: number, requestIndex?: number, signal?: AbortSignal): Promise<RecallResult> => {
-        const usage: Usage = { elapsedMs: 0, databaseRequests: 0 };
-        const hook = <T extends Observation | RecordEvent>(callback?: ((event: T) => void | Promise<void>)) => async (event: T) => {
-            checkAbort(signal);
-            await callback?.(requestIndex === undefined ? event : { ...event, requestIndex });
-            checkAbort(signal);
-        };
-        const record = hook(options.record);
-        const observe = hook(options.observe);
-        const executeDb = <T>(operation: (options?: RequestOptions) => Promise<T>): Promise<T> => queue(async () => {
-            backend.assertActive(); checkAbort(signal);
-            usage.databaseRequests++;
-            try { const result = await operation({ signal }); checkAbort(signal); return result; }
-            catch (cause) {
-                const failure = abortError(cause, signal);
-                if (failure instanceof MemDriveError) throw failure;
-                const error = new MemDriveError('DATABASE_ERROR', 'MemDrive database request failed.', { cause: failure });
-                const remote = failure as { statusCode?: number; status?: number };
-                error.status = remote.statusCode ?? remote.status;
-                throw error;
-            }
-        }, signal);
-        try {
-            checkAbort(signal);
-            backend.assertActive();
-            if (generation !== backend.generation) invalidate();
-            const schema = () => backend.metadataSchema;
-            const request = recallInput(input, schema(), backend.embedding);
-            requireInput(request.rerank !== true || backend.embedding.mode === 'managed',
-                'rerank: true requires managed embeddings.');
-            const query = async (body: QueryBody): Promise<NormalizedResponse> => {
-                const response = await executeDb(options => backend.query(body, options));
-                const mems = await validatedHits(response, request, schema(), options.name, body.size ?? 10, backend.embedding);
-                return { ...response, docs: response.docs.map((hit, i) => ({ ...hit, doc: mems[i]! })) };
-            };
-            const body = recallQuery(request, schema(), backend.textSearch, backend.embedding);
-            await record({ phase: 'query', request: structuredClone(body) });
-            const response = await query(body);
-            if (body.rerank) verifyRerank(response, body);
-            const mems = response.docs.map(hit => hit.doc);
-            await record({ phase: 'query_result', response: structuredClone(response) });
-            await observe({ type: 'retrieved', ids: mems.map(mem => mem.id), matches: mems.map(publicMatch) });
-            backend.assertActive(); checkAbort(signal);
-            usage.elapsedMs = performance.now() - start;
-            return { matches: mems.map(publicMatch), usage };
-        } catch (cause) {
-            const failure = abortError(cause, signal);
-            usage.elapsedMs = performance.now() - start;
-            const error = failure instanceof MemDriveError ? failure
-                : new MemDriveError('RECALL_FAILED', 'MemDrive retrieval failed.', { cause: failure });
-            error.usage = structuredClone(usage);
-            throw error;
-        }
-    };
-    const snapshot = (input: unknown): PreparedRecall => {
-        const start = performance.now();
-        try { return { input: structuredClone(input), start }; }
-        catch (cause) {
-            const error = new MemDriveError('INVALID_INPUT', 'Recall input must be cloneable data.', { cause });
-            error.usage = { elapsedMs: 0, databaseRequests: 0 };
-            return { error };
-        }
-    };
-    const submit = async (prepared: PreparedRecall, requestIndex?: number, signal?: AbortSignal): Promise<RecallResult> => {
-        if (prepared.error) throw prepared.error;
-        try { return await recallQueue(() => executeRecall(prepared.input, prepared.start, requestIndex, signal), signal); }
-        catch (cause) {
-            // Queue cancellation and executeRecall both reject with MemDriveError.
-            const error = cause as MemDriveError;
-            error.usage ??= { elapsedMs: performance.now() - prepared.start, databaseRequests: 0 };
-            throw error;
-        }
-    };
-    async function recall(input: RecallRequest, options?: RequestOptions): Promise<RecallResult>;
-    async function recall(input: { requests: RecallRequest[] }, options?: RequestOptions): Promise<BatchRecallResult>;
-    async function recall(input: unknown, options?: RequestOptions): Promise<RecallResult | BatchRecallResult> {
-            const { signal } = operationOptions(options);
-            if (input !== null && typeof input === 'object' && Object.hasOwn(input, 'requests')) {
-                requireInput(keys(input, ['requests']) && Array.isArray(input.requests) && input.requests.length > 0,
-                    'Batch recall requires only a nonempty requests array.');
-                // Snapshot every item before any operation can yield or mutate caller data.
-                const prepared = Array.from(input.requests, snapshot);
-                const results = await Promise.all(prepared.map(async (item, requestIndex) => {
-                    try { return await submit(item, requestIndex, signal); }
-                    catch (cause) {
-                        const error = cause as MemDriveError;
-                        return { error: { code: error.code, message: error.message,
-                            ...(Number.isInteger(error.status) ? { status: error.status! } : {}) },
-                        usage: structuredClone(error.usage!) };
-                    }
-                }));
-                return { results };
-            }
-            return submit(snapshot(input), undefined, signal);
-
+async function remote<T>(operation: () => Promise<T>, message: string, signal?: AbortSignal, codes: Record<number, string> = {}) {
+    try { return await nativeRequest(operation, signal); }
+    catch (cause) {
+        const error = databaseError(cause, message);
+        if (error.status !== undefined && codes[error.status] !== undefined) error.code = codes[error.status]!;
+        throw error;
     }
-    return Object.freeze({
-        remember: (request: { mems: MemInput[] }, options?: RequestOptions) => mutation(() => backend.remember(request, options)),
-        forget: (request: ForgetRequest, options?: RequestOptions) => mutation(() => backend.forget(request, options)),
-        read: (request: { ids: string[] }, options?: RequestOptions) => backend.read(request, undefined, options),
-        list: (request?: ListRequest, options?: RequestOptions) => backend.list(request, options),
-        embedding: Object.freeze(structuredClone(backend.embedding)),
-        recall,
-        async countValues(request: CountValuesRequest, options?: RequestOptions) {
+}
+
+function fileFromResponse(response: unknown, name: string, request: ReadFileRequest): DriveFile | null {
+    if (!isObject(response) || response.isDocsInline === false || !Array.isArray(response.docs) || response.docs.length > 1)
+        throw new MemDriveError('INVALID_RESULT', 'File read returned an invalid or ambiguous result.');
+    if (response.docs.length === 0) return null;
+    const hit: unknown = response.docs[0];
+    const doc = isObject(hit) && hit.collection === name ? hit.doc : undefined;
+    if (!isObject(doc) || doc.kind !== 'file' || !validFileId(doc.fileId) || doc.id !== originalId(doc.fileId)
+        || !validPath(doc.path) || typeof doc.content !== 'string' || /\p{Surrogate}/u.test(doc.content)
+        || (request.fileId === undefined ? doc.path !== request.path : doc.fileId !== request.fileId))
+        throw new MemDriveError('INVALID_RESULT', 'File read returned an invalid original.');
+    return { fileId: doc.fileId, path: doc.path, content: doc.content };
+}
+
+type Store = ReturnType<typeof store>;
+function store(handle: Handle, name: string) {
+    const forks = new Map<string, WorkingFileDrive>();
+
+    function reader(branch: string) {
+        return async (request: ReadFileRequest, options?: RequestOptions) => {
             const { signal } = operationOptions(options);
             checkAbort(signal);
-            return inspect(() => counter.countValues(request, operation => queue(async () => {
-                backend.assertActive(); checkAbort(signal);
-                const result = await operation({ signal });
-                backend.assertActive(); checkAbort(signal);
-                return result;
-            }, signal), signal));
+            requireInput(keysOnly(request, ['fileId', 'path']) && Object.keys(request).length === 1,
+                'Read requires exactly one of fileId or path.');
+            const settings = { ref: { kind: 'branch' as const, name: branch }, consistentRead: true, includeVectors: false };
+            let response;
+            let selector: ReadFileRequest;
+            if (Object.hasOwn(request, 'fileId')) {
+                const { fileId } = request;
+                requireInput(validFileId(fileId), 'Provide a fileId returned by MemDrive.');
+                selector = { fileId };
+                response = await remote(() => handle.docs.fetch({ ids: [originalId(fileId)], ...settings }, nativeOptions(signal)),
+                    'Could not read the file by ID.', signal);
+            } else {
+                const { path } = request;
+                requirePath(path);
+                selector = { path };
+                response = await remote(() => handle.query({ size: 2, ...settings, query: { bool: [
+                    { queryString: { query: quote('file'), defaultField: 'kind' }, occur: 'filter' },
+                    { queryString: { query: quote(path), defaultField: 'path' }, occur: 'filter' },
+                ] } }, nativeOptions(signal)), 'Could not read the file by path.', signal);
+            }
+            checkAbort(signal);
+            return fileFromResponse(response, name, selector);
+        };
+    }
+
+    function working(fork: string): WorkingFileDrive {
+        const existing = forks.get(fork);
+        if (existing) return existing;
+        const branch = prefix + fork;
+        const read = reader(branch);
+        let writes = Promise.resolve();
+        const unconfirmed = new Map<string, string>();
+        const drive: WorkingFileDrive = Object.freeze({
+            name, at: Object.freeze({ kind: 'fork' as const, name: fork }), read,
+            async write(request: CreateFileRequest, options?: RequestOptions) {
+                const { signal } = operationOptions(options);
+                checkAbort(signal);
+                requireInput(keysOnly(request, ['op', 'path', 'content']) && request.op === 'create',
+                    'Write requires a create operation with path and original text.');
+                const { path, content } = request;
+                requirePath(path);
+                requireInput(typeof content === 'string' && !/\p{Surrogate}/u.test(content), 'File content must be UTF-8 text.');
+                const fileId = globalThis.crypto.randomUUID();
+                const parts = path.slice(1).split('/');
+                const fileName = parts.pop()!;
+                const ancestorPaths = ['/'];
+                let ancestor = '/';
+                for (const part of parts) {
+                    ancestor += part + '/';
+                    ancestorPaths.push(ancestor);
+                }
+                const doc = { id: originalId(fileId), kind: 'file', fileId, path, fileName, ancestorPaths, content, changed: true };
+                requireInput(encoder.encode(JSON.stringify(doc)).length <= maxDocumentBytes, 'File record exceeds the native 5 MiB document limit.');
+
+                const write = writes.then(async () => {
+                    if (await read({ path }, { signal })) {
+                        unconfirmed.delete(path);
+                        throw new MemDriveError('PATH_EXISTS', 'A file already exists at this path.');
+                    }
+                    const pendingId = unconfirmed.get(path);
+                    if (pendingId)
+                        throw new MemDriveError('WRITE_UNCONFIRMED', 'An earlier create at this path is still unconfirmed.',
+                            { details: { fileId: pendingId, path } });
+                    checkAbort(signal);
+                    const uncertain = (cause?: unknown) => {
+                        unconfirmed.set(path, fileId);
+                        return new MemDriveError('WRITE_UNCONFIRMED', 'The create may have been accepted. Inspect the file by ID or path.',
+                            { cause, details: { fileId, path } });
+                    };
+                    try {
+                        await nativeRequest(() => handle.docs.upsert({ docs: [doc], branch }, nativeOptions(signal)), signal);
+                    } catch (cause) {
+                        const error = databaseError(cause, 'The file create was rejected.');
+                        if ([400, 401, 403, 404, 413, 422, 429].includes(error.status ?? 0)) throw error;
+                        throw uncertain(cause);
+                    }
+                    const visible = await read({ path }, { signal }).catch(cause => { throw uncertain(cause); });
+                    if (!visible || visible.fileId !== fileId || visible.content !== content) throw uncertain();
+                    return visible;
+                });
+                writes = write.then(() => undefined, () => undefined);
+                return write;
+            },
+        });
+        forks.set(fork, drive);
+        return drive;
+    }
+
+    const mainView = Object.freeze({
+        name, at: Object.freeze({ kind: 'main' as const }), read: reader(main),
+        async fork(request: { name: string }, options?: RequestOptions) {
+            const { signal } = operationOptions(options);
+            checkAbort(signal);
+            requireInput(keysOnly(request, ['name']) && validName(request.name, 52 - prefix.length) && request.name !== main,
+                'Fork name must be 3–47 letters, digits, underscores or hyphens and cannot be main.');
+            const fork = request.name;
+            const branch = prefix + fork;
+            const result = await remote(() => handle.branches.create({ branchName: branch, source: { kind: 'branch', name: main } },
+                nativeOptions(signal)), 'Could not create the working fork.', signal, { 409: 'BRANCH_CONFLICT' });
+            checkAbort(signal);
+            if (result?.branch?.name !== branch) throw new MemDriveError('INVALID_RESULT', 'Fork creation returned an invalid branch.');
+            return working(fork);
         },
-    });
-}
+    }) satisfies MainFileDrive;
 
-function makeDrive(backend: Backend, options: Options): MemDrive {
-    const concurrency = options.maxConcurrentRequests ?? 5;
-    const queue = requestQueue(concurrency), recallQueue = requestQueue(concurrency);
-    const at = (ref: { branch: string }) => {
-        requireInput(keys(ref, ['branch']) && Object.hasOwn(ref, 'branch'), 'Select a branch with { branch }.');
-        return makeDataHandle(backend.at(ref.branch), options, queue, recallQueue);
+    return {
+        main: mainView,
+        async openFork(fork: string, signal?: AbortSignal) {
+            const cached = forks.get(fork);
+            if (cached) return cached;
+            const response = await remote(() => handle.branches.list(nativeOptions(signal)), 'Could not find the working fork.', signal);
+            checkAbort(signal);
+            if (!Array.isArray(response?.branches) || !response.branches.every(branch => typeof branch?.name === 'string'))
+                throw new MemDriveError('INVALID_RESULT', 'Fork lookup returned invalid branches.');
+            if (!response.branches.some(branch => branch.name === prefix + fork))
+                throw new MemDriveError('BRANCH_NOT_FOUND', 'The working fork does not exist.');
+            return working(fork);
+        },
     };
-    return Object.freeze({
-        ...at({ branch: options.branch ?? 'main' }),
-        at,
-        branches: Object.freeze({
-            create: (request: BranchRequest, options?: RequestOptions) => backend.branches.create(request, options),
-            list: (options?: RequestOptions) => backend.branches.list(options),
-            delete: (name: string, options?: RequestOptions) => backend.branches.delete(name, options),
-        }),
-        configure: (request: ConfigureRequest, options?: RequestOptions) => backend.configure(request, options),
-        destroy: (options?: RequestOptions) => backend.destroy(options),
-        describe: (options?: RequestOptions) => backend.describeDescriptor(options),
-    });
 }
 
-export async function create(options: CreateOptions, requestOptions?: RequestOptions): Promise<MemDrive> {
-    requestOptions = operationOptions(requestOptions); checkAbort(requestOptions.signal);
-    options = validateOptions(options, true);
-    const backend = await createBackend({ client: options.client, name: options.name, metadataSchema: options.metadataSchema, textSearch: options.textSearch, embedding: options.embedding, labels: options.labels,
-        description: options.description }, requestOptions);
-    return makeDrive(backend, options);
+function storesFor(client: Client) {
+    const existing = clients.get(client);
+    if (existing) return existing;
+    const stores = new Map<string, Store>();
+    clients.set(client, stores);
+    return stores;
 }
 
-export async function open(options: OpenOptions, requestOptions?: RequestOptions): Promise<MemDrive> {
-    requestOptions = operationOptions(requestOptions); checkAbort(requestOptions.signal);
-    options = validateOptions(options, false);
-    const backend = await openBackend({ client: options.client, name: options.name }, requestOptions);
-    if (options.branch !== undefined && options.branch !== 'main'
-        && !(await backend.branches.list(requestOptions)).some(branch => branch.name === options.branch))
-        throw new MemDriveError('BRANCH_NOT_FOUND', 'The selected MemDrive branch does not exist.');
-    return makeDrive(backend, options);
+export async function create(options: ConnectionOptions, requestOptions?: RequestOptions): Promise<MainFileDrive> {
+    const { signal } = operationOptions(requestOptions);
+    checkAbort(signal);
+    validateConnection(options, ['client', 'name']);
+    const { client, name } = options;
+    requireInput(typeof client.createCollection === 'function', 'Client must support collection creation.');
+    await remote(() => client.createCollection({ collectionName: name, indexConfigs: indexes, tags: { [formatTag]: format } },
+        nativeOptions(signal)), 'Could not create the file store.', signal, { 409: 'STORE_EXISTS' });
+    checkAbort(signal);
+    const stores = storesFor(client);
+    const created = stores.get(name) ?? store(client.collection(name), name);
+    stores.set(name, created);
+    return created.main;
 }
 
-export const list = (request: CatalogRequest, options?: RequestOptions): Promise<CatalogResult> => listBackends(request, options);
+export function open(options: ConnectionOptions & { at?: undefined }, requestOptions?: RequestOptions): Promise<MainFileDrive>;
+export function open(options: ConnectionOptions & { at: { fork: string } }, requestOptions?: RequestOptions): Promise<WorkingFileDrive>;
+export function open(options: OpenFileStoreOptions, requestOptions?: RequestOptions): Promise<FileDrive>;
+export async function open(options: OpenFileStoreOptions, requestOptions?: RequestOptions): Promise<FileDrive> {
+    const { signal } = operationOptions(requestOptions);
+    checkAbort(signal);
+    validateConnection(options, ['client', 'name', 'at']);
+    const { client, name, at } = options;
+    let fork: string | undefined;
+    if (at !== undefined) {
+        requireInput(keysOnly(at, ['fork']) && validName(at.fork, 52 - prefix.length) && at.fork !== main,
+            'Select a working fork by its name.');
+        fork = at.fork;
+    }
+    const stores = storesFor(client);
+    let selected = stores.get(name);
+    if (!selected) {
+        const handle = client.collection(name);
+        const response = await remote(() => handle.get(nativeOptions(signal)), 'Could not inspect the file store.', signal, { 404: 'STORE_NOT_FOUND' });
+        checkAbort(signal);
+        const collection = response?.collection;
+        if (collection?.collectionName !== name || collection.tags?.[formatTag] !== format
+            || collection.defaultBranchName !== main || !Object.entries(indexes).every(([field, config]) =>
+                collection.indexConfigs?.[field]?.type === config.type))
+            throw new MemDriveError('INCOMPATIBLE_STORE', 'The collection is not a compatible MemDrive file store.');
+        selected = stores.get(name) ?? store(handle, name);
+        stores.set(name, selected);
+    }
+    return fork === undefined ? selected.main : selected.openFork(fork, signal);
+}
+
+export const MemDrive = Object.freeze({ create, open });
