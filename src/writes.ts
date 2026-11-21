@@ -1,8 +1,8 @@
 import { editRequest, planEdit } from './edits.js';
 import { diffFiles } from './diff.js';
-import { checkAbort, databaseError, MemDriveError, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
+import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
 import { bytes, createRecords, fileOriginal, originalId, resultDocs, validFileId } from './records.js';
-import { afterId, branchRead, fetchOriginals, pathQuery, type Handle } from './storage-reads.js';
+import { afterId, branchRead, branchRef, fetchOriginals, pathQuery, type Handle } from './storage-reads.js';
 import type { CreateFileRequest, DeleteFileRequest, DeleteFileResult, DriveFile, MetadataSchema, RequestOptions, UpdateFileRequest,
     WriteFileRequest, WriteFileResult } from './types.js';
 
@@ -11,7 +11,6 @@ const maximumInputBytes = 300_000;
 const maximumRequestDocuments = 1000;
 export const writeBatchLimit = 100;
 const maximumCleanupBatches = 32;
-const mutationOptions = (signal?: AbortSignal) => ({ ...nativeOptions(signal), retries: { strategy: 'none' as const } });
 const knownRejected = new Set([400, 401, 403, 404, 413, 422, 429]);
 
 type Identity = { fileId: string; path?: string | undefined };
@@ -184,7 +183,7 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
                 pending.delete(uncertain);
             }
 
-            const originals = await fetchOriginals(handle, name, branch, targetIds, signal);
+            const originals = await fetchOriginals(handle, name, branchRef(branch), targetIds, signal);
             const plans: Plan[] = await Promise.all(inputs.map(input =>
                 input.op === 'create' ? input : planEdit(input, originals.get(input.fileId), schema)));
             const destinations = new Map<string, string>();
@@ -365,6 +364,21 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
     }
     return {
         write,
+        enqueueRef<T>(operation: () => Promise<T>, signal?: AbortSignal) {
+            return enqueue(async () => {
+                checkAbort(signal);
+                for (const unsettled of pending) {
+                    try { await confirm(unsettled.expected, signal); }
+                    catch (cause) {
+                        checkAbort(signal);
+                        throw new MemDriveError('WRITE_UNCONFIRMED', 'A source write is still unconfirmed. Inspect the fork before creating a reference.',
+                            { cause, details: { targets: unsettled.targets, stage: unsettled.stage } });
+                    }
+                    pending.delete(unsettled);
+                }
+                return operation();
+            });
+        },
         async diff(options?: RequestOptions) {
             const { signal } = operationOptions(options);
             checkAbort(signal);

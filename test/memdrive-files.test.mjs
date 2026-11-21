@@ -727,3 +727,137 @@ test('diff rejects invalid records, nonprogress and incomplete pages and recover
     assert.deepEqual(await work.diff(), [{ op: 'create', fileId: original.fileId, path: '/a' }]);
     await assert.rejects(work.diff({ limit: 1 }), { code: 'INVALID_INPUT' });
 });
+
+test('checkpoints reopen as read-only tag views and fork independent working state', async () => {
+    const fixture = fileClient();
+    const { client, calls, collections } = fixture;
+    const main = await create({ client, name: 'workspace' });
+    const work = await main.fork({ name: 'saved' });
+    const [file, deleted] = await work.write([request('/file.txt', 'before'), request('/removed.txt', 'remove')]);
+    const docs = collections.get('workspace').branches.get('fork-saved').docs;
+    docs.get(`file:${deleted.fileId}`).version = 'baseline-version';
+    delete docs.get(`file:${deleted.fileId}`).changed;
+    await work.write({ op: 'delete', fileId: deleted.fileId });
+    const saved = await work.checkpoint({ name: 'saved' });
+    assert.deepEqual(saved.at, { kind: 'checkpoint', name: 'saved' });
+    for (const method of ['write', 'diff']) assert.equal(method in saved, false);
+    assert.throws(() => { saved.at.name = 'changed'; }, TypeError);
+    assert.deepEqual(await saved.describe(), await work.describe());
+    assert.strictEqual(await open({ client, name: 'workspace', at: { checkpoint: 'saved' } }), saved);
+    assert.strictEqual(await open({ client, name: 'workspace', at: { fork: 'saved' } }), work);
+    const reopened = await open({ client: { ...client }, name: 'workspace', at: { checkpoint: 'saved' } });
+    assert.notEqual(reopened, saved);
+    assert(calls.some(call => call.kind === 'tag-get' && call.tagName === 'checkpoint-saved'));
+
+    await work.write({ op: 'update', fileId: file.fileId, content: 'after', newPath: '/after.txt' });
+    assert.equal(await reopened.read({ fileId: deleted.fileId }), null);
+    assert.deepEqual(await reopened.read({ fileId: file.fileId }), file);
+    assert.deepEqual(await reopened.read({ path: file.path }), file);
+    assert.deepEqual(await reopened.read({ paths: [file.path, '/after.txt'] }), [file]);
+    assert.deepEqual((await reopened.list()).files.map(entry => entry.fileId), [file.fileId]);
+    assert.deepEqual((await reopened.search({ query: 'before', rerank: false })).hits,
+        [{ ...file, range: { start: 0, end: file.content.length } }]);
+    const tagReads = calls.filter(call => call.request?.ref?.kind === 'tag');
+    assert(tagReads.some(call => call.kind === 'list' && !('consistentRead' in call.request)));
+    assert(tagReads.some(call => call.kind === 'fetch' && call.request.consistentRead === false));
+    assert(tagReads.some(call => call.kind === 'query' && call.request.consistentRead === false));
+    assert(tagReads.every(call => call.request.ref.name === 'checkpoint-saved'));
+
+    const copied = await saved.checkpoint({ name: 'copied' });
+    assert.deepEqual(await copied.read({ fileId: file.fileId }), file);
+    const child = await saved.fork({ name: 'child' });
+    const nested = await work.fork({ name: 'nested' });
+    assert.deepEqual(await child.read({ fileId: file.fileId }), file);
+    assert.equal(await child.read({ fileId: deleted.fileId }), null);
+    assert.equal((await nested.read({ fileId: file.fileId })).content, 'after');
+    assert.deepEqual((await child.diff()).find(change => change.fileId === deleted.fileId),
+        { op: 'delete', fileId: deleted.fileId, previousPath: deleted.path });
+    await child.write({ op: 'update', fileId: file.fileId, newPath: '/child.txt' });
+    assert.equal((await child.diff()).find(change => change.fileId === file.fileId).path, '/child.txt');
+    assert.equal((await work.read({ fileId: file.fileId })).path, '/after.txt');
+    assert.equal((await saved.read({ fileId: file.fileId })).path, file.path);
+    assert(calls.filter(call => ['tag-create', 'branch-create'].includes(call.kind)).every(call => call.retries.strategy === 'none'));
+    assert(calls.some(call => call.kind === 'branch-create' && call.request.source.kind === 'tag'));
+    assert(calls.some(call => call.kind === 'tag-create' && call.request.source.kind === 'tag'));
+});
+
+test('checkpoint names are store-scoped and absent or invalid lookups are not cached', async () => {
+    const fixture = fileClient();
+    const { client } = fixture;
+    const main = await create({ client, name: 'workspace' });
+    await assert.rejects(main.checkpoint({ name: 'saved' }), { code: 'CHECKPOINT_NOT_READY', status: 400 });
+    fixture.beforeTagCreate = () => { throw Object.assign(new Error('Different bad request'), { statusCode: 400 }); };
+    await assert.rejects(main.checkpoint({ name: 'saved' }), { code: 'DATABASE_ERROR', status: 400 });
+    fixture.beforeTagCreate = undefined;
+    await assert.rejects(open({ client, name: 'workspace', at: { fork: 'saved', checkpoint: 'saved' } }), { code: 'INVALID_INPUT' });
+    await assert.rejects(open({ client, name: 'workspace', at: { checkpoint: 'x'.repeat(42) } }), { code: 'INVALID_INPUT' });
+    await assert.rejects(open({ client, name: 'workspace', at: { checkpoint: 'saved' } }), { code: 'CHECKPOINT_NOT_FOUND' });
+    fixture.getTag = () => ({ tag: { name: 'checkpoint-saved' } });
+    await assert.rejects(open({ client, name: 'workspace', at: { checkpoint: 'saved' } }), { code: 'INVALID_RESULT' });
+    fixture.getTag = undefined;
+
+    const work = await main.fork({ name: 'research' });
+    await work.write(request('/file.txt'));
+    const saved = await work.checkpoint({ name: 'saved' });
+    assert.strictEqual(await open({ client, name: 'workspace', at: { checkpoint: 'saved' } }), saved);
+    await assert.rejects(work.checkpoint({ name: 'saved' }), { code: 'CHECKPOINT_CONFLICT' });
+    await assert.rejects(saved.fork({ name: 'research' }), { code: 'BRANCH_CONFLICT' });
+    await create({ client, name: 'another' });
+    await assert.rejects(open({ client, name: 'another', at: { checkpoint: 'saved' } }), { code: 'CHECKPOINT_NOT_FOUND' });
+});
+
+test('ref creation queues with writes and diff and protects against retries after a lost acknowledgement', async () => {
+    const fixture = fileClient();
+    const { client, calls } = fixture;
+    const main = await create({ client, name: 'workspace' });
+    const work = await main.fork({ name: 'research' });
+    let release;
+    const held = new Promise(resolve => { release = resolve; });
+    fixture.beforeUpsert = () => held;
+    const writing = work.write(request('/before.txt', 'before'));
+    const scanning = work.diff();
+    const captured = work.checkpoint({ name: 'queued' });
+    const child = work.fork({ name: 'child' });
+    const later = work.write(request('/later.txt', 'after'));
+    await new Promise(resolve => setImmediate(resolve));
+    assert(!calls.some(call => call.kind === 'tag-create' || call.request?.branchName === 'fork-child'));
+    fixture.beforeUpsert = undefined;
+    release();
+    const before = await writing;
+    assert.deepEqual(await scanning, [{ op: 'create', fileId: before.fileId, path: before.path }]);
+    const saved = await captured;
+    const branch = await child;
+    await later;
+    assert.deepEqual(await saved.read({ fileId: before.fileId }), before);
+    assert.equal(await branch.read({ path: '/later.txt' }), null);
+
+    fixture.afterTagCreate = () => { throw new Error('Response lost after acceptance'); };
+    await assert.rejects(work.checkpoint({ name: 'lost' }), { code: 'REF_CREATION_UNCONFIRMED' });
+    fixture.afterTagCreate = undefined;
+    await work.write(request('/later-again.txt'));
+    await assert.rejects(work.checkpoint({ name: 'lost' }), { code: 'REF_CREATION_UNCONFIRMED' });
+    assert.equal(calls.filter(call => call.request?.tagName === 'checkpoint-lost').length, 1);
+    const reopened = await open({ client, name: 'workspace', at: { checkpoint: 'lost' } });
+    assert.equal(await reopened.read({ path: '/later-again.txt' }), null);
+});
+
+test('working ref creation waits for an unconfirmed source mutation to settle', async () => {
+    const fixture = fileClient();
+    const { client, calls, collections } = fixture;
+    const main = await create({ client, name: 'workspace' });
+    const work = await main.fork({ name: 'research' });
+    const docs = collections.get('workspace').branches.get('fork-research').docs;
+    let settle;
+    fixture.beforeUpsert = request => {
+        settle = () => { for (const doc of request.docs) docs.set(doc.id, doc); };
+        throw new Error('Lost before confirmation');
+    };
+    await assert.rejects(work.write(request('/uncertain.txt')), { code: 'WRITE_UNCONFIRMED' });
+    await assert.rejects(work.checkpoint({ name: 'saved' }), { code: 'WRITE_UNCONFIRMED' });
+    await assert.rejects(work.fork({ name: 'child' }), { code: 'WRITE_UNCONFIRMED' });
+    assert.equal(calls.filter(call => call.kind === 'tag-create' || call.request?.branchName === 'fork-child').length, 0);
+    settle();
+    fixture.beforeUpsert = undefined;
+    const saved = await work.checkpoint({ name: 'saved' });
+    assert.equal((await saved.read({ path: '/uncertain.txt' })).content, '');
+});
