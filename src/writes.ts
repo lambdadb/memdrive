@@ -2,7 +2,7 @@ import { editRequest, planEdit } from './edits.js';
 import { diffFiles } from './diff.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
 import { bytes, createRecords, fileOriginal, originalId, resultDocs, validFileId } from './records.js';
-import { afterId, branchRead, branchRef, fetchOriginals, pathQuery, type Handle } from './storage-reads.js';
+import { afterId, branchRead, branchRef, fetchOriginals, pathQuery, viewRead, type Handle, type ViewRef } from './storage-reads.js';
 import type { CreateFileRequest, DeleteFileRequest, DeleteFileResult, DriveFile, MetadataSchema, RequestOptions, UpdateFileRequest,
     WriteFileRequest, WriteFileResult } from './types.js';
 
@@ -26,7 +26,7 @@ type Pending = {
     stage: Stage;
 };
 
-function writeBatches(records: { docs: WriteRecord[] }[], branch: string): WriteRecord[][] {
+export function writeBatches(records: { docs: WriteRecord[] }[], branch: string): WriteRecord[][] {
     const envelope = bytes({ docs: [], branch });
     const batches: WriteRecord[][] = [];
     let batch: WriteRecord[] = [];
@@ -79,14 +79,68 @@ const generationPattern = (fileId: string, generation?: string) =>
     `${chunkIdBase(fileId)}[0-9a-f]{64}:[0-9]+${generation ? `:${generation}` : ''}`;
 const chunkFields = { include: ['id', 'kind', 'fileId'] };
 
+export async function listChunkIds(handle: Handle, name: string, ref: ViewRef, fileId: string,
+    selection: 'all' | { generation: string | undefined }, signal?: AbortSignal) {
+    const pattern = selection === 'all'
+        ? `${generationPattern(fileId)}(:[0-9a-f-]+)?`
+        : generationPattern(fileId, selection.generation);
+    const active = new RegExp(`^${pattern}$`);
+    const match = { queryString: { query: `/${pattern}/`, defaultField: 'id' }, occur: 'filter' };
+    const ids: string[] = [];
+    let after: string | undefined;
+    for (let page = 0; page <= maximumCleanupBatches; page++) {
+        let response;
+        try {
+            response = await nativeRequest(() => handle.query({ ...viewRead(ref), size: maximumRequestDocuments,
+                fields: chunkFields, sort: [{ id: 'asc' }], query: { bool: [chunkKind, match, ...afterId(after)] },
+            }, nativeOptions(signal)), signal);
+        } catch (cause) {
+            throw databaseError(cause, 'Could not read the file’s current chunk IDs.');
+        }
+        checkAbort(signal);
+        const docs = resultDocs(response, name, maximumRequestDocuments);
+        if (response.isDocsInline !== true || response.total !== docs.length)
+            throw new MemDriveError('INVALID_RESULT', 'Current chunk lookup returned an incomplete page.');
+        if (page === maximumCleanupBatches && docs.length)
+            throw new MemDriveError('CHUNK_SCAN_LIMIT', 'Current chunk lookup exceeded the supported number of pages.');
+        for (const doc of docs) {
+            if (doc.kind !== 'chunk' || doc.fileId !== fileId || typeof doc.id !== 'string' || !active.test(doc.id)
+                || (after !== undefined && doc.id <= after))
+                throw new MemDriveError('INVALID_RESULT', 'Current chunk lookup returned an unexpected or unordered record.');
+            ids.push(doc.id);
+            after = doc.id;
+        }
+        if (docs.length < maximumRequestDocuments) return ids;
+    }
+    throw new MemDriveError('CHUNK_SCAN_LIMIT', 'Current chunk lookup exceeded the supported number of pages.');
+}
+
 export function workingWriter(handle: Handle, name: string, branch: string, schema: MetadataSchema) {
     let queue = Promise.resolve();
+    let userBarrier: Promise<void> | undefined;
+
+    function deferUserOperations(until: Promise<unknown>) {
+        const barrier = until.then(() => undefined, () => undefined);
+        userBarrier = barrier;
+        void barrier.then(() => {
+            if (userBarrier === barrier) userBarrier = undefined;
+        });
+    }
+
+    function enqueueUser<T>(schedule: () => Promise<T>) {
+        return userBarrier ? userBarrier.then(schedule) : schedule();
+    }
     function enqueue<T>(operation: () => Promise<T>): Promise<T> {
         const result = queue.then(operation);
         queue = result.then(() => undefined, () => undefined);
         return result;
     }
     const pending = new Set<Pending>();
+    let baselineUnconfirmed: MemDriveError | undefined;
+
+    function requireBaselineSettled() {
+        if (baselineUnconfirmed) throw baselineUnconfirmed;
+    }
     const branchSettings = branchRead(branch);
 
     async function confirm(expected: Expected, signal?: AbortSignal) {
@@ -113,39 +167,6 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
         if (originals.size) throw new MemDriveError('INVALID_RESULT', 'The written file or complete chunk set was not confirmed.');
     }
 
-    async function currentChunkIds(fileId: string, generation: string | undefined, signal?: AbortSignal) {
-        const pattern = generationPattern(fileId, generation);
-        const active = new RegExp(`^${pattern}$`);
-        const match = { queryString: { query: `/${pattern}/`, defaultField: 'id' }, occur: 'filter' };
-        const ids: string[] = [];
-        let after: string | undefined;
-        for (let page = 0; page <= maximumCleanupBatches; page++) {
-            let response;
-            try {
-                response = await nativeRequest(() => handle.query({ ...branchSettings, size: maximumRequestDocuments,
-                    fields: chunkFields, sort: [{ id: 'asc' }], query: { bool: [chunkKind, match, ...afterId(after)] },
-                }, nativeOptions(signal)), signal);
-            } catch (cause) {
-                throw databaseError(cause, 'Could not read the file’s current chunk IDs.');
-            }
-            checkAbort(signal);
-            const docs = resultDocs(response, name, maximumRequestDocuments);
-            if (response.isDocsInline !== true || response.total !== docs.length)
-                throw new MemDriveError('INVALID_RESULT', 'Current chunk lookup returned an incomplete page.');
-            if (page === maximumCleanupBatches && docs.length)
-                throw new MemDriveError('CHUNK_SCAN_LIMIT', 'Current chunk lookup exceeded the supported number of pages.');
-            for (const doc of docs) {
-                if (doc.kind !== 'chunk' || doc.fileId !== fileId || typeof doc.id !== 'string' || !active.test(doc.id)
-                    || (after !== undefined && doc.id <= after))
-                    throw new MemDriveError('INVALID_RESULT', 'Current chunk lookup returned an unexpected or unordered record.');
-                ids.push(doc.id);
-                after = doc.id;
-            }
-            if (docs.length < maximumRequestDocuments) return ids;
-        }
-        throw new MemDriveError('CHUNK_SCAN_LIMIT', 'Current chunk lookup exceeded the supported number of pages.');
-    }
-
     function write(request: CreateFileRequest | UpdateFileRequest, options?: RequestOptions): Promise<DriveFile>;
     function write(request: DeleteFileRequest, options?: RequestOptions): Promise<DeleteFileResult>;
     function write(request: WriteFileRequest, options?: RequestOptions): Promise<WriteFileResult>;
@@ -161,8 +182,9 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
             ? { op: 'create' as const, records: await createRecords(operation, schema) }
             : editRequest(operation, schema)));
         void prepared.catch(() => {});
-        return enqueue(async () => {
+        return enqueueUser(() => enqueue(async () => {
             checkAbort(signal);
+            requireBaselineSettled();
             const inputs = await prepared;
             const targetIds = inputs.flatMap(input => input.op === 'create' ? [] : [input.fileId]);
             requireInput(new Set(targetIds).size === targetIds.length, 'Target file IDs must be distinct within one write.');
@@ -228,7 +250,7 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
                     let batches: WriteRecord[][] = [];
                     if (plan.op === 'update') {
                         if (plan.moveOnly) {
-                            const ids = await currentChunkIds(plan.file.fileId, plan.generation, signal);
+                            const ids = await listChunkIds(handle, name, branchRef(branch), plan.file.fileId, { generation: plan.generation }, signal);
                             if (!ids.length && plan.file.content.trim())
                                 throw new MemDriveError('INVALID_RESULT', 'The nonempty file has no visible chunks in its current generation.');
                             batches = writeBatches([moveRecords(plan.original, ids)], branch);
@@ -360,11 +382,12 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
                 }
             }
             return multi ? completed : completed[0]!;
-        });
+        }));
     }
     function enqueueCapture<T>(operation: (source: string, confirmSource: () => Promise<void>) => Promise<T>, signal?: AbortSignal) {
         return enqueue(async () => {
             checkAbort(signal);
+            requireBaselineSettled();
             return operation(branch, async () => {
                 for (const unsettled of pending) {
                     try { await confirm(unsettled.expected, signal); }
@@ -382,16 +405,29 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
     return {
         write,
         enqueueCapture,
+        deferUserOperations,
         enqueueRef<T>(operation: () => Promise<T>, signal?: AbortSignal) {
-            return enqueueCapture(async (_source, confirmSource) => {
+            return enqueueUser(() => enqueueCapture(async (_source, confirmSource) => {
                 await confirmSource();
                 return operation();
+            }, signal));
+        },
+        enqueueBaseline(operation: (branch: string) => Promise<void>, signal?: AbortSignal) {
+            return enqueueCapture(async (source, confirmSource) => {
+                await confirmSource();
+                try {
+                    await operation(source);
+                } catch (error) {
+                    if (error instanceof MemDriveError && error.code === 'MERGE_MUTATION_UNCONFIRMED')
+                        baselineUnconfirmed = error;
+                    throw error;
+                }
             }, signal);
         },
         async diff(options?: RequestOptions) {
             const { signal } = operationOptions(options);
             checkAbort(signal);
-            return enqueue(() => diffFiles(handle, name, branch, signal));
+            return enqueueUser(() => enqueue(() => diffFiles(handle, name, branch, signal)));
         },
     };
 }

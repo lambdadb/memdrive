@@ -21,12 +21,15 @@ export function nativeFixture() {
             collections.delete(name);
             return response({ message: 'deleted' });
         }
+        const branch = name => {
+            const numDocs = branches.get(name).docs.size;
+            return { name, parentBranch: null, headSnapshot: numDocs ? { snapshotId: 'synthetic', snapshotCommittedAt: 0 } : null,
+                parentSnapshot: null, createdAt: 0, dataUpdatedAt: numDocs ? 0 : null, numDocs, indexConfigs: collection.indexConfigs };
+        };
+        const branchName = /\/branches\/([^/]+)$/.exec(pathname)?.[1];
+        if (branchName && options.method === 'GET')
+            return branches.has(branchName) ? response({ branch: branch(branchName) }) : response({ message: 'not found' }, 404);
         if (pathname.endsWith('/branches')) {
-            const branch = name => {
-                const numDocs = branches.get(name).docs.size;
-                return { name, parentBranch: null, headSnapshot: numDocs ? { snapshotId: 'synthetic', snapshotCommittedAt: 0 } : null,
-                    parentSnapshot: null, createdAt: 0, dataUpdatedAt: numDocs ? 0 : null, numDocs, indexConfigs: collection.indexConfigs };
-            };
             if (options.method === 'GET') return response({ branches: [...branches.keys()].map(branch) });
             const { branchName, source } = body;
             branches.set(branchName, { docs: new Map(branches.get(source.name).docs) });

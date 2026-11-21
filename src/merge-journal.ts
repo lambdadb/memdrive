@@ -1,12 +1,14 @@
 import { keysOnly } from './config.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, requireInput } from './errors.js';
+import { changedFiles } from './diff.js';
 import { captureMergeSource, confirmedMergeSource, type MergeSource } from './merge-preflight.js';
+import { awaitMergeTag } from './refs.js';
 import { contentHash, resultDocs, validFileId, validText } from './records.js';
-import { branchRead, type Handle } from './storage-reads.js';
+import { branchRead, branchRef, type Handle } from './storage-reads.js';
 import type { workingWriter } from './writes.js';
 
 type CaptureRequest = { requestId: string; branch: string; summary: string };
-type Binding = CaptureRequest & { id: string; driveId: string; kind: 'merge-capture-v1'; fingerprint: string; tag: string };
+type Binding = CaptureRequest & { id: string; driveId: string; kind: 'merge-capture-v1'; fingerprint: string; tag: string | null };
 
 const capturePrefix = 'merge-capture-';
 const captureKind = 'merge-capture-v1';
@@ -36,7 +38,7 @@ async function readBinding(handle: Handle, collection: string, driveId: string, 
     const { kind, requestId, branch, summary, fingerprint, tag } = doc;
     if (doc.id !== id || kind !== captureKind || doc.driveId !== driveId || !validRequestId(requestId)
         || !validBranch(branch) || !validSummary(summary) || fingerprint !== await fingerprintOf(branch, summary)
-        || typeof tag !== 'string' || !tag.startsWith(capturePrefix) || !validFileId(tag.slice(capturePrefix.length)))
+        || (tag !== null && (typeof tag !== 'string' || !tag.startsWith(capturePrefix) || !validFileId(tag.slice(capturePrefix.length)))))
         throw new MemDriveError('INVALID_RESULT', 'Read returned an invalid merge capture binding.');
     return { id, kind, driveId, requestId, branch, summary, fingerprint, tag };
 }
@@ -49,7 +51,8 @@ async function readBinding(handle: Handle, collection: string, driveId: string, 
  * must reserve the capture namespace, retain bound tags and avoid reusing
  * source branch names while their requests are retained.
  */
-export function mergeCaptureJournal(content: Handle, internal: Handle, collection: { name: string; driveId: string }) {
+export function mergeCaptureJournal(content: Handle, internal: Handle, collection: { name: string; driveId: string },
+    { captureEmpty = false } = {}) {
     const { name, driveId } = collection;
     requireInput(internal.collectionName === name && content.collectionName !== name
         && /^[A-Za-z0-9_-]{3,52}$/.test(name) && validRequestId(driveId),
@@ -57,7 +60,9 @@ export function mergeCaptureJournal(content: Handle, internal: Handle, collectio
     const pending = new Map<string, Binding>();
     let tail = Promise.resolve();
 
-    return function capture(request: CaptureRequest, enqueueSource: ReturnType<typeof workingWriter>['enqueueCapture'], signal?: AbortSignal): Promise<MergeSource> {
+    const sourceFor = (tag: string | null): MergeSource | null => tag === null ? null : confirmedMergeSource(content, tag);
+    return function capture(request: CaptureRequest, enqueueSource: ReturnType<typeof workingWriter>['enqueueCapture'],
+        signal?: AbortSignal): Promise<MergeSource | null> {
         checkAbort(signal);
         requireInput(keysOnly(request, ['requestId', 'branch', 'summary']) && validRequestId(request.requestId)
             && validBranch(request.branch) && validSummary(request.summary), 'Provide a merge request ID, working branch and summary.');
@@ -78,16 +83,25 @@ export function mergeCaptureJournal(content: Handle, internal: Handle, collectio
                     throw new MemDriveError('MERGE_REQUEST_CONFLICT', 'The merge request ID is already bound to different input.', { details: { requestId } });
                 if (existing) {
                     pending.delete(id);
-                    return confirmedMergeSource(content, existing.tag);
+                    return sourceFor(existing.tag);
                 }
 
                 let binding = uncertain;
                 if (!binding) {
                     await confirmSource();
-                    const tag = capturePrefix + globalThis.crypto.randomUUID();
+                    const source = branchRef(branch);
+                    let tag: string | null = null;
+                    const changes = captureEmpty ? changedFiles(content, content.collectionName, source, signal) : undefined;
+                    const first = await changes?.next();
+                    await changes?.return(undefined);
+                    if (!first?.done) {
+                        tag = capturePrefix + globalThis.crypto.randomUUID();
+                        const tagName = tag;
+                        const pin = () => captureMergeSource(content, source, tagName, operation => operation(), new Set(), signal);
+                        if (captureEmpty) await awaitMergeTag(pin, 'source', signal);
+                        else await pin();
+                    }
                     const fingerprint = await fingerprintOf(branch, summary);
-                    await captureMergeSource(content, { kind: 'branch', name: branch }, tag,
-                        operation => operation(), new Set(), signal);
                     binding = { id, kind: captureKind, driveId, requestId, branch, summary, fingerprint, tag };
                 }
                 checkAbort(signal);
@@ -108,7 +122,7 @@ export function mergeCaptureJournal(content: Handle, internal: Handle, collectio
                 }
                 if (!sameBinding(confirmed, binding)) throw unconfirmed(cause);
                 pending.delete(id);
-                return confirmedMergeSource(content, binding.tag);
+                return sourceFor(binding.tag);
             });
             tail = result.then(() => undefined, () => undefined);
             return result;

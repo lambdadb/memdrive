@@ -12,9 +12,10 @@ export interface RequestOptions {
 export type ForkSelection = { fork: string; checkpoint?: never };
 export type CheckpointSelection = { checkpoint: string; fork?: never };
 
-export interface OpenFileStoreOptions extends ConnectionOptions {
-    at?: ForkSelection | CheckpointSelection | undefined;
-}
+export type OpenFileStoreOptions = ConnectionOptions & (
+    { at?: undefined; recover?: boolean | undefined }
+    | { at: ForkSelection | CheckpointSelection; recover?: never }
+);
 
 export interface FileListEntry {
     fileId: string;
@@ -105,8 +106,20 @@ export type FileChange =
     | { op: 'update'; fileId: string; path: string; previousPath?: string | undefined }
     | { op: 'delete'; fileId: string; previousPath: string };
 
+export interface MergeRequest {
+    requestId: string;
+    summary: string;
+}
+
+export interface MergeResult {
+    requestId: string;
+    status: 'published' | 'unchanged';
+    version: string;
+}
+
 export interface WorkingFileDrive extends FileView {
     readonly at: { readonly kind: 'fork'; readonly name: string };
+    merge(request: MergeRequest, options?: RequestOptions): Promise<MergeResult>;
     diff(options?: RequestOptions): Promise<FileChange[]>;
     write(request: CreateFileRequest | UpdateFileRequest, options?: RequestOptions): Promise<DriveFile>;
     write(request: DeleteFileRequest, options?: RequestOptions): Promise<DeleteFileResult>;

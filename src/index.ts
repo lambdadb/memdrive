@@ -1,14 +1,16 @@
 import type { CheckpointFileDrive, CheckpointSelection, ConnectionOptions, CreateFileStoreOptions, ForkSelection, DriveFile, FileDrive, FileSearchHit,
-    FileStoreDescription, MainFileDrive, OpenFileStoreOptions, ReadFileRequest, RequestOptions, SearchFilesRequest,
+    FileStoreDescription, MainFileDrive, MergeRequest, OpenFileStoreOptions, ReadFileRequest, RequestOptions, SearchFilesRequest,
     WorkingFileDrive } from './types.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
 import { keysOnly, parseStore, storeConfiguration } from './config.js';
 import { decodeFile, resultDocs, validFileId, validPath } from './records.js';
-import { branchRef, fetchOriginals, pathQuery, viewRead, type Handle, type ViewRef } from './storage-reads.js';
+import { branchRef, fetchOriginals, pathQuery, pinRef, readRef, viewRead, type Handle, type RefSource } from './storage-reads.js';
 import { workingWriter, writeBatchLimit } from './writes.js';
 import { searchQuery, validateReranking } from './search.js';
 import { fileLister } from './list.js';
 import { createRef } from './refs.js';
+import { publicationIdentity, validateMergeRequest } from './publication-log.js';
+import { publication } from './publication.js';
 export type * from './types.js';
 export { MemDriveError } from './errors.js';
 
@@ -39,11 +41,20 @@ async function remote<T>(operation: () => Promise<T>, message: string, signal?: 
 }
 
 type Store = ReturnType<typeof store>;
-function store(handle: Handle, description: FileStoreDescription) {
+function store(client: Client, handle: Handle, description: FileStoreDescription, identity: Awaited<ReturnType<typeof publicationIdentity>>) {
     const { name, metadataSchema } = description;
     const forks = new Map<string, WorkingFileDrive>();
     const checkpoints = new Map<string, CheckpointFileDrive>();
     const pendingRefs = new Set<string>();
+    const writers = new Map<string, ReturnType<typeof workingWriter>>();
+    function writerFor(branch: string) {
+        const existing = writers.get(branch);
+        if (existing) return existing;
+        const writer = workingWriter(handle, name, branch, metadataSchema);
+        writers.set(branch, writer);
+        return writer;
+    }
+    const publishing = publication(client, handle, identity, metadataSchema, writerFor);
 
     async function describe(options?: RequestOptions) {
         const { signal } = operationOptions(options);
@@ -51,7 +62,7 @@ function store(handle: Handle, description: FileStoreDescription) {
         return structuredClone(description);
     }
 
-    function reader(ref: ViewRef) {
+    function reader(source: RefSource) {
         function read(request: ReadFileRequest, options?: RequestOptions): Promise<DriveFile | null>;
         function read(request: { paths: string[] }, options?: RequestOptions): Promise<DriveFile[]>;
         async function read(request: ReadFileRequest | { paths: string[] }, options?: RequestOptions) {
@@ -62,72 +73,78 @@ function store(handle: Handle, description: FileStoreDescription) {
             if ('fileId' in request) {
                 const fileId = request.fileId;
                 requireInput(validFileId(fileId), 'Provide a fileId returned by MemDrive.');
-                const doc = (await fetchOriginals(handle, name, ref, [fileId], signal)).get(fileId);
-                return doc?.kind === 'file' ? decodeFile(doc, metadataSchema) : null;
+                return readRef(source, async ref => {
+                    const doc = (await fetchOriginals(handle, name, ref, [fileId], signal)).get(fileId);
+                    return doc?.kind === 'file' ? decodeFile(doc, metadataSchema) : null;
+                }, signal);
             }
             const multi = 'paths' in request;
             const value = multi ? request.paths : [request.path];
             requireInput(Array.isArray(value) && value.length >= 1 && value.length <= writeBatchLimit && [...value].every(validPath)
                 && new Set(value).size === value.length, 'Provide 1–100 distinct valid absolute file paths.');
             const paths: string[] = [...value];
-            const response = await remote(() => handle.query({ size: paths.length * 2, ...viewRead(ref), query: pathQuery(paths) },
-                nativeOptions(signal)), 'Could not read files by path.', signal);
-            checkAbort(signal);
-            const expected = new Set(paths), files = new Map<string, DriveFile>();
-            for (const doc of resultDocs(response, name, paths.length)) {
-                const file = decodeFile(doc, metadataSchema);
-                if (!expected.has(file.path) || files.has(file.path))
-                    throw new MemDriveError('INVALID_RESULT', 'Read returned unexpected or duplicate paths.');
-                files.set(file.path, file);
-            }
-            return multi ? paths.flatMap(path => files.has(path) ? [files.get(path)!] : []) : files.get(paths[0]!) ?? null;
+            return readRef(source, async ref => {
+                const response = await remote(() => handle.query({ size: paths.length * 2, ...viewRead(ref), query: pathQuery(paths) },
+                    nativeOptions(signal)), 'Could not read files by path.', signal);
+                checkAbort(signal);
+                const expected = new Set(paths), files = new Map<string, DriveFile>();
+                for (const doc of resultDocs(response, name, paths.length)) {
+                    const file = decodeFile(doc, metadataSchema);
+                    if (!expected.has(file.path) || files.has(file.path))
+                        throw new MemDriveError('INVALID_RESULT', 'Read returned unexpected or duplicate paths.');
+                    files.set(file.path, file);
+                }
+                return multi ? paths.flatMap(path => files.has(path) ? [files.get(path)!] : []) : files.get(paths[0]!) ?? null;
+            }, signal);
         }
         return read;
     }
 
-    function searcher(ref: ViewRef) {
+    function searcher(source: RefSource) {
         return async (request: SearchFilesRequest, options?: RequestOptions) => {
             const { signal } = operationOptions(options);
             checkAbort(signal);
             const body = searchQuery(request, metadataSchema);
-            const response = await remote(() => handle.query({ ...body, ...viewRead(ref),
-                fields: { include: ['id', 'kind', 'fileId', 'path', 'modifiedAt', 'content', 'start', 'end', 'revision'] } },
-            nativeOptions(signal)), 'File search failed.', signal);
-            checkAbort(signal);
-            const docs = resultDocs(response, name, body.size!);
-            const reranked = validateReranking(response, body);
-            const fileIds = new Set<string>(), chunkIds = new Set<string>();
-            const chunks = docs.map(doc => {
-                if (doc.kind !== 'chunk' || !validFileId(doc.fileId) || typeof doc.id !== 'string'
-                    || !doc.id.startsWith(`chunk:${doc.fileId}:`) || chunkIds.has(doc.id) || !validPath(doc.path)
-                    || typeof doc.content !== 'string' || !doc.content.trim() || /\p{Surrogate}/u.test(doc.content))
-                    throw new MemDriveError('INVALID_RESULT', 'Search returned an invalid or duplicate chunk.');
-                fileIds.add(doc.fileId);
-                chunkIds.add(doc.id);
-                return { fileId: doc.fileId, path: doc.path, modifiedAt: doc.modifiedAt, content: doc.content,
-                    start: doc.start, end: doc.end, revision: doc.revision };
-            });
-            if (!chunks.length) return { hits: [], reranked };
-            const originals = await fetchOriginals(handle, name, ref, [...fileIds], signal);
-            const files = new Map([...originals].flatMap(([id, doc]) => doc.kind === 'file' ? [[id, decodeFile(doc, metadataSchema)] as const] : []));
-            const hits: FileSearchHit[] = [];
-            for (const chunk of chunks) {
-                const file = files.get(chunk.fileId);
-                // An orphan or stale chunk must not expose body text from another file or revision.
-                if (!file || file.path !== chunk.path || file.modifiedAt !== chunk.modifiedAt || originals.get(chunk.fileId)?.revision !== chunk.revision) continue;
-                const { start, end } = chunk;
-                const verified = typeof start === 'number' && typeof end === 'number'
-                    && Number.isSafeInteger(start) && Number.isSafeInteger(end) && start >= 0 && end > start && end <= file.content.length
-                    && file.content.slice(start, end) === chunk.content;
-                hits.push({ ...file, content: chunk.content, ...(verified ? { range: { start, end } } : {}) });
-            }
-            return { hits, reranked };
+            return readRef(source, async ref => {
+                const response = await remote(() => handle.query({ ...body, ...viewRead(ref),
+                    fields: { include: ['id', 'kind', 'fileId', 'path', 'modifiedAt', 'content', 'start', 'end', 'revision'] } },
+                nativeOptions(signal)), 'File search failed.', signal);
+                checkAbort(signal);
+                const docs = resultDocs(response, name, body.size!);
+                const reranked = validateReranking(response, body);
+                const fileIds = new Set<string>(), chunkIds = new Set<string>();
+                const chunks = docs.map(doc => {
+                    if (doc.kind !== 'chunk' || !validFileId(doc.fileId) || typeof doc.id !== 'string'
+                        || !doc.id.startsWith(`chunk:${doc.fileId}:`) || chunkIds.has(doc.id) || !validPath(doc.path)
+                        || typeof doc.content !== 'string' || !doc.content.trim() || /\p{Surrogate}/u.test(doc.content))
+                        throw new MemDriveError('INVALID_RESULT', 'Search returned an invalid or duplicate chunk.');
+                    fileIds.add(doc.fileId);
+                    chunkIds.add(doc.id);
+                    return { fileId: doc.fileId, path: doc.path, modifiedAt: doc.modifiedAt, content: doc.content,
+                        start: doc.start, end: doc.end, revision: doc.revision };
+                });
+                if (!chunks.length) return { hits: [], reranked };
+                const originals = await fetchOriginals(handle, name, ref, [...fileIds], signal);
+                const files = new Map([...originals].flatMap(([id, doc]) => doc.kind === 'file' ? [[id, decodeFile(doc, metadataSchema)] as const] : []));
+                const hits: FileSearchHit[] = [];
+                for (const chunk of chunks) {
+                    const file = files.get(chunk.fileId);
+                    // An orphan or stale chunk must not expose body text from another file or revision.
+                    if (!file || file.path !== chunk.path || file.modifiedAt !== chunk.modifiedAt || originals.get(chunk.fileId)?.revision !== chunk.revision) continue;
+                    const { start, end } = chunk;
+                    const verified = typeof start === 'number' && typeof end === 'number'
+                        && Number.isSafeInteger(start) && Number.isSafeInteger(end) && start >= 0 && end > start && end <= file.content.length
+                        && file.content.slice(start, end) === chunk.content;
+                    hits.push({ ...file, content: chunk.content, ...(verified ? { range: { start, end } } : {}) });
+                }
+                return { hits, reranked };
+            }, signal);
         };
     }
 
-    function view(ref: ViewRef, enqueueRef?: <T>(operation: () => Promise<T>, signal?: AbortSignal) => Promise<T>) {
+    function view(source: RefSource, enqueueRef?: <T>(operation: () => Promise<T>, signal?: AbortSignal) => Promise<T>) {
         return {
-            name, read: reader(ref), search: searcher(ref), list: fileLister(handle, name, ref, metadataSchema), describe,
+            name, read: reader(source), search: searcher(source), list: fileLister(handle, name, source, metadataSchema), describe,
             async fork(request: { name: string }, options?: RequestOptions) {
                 const { signal } = operationOptions(options);
                 checkAbort(signal);
@@ -136,6 +153,7 @@ function store(handle: Handle, description: FileStoreDescription) {
                 const fork = request.name;
                 const branchName = forkPrefix + fork;
                 const create = async () => {
+                    const ref = await pinRef(source, signal);
                     await createRef(pendingRefs, { kind: 'fork', name: fork }, signal,
                         () => handle.branches.create({ branchName, source: ref }, mutationOptions(signal)),
                         response => response?.branch?.name === branchName);
@@ -151,6 +169,7 @@ function store(handle: Handle, description: FileStoreDescription) {
                 const checkpoint = request.name;
                 const tagName = checkpointPrefix + checkpoint;
                 const create = async () => {
+                    const ref = await pinRef(source, signal);
                     await createRef(pendingRefs, { kind: 'checkpoint', name: checkpoint }, signal,
                         () => handle.tags.create({ tagName, source: ref }, mutationOptions(signal)),
                         response => response?.tag?.name === tagName);
@@ -165,9 +184,17 @@ function store(handle: Handle, description: FileStoreDescription) {
         const existing = forks.get(fork);
         if (existing) return existing;
         const branch = forkPrefix + fork;
-        const { enqueueRef, enqueueCapture: _enqueueCapture, ...writer } = workingWriter(handle, name, branch, metadataSchema);
+        const writer = writerFor(branch);
+        const { enqueueRef, write, diff } = writer;
         const drive: WorkingFileDrive = Object.freeze({
-            ...view(branchRef(branch), enqueueRef), at: Object.freeze({ kind: 'fork' as const, name: fork }), ...writer,
+            ...view(branchRef(branch), enqueueRef), at: Object.freeze({ kind: 'fork' as const, name: fork }), write, diff,
+            merge(request: MergeRequest, options?: RequestOptions) {
+                const { signal } = operationOptions(options);
+                checkAbort(signal);
+                validateMergeRequest(request);
+                const bound = { requestId: request.requestId, summary: request.summary, branch };
+                return publishing.merge(bound, writer, signal);
+            },
         });
         forks.set(fork, drive);
         return drive;
@@ -185,11 +212,13 @@ function store(handle: Handle, description: FileStoreDescription) {
     }
 
     const mainView: MainFileDrive = Object.freeze({
-        ...view(branchRef(main)), at: Object.freeze({ kind: 'main' as const }),
+        ...view(publishing.main), at: Object.freeze({ kind: 'main' as const }),
     });
 
     return {
         main: mainView,
+        recover: publishing.recover,
+        initialize: publishing.initialize,
         async openFork(fork: string, signal?: AbortSignal) {
             const cached = forks.get(fork);
             if (cached) return cached;
@@ -232,24 +261,29 @@ export async function create(options: CreateFileStoreOptions, requestOptions?: R
     const { client, name } = options;
     requireInput(typeof client.createCollection === 'function', 'Client must support collection creation.');
     const { indexConfigs, tags, description } = storeConfiguration(options);
-    await remote(() => client.createCollection({ collectionName: name, indexConfigs, tags },
+    const response = await remote(() => client.createCollection({ collectionName: name, indexConfigs, tags },
         nativeOptions(signal)), 'Could not create the file store.', signal, { 409: 'STORE_EXISTS' });
     checkAbort(signal);
     const stores = storesFor(client);
-    const created = stores.get(name) ?? store(client.collection(name), description);
+    const identity = await publicationIdentity(name, response.collection);
+    checkAbort(signal);
+    const created = stores.get(name) ?? store(client, client.collection(name), description, identity);
     stores.set(name, created);
+    await created.initialize(signal);
     return created.main;
 }
 
-export function open(options: ConnectionOptions & { at?: undefined }, requestOptions?: RequestOptions): Promise<MainFileDrive>;
+export function open(options: ConnectionOptions & { at?: undefined; recover?: boolean | undefined }, requestOptions?: RequestOptions): Promise<MainFileDrive>;
 export function open(options: ConnectionOptions & { at: ForkSelection }, requestOptions?: RequestOptions): Promise<WorkingFileDrive>;
 export function open(options: ConnectionOptions & { at: CheckpointSelection }, requestOptions?: RequestOptions): Promise<CheckpointFileDrive>;
 export function open(options: OpenFileStoreOptions, requestOptions?: RequestOptions): Promise<FileDrive>;
 export async function open(options: OpenFileStoreOptions, requestOptions?: RequestOptions): Promise<FileDrive> {
     const { signal } = operationOptions(requestOptions);
     checkAbort(signal);
-    validateConnection(options, ['client', 'name', 'at']);
-    const { client, name, at } = options;
+    validateConnection(options, ['client', 'name', 'at', 'recover']);
+    const { client, name, at, recover } = options;
+    requireInput(recover === undefined || at === undefined && typeof recover === 'boolean',
+        'Recovery can be requested when opening main.');
     let fork: string | undefined;
     let checkpoint: string | undefined;
     if (at !== undefined) {
@@ -270,11 +304,14 @@ export async function open(options: OpenFileStoreOptions, requestOptions?: Reque
         const response = await remote(() => handle.get(nativeOptions(signal)), 'Could not inspect the file store.', signal, { 404: 'STORE_NOT_FOUND' });
         checkAbort(signal);
         const description = parseStore(response?.collection, name);
-        selected = stores.get(name) ?? store(handle, description);
+        const identity = await publicationIdentity(name, response.collection);
+        checkAbort(signal);
+        selected = stores.get(name) ?? store(client, handle, description, identity);
         stores.set(name, selected);
     }
     if (fork !== undefined) return selected.openFork(fork, signal);
     if (checkpoint !== undefined) return selected.openCheckpoint(checkpoint, signal);
+    if (recover) await selected.recover(signal);
     return selected.main;
 }
 

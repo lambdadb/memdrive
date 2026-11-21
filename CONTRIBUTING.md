@@ -38,8 +38,10 @@ requires Node.js 24 and `LAMBDADB_BASE_URL`, `LAMBDADB_PROJECT_NAME` and
 `LAMBDADB_PROJECT_API_KEY` in the environment or a local `.env.local`. It creates
 and deletes one isolated test collection. Use a dedicated test project;
 missing settings fail rather than silently skipping. The publication workflow
-runs the live suite against the exact installed tarball. Document unperformed
-checks accurately.
+runs the live suite against the exact installed tarball. Set
+`MEMDRIVE_RUN_LIVE_MERGE_TESTS=1` to additionally run the opt-in public merge
+scenario, which owns and cleans up its content collection and merge journal.
+Document unperformed checks accurately.
 
 ## Versions and releases
 

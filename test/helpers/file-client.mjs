@@ -4,13 +4,20 @@ export function fileClient() {
     const calls = [];
     const fixture = { collections, calls };
     const fail = (statusCode, message) => { throw Object.assign(new Error(message), { statusCode }); };
+    const collectionResult = state => {
+        const collection = structuredClone(state.metadata);
+        collection.createdAt = new Date(collection.createdAt);
+        return { collection };
+    };
     const client = {
         async createCollection(request) {
             if (collections.has(request.collectionName)) fail(409, 'Collection already exists');
             collections.set(request.collectionName, {
-                metadata: structuredClone({ ...request, defaultBranchName: 'main' }),
+                metadata: structuredClone({ ...request, defaultBranchName: 'main', projectName: 'fixture',
+                    createdAt: new Date(collections.size + 1) }),
                 branches: new Map([['main', { docs: new Map() }]]), tags: new Map(),
             });
+            return collectionResult(collections.get(request.collectionName));
         },
         collection(name) {
             const state = () => collections.get(name) ?? fail(404, 'Collection missing');
@@ -25,12 +32,16 @@ export function fileClient() {
             })) });
             return {
                 collectionName: name,
-                async get() { return { collection: structuredClone(state().metadata) }; },
+                async get() { return collectionResult(state()); },
                 branches: {
                     async create({ branchName, source }, options) {
                         calls.push({ kind: 'branch-create', request: { branchName, source }, retries: options?.retries });
                         if (state().branches.has(branchName)) fail(409, 'Branch already exists');
                         state().branches.set(branchName, { docs: copyView(source) });
+                        return { branch: { name: branchName } };
+                    },
+                    async get(branchName) {
+                        if (!state().branches.has(branchName)) fail(404, 'Branch missing');
                         return { branch: { name: branchName } };
                     },
                     async list() {
@@ -67,8 +78,13 @@ export function fileClient() {
                         };
                         return native;
                     }
+                    const direct = request.query.queryString;
+                    if (direct?.defaultField === 'id' && direct.skipSyntax)
+                        return response(source.filter(doc => doc.id === direct.query).slice(0, request.size), request.fields);
+                    if (request.query.queryString?.defaultField === 'id' && request.query.queryString.skipSyntax)
+                        return response(source.filter(doc => doc.id === request.query.queryString.query).slice(0, request.size), request.fields);
                     const [kind, path, exclude] = request.query.bool;
-                    if (path.queryString?.defaultField === 'changed') {
+                    if (path?.queryString?.defaultField === 'changed') {
                         const overridden = await fixture.diffPage?.(request, options);
                         if (overridden !== undefined) return overridden;
                         const kinds = kind.bool.map(clause => JSON.parse(clause.queryString.query));
@@ -78,7 +94,7 @@ export function fileClient() {
                         docs.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
                         return response(docs.slice(0, request.size), request.fields);
                     }
-                    if (path.queryString?.defaultField === 'id') {
+                    if (path?.queryString?.defaultField === 'id' && path.queryString.query.startsWith('/')) {
                         const regex = clause => new RegExp(`^${clause.queryString.query.slice(1, -1)}$`);
                         const owned = regex(path);
                         const keep = exclude?.occur === 'must_not' ? regex(exclude) : undefined;
@@ -87,6 +103,17 @@ export function fileClient() {
                             && owned.test(doc.id) && !keep?.test(doc.id) && (after === undefined || doc.id > after));
                         if (request.sort?.[0]?.id === 'asc') selected.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
                         return response(selected.slice(0, request.size), request.fields);
+                    }
+                    if (request.sort?.[0]?.id === 'asc') {
+                        const docs = source.filter(doc => request.query.bool.every(({ queryString }) => {
+                            const { query, defaultField } = queryString;
+                            if (defaultField === 'kind') return doc.kind === JSON.parse(query);
+                            if (defaultField === 'id') return doc.id > /^\{(.+) TO \*\}$/.exec(query)[1];
+                            if (defaultField === 'ancestorPaths') return doc.ancestorPaths?.includes(JSON.parse(query));
+                            if (defaultField === 'fileName') return doc.fileName?.includes(query.slice(3, -3));
+                            throw new Error('Unexpected indexed list filter');
+                        })).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+                        return response(docs.slice(0, request.size), request.fields);
                     }
                     const overridden = await fixture.pathLookup?.(request, options);
                     if (overridden !== undefined) return overridden;
@@ -115,10 +142,12 @@ export function fileClient() {
                         calls.push({ kind: 'fetch', request: structuredClone(request) });
                         const docs = sourceDocs(request.ref);
                         const override = await fixture.beforeFetch?.(request, docs);
-                        return override ?? response(request.ids.map(id => docs.get(id)).filter(Boolean), request.fields);
+                        const selected = request.ids.map(id => docs.get(id)).filter(Boolean);
+                        return override ?? response(request.includeVectors ? selected.map(doc => doc.kind === 'chunk' && !doc.embedding
+                            ? { ...doc, embedding: new Array(1536).fill(1) } : doc) : selected, request.fields);
                     },
                     async upsert(request, options) {
-                        calls.push({ kind: 'upsert', request: structuredClone(request), retries: options?.retries });
+                        calls.push({ kind: 'upsert', collection: name, request: structuredClone(request), retries: options?.retries });
                         await fixture.beforeUpsert?.(request);
                         const docs = docsAt(request.branch);
                         for (const doc of request.docs) docs.set(doc.id, structuredClone(doc));
@@ -131,7 +160,7 @@ export function fileClient() {
                         for (const doc of request.docs) docs.set(doc.id, { ...docs.get(doc.id), ...structuredClone(doc) });
                     },
                     async delete(request, options) {
-                        calls.push({ kind: 'delete', request: structuredClone(request), retries: options?.retries });
+                        calls.push({ kind: 'delete', collection: name, request: structuredClone(request), retries: options?.retries });
                         const docs = docsAt(request.branch);
                         await fixture.beforeDelete?.(request, docs);
                         for (const id of request.ids) docs.delete(id);
