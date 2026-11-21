@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { create } from 'memdrive-memory-baseline';
 import { createTools } from 'memdrive-memory-baseline/tools';
-import { memdriveClient } from './helpers/memdrive-client.mjs';
+import { memoryBaselineClient } from './helpers/memory-baseline-client.mjs';
 import { prepareCase, timestamp, metadataSchema, packEvidence, evidenceMetrics, validateSpan, resultSpans, jsonHash } from '../benchmark/longmemeval/protocol.mjs';
 import { collectEvidence, canonicalToolDefinitions } from '../benchmark/longmemeval/agent.mjs';
 import { Journal, ingest, reuse, cleanup, readJSON } from '../benchmark/longmemeval/runtime.mjs';
@@ -14,7 +14,7 @@ const config = JSON.parse(await readFile(new URL('../benchmark/longmemeval/confi
 
 const textCount = text => text.length;
 async function toolsFor(prepared) {
-    const fixture = memdriveClient(); fixture.search = (_request, docs) => docs;
+    const fixture = memoryBaselineClient(); fixture.search = (_request, docs) => docs;
     const drive = await create({ client: fixture.client, name: 'benchmark_test', metadataSchema, textSearch: { analyzers: ['english'] } });
     await drive.remember({ mems: prepared.mems });
     return createTools({ drive });
@@ -263,7 +263,7 @@ test('aborted attempts record nondispatched receipts without counter gaps', asyn
 
 test('SDK collector adapter preserves known usage on malformed output and forwards cancellation', async () => {
     const { sdkCollector, sdkDefinitions } = await import('../benchmark/longmemeval/sdk-agent.mjs');
-    const prepared = prepareCase(row(), config), fixture = memdriveClient();
+    const prepared = prepareCase(row(), config), fixture = memoryBaselineClient();
     const drive = await create({ client: fixture.client, name: 'adapter_test', metadataSchema });
     await drive.remember({ mems: prepared.mems });
     const definitions = await sdkDefinitions(drive);

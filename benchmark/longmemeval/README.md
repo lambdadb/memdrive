@@ -29,7 +29,6 @@ quality or model-provider compatibility for every configuration.
 
 ```sh
 npm ci
-npm run build
 node benchmark/longmemeval/run.mjs setup --root artifacts/lme-corpus
 node benchmark/longmemeval/run.mjs ingest --root artifacts/lme-corpus --limit 10 --env-file /path/to/evaluation.env
 ```
@@ -205,8 +204,9 @@ the serial verifier restores its clock on failure. Runtime elapsed values and
 count fetch timestamps are excluded from semantic tool-output comparison.
 
 Frozen configuration and judge-rule snapshots remain authoritative even after
-current settings change. Executable SDK/runner/dependency code must still match
-the run's fingerprints; use the recorded checkout/runtime if that code changes.
+current settings change. The historical memory SDK, runner, and dependencies must
+still match the run's fingerprints. Use the recorded checkout and runtime if
+they change.
 Receipts provide local audit consistency, not provider attestation or a frozen
 server implementation. Legacy v1 one-shot artifacts are not adopted as reusable
 corpora; retain their original checkout for verification.

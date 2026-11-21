@@ -2,7 +2,7 @@ import type { RequestOptions } from './types.js';
 
 export class MemDriveError extends Error {
     declare code: string;
-    declare details?: Record<string, unknown> | undefined;
+    declare readonly details?: Record<string, unknown> | undefined;
     declare status?: number | undefined;
     constructor(code: string, message: string, { cause, details }: { cause?: unknown; details?: Record<string, unknown> | undefined } = {}) {
         super(message, cause === undefined ? undefined : { cause });
@@ -30,19 +30,16 @@ export function checkAbort(signal?: AbortSignal) {
     if (signal?.aborted) throw new MemDriveError('ABORTED', 'Operation aborted.');
 }
 
-export function abortError(cause: unknown, signal?: AbortSignal): unknown {
+function abortError(cause: unknown, signal?: AbortSignal): unknown {
     const error = cause as { code?: string; name?: string } | undefined;
     if (error?.code === 'ABORTED') return cause;
     return signal?.aborted || error?.name === 'AbortError'
         ? new MemDriveError('ABORTED', 'Operation aborted.', { cause }) : cause;
 }
 
-export function databaseError(error: unknown, message: string, details?: Record<string, unknown>): MemDriveError {
-    if (error instanceof MemDriveError) {
-        if (details !== undefined) error.details = { ...error.details, ...details };
-        return error;
-    }
-    const result = new MemDriveError('DATABASE_ERROR', message, { cause: error, details });
+export function databaseError(error: unknown, message: string): MemDriveError {
+    if (error instanceof MemDriveError) return error;
+    const result = new MemDriveError('DATABASE_ERROR', message, { cause: error });
     const remote = error as { statusCode?: unknown; status?: unknown; httpStatus?: unknown } | null | undefined;
     const status = remote?.statusCode ?? remote?.status ?? remote?.httpStatus;
     if (typeof status === 'number' && Number.isInteger(status)) result.status = status;

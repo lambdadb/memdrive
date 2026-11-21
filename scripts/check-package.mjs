@@ -54,8 +54,7 @@ try {
         bundle: true, platform: 'browser', format: 'esm', target: 'es2022', write: false,
     });
     mkdirSync(join(temporary, 'test/helpers'), { recursive: true });
-    for (const file of ['file-client.mjs', 'memdrive-client.mjs'])
-        copyFileSync(join(root, 'test/helpers', file), join(temporary, 'test/helpers', file));
+    copyFileSync(join(root, 'test/helpers/file-client.mjs'), join(temporary, 'test/helpers/file-client.mjs'));
     copyFileSync(join(root, 'test/memdrive-files.test.mjs'), join(temporary, 'test/memdrive-files.test.mjs'));
     run(process.execPath, ['--test', 'test/memdrive-files.test.mjs']);
     if (live) {

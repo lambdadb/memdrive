@@ -30,4 +30,4 @@ Use one writer per fork across runtimes and LambdaDB client instances. The SDK s
 
 ## Historical memory SDK
 
-The earlier memory SDK and its API documentation are available at [the historical revision](https://github.com/lambdadb/memdrive/tree/3b7bd21d9b73f2cf735eeae9e4052ef046b668db). File stores require newly created collections.
+The earlier memory SDK and its API documentation are available at [the historical revision](https://github.com/lambdadb/memdrive/tree/3b7bd21d9b73f2cf735eeae9e4052ef046b668db).

@@ -1,5 +1,5 @@
-import type { ConnectionOptions, RequestOptions } from './types.js';
-import type { CreateFileRequest, DriveFile, FileDrive, MainFileDrive, OpenFileStoreOptions, ReadFileRequest, WorkingFileDrive } from './types.js';
+import type { ConnectionOptions, CreateFileRequest, DriveFile, FileDrive, MainFileDrive, OpenFileStoreOptions,
+    ReadFileRequest, RequestOptions, WorkingFileDrive } from './types.js';
 import { checkAbort, databaseError, MemDriveError, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
 export type * from './types.js';
 export { MemDriveError } from './errors.js';
@@ -26,11 +26,11 @@ const indexes = {
 const clients = new WeakMap<Client, Map<string, Store>>();
 const isObject = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object'
     && !Array.isArray(value) && [Object.prototype, null].includes(Object.getPrototypeOf(value));
-const quote = (value: string) => JSON.stringify(value);
 const keysOnly = (value: unknown, keys: string[]): value is Record<string, unknown> =>
     isObject(value) && Object.keys(value).every(key => keys.includes(key));
 const validName = (name: unknown, maxLength = 52): name is string =>
     typeof name === 'string' && name.length >= 3 && name.length <= maxLength && /^[A-Za-z0-9_-]+$/.test(name);
+const validForkName = (name: unknown): name is string => validName(name, 52 - prefix.length) && name !== main;
 const validFileId = (value: unknown): value is string => typeof value === 'string' && fileIdPattern.test(value);
 const validPath = (value: unknown): value is string => typeof value === 'string' && value.startsWith('/')
     && !/[\\\p{Cc}\p{Surrogate}]/u.test(value) && encoder.encode(value).length <= 4096
@@ -94,8 +94,8 @@ function store(handle: Handle, name: string) {
                 requirePath(path);
                 selector = { path };
                 response = await remote(() => handle.query({ size: 2, ...settings, query: { bool: [
-                    { queryString: { query: quote('file'), defaultField: 'kind' }, occur: 'filter' },
-                    { queryString: { query: quote(path), defaultField: 'path' }, occur: 'filter' },
+                    { queryString: { query: JSON.stringify('file'), defaultField: 'kind' }, occur: 'filter' },
+                    { queryString: { query: JSON.stringify(path), defaultField: 'path' }, occur: 'filter' },
                 ] } }, nativeOptions(signal)), 'Could not read the file by path.', signal);
             }
             checkAbort(signal);
@@ -171,7 +171,7 @@ function store(handle: Handle, name: string) {
         async fork(request: { name: string }, options?: RequestOptions) {
             const { signal } = operationOptions(options);
             checkAbort(signal);
-            requireInput(keysOnly(request, ['name']) && validName(request.name, 52 - prefix.length) && request.name !== main,
+            requireInput(keysOnly(request, ['name']) && validForkName(request.name),
                 'Fork name must be 3–47 letters, digits, underscores or hyphens and cannot be main.');
             const fork = request.name;
             const branch = prefix + fork;
@@ -232,7 +232,7 @@ export async function open(options: OpenFileStoreOptions, requestOptions?: Reque
     const { client, name, at } = options;
     let fork: string | undefined;
     if (at !== undefined) {
-        requireInput(keysOnly(at, ['fork']) && validName(at.fork, 52 - prefix.length) && at.fork !== main,
+        requireInput(keysOnly(at, ['fork']) && validForkName(at.fork),
             'Select a working fork by its name.');
         fork = at.fork;
     }

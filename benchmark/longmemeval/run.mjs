@@ -41,7 +41,7 @@ async function treeFiles(directory) {
 }
 export async function fingerprints() {
     const files = [path.join(repository, 'package.json'), path.join(repository, 'package-lock.json')];
-    for (const folder of ['src', 'dist/esm', 'benchmark/longmemeval']) files.push(...await treeFiles(path.join(repository, folder)));
+    files.push(...await treeFiles(path.join(repository, 'benchmark/longmemeval')));
     // Fingerprint actual installed runtime code as well as the dependency lock.
     for (const name of ['memdrive-memory-baseline', '@functional-systems/lambdadb', 'tiktoken', 'zod']) {
         const packageRoot = path.join(repository, 'node_modules', name);
