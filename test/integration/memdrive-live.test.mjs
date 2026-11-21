@@ -14,7 +14,7 @@ const safeFailure = (phase, error) => {
     return new Error(`${phase} failed (${error?.code ?? error?.name ?? 'Error'}${statusOf(error) ? `, status ${statusOf(error)}` : ''}).${detail}`);
 };
 
-test('live file store writes and reopens a fresh fork with verified cleanup', {
+test('live file store writes, searches and reopens a fresh fork with verified cleanup', {
     skip: enabled ? false : 'Set MEMDRIVE_RUN_LIVE_TESTS=1 to permit live resources.',
     timeout: 600_000,
 }, async t => {
@@ -34,20 +34,30 @@ test('live file store writes and reopens a fresh fork with verified cleanup', {
     const name = `memdrive-smoke-files-${randomUUID().replaceAll('-', '').slice(0, 16)}`;
     let failure, collision = false;
     try {
-        const main = await MemDrive.create({ client, name }, options());
+        const main = await MemDrive.create({ client, name, metadataSchema: { topic: { type: 'string' } } }, options());
         assert.equal('write' in main, false);
         const fork = await main.fork({ name: 'research' }, options());
         const path = '/notes/한글 "draft":*?.md';
         const content = '# Synthetic note\r\n Trailing space \n';
-        const original = await fork.write({ op: 'create', path, content }, options());
-        const empty = await fork.write({ op: 'create', path: '/empty.txt', content: '' }, options());
+        const [original, empty] = await fork.write([
+            { op: 'create', path, content, metadata: { topic: 'synthetic' } },
+            { op: 'create', path: '/empty.txt', content: '' },
+        ], options());
         const reopened = await MemDrive.open({ client: new LambdaDBClient(connection), name, at: { fork: 'research' } }, options());
-        assert.deepEqual(await reopened.read({ path }, options()), { fileId: original.fileId, path, content });
+        assert.deepEqual(await reopened.read({ path }, options()), original);
+        assert.equal(original.content, content);
+        assert.deepEqual(original.metadata, { topic: 'synthetic' });
         assert.deepEqual(await reopened.read({ fileId: original.fileId }, options()), original);
         assert.deepEqual(await reopened.read({ path: '/empty.txt' }, options()), empty);
         assert.equal(empty.content, '');
         await assert.rejects(reopened.write({ op: 'create', path, content: 'Duplicate' }, options()), { code: 'PATH_EXISTS' });
         assert.equal(await main.read({ fileId: original.fileId }, options()), null);
+        const ranked = await reopened.search({ query: 'synthetic note', limit: 4 }, options());
+        assert.equal(ranked.reranked, true);
+        assert.deepEqual(ranked.hits, [{ ...original, range: { start: 0, end: content.length } }]);
+        const fused = await reopened.search({ query: 'synthetic note', limit: 4, rerank: false }, options());
+        assert.equal(fused.reranked, false);
+        assert.deepEqual(fused.hits, ranked.hits);
     } catch (error) {
         collision = error?.code === 'STORE_EXISTS';
         failure = safeFailure('File store smoke', error);

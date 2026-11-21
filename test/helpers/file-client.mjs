@@ -15,8 +15,11 @@ export function fileClient() {
         collection(name) {
             const state = () => collections.get(name) ?? fail(404, 'Collection missing');
             const docsAt = branch => (state().branches.get(branch) ?? fail(404, 'Branch missing')).docs;
-            const response = docs => ({ isDocsInline: true,
-                docs: docs.map(doc => ({ collection: name, doc: structuredClone(doc) })) });
+            const response = (docs, fields) => ({ isDocsInline: true, docs: docs.map(doc => ({
+                collection: name, score: 0.8, doc: structuredClone(fields?.include
+                    ? Object.fromEntries(fields.include.filter(key => Object.hasOwn(doc, key)).map(key => [key, doc[key]]))
+                    : doc),
+            })) });
             return {
                 async get() { return { collection: structuredClone(state().metadata) }; },
                 branches: {
@@ -31,16 +34,28 @@ export function fileClient() {
                 },
                 async query(request) {
                     calls.push({ kind: 'query', request: structuredClone(request) });
-                    const [kind, path] = request.query.bool.map(clause => JSON.parse(clause.queryString.query));
-                    const docs = [...docsAt(request.ref.name).values()]
-                        .filter(doc => doc.kind === kind && doc.path === path).slice(0, request.size);
-                    return response(docs);
+                    const source = [...docsAt(request.ref.name).values()];
+                    if (request.query.bayesian) {
+                        const candidates = source.filter(doc => doc.kind === 'chunk');
+                        const docs = (fixture.rank?.(candidates, request) ?? candidates).slice(0, request.size);
+                        const native = response(docs, request.fields);
+                        if (request.rerank) native.rerank = {
+                            provider: request.rerank.provider, model: request.rerank.model,
+                            status: docs.length ? 'applied' : 'skipped', ...(docs.length ? {} : { reason: 'noCandidates' }),
+                            candidateCount: docs.length, scoredCount: docs.length, ...fixture.rerank,
+                        };
+                        return native;
+                    }
+                    const [kind, path] = request.query.bool;
+                    const paths = (path.bool ?? [path]).map(clause => JSON.parse(clause.queryString.query));
+                    const docs = source.filter(doc => doc.kind === JSON.parse(kind.queryString.query) && paths.includes(doc.path)).slice(0, request.size);
+                    return response(docs, request.fields);
                 },
                 docs: {
                     async fetch(request) {
                         calls.push({ kind: 'fetch', request: structuredClone(request) });
                         const docs = docsAt(request.ref.name);
-                        return response(request.ids.map(id => docs.get(id)).filter(Boolean));
+                        return response(request.ids.map(id => docs.get(id)).filter(Boolean), request.fields);
                     },
                     async upsert(request) {
                         calls.push({ kind: 'upsert', request: structuredClone(request) });
