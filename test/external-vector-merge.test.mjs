@@ -5,16 +5,19 @@ import { fileClient } from './helpers/file-client.mjs';
 
 const name = 'workspace';
 const request = requestId => ({ requestId, summary: `Publish ${requestId}` });
-const originalVector = [0.1, 0.2];
-const capturedVector = [0.3, 0.4];
-const laterVector = [0.5, 0.6];
+const dimensions = 64;
+const vector = (x, y) => [x, y, ...Array(dimensions - 2).fill(0)];
+const originalVector = vector(0.1, 0.2);
+const capturedVector = vector(0.3, 0.4);
+const laterVector = vector(0.5, 0.6);
 
 test('external vector publication replays the pinned vector and rebases later edits on the published vector', async () => {
     const fixture = fileClient();
     const main = await MemDrive.create({ client: fixture.client, name,
-        embedding: { mode: 'external', dimensions: 2, similarity: 'cosine', identity: 'fixture' } });
+        metadataSchema: { label: { type: 'string' } },
+        embedding: { mode: 'external', dimensions, similarity: 'cosine', identity: 'fixture' } });
     const work = await main.fork({ name: 'research' });
-    const { fileId } = await work.write({ op: 'create', path: '/notes', embedding: originalVector });
+    const { fileId } = await work.write({ op: 'create', path: '/notes', embedding: originalVector, metadata: { label: 'old' } });
     const id = `file:${fileId}`;
     const state = fixture.collections.get(name);
 
@@ -55,9 +58,10 @@ test('external vector publication replays the pinned vector and rebases later ed
     await assert.rejects(stale.merge(request('stale')), { code: 'MERGE_CONFLICT',
         details: { fileIds: [fileId], paths: [], requestId: 'stale' } });
 
-    await reopened.write({ op: 'update', fileId, newPath: '/renamed' });
+    await reopened.write({ op: 'update', fileId, newPath: '/renamed', metadata: {} });
     const { version } = await reopened.merge(request('move'));
     assert.equal(published(version).path, '/renamed');
+    assert.equal(published(version).metadata, undefined);
     assert.deepEqual(published(version).embedding.map(Math.fround), capturedVector.map(Math.fround));
     assert.equal(state.tags.get(`md-main-${version}`).docs.size, 1);
     for (const field of ['body', 'content', 'changed', 'baseline', 'fingerprint'])
