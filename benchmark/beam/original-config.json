@@ -1,0 +1,71 @@
+{
+  "protocol": "beam-original-v1",
+  "upstream": {
+    "repository": "https://github.com/mohammadtavakoli78/BEAM",
+    "revision": "b2da22eac88bb0874c64665f13457eb99835774a",
+    "files": {
+      "src/prompts.py": "81fe51ab2bcd7e8ad218b3a9a969a340c38d31f90ac2d93fa78a3bb890ba157b",
+      "LICENSE": "60c7b74ffaacaae383c3f06a48bc79d204b25bc9c1856df9711b3d290febd474"
+    }
+  },
+  "cohorts": {
+    "100k": {
+      "conversations": 20,
+      "questions": 400,
+      "datasetRevision": "3205395e897e7318c7b094ef4e6047b9b82dbb03",
+      "files": [
+        {
+          "name": "100k.parquet",
+          "sha256": "c0519be25907005ba873c927c50877471d550873039d96c041554d0075a78ace",
+          "url": "https://huggingface.co/datasets/Mohammadta/BEAM/resolve/3205395e897e7318c7b094ef4e6047b9b82dbb03/data/100K-00000-of-00001.parquet",
+          "bytes": 5429768
+        }
+      ]
+    },
+    "500k": {
+      "conversations": 35,
+      "questions": 700,
+      "datasetRevision": "3205395e897e7318c7b094ef4e6047b9b82dbb03",
+      "files": [
+        {
+          "name": "500k.parquet",
+          "sha256": "af05921c979355038e1761b7cde3d2dd713200dd3071b278de0200f6c7f30122",
+          "url": "https://huggingface.co/datasets/Mohammadta/BEAM/resolve/3205395e897e7318c7b094ef4e6047b9b82dbb03/data/500K-00000-of-00001.parquet",
+          "bytes": 33956263
+        }
+      ]
+    },
+    "1m": {
+      "conversations": 35,
+      "questions": 700,
+      "datasetRevision": "3205395e897e7318c7b094ef4e6047b9b82dbb03",
+      "files": [
+        {
+          "name": "1m.parquet",
+          "sha256": "41b5acbbb55a586b1305514ef9d9fb03365d9b3331b598a1c2dd7603d93ef533",
+          "url": "https://huggingface.co/datasets/Mohammadta/BEAM/resolve/3205395e897e7318c7b094ef4e6047b9b82dbb03/data/1M-00000-of-00001.parquet",
+          "bytes": 66156374
+        }
+      ]
+    },
+    "10m": {
+      "conversations": 10,
+      "questions": 200,
+      "datasetRevision": "9b2096193fe74e2837e4713e483351e19817773c",
+      "files": [
+        {
+          "name": "10m-00000-of-00002.parquet",
+          "sha256": "31d96fd47ec56221d202e68792f26c00e49467dd4b36ee105c36ebd19ef78ad5",
+          "url": "https://huggingface.co/datasets/Mohammadta/BEAM-10M/resolve/9b2096193fe74e2837e4713e483351e19817773c/data/10M-00000-of-00002.parquet",
+          "bytes": 153844664
+        },
+        {
+          "name": "10m-00001-of-00002.parquet",
+          "sha256": "a4f13fe25af51d57405ae41008689c31d1421377f3efde56a024b441deb2ee65",
+          "url": "https://huggingface.co/datasets/Mohammadta/BEAM-10M/resolve/9b2096193fe74e2837e4713e483351e19817773c/data/10M-00001-of-00002.parquet",
+          "bytes": 189980875
+        }
+      ]
+    }
+  }
+}
