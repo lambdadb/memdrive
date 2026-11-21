@@ -78,6 +78,9 @@ export function fileClient() {
                         };
                         return native;
                     }
+                    const direct = request.query.queryString;
+                    if (direct?.defaultField === 'id' && direct.skipSyntax)
+                        return response(source.filter(doc => doc.id === direct.query).slice(0, request.size), request.fields);
                     const [kind, path, exclude] = request.query.bool;
                     if (path?.queryString?.defaultField === 'changed') {
                         const overridden = await fixture.diffPage?.(request, options);

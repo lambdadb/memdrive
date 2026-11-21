@@ -9,7 +9,7 @@ export const keysOnly = (value: unknown, keys: string[]): value is Record<string
 
 export const formatTag = 'memdrive.format';
 export const format = 'files-v0';
-const managedEmbedding = { mode: 'managed', provider: 'openai', model: 'text-embedding-3-small',
+export const managedEmbedding = { mode: 'managed', provider: 'openai', model: 'text-embedding-3-small',
     dimensions: 1536, similarity: 'cosine' } as const;
 const fileIndexes = {
     kind: { type: 'keyword' },
