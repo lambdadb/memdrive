@@ -56,7 +56,7 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         writers.set(branch, writer);
         return writer;
     }
-    const publishing = publication(client, handle, identity, metadataSchema, writerFor);
+    const publishing = publication(client, handle, identity, metadataSchema, writerFor, dimensions);
 
     async function describe(options?: RequestOptions) {
         const { signal } = operationOptions(options);

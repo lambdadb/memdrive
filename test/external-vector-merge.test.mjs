@@ -46,7 +46,7 @@ test('external vector publication replays the pinned vector and rebases later ed
     assert.deepEqual(published('v1').embedding, originalVector.map(Math.fround));
 
     fixture.beforeUpsert = undefined;
-    const reopened = await MemDrive.open({ client: { ...fixture.client }, name, at: { fork: 'research' } });
+    const reopened = await MemDrive.open({ client: { ...fixture.client }, name, mode: 'external', at: { fork: 'research' } });
     await reopened.merge(request('replace'));
     assert.deepEqual(published('v2').embedding.map(Math.fround), capturedVector.map(Math.fround));
     assert.deepEqual(await reopened.diff(), [{ op: 'update', fileId, path: '/notes' }]);
