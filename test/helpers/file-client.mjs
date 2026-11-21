@@ -49,9 +49,13 @@ export function fileClient() {
                     const [kind, path, exclude] = request.query.bool;
                     if (path.queryString?.defaultField === 'id') {
                         const regex = clause => new RegExp(`^${clause.queryString.query.slice(1, -1)}$`);
-                        const owned = regex(path), keep = exclude && regex(exclude);
-                        return response(source.filter(doc => doc.kind === JSON.parse(kind.queryString.query)
-                            && owned.test(doc.id) && !keep?.test(doc.id)).slice(0, request.size), request.fields);
+                        const owned = regex(path);
+                        const keep = exclude?.occur === 'must_not' ? regex(exclude) : undefined;
+                        const after = exclude?.occur === 'filter' ? /^\{(.+) TO \*\}$/.exec(exclude.queryString.query)?.[1] : undefined;
+                        const selected = source.filter(doc => doc.kind === JSON.parse(kind.queryString.query)
+                            && owned.test(doc.id) && !keep?.test(doc.id) && (after === undefined || doc.id > after));
+                        if (request.sort?.[0]?.id === 'asc') selected.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+                        return response(selected.slice(0, request.size), request.fields);
                     }
                     const paths = (path.bool ?? [path]).map(clause => JSON.parse(clause.queryString.query));
                     const docs = source.filter(doc => doc.kind === JSON.parse(kind.queryString.query) && paths.includes(doc.path)).slice(0, request.size);

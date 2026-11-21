@@ -543,3 +543,61 @@ test('edit preflight rejects an ambiguous identity and cancellation after dispat
     fixture.afterUpsert = undefined;
     assert.deepEqual(await work.read({ fileId: file.fileId }), await work.write(update));
 });
+
+test('moves patch persisted chunks across fallback and segmented runtimes in both directions', async () => {
+    const fixture = fileClient();
+    const main = await create({ client: fixture.client, name: 'workspace' });
+    const work = await main.fork({ name: 'research' });
+    const text = 'a'.repeat(500) + ' Mr. ' + 'b'.repeat(160) + ' final ' + 'c'.repeat(500);
+    const docs = fixture.collections.get('workspace').branches.get('fork-research').docs;
+    const chunks = file => [...docs.values()].filter(doc => doc.kind === 'chunk' && doc.fileId === file.fileId);
+    const segmenter = Intl.Segmenter;
+    try {
+        Intl.Segmenter = undefined;
+        const fallback = await work.write(request('/fallback.txt', text));
+        const fallbackIds = chunks(fallback).map(doc => doc.id);
+        Intl.Segmenter = segmenter;
+        const segmented = await work.write(request('/segmented.txt', text));
+        const segmentedIds = chunks(segmented).map(doc => doc.id);
+        assert.notDeepEqual(chunks(fallback).map(doc => doc.end), chunks(segmented).map(doc => doc.end));
+        await work.write({ op: 'update', fileId: fallback.fileId, newPath: '/fallback-moved.txt' });
+        assert.deepEqual(chunks(fallback).map(doc => doc.id), fallbackIds);
+        assert(chunks(fallback).every(doc => doc.path === '/fallback-moved.txt'));
+
+        Intl.Segmenter = undefined;
+        await work.write({ op: 'update', fileId: segmented.fileId, newPath: '/segmented-moved.txt' });
+        await work.write({ op: 'update', fileId: segmented.fileId, content: text });
+        assert.deepEqual(chunks(segmented).map(doc => doc.id), segmentedIds);
+        assert(chunks(segmented).every(doc => doc.path === '/segmented-moved.txt'));
+        assert.deepEqual(await work.read({ fileId: segmented.fileId }).then(file => file.content), text);
+        assert.equal(fixture.calls.filter(call => call.kind === 'upsert').length, 2);
+    } finally {
+        Intl.Segmenter = segmenter;
+    }
+});
+
+test('move scans every page of persisted chunk IDs with the same hash and writes the original last', async () => {
+    const fixture = fileClient();
+    const main = await create({ client: fixture.client, name: 'workspace' });
+    const work = await main.fork({ name: 'research' });
+    const file = await work.write(request('/old.txt', 'source'));
+    const docs = fixture.collections.get('workspace').branches.get('fork-research').docs;
+    const template = [...docs.values()].find(doc => doc.kind === 'chunk');
+    const base = template.id.slice(0, -1);
+    for (let i = 1000; i >= 1; i--) {
+        const id = base + i;
+        docs.set(id, { ...template, id });
+    }
+    await work.write({ op: 'update', fileId: file.fileId, newPath: '/new.txt' });
+
+    const query = fixture.calls.filter(call => call.kind === 'query' && call.request.sort);
+    assert.equal(query.length, 2);
+    assert.deepEqual(query[0].request.sort, [{ id: 'asc' }]);
+    assert.equal(query[1].request.query.bool[2].queryString.query, `{${[...docs.keys()].filter(id => id.startsWith(base)).sort()[999]} TO *}`);
+    assert(query.every(call => call.request.consistentRead && call.request.ref.name === 'fork-research'));
+    const patches = fixture.calls.filter(call => call.kind === 'update').flatMap(call => call.request.docs);
+    assert.equal(patches.length, 1002);
+    assert.equal(patches.at(-1).id, `file:${file.fileId}`);
+    assert.equal(new Set(patches.map(doc => doc.id)).size, 1002);
+    assert([...docs.values()].every(doc => doc.path === '/new.txt'));
+});

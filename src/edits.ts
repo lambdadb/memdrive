@@ -1,6 +1,6 @@
 import { keysOnly, metadataValues } from './config.js';
 import { MemDriveError, requireInput } from './errors.js';
-import { validFileId, validPath, validText, baselineOf, decodeFile, fileRecords, fingerprintOf, metadataKey, originalId } from './records.js';
+import { validFileId, validPath, validText, baselineOf, decodeFile, fileOriginal, fileRecords, fingerprintOf, metadataKey, originalId } from './records.js';
 import type { DeleteFileRequest, DriveFile, MetadataSchema, TextEdit, UpdateFileRequest } from './types.js';
 
 export function editRequest(request: unknown, schema: MetadataSchema): UpdateFileRequest | DeleteFileRequest {
@@ -77,6 +77,9 @@ export async function planEdit(request: UpdateFileRequest | DeleteFileRequest, d
     const generation = replace ? revision : generationValue;
     const modifiedAt = !replace && path === current.path ? current.modifiedAt : new Date().toISOString();
     const file: DriveFile = { fileId, path, modifiedAt, content, ...(metadata === undefined ? {} : { metadata }) };
-    const records = await fileRecords(file, { revision, generation, baseline, fingerprint: await fingerprintOf(file), version });
-    return { op: 'update' as const, current, file, generation, records, moveOnly: !replace };
+    const tracking = { revision, generation, baseline, fingerprint: await fingerprintOf(file), version };
+    const base = { op: 'update' as const, file, generation };
+    return replace
+        ? { ...base, moveOnly: false as const, records: await fileRecords(file, tracking) }
+        : { ...base, moveOnly: true as const, original: fileOriginal(file, tracking) };
 }

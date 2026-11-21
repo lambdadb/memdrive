@@ -1,6 +1,6 @@
 import { editRequest, planEdit } from './edits.js';
 import { checkAbort, databaseError, MemDriveError, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
-import { bytes, createRecords, originalId, resultDocs, validFileId } from './records.js';
+import { bytes, createRecords, fileOriginal, originalId, resultDocs, validFileId } from './records.js';
 import { branchRead, fetchOriginals, pathQuery, type Handle } from './storage-reads.js';
 import type { CreateFileRequest, DeleteFileRequest, DeleteFileResult, DriveFile, MetadataSchema, RequestOptions, UpdateFileRequest,
     WriteFileRequest, WriteFileResult } from './types.js';
@@ -62,14 +62,22 @@ function writeBatches(records: { docs: WriteRecord[] }[], branch: string): Write
     return batches;
 }
 
-function moveRecords(records: FileRecords): { docs: WriteRecord[] } {
-    return { docs: records.docs.map(({ doc }) => {
-        const { id, kind, fileId, path, fileName, ancestorPaths, modifiedAt, revision } = doc;
-        const patch = { id, kind, fileId, path, fileName, ancestorPaths, modifiedAt, revision,
-            ...('body' in doc ? { changed: doc.changed, fingerprint: doc.fingerprint, baseline: doc.baseline, version: doc.version } : {}) };
-        return { doc: patch, inputBytes: 0, wireBytes: bytes(patch) + 1 };
-    }) };
+function moveRecords(original: ReturnType<typeof fileOriginal>, ids: string[]): { docs: WriteRecord[] } {
+    requireInput(bytes(original) <= 5 * 1024 * 1024, 'The file original exceeds the native 5 MiB document limit.');
+    const { id, fileId, path, fileName, ancestorPaths, modifiedAt, revision, changed, fingerprint, baseline, version } = original;
+    const shared = { fileId, path, fileName, ancestorPaths, modifiedAt, revision };
+    const patches = [
+        ...ids.map(id => ({ id, kind: 'chunk' as const, ...shared })),
+        { id, kind: 'file' as const, ...shared, changed, fingerprint, baseline, version },
+    ];
+    return { docs: patches.map(doc => ({ doc, inputBytes: 0, wireBytes: bytes(doc) + 1 })) };
 }
+
+const chunkKind = { queryString: { query: '"chunk"', defaultField: 'kind' }, occur: 'filter' };
+const chunkIdBase = (fileId: string) => `chunk:${fileId}:`;
+const generationPattern = (fileId: string, generation?: string) =>
+    `${chunkIdBase(fileId)}[0-9a-f]{64}:[0-9]+${generation ? `:${generation}` : ''}`;
+const chunkFields = { include: ['id', 'kind', 'fileId'] };
 
 export function workingWriter(handle: Handle, name: string, branch: string, schema: MetadataSchema) {
     let writes = Promise.resolve();
@@ -98,6 +106,42 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
             originals.delete(expectedDoc.id);
         }
         if (originals.size) throw new MemDriveError('INVALID_RESULT', 'The written file or complete chunk set was not confirmed.');
+    }
+
+    async function currentChunkIds(fileId: string, generation: string | undefined, signal?: AbortSignal) {
+        const pattern = generationPattern(fileId, generation);
+        const active = new RegExp(`^${pattern}$`);
+        const match = { queryString: { query: `/${pattern}/`, defaultField: 'id' }, occur: 'filter' };
+        const ids: string[] = [];
+        let after: string | undefined;
+        for (let page = 0; page <= maximumCleanupBatches; page++) {
+            const cursor = after === undefined ? [] : [
+                { queryString: { query: `{${after} TO *}`, defaultField: 'id' }, occur: 'filter' },
+            ];
+            let response;
+            try {
+                response = await nativeRequest(() => handle.query({ ...branchSettings, size: maximumRequestDocuments,
+                    fields: chunkFields, sort: [{ id: 'asc' }], query: { bool: [chunkKind, match, ...cursor] },
+                }, nativeOptions(signal)), signal);
+            } catch (cause) {
+                throw databaseError(cause, 'Could not read the file’s current chunk IDs.');
+            }
+            checkAbort(signal);
+            const docs = resultDocs(response, name, maximumRequestDocuments);
+            if (response.isDocsInline !== true || response.total !== docs.length)
+                throw new MemDriveError('INVALID_RESULT', 'Current chunk lookup returned an incomplete page.');
+            if (page === maximumCleanupBatches && docs.length)
+                throw new MemDriveError('CHUNK_SCAN_LIMIT', 'Current chunk lookup exceeded the supported number of pages.');
+            for (const doc of docs) {
+                if (doc.kind !== 'chunk' || doc.fileId !== fileId || typeof doc.id !== 'string' || !active.test(doc.id)
+                    || (after !== undefined && doc.id <= after))
+                    throw new MemDriveError('INVALID_RESULT', 'Current chunk lookup returned an unexpected or unordered record.');
+                ids.push(doc.id);
+                after = doc.id;
+            }
+            if (docs.length < maximumRequestDocuments) return ids;
+        }
+        throw new MemDriveError('CHUNK_SCAN_LIMIT', 'Current chunk lookup exceeded the supported number of pages.');
     }
 
     function write(request: CreateFileRequest | UpdateFileRequest, options?: RequestOptions): Promise<DriveFile>;
@@ -179,7 +223,17 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
                 if (plan.op === 'create') creates.push(plan.records);
                 else {
                     queueCreates();
-                    const batches = plan.op === 'update' ? writeBatches([plan.moveOnly ? moveRecords(plan.records) : plan.records], branch) : [];
+                    let batches: WriteRecord[][] = [];
+                    if (plan.op === 'update') {
+                        if (plan.moveOnly) {
+                            const ids = await currentChunkIds(plan.file.fileId, plan.generation, signal);
+                            if (!ids.length && plan.file.content.trim())
+                                throw new MemDriveError('INVALID_RESULT', 'The nonempty file has no visible chunks in its current generation.');
+                            batches = writeBatches([moveRecords(plan.original, ids)], branch);
+                        } else {
+                            batches = writeBatches([plan.records], branch);
+                        }
+                    }
                     steps.push({ edit: plan, batches });
                 }
             }
@@ -241,17 +295,16 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
             }
 
             async function cleanup(target: Identity, keepOld?: { generation?: string | undefined }) {
-                const root = `chunk:${target.fileId}:`;
-                const kind = { queryString: { query: '"chunk"', defaultField: 'kind' }, occur: 'filter' };
+                const root = chunkIdBase(target.fileId);
                 const matches = { queryString: { query: `/${root}.*/`, defaultField: 'id' }, occur: 'filter' };
-                const suffix = keepOld?.generation ? `:${keepOld.generation}` : '';
-                const keep = { queryString: { query: `/${root}[0-9a-f]{64}:[0-9]+${suffix}/`, defaultField: 'id' }, occur: 'must_not' };
-                const active = new RegExp(`^${root}[0-9a-f]{64}:[0-9]+${suffix}$`);
+                const pattern = generationPattern(target.fileId, keepOld?.generation);
+                const keep = { queryString: { query: `/${pattern}/`, defaultField: 'id' }, occur: 'must_not' };
+                const active = new RegExp(`^${pattern}$`);
                 const cleaned = new Set<string>();
                 try {
                     for (let attempt = 0; attempt <= maximumCleanupBatches; attempt++) {
                         const response = await nativeRequest(() => handle.query({ ...branchSettings, size: maximumRequestDocuments,
-                            fields: { include: ['id', 'kind', 'fileId'] }, query: { bool: keepOld ? [kind, matches, keep] : [kind, matches] },
+                            fields: chunkFields, query: { bool: keepOld ? [chunkKind, matches, keep] : [chunkKind, matches] },
                         }, nativeOptions(signal)), signal);
                         checkAbort(signal);
                         const docs = resultDocs(response, name, maximumRequestDocuments);

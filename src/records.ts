@@ -86,7 +86,7 @@ type FileTracking = {
     version?: string | undefined;
 };
 
-export async function fileRecords(file: DriveFile, tracking?: FileTracking) {
+export function fileOriginal(file: DriveFile, tracking?: FileTracking) {
     const { fileId, path, content, modifiedAt, metadata } = file;
     const parts = path.slice(1).split('/');
     const fileName = parts.pop()!;
@@ -96,11 +96,20 @@ export async function fileRecords(file: DriveFile, tracking?: FileTracking) {
         ancestor += part + '/';
         ancestorPaths.push(ancestor);
     }
-    const { revision, generation } = tracking ?? {};
+    const { revision } = tracking ?? {};
     const shared = { fileId, path, fileName, ancestorPaths, modifiedAt, ...(metadata === undefined ? {} : { metadata }),
         ...(revision === undefined ? {} : { revision }) };
-    const original = { id: originalId(fileId), kind: 'file' as const, ...shared, body: content,
+    return { id: originalId(fileId), kind: 'file' as const, ...shared, body: content,
         changed: !tracking?.baseline || tracking.fingerprint !== tracking.baseline.fingerprint, ...tracking };
+}
+
+export async function fileRecords(file: DriveFile, tracking?: FileTracking) {
+    const { content, fileId } = file;
+    const original = fileOriginal(file, tracking);
+    const { path, fileName, ancestorPaths, modifiedAt, metadata, revision } = original;
+    const generation = tracking?.generation;
+    const shared = { fileId, path, fileName, ancestorPaths, modifiedAt,
+        ...(metadata === undefined ? {} : { metadata }), ...(revision === undefined ? {} : { revision }) };
     const originalBytes = bytes(original);
     requireInput(originalBytes <= 5 * 1024 * 1024, 'The file original exceeds the native 5 MiB document limit.');
     const spans = chunkSpans(content).filter(span => span.text.trim());
