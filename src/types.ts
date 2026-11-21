@@ -12,10 +12,14 @@ export interface RequestOptions {
 export type ForkSelection = { fork: string; checkpoint?: never };
 export type CheckpointSelection = { checkpoint: string; fork?: never };
 
-export type OpenFileStoreOptions = ConnectionOptions & (
+export type EmbeddingMode = 'managed' | 'external';
+
+export type OpenFileStoreOptions<Mode extends EmbeddingMode = 'managed'> = ConnectionOptions & ModeOption<Mode> & (
     { at?: undefined; recover?: boolean | undefined }
     | { at: ForkSelection | CheckpointSelection; recover?: never }
 );
+
+type ModeOption<Mode extends EmbeddingMode> = Mode extends 'external' ? { mode: 'external' } : { mode?: 'managed' | undefined };
 
 export interface FileListEntry {
     fileId: string;
@@ -82,22 +86,47 @@ export interface DeleteFileResult {
 export type WriteFileRequest = CreateFileRequest | UpdateFileRequest | DeleteFileRequest;
 export type WriteFileResult = DriveFile | DeleteFileResult;
 
-interface FileView {
-    readonly name: string;
-    fork(request: { name: string }, options?: RequestOptions): Promise<WorkingFileDrive>;
-    checkpoint(request: { name: string }, options?: RequestOptions): Promise<CheckpointFileDrive>;
-    list(request?: ListFilesRequest, options?: RequestOptions): Promise<ListFilesResult>;
-    describe(options?: RequestOptions): Promise<FileStoreDescription>;
-    search(request: SearchFilesRequest, options?: RequestOptions): Promise<SearchFilesResult>;
-    read(request: ReadFileRequest, options?: RequestOptions): Promise<DriveFile | null>;
-    read(request: { paths: string[] }, options?: RequestOptions): Promise<DriveFile[]>;
+export interface CreateExternalFileRequest {
+    op: 'create';
+    path: string;
+    embedding: readonly number[];
+    metadata?: Metadata | undefined;
+    content?: never;
 }
 
-export interface MainFileDrive extends FileView {
+export interface UpdateExternalFileRequest {
+    op: 'update';
+    fileId: string;
+    newPath?: string | undefined;
+    metadata?: Metadata | undefined;
+    embedding?: readonly number[] | undefined;
+    content?: never;
+    edits?: never;
+}
+
+type FileMutation<Mode extends EmbeddingMode> = Mode extends 'external'
+    ? CreateExternalFileRequest | UpdateExternalFileRequest
+    : CreateFileRequest | UpdateFileRequest;
+type ViewFile<Mode extends EmbeddingMode> = Mode extends 'external' ? FileListEntry : DriveFile;
+type ViewSearch<Mode extends EmbeddingMode> = Mode extends 'external' ? SearchExternalFilesRequest : SearchFilesRequest;
+type ViewSearchResult<Mode extends EmbeddingMode> = Mode extends 'external' ? SearchExternalFilesResult : SearchFilesResult;
+
+interface FileView<Mode extends EmbeddingMode> {
+    readonly name: string;
+    fork(request: { name: string }, options?: RequestOptions): Promise<WorkingFileDrive<Mode>>;
+    checkpoint(request: { name: string }, options?: RequestOptions): Promise<CheckpointFileDrive<Mode>>;
+    list(request?: ListFilesRequest, options?: RequestOptions): Promise<ListFilesResult>;
+    describe(options?: RequestOptions): Promise<FileStoreDescription<Mode>>;
+    search(request: ViewSearch<Mode>, options?: RequestOptions): Promise<ViewSearchResult<Mode>>;
+    read(request: ReadFileRequest, options?: RequestOptions): Promise<ViewFile<Mode> | null>;
+    read(request: { paths: string[] }, options?: RequestOptions): Promise<ViewFile<Mode>[]>;
+}
+
+export interface MainFileDrive<Mode extends EmbeddingMode = 'managed'> extends FileView<Mode> {
     readonly at: { readonly kind: 'main' };
 }
 
-export interface CheckpointFileDrive extends FileView {
+export interface CheckpointFileDrive<Mode extends EmbeddingMode = 'managed'> extends FileView<Mode> {
     readonly at: { readonly kind: 'checkpoint'; readonly name: string };
 }
 
@@ -117,41 +146,81 @@ export interface MergeResult {
     version: string;
 }
 
-export interface WorkingFileDrive extends FileView {
+export interface WorkingFileDrive<Mode extends EmbeddingMode = 'managed'> extends FileView<Mode> {
     readonly at: { readonly kind: 'fork'; readonly name: string };
     merge(request: MergeRequest, options?: RequestOptions): Promise<MergeResult>;
     diff(options?: RequestOptions): Promise<FileChange[]>;
-    write(request: CreateFileRequest | UpdateFileRequest, options?: RequestOptions): Promise<DriveFile>;
+    write(request: FileMutation<Mode>, options?: RequestOptions): Promise<ViewFile<Mode>>;
     write(request: DeleteFileRequest, options?: RequestOptions): Promise<DeleteFileResult>;
-    write(request: WriteFileRequest, options?: RequestOptions): Promise<WriteFileResult>;
-    write(request: (CreateFileRequest | UpdateFileRequest)[], options?: RequestOptions): Promise<DriveFile[]>;
-    write(request: WriteFileRequest[], options?: RequestOptions): Promise<WriteFileResult[]>;
+    write(request: FileMutation<Mode> | DeleteFileRequest, options?: RequestOptions): Promise<ViewFile<Mode> | DeleteFileResult>;
+    write(request: FileMutation<Mode>[], options?: RequestOptions): Promise<ViewFile<Mode>[]>;
+    write(request: (FileMutation<Mode> | DeleteFileRequest)[], options?: RequestOptions): Promise<(ViewFile<Mode> | DeleteFileResult)[]>;
 }
 
-export type FileDrive = MainFileDrive | WorkingFileDrive | CheckpointFileDrive;
+export type FileDrive<Mode extends EmbeddingMode = 'managed'> =
+    MainFileDrive<Mode> | WorkingFileDrive<Mode> | CheckpointFileDrive<Mode>;
 
 export type MetadataType = 'string' | 'number' | 'boolean' | 'datetime';
 export type Metadata = Record<string, string | number | boolean>;
 export type MetadataSchema = Record<string, { type: MetadataType; description?: string | undefined }>;
 
-export interface CreateFileStoreOptions extends ConnectionOptions {
-    labels?: Record<string, string> | undefined;
-    metadataSchema?: MetadataSchema | undefined;
-    textSearch?: { analyzers: string[] } | undefined;
+export interface ExternalEmbedding {
+    mode: 'external';
+    dimensions: number;
+    similarity: 'cosine';
+    identity: string;
 }
 
-export interface FileStoreDescription {
+type StoreOptions = ConnectionOptions & {
+    labels?: Record<string, string> | undefined;
+    metadataSchema?: MetadataSchema | undefined;
+};
+
+export type CreateFileStoreOptions = StoreOptions & {
+    embedding?: { mode: 'managed' } | undefined;
+    textSearch?: { analyzers: string[] } | undefined;
+};
+
+export type CreateExternalFileStoreOptions = StoreOptions & {
+    embedding: ExternalEmbedding;
+    textSearch?: never;
+};
+
+interface StoreDescription {
     name: string;
     labels: Record<string, string>;
     metadataSchema: MetadataSchema;
-    textSearch: { analyzers: string[] };
-    embedding: {
-        mode: 'managed';
-        provider: 'openai';
-        model: 'text-embedding-3-small';
-        dimensions: 1536;
-        similarity: 'cosine';
-    };
+}
+
+export type FileStoreDescription<Mode extends EmbeddingMode = 'managed'> = StoreDescription & (
+    Mode extends 'external' ? { embedding: ExternalEmbedding; textSearch?: never } : {
+        textSearch: { analyzers: string[] };
+        embedding: {
+            mode: 'managed';
+            provider: 'openai';
+            model: 'text-embedding-3-small';
+            dimensions: 1536;
+            similarity: 'cosine';
+        };
+    }
+);
+
+export type FileFilter =
+    | { and: FileFilter[]; or?: never }
+    | { or: FileFilter[]; and?: never }
+    | { field: `metadata.${string}`; op: 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte'; value: string | number | boolean }
+    | { field: `metadata.${string}`; op: 'in'; value: (string | number | boolean)[] }
+    | { field: `metadata.${string}`; op: 'exists'; value: boolean };
+
+export interface SearchExternalFilesRequest {
+    queryVector: readonly number[];
+    limit?: number | undefined;
+    filter?: FileFilter | undefined;
+}
+
+export interface SearchExternalFilesResult {
+    hits: FileListEntry[];
+    reranked: false;
 }
 
 export interface SearchFilesRequest {

@@ -1,7 +1,7 @@
 import { MemDriveError, requireInput } from './errors.js';
-import { isObject, keysOnly, metadataValues, validDate } from './config.js';
+import { isObject, keysOnly, metadataValues, validDate, vectorValues } from './config.js';
 import { chunkSpans } from './chunking.js';
-import type { CreateFileRequest, DriveFile, FileListEntry, MetadataSchema } from './types.js';
+import type { CreateExternalFileRequest, CreateFileRequest, DriveFile, FileListEntry, MetadataSchema } from './types.js';
 
 const encoder = new TextEncoder();
 export const bytes = (value: unknown) => encoder.encode(JSON.stringify(value)).length;
@@ -53,15 +53,38 @@ export async function contentHash(content: string): Promise<string> {
 
 export const validText = (value: unknown): value is string => typeof value === 'string' && !/\p{Surrogate}/u.test(value);
 
-export async function createRecords(request: CreateFileRequest, schema: MetadataSchema) {
-    requireInput(keysOnly(request, ['op', 'path', 'content', 'metadata']) && request.op === 'create',
-        'Create requires a path and original text.');
-    const { path, content } = request;
+export type StoredFile = DriveFile | (FileListEntry & { embedding: number[] });
+
+export function decodeStoredFile(doc: Record<string, unknown>, schema: MetadataSchema, dimensions?: number): StoredFile {
+    if (dimensions === undefined) return decodeFile(doc, schema);
+    const file = decodeFileEntry(doc, schema);
+    if (doc.body !== undefined || doc.content !== undefined)
+        throw new MemDriveError('INVALID_RESULT', 'Read returned text on an external-vector file original.');
+    try {
+        return { ...file, embedding: vectorValues(doc.embedding, dimensions) };
+    } catch (cause) {
+        throw new MemDriveError('INVALID_RESULT', 'Read returned an invalid external file embedding.', { cause });
+    }
+}
+
+export async function createRecords(request: CreateFileRequest | CreateExternalFileRequest, schema: MetadataSchema, dimensions?: number) {
+    const field = dimensions === undefined ? 'content' : 'embedding';
+    requireInput(keysOnly(request, ['op', 'path', field, 'metadata']) && request.op === 'create',
+        dimensions === undefined ? 'Create requires a path and original text.' : 'Create requires a path and external embedding.');
+    const { path } = request;
     requirePath(path);
-    requireInput(validText(content), 'File content must be UTF-8 text.');
+    let payload: { content: string } | { embedding: number[] };
+    if (dimensions === undefined) {
+        requireInput(validText(request.content), 'File content must be UTF-8 text.');
+        payload = { content: request.content };
+    } else {
+        payload = { embedding: vectorValues(request.embedding, dimensions) };
+    }
     const metadata = metadataValues(request.metadata, schema);
-    const file: DriveFile = { fileId: globalThis.crypto.randomUUID(), path, modifiedAt: new Date().toISOString(), content,
+    const file: StoredFile = { fileId: globalThis.crypto.randomUUID(), path, modifiedAt: new Date().toISOString(), ...payload,
         ...(metadata === undefined ? {} : { metadata }) };
+    if ('embedding' in file)
+        return fileRecords(file, { revision: globalThis.crypto.randomUUID(), fingerprint: await fingerprintOf(file) });
     return fileRecords(file);
 }
 
@@ -76,7 +99,8 @@ export function baselineOf(doc: Record<string, unknown>): FileBaseline | undefin
 }
 
 export const metadataKey = (metadata: DriveFile['metadata']) => metadata === undefined ? null : Object.entries(metadata).sort();
-export const fingerprintOf = (file: DriveFile) => contentHash(JSON.stringify([file.path, metadataKey(file.metadata), file.content]));
+export const fingerprintOf = (file: StoredFile) =>
+    contentHash(JSON.stringify([file.path, metadataKey(file.metadata), 'embedding' in file ? file.embedding : file.content]));
 
 type FileTracking = {
     revision: string;
@@ -86,8 +110,8 @@ type FileTracking = {
     version?: string | undefined;
 };
 
-export function fileOriginal(file: DriveFile, tracking?: FileTracking) {
-    const { fileId, path, content, modifiedAt, metadata } = file;
+export function fileOriginal(file: StoredFile, tracking?: FileTracking) {
+    const { fileId, path, modifiedAt, metadata } = file;
     const parts = path.slice(1).split('/');
     const fileName = parts.pop()!;
     const ancestorPaths = ['/'];
@@ -99,12 +123,13 @@ export function fileOriginal(file: DriveFile, tracking?: FileTracking) {
     const { revision } = tracking ?? {};
     const shared = { fileId, path, fileName, ancestorPaths, modifiedAt, ...(metadata === undefined ? {} : { metadata }),
         ...(revision === undefined ? {} : { revision }) };
-    return { id: originalId(fileId), kind: 'file' as const, ...shared, body: content,
+    const payload = 'embedding' in file ? { embedding: file.embedding } : { body: file.content };
+    return { id: originalId(fileId), kind: 'file' as const, ...shared, ...payload,
         changed: !tracking?.baseline || tracking.fingerprint !== tracking.baseline.fingerprint, ...tracking };
 }
 
-export async function fileRecords(file: DriveFile, tracking?: FileTracking) {
-    const { content, fileId } = file;
+export async function fileRecords(file: StoredFile, tracking?: FileTracking) {
+    const { fileId } = file;
     const original = fileOriginal(file, tracking);
     const { path, fileName, ancestorPaths, modifiedAt, metadata, revision } = original;
     const generation = tracking?.generation;
@@ -112,7 +137,12 @@ export async function fileRecords(file: DriveFile, tracking?: FileTracking) {
         ...(metadata === undefined ? {} : { metadata }), ...(revision === undefined ? {} : { revision }) };
     const originalBytes = bytes(original);
     requireInput(originalBytes <= 5 * 1024 * 1024, 'The file original exceeds the native 5 MiB document limit.');
-    const spans = chunkSpans(content).filter(span => span.text.trim());
+    const originalRecord = { doc: original, inputBytes: 0, wireBytes: originalBytes + 1 };
+    if ('embedding' in file) {
+        const { embedding: _embedding, ...reference } = file;
+        return { file: reference, docs: [originalRecord] };
+    }
+    const spans = chunkSpans(file.content).filter(span => span.text.trim());
     const occurrences = new Map<string, number>();
     const hashes = await Promise.all(spans.map(span => contentHash(span.text)));
     const chunks = spans.map(({ text, start, end }, index) => {
@@ -127,6 +157,6 @@ export async function fileRecords(file: DriveFile, tracking?: FileTracking) {
     // Large files stage their chunks before making the original visible.
     const chunkRecords = chunks.map(doc => ({ doc, inputBytes: encoder.encode(doc.content).length, wireBytes: bytes(doc) + 1 }));
     requireInput(chunkRecords.every(record => record.wireBytes - 1 <= 5 * 1024 * 1024), 'A chunk exceeds the native 5 MiB document limit.');
-    const docs = [...chunkRecords, { doc: original, inputBytes: 0, wireBytes: originalBytes + 1 }];
+    const docs = [...chunkRecords, originalRecord];
     return { file, docs };
 }

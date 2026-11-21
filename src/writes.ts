@@ -3,8 +3,8 @@ import { diffFiles } from './diff.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
 import { bytes, createRecords, fileOriginal, originalId, resultDocs, validFileId } from './records.js';
 import { afterId, branchRead, branchRef, fetchOriginals, pathQuery, viewRead, type Handle, type ViewRef } from './storage-reads.js';
-import type { CreateFileRequest, DeleteFileRequest, DeleteFileResult, DriveFile, MetadataSchema, RequestOptions, UpdateFileRequest,
-    WriteFileRequest, WriteFileResult } from './types.js';
+import type { CreateExternalFileRequest, DeleteFileRequest, FileListEntry, MetadataSchema, RequestOptions, UpdateExternalFileRequest,
+    WriteFileRequest } from './types.js';
 
 const requestMaxBytes = 6_029_312;
 const maximumInputBytes = 300_000;
@@ -16,6 +16,7 @@ const knownRejected = new Set([400, 401, 403, 404, 413, 422, 429]);
 type Identity = { fileId: string; path?: string | undefined };
 type NativeRecord = Identity & { id: string; kind: 'file' | 'chunk' | 'tombstone'; revision?: string | undefined } & Record<string, unknown>;
 type WriteRecord = { doc: NativeRecord; inputBytes: number; wireBytes: number };
+type Mutation = WriteFileRequest | CreateExternalFileRequest | UpdateExternalFileRequest;
 type FileRecords = Awaited<ReturnType<typeof createRecords>>;
 type Plan = { op: 'create'; records: FileRecords } | Awaited<ReturnType<typeof planEdit>>;
 type Stage = 'write-chunks' | 'write-original' | 'delete-original' | 'cleanup-chunks';
@@ -115,7 +116,7 @@ export async function listChunkIds(handle: Handle, name: string, ref: ViewRef, f
     throw new MemDriveError('CHUNK_SCAN_LIMIT', 'Current chunk lookup exceeded the supported number of pages.');
 }
 
-export function workingWriter(handle: Handle, name: string, branch: string, schema: MetadataSchema) {
+export function workingWriter(handle: Handle, name: string, branch: string, schema: MetadataSchema, dimensions?: number) {
     let queue = Promise.resolve();
     let userBarrier: Promise<void> | undefined;
 
@@ -167,20 +168,20 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
         if (originals.size) throw new MemDriveError('INVALID_RESULT', 'The written file or complete chunk set was not confirmed.');
     }
 
-    function write(request: CreateFileRequest | UpdateFileRequest, options?: RequestOptions): Promise<DriveFile>;
-    function write(request: DeleteFileRequest, options?: RequestOptions): Promise<DeleteFileResult>;
-    function write(request: WriteFileRequest, options?: RequestOptions): Promise<WriteFileResult>;
-    function write(request: (CreateFileRequest | UpdateFileRequest)[], options?: RequestOptions): Promise<DriveFile[]>;
-    function write(request: WriteFileRequest[], options?: RequestOptions): Promise<WriteFileResult[]>;
-    async function write(request: WriteFileRequest | WriteFileRequest[], options?: RequestOptions) {
+    function write(request: Exclude<Mutation, DeleteFileRequest>, options?: RequestOptions): Promise<FileListEntry>;
+    function write(request: DeleteFileRequest, options?: RequestOptions): Promise<{ fileId: string }>;
+    function write(request: Mutation, options?: RequestOptions): Promise<FileListEntry | { fileId: string }>;
+    function write(request: Exclude<Mutation, DeleteFileRequest>[], options?: RequestOptions): Promise<FileListEntry[]>;
+    function write(request: Mutation[], options?: RequestOptions): Promise<(FileListEntry | { fileId: string })[]>;
+    async function write(request: Mutation | Mutation[], options?: RequestOptions) {
         const { signal } = operationOptions(options);
         checkAbort(signal);
         const multi = Array.isArray(request);
         const operations = multi ? [...request] : [request];
         requireInput(operations.length >= 1 && operations.length <= writeBatchLimit, 'Submit 1–100 file operations.');
         const prepared = Promise.all(operations.map(async operation => operation?.op === 'create'
-            ? { op: 'create' as const, records: await createRecords(operation, schema) }
-            : editRequest(operation, schema)));
+            ? { op: 'create' as const, records: await createRecords(operation, schema, dimensions) }
+            : editRequest(operation, schema, dimensions)));
         void prepared.catch(() => {});
         return enqueueUser(() => enqueue(async () => {
             checkAbort(signal);
@@ -205,9 +206,9 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
                 pending.delete(uncertain);
             }
 
-            const originals = await fetchOriginals(handle, name, branchRef(branch), targetIds, signal);
+            const originals = await fetchOriginals(handle, name, branchRef(branch), targetIds, signal, dimensions !== undefined);
             const plans: Plan[] = await Promise.all(inputs.map(input =>
-                input.op === 'create' ? input : planEdit(input, originals.get(input.fileId), schema)));
+                input.op === 'create' ? input : planEdit(input, originals.get(input.fileId), schema, dimensions)));
             const destinations = new Map<string, string>();
             for (const plan of plans) {
                 if (plan.op === 'delete') continue;
@@ -263,7 +264,7 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
             }
             queueCreates();
 
-            const completed: WriteFileResult[] = [];
+            const completed: (FileListEntry | { fileId: string })[] = [];
             const staged = new Map<string, Identity>();
             const published = new Set<string>();
             const context = () => ({ completedFileIds: completed.map(file => file.fileId),
@@ -365,7 +366,8 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
                 if (edit.op === 'update') {
                     for (const batch of step.batches) await put(batch.map(record => record.doc), edit.moveOnly, false);
                     published.add(edit.file.fileId);
-                    await cleanup({ fileId: edit.file.fileId, path: edit.file.path }, { generation: edit.generation });
+                    if (dimensions === undefined)
+                        await cleanup({ fileId: edit.file.fileId, path: edit.file.path }, { generation: edit.generation });
                     completed.push(edit.file);
                 } else {
                     const { fileId, path, removeOriginal, tombstone } = edit;
@@ -373,7 +375,7 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
                         await put([tombstone], false, false);
                         published.add(fileId);
                     }
-                    await cleanup({ fileId, path });
+                    if (dimensions === undefined) await cleanup({ fileId, path });
                     if (removeOriginal) {
                         await remove([originalId(fileId)], { fileId, path }, 'delete-original');
                         published.add(fileId);

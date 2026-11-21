@@ -1,6 +1,7 @@
 import { MemDriveError, requireInput } from './errors.js';
-import { keysOnly } from './config.js';
-import type { ConnectionOptions, MetadataSchema, SearchFilesRequest } from './types.js';
+import { keysOnly, vectorValues } from './config.js';
+import { compileFilter } from './filter.js';
+import type { ConnectionOptions, MetadataSchema, SearchExternalFilesRequest, SearchFilesRequest } from './types.js';
 
 type NativeQuery = ReturnType<ConnectionOptions['client']['collection']>['query'];
 type QueryCollectionInput = Parameters<NativeQuery>[0];
@@ -11,8 +12,8 @@ const reranker = { provider: 'typesafe', model: 'jev-1.13.0' } as const;
 const usableQuery = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0
     && !/\p{Surrogate}/u.test(value) && encoder.encode(value).length <= 8192;
 
-export function searchQuery(request: SearchFilesRequest, schema: MetadataSchema): QueryCollectionInput {
-    requireInput(keysOnly(request, ['query', 'embeddingQuery', 'limit', 'rerank']) && usableQuery(request.query),
+export function searchQuery(request: SearchFilesRequest | SearchExternalFilesRequest, schema: MetadataSchema): QueryCollectionInput {
+    requireInput(keysOnly(request, ['query', 'embeddingQuery', 'limit', 'rerank']) && 'query' in request && usableQuery(request.query),
         'Search requires a nonblank query of at most 8192 UTF-8 bytes.');
     const { query, embeddingQuery = query, limit = 10, rerank = true } = request;
     requireInput(usableQuery(embeddingQuery), 'Embedding query must be nonblank text of at most 8192 UTF-8 bytes.');
@@ -39,6 +40,18 @@ export function searchQuery(request: SearchFilesRequest, schema: MetadataSchema)
         ...(rerank === false ? { candidateSize: candidates }
             : { rerank: { ...reranker, queryText: embeddingQuery, fields: [...fields], candidateSize: candidates, onFailure } }),
     };
+}
+
+export function vectorSearchQuery(request: SearchExternalFilesRequest | SearchFilesRequest, schema: MetadataSchema,
+    dimensions: number): QueryCollectionInput {
+    requireInput(keysOnly(request, ['queryVector', 'limit', 'filter']) && 'queryVector' in request,
+        'External search requires a queryVector and optional limit or filter.');
+    const { limit = 10, filter } = request;
+    requireInput(Number.isSafeInteger(limit) && limit >= 1 && limit <= 1000, 'Search limit must be 1–1000.');
+    const queryVector = vectorValues(request.queryVector, dimensions);
+    const original = { queryString: { query: '"file"', defaultField: 'kind' } };
+    return { size: limit, query: { knn: { field: 'embedding', queryVector, k: limit, filter: filter === undefined ? original
+        : { bool: [{ ...original, occur: 'filter' }, { ...compileFilter(filter, schema), occur: 'filter' }] } } } };
 }
 
 export function validateReranking(response: QueryCollectionResponse, body: QueryCollectionInput): boolean {

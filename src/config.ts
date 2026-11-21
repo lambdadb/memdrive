@@ -1,5 +1,5 @@
 import { Analyzer, type IndexConfigsUnion } from '@functional-systems/lambdadb/models/indexconfigsunion.js';
-import type { CreateFileStoreOptions, FileStoreDescription, Metadata, MetadataSchema } from './types.js';
+import type { CreateExternalFileStoreOptions, CreateFileStoreOptions, EmbeddingMode, ExternalEmbedding, FileStoreDescription, Metadata, MetadataSchema } from './types.js';
 import { MemDriveError, requireInput } from './errors.js';
 
 export const isObject = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object'
@@ -9,6 +9,7 @@ export const keysOnly = (value: unknown, keys: string[]): value is Record<string
 
 export const formatTag = 'memdrive.format';
 export const format = 'files-v0';
+const embeddingTag = 'memdrive.embedding';
 export const managedEmbedding = { mode: 'managed', provider: 'openai', model: 'text-embedding-3-small',
     dimensions: 1536, similarity: 'cosine' } as const;
 const fileIndexes = {
@@ -26,14 +27,36 @@ export const validDate = (value: unknown): value is string => typeof value === '
     && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
     && !Number.isNaN(Date.parse(value)) && new Date(value).toISOString() === value;
 
-function labelEntries(value: unknown = {}): Record<string, string> {
-    // Match the native tag restrictions, including Java's definition of whitespace.
-    // eslint-disable-next-line no-control-regex
-    const blank = /^[\u0009-\u000d\u001c-\u0020\u1680\u2000-\u2006\u2008-\u200a\u2028\u2029\u205f\u3000]*$/u;
-    requireInput(isObject(value) && Object.keys(value).length <= 4 && Object.entries(value).every(([key, item]) =>
-        /^[A-Za-z0-9_.-]{1,63}$/.test(key) && !key.startsWith('memdrive.') && typeof item === 'string'
-        && item.length <= 127 && !/[:#,]/.test(item) && !blank.test(item)), 'Labels must use native-safe names and values. memdrive.* names are reserved.');
+// Match the native tag restrictions, including Java's definition of whitespace.
+// eslint-disable-next-line no-control-regex
+const blankTag = /^[\u0009-\u000d\u001c-\u0020\u1680\u2000-\u2006\u2008-\u200a\u2028\u2029\u205f\u3000]*$/u;
+const validTagValue = (value: unknown): value is string => typeof value === 'string'
+    && value.length <= 127 && !/[:#,]/.test(value) && !blankTag.test(value);
+
+function labelEntries(value: unknown = {}, limit = 4): Record<string, string> {
+    requireInput(isObject(value) && Object.keys(value).length <= limit && Object.entries(value).every(([key, item]) =>
+        /^[A-Za-z0-9_.-]{1,63}$/.test(key) && !key.startsWith('memdrive.') && validTagValue(item)),
+    'Labels must use native-safe names and values. memdrive.* names are reserved.');
     return { ...value } as Record<string, string>;
+}
+
+function externalEmbedding(value: unknown): ExternalEmbedding {
+    requireInput(keysOnly(value, ['mode', 'dimensions', 'similarity', 'identity']) && value.mode === 'external'
+        && typeof value.dimensions === 'number' && Number.isInteger(value.dimensions) && value.dimensions >= 64 && value.dimensions <= 4096
+        && value.similarity === 'cosine' && validTagValue(value.identity) && value.identity.trim().length > 0 && !/\p{Surrogate}/u.test(value.identity),
+    'External embedding requires dimensions 64–4096, cosine similarity and a native-safe nonblank identity of at most 127 characters.');
+    return { mode: 'external', dimensions: value.dimensions, similarity: 'cosine', identity: value.identity };
+}
+
+export function vectorValues(value: unknown, dimensions: number): number[] {
+    requireInput(Array.isArray(value) && value.length === dimensions && [...value].every(item => typeof item === 'number'),
+        'Embedding must be a dense, finite, nonzero vector with the configured dimensions.');
+    // The native vector index stores float32. Canonicalize before fingerprinting so
+    // input values and the server's shortest decimal representations agree.
+    const vector = value.map(item => Math.fround(item));
+    requireInput(vector.every(Number.isFinite) && vector.some(item => item !== 0),
+        'Embedding must be a dense, finite, nonzero vector with the configured dimensions.');
+    return vector;
 }
 
 function schemaEntries(value: unknown = {}): MetadataSchema {
@@ -66,44 +89,49 @@ export function metadataValues(value: unknown, schema: MetadataSchema): Metadata
     return Object.keys(value).length ? { ...value } as Metadata : undefined;
 }
 
-export function storeConfiguration(options: CreateFileStoreOptions) {
-    const name = options.name;
+export function storeConfiguration(options: CreateFileStoreOptions | CreateExternalFileStoreOptions) {
+    const { name } = options;
     const metadataSchema = schemaEntries(options.metadataSchema);
-    const labels = labelEntries(options.labels);
-    const analyzers = textAnalyzers(options.textSearch);
-    const indexConfigs: Record<string, IndexConfigsUnion> = {
-        ...fileIndexes,
-        body: { type: 'text', analyzers },
-        content: { type: 'text', analyzers },
-        embedding: { type: 'vector', managedEmbedding: true, embedding: {
+    const external = options.embedding?.mode === 'external';
+    const labels = labelEntries(options.labels, external ? 3 : 4);
+    const tags: Record<string, string> = { ...labels, [formatTag]: format };
+    const indexConfigs: Record<string, IndexConfigsUnion> = { ...fileIndexes };
+    let description: FileStoreDescription<EmbeddingMode>;
+    if (external) {
+        const embedding = externalEmbedding(options.embedding);
+        requireInput(options.textSearch === undefined, 'External embedding does not support text indexes.');
+        indexConfigs.embedding = { type: 'vector', dimensions: embedding.dimensions, similarity: embedding.similarity };
+        tags[embeddingTag] = embedding.identity;
+        description = { name, labels, metadataSchema, embedding };
+    } else {
+        requireInput(options.embedding === undefined || keysOnly(options.embedding, ['mode']) && options.embedding.mode === 'managed',
+            'Managed embedding accepts only mode.');
+        const analyzers = textAnalyzers(options.textSearch);
+        indexConfigs.body = { type: 'text', analyzers };
+        indexConfigs.content = { type: 'text', analyzers };
+        indexConfigs.embedding = { type: 'vector', managedEmbedding: true, embedding: {
             provider: managedEmbedding.provider, model: managedEmbedding.model, dimensions: managedEmbedding.dimensions,
             similarity: managedEmbedding.similarity, sourceField: 'content',
-        } },
-    };
+        } };
+        description = { name, labels, metadataSchema, textSearch: { analyzers }, embedding: { ...managedEmbedding } };
+    }
     if (Object.keys(metadataSchema).length) indexConfigs.metadata = { type: 'object', objectIndexConfigs:
         Object.fromEntries(Object.entries(metadataSchema).map(([key, value]) => [key, { ...value, type: indexTypes[value.type] }])) };
-    const description: FileStoreDescription = { name, labels, metadataSchema, textSearch: { analyzers }, embedding: { ...managedEmbedding } };
-    return { indexConfigs, tags: { ...labels, [formatTag]: format }, description };
+    return { indexConfigs, tags, description };
 }
 
-export function parseStore(collection: unknown, name: string): FileStoreDescription {
+export function parseStore(collection: unknown, name: string): FileStoreDescription<EmbeddingMode> {
     try {
         requireInput(isObject(collection) && collection.collectionName === name && collection.defaultBranchName === 'main'
             && isObject(collection.tags) && collection.tags[formatTag] === format && isObject(collection.indexConfigs),
         'Collection format or main branch is incompatible.');
         const { tags, indexConfigs } = collection;
-        const labels = labelEntries(Object.fromEntries(Object.entries(tags).filter(([key]) => key !== formatTag)));
+        const external = Object.hasOwn(tags, embeddingTag);
+        const labels = labelEntries(Object.fromEntries(Object.entries(tags).filter(([key]) => key !== formatTag && key !== embeddingTag)),
+            external ? 3 : 4);
         requireInput(Object.entries(fileIndexes).every(([field, config]) => isObject(indexConfigs[field])
             && indexConfigs[field].type === config.type), 'Required file indexes are missing.');
         const { embedding, content, body, metadata } = indexConfigs;
-        requireInput(isObject(embedding) && embedding.type === 'vector' && embedding.managedEmbedding !== false && isObject(embedding.embedding)
-            && embedding.embedding.provider === managedEmbedding.provider && embedding.embedding.model === managedEmbedding.model
-            && embedding.embedding.dimensions === managedEmbedding.dimensions && embedding.embedding.similarity === managedEmbedding.similarity
-            && embedding.embedding.sourceField === 'content', 'Managed chunk embedding index is incompatible.');
-        requireInput(isObject(content) && content.type === 'text' && isObject(body) && body.type === 'text', 'Text indexes are missing.');
-        const analyzers = textAnalyzers({ analyzers: content.analyzers ?? ['standard'] });
-        requireInput(JSON.stringify(analyzers) === JSON.stringify(textAnalyzers({ analyzers: body.analyzers ?? ['standard'] })),
-            'Original and chunk analyzers must match.');
         let metadataSchema: MetadataSchema = {};
         if (metadata !== undefined) {
             requireInput(isObject(metadata) && metadata.type === 'object' && isObject(metadata.objectIndexConfigs),
@@ -114,6 +142,21 @@ export function parseStore(collection: unknown, name: string): FileStoreDescript
                     ...(value.description === undefined ? {} : { description: value.description }) }];
             })));
         }
+        if (external) {
+            requireInput(isObject(embedding) && embedding.type === 'vector' && embedding.managedEmbedding !== true
+                && embedding.embedding === undefined && content === undefined && body === undefined,
+            'External file embedding index is incompatible.');
+            return { name, labels, metadataSchema, embedding: externalEmbedding({ mode: 'external',
+                dimensions: embedding.dimensions, similarity: embedding.similarity, identity: tags[embeddingTag] }) };
+        }
+        requireInput(isObject(embedding) && embedding.type === 'vector' && embedding.managedEmbedding !== false && isObject(embedding.embedding)
+            && embedding.embedding.provider === managedEmbedding.provider && embedding.embedding.model === managedEmbedding.model
+            && embedding.embedding.dimensions === managedEmbedding.dimensions && embedding.embedding.similarity === managedEmbedding.similarity
+            && embedding.embedding.sourceField === 'content', 'Managed chunk embedding index is incompatible.');
+        requireInput(isObject(content) && content.type === 'text' && isObject(body) && body.type === 'text', 'Text indexes are missing.');
+        const analyzers = textAnalyzers({ analyzers: content.analyzers ?? ['standard'] });
+        requireInput(JSON.stringify(analyzers) === JSON.stringify(textAnalyzers({ analyzers: body.analyzers ?? ['standard'] })),
+            'Original and chunk analyzers must match.');
         return { name, labels, metadataSchema, textSearch: { analyzers }, embedding: { ...managedEmbedding } };
     } catch (cause) {
         throw new MemDriveError('INCOMPATIBLE_STORE', 'The collection is not a compatible MemDrive file store.', { cause });
