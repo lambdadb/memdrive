@@ -15,9 +15,10 @@ export function viewRead(ref: ViewRef) {
 export const branchRead = (branch: string) => viewRead(branchRef(branch));
 
 const kindClause = { queryString: { query: '"file"', defaultField: 'kind' }, occur: 'filter' };
-const pathClause = (path: string) => ({ queryString: { query: JSON.stringify(path), defaultField: 'path' } });
-
-export function pathQuery(paths: string[]) {
+export function pathQuery(paths: string[], { literal = false } = {}) {
+    const pathClause = (path: string) => ({ queryString: { defaultField: 'path',
+        ...(literal ? { query: path, skipSyntax: true } : { query: JSON.stringify(path) }),
+    } });
     return { bool: [
         kindClause,
         paths.length === 1 ? { ...pathClause(paths[0]!), occur: 'filter' }
