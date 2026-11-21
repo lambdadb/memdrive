@@ -163,9 +163,10 @@ test('live external vectors preserve private application text and frozen vector 
         assert(scan.docs.every(hit => hit.doc.kind === 'file'));
         assert.deepEqual(scan.docs.map(hit => hit.doc.fileId).sort(), [...ids].sort());
         const fresh = await open({ fork: 'source-vector' });
-        const results = await nearest(fresh, [a.fileId, b.fileId]);
+        const results = await nearest(fresh, [a.fileId, b.fileId], { probe: input });
         assert.deepEqual(results.map(hit => localTexts.get(hit.fileId)), [localTexts.get(a.fileId), localTexts.get(b.fileId)]);
-        assert(observed.queries.some(probe => JSON.stringify(probe) === JSON.stringify(query)));
+        assert(observed.queries.some(probe => JSON.stringify(probe) === JSON.stringify(canonical)),
+            'Query must preserve the same Float32 coordinates on the wire.');
         const read = await fresh.read({ fileId: a.fileId }, options());
         noPayloadText(read);
         assert(!Object.hasOwn(read, 'embedding'), 'A public read exposed the stored vector.');
@@ -187,6 +188,12 @@ test('live external vectors preserve private application text and frozen vector 
         assert.equal(first.status, 'published');
         const published = await open();
         await nearest(published, [a.fileId, b.fileId]);
+        const listed = (await published.list({}, options())).files;
+        assert.deepEqual(listed.map(file => file.fileId).sort(), [...ids].sort());
+        for (const file of listed) {
+            noPayloadText(file);
+            assert(!Object.hasOwn(file, 'embedding'), 'A public list exposed the stored vector.');
+        }
         const checkpointName = 'initial-vector-view';
         await published.checkpoint({ name: checkpointName }, options());
         const stale = await published.fork({ name: 'stale-vector-draft' }, options());
