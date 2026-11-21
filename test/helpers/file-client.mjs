@@ -52,6 +52,21 @@ export function fileClient() {
                     return response(docs, request.fields);
                 },
                 docs: {
+                    async list(request, options) {
+                        calls.push({ kind: 'list', request: structuredClone(request), signal: options?.signal });
+                        if (fixture.listPage) return fixture.listPage(request);
+                        const filters = request.filter.bool;
+                        const docs = [...docsAt(request.ref.name).values()].filter(doc => filters.every(({ queryString }) => {
+                            const { query, defaultField } = queryString;
+                            if (defaultField === 'fileName') return doc.fileName.includes(query.slice(3, -3));
+                            const expected = JSON.parse(query);
+                            return defaultField === 'ancestorPaths' ? doc.ancestorPaths.includes(expected) : doc.kind === expected;
+                        }));
+                        const start = Number(request.pageToken ?? 0);
+                        const end = Math.min(docs.length, start + (fixture.listPageSize ?? request.size));
+                        return { ...response(docs.slice(start, end), request.fields),
+                            ...(end < docs.length ? { nextPageToken: String(end) } : {}) };
+                    },
                     async fetch(request) {
                         calls.push({ kind: 'fetch', request: structuredClone(request) });
                         const docs = docsAt(request.ref.name);

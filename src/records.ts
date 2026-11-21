@@ -1,7 +1,7 @@
 import { MemDriveError, requireInput } from './errors.js';
 import { isObject, keysOnly, metadataValues, validDate } from './config.js';
 import { chunkSpans } from './chunking.js';
-import type { CreateFileRequest, DriveFile, MetadataSchema } from './types.js';
+import type { CreateFileRequest, DriveFile, FileListEntry, MetadataSchema } from './types.js';
 
 const encoder = new TextEncoder();
 export const bytes = (value: unknown) => encoder.encode(JSON.stringify(value)).length;
@@ -26,17 +26,24 @@ export function resultDocs(response: unknown, collection: string, maximum: numbe
     });
 }
 
-export function decodeFile(doc: Record<string, unknown>, schema: MetadataSchema): DriveFile {
+export function decodeFileEntry(doc: Record<string, unknown>, schema: MetadataSchema): FileListEntry {
     if (doc.kind !== 'file' || !validFileId(doc.fileId) || doc.id !== originalId(doc.fileId)
-        || !validPath(doc.path) || typeof doc.body !== 'string' || /\p{Surrogate}/u.test(doc.body) || !validDate(doc.modifiedAt))
+        || !validPath(doc.path) || !validDate(doc.modifiedAt))
         throw new MemDriveError('INVALID_RESULT', 'Read returned an invalid file original.');
     try {
         const metadata = metadataValues(doc.metadata, schema);
-        return { fileId: doc.fileId, path: doc.path, modifiedAt: doc.modifiedAt, content: doc.body,
+        return { fileId: doc.fileId, path: doc.path, modifiedAt: doc.modifiedAt,
             ...(metadata === undefined ? {} : { metadata }) };
     } catch (cause) {
         throw new MemDriveError('INVALID_RESULT', 'Read returned invalid file metadata.', { cause });
     }
+}
+
+export function decodeFile(doc: Record<string, unknown>, schema: MetadataSchema): DriveFile {
+    if (typeof doc.body !== 'string' || /\p{Surrogate}/u.test(doc.body))
+        throw new MemDriveError('INVALID_RESULT', 'Read returned an invalid file original.');
+    const { metadata, ...entry } = decodeFileEntry(doc, schema);
+    return { ...entry, content: doc.body, ...(metadata === undefined ? {} : { metadata }) };
 }
 
 async function contentHash(content: string): Promise<string> {

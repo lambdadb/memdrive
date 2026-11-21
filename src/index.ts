@@ -5,6 +5,7 @@ import { checkAbort, databaseError, MemDriveError, nativeOptions, nativeRequest,
 import { keysOnly, parseStore, storeConfiguration } from './config.js';
 import { bytes, decodeFile, fileRecords, originalId, resultDocs, validFileId, validPath } from './records.js';
 import { searchQuery, validateReranking } from './search.js';
+import { fileLister } from './list.js';
 export type * from './types.js';
 export { MemDriveError } from './errors.js';
 
@@ -292,14 +293,16 @@ function store(handle: Handle, description: FileStoreDescription) {
             return write;
         }
         const drive: WorkingFileDrive = Object.freeze({
-            name, at: Object.freeze({ kind: 'fork' as const, name: fork }), read: reader(branch), search: searcher(branch), describe, write,
+            name, at: Object.freeze({ kind: 'fork' as const, name: fork }), read: reader(branch), search: searcher(branch),
+            list: fileLister(handle, name, branch, metadataSchema), describe, write,
         });
         forks.set(fork, drive);
         return drive;
     }
 
     const mainView = Object.freeze({
-        name, at: Object.freeze({ kind: 'main' as const }), read: reader(main), search: searcher(main), describe,
+        name, at: Object.freeze({ kind: 'main' as const }), read: reader(main), search: searcher(main),
+        list: fileLister(handle, name, main, metadataSchema), describe,
         async fork(request: { name: string }, options?: RequestOptions) {
             const { signal } = operationOptions(options);
             checkAbort(signal);

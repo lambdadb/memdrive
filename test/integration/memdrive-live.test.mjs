@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { HTTPClient, LambdaDBClient } from '@functional-systems/lambdadb';
 import { MemDrive } from '@functional-systems/memdrive';
 
 const enabled = process.env.MEMDRIVE_RUN_LIVE_TESTS === '1';
+const verifyListConvergence = process.env.MEMDRIVE_RUN_LIVE_LIST_TESTS === '1';
 const required = ['LAMBDADB_BASE_URL', 'LAMBDADB_PROJECT_NAME', 'LAMBDADB_PROJECT_API_KEY'];
 const options = () => ({ signal: AbortSignal.timeout(60_000) });
 const statusOf = error => error?.status ?? error?.statusCode;
@@ -14,7 +16,7 @@ const safeFailure = (phase, error) => {
     return new Error(`${phase} failed (${error?.code ?? error?.name ?? 'Error'}${statusOf(error) ? `, status ${statusOf(error)}` : ''}).${detail}`);
 };
 
-test('live file store writes, searches and reopens a fresh fork with verified cleanup', {
+test('live file store writes, searches, lists and reopens a fresh fork with verified cleanup', {
     skip: enabled ? false : 'Set MEMDRIVE_RUN_LIVE_TESTS=1 to permit live resources.',
     timeout: 600_000,
 }, async t => {
@@ -36,14 +38,51 @@ test('live file store writes, searches and reopens a fresh fork with verified cl
     try {
         const main = await MemDrive.create({ client, name, metadataSchema: { topic: { type: 'string' } } }, options());
         assert.equal('write' in main, false);
+        assert.deepEqual(await main.list({}, options()), { files: [], prefixes: [], consistency: 'eventual' });
         const fork = await main.fork({ name: 'research' }, options());
         const path = '/notes/한글 "draft":*?.md';
         const content = '# Synthetic note\r\n Trailing space \n';
-        const [original, empty] = await fork.write([
+        const [original, empty, nested] = await fork.write([
             { op: 'create', path, content, metadata: { topic: 'synthetic' } },
             { op: 'create', path: '/empty.txt', content: '' },
+            { op: 'create', path: '/notes/sub/also "draft":*?.txt', content: '' },
         ], options());
         const reopened = await MemDrive.open({ client: new LambdaDBClient(connection), name, at: { fork: 'research' } }, options());
+        const listStartedAt = Date.now();
+        let listed = await reopened.list({ prefix: '/notes/' }, options());
+        t.diagnostic(`Initial list observed ${listed.files.length} file(s).`);
+        const reference = ({ fileId, path, modifiedAt, metadata }) => ({
+            fileId, path, modifiedAt, ...(metadata === undefined ? {} : { metadata }),
+        });
+        const expected = [reference(nested), reference(original)];
+        assert.deepEqual(listed, {
+            files: expected.filter(file => listed.files.some(row => row.fileId === file.fileId)),
+            prefixes: [], consistency: 'eventual',
+        });
+        assert.deepEqual(await main.list({ prefix: '/notes/' }, options()), { files: [], prefixes: [], consistency: 'eventual' });
+
+        // The release smoke checks the preview contract without a freshness
+        // deadline. The opt-in diagnostic observes convergence in this run.
+        if (verifyListConvergence) {
+            const deadline = listStartedAt + 150_000;
+            while (listed.files.length < expected.length && Date.now() < deadline) {
+                await sleep(Math.min(5_000, Math.max(0, deadline - Date.now())));
+                const remaining = deadline - Date.now();
+                if (remaining <= 0) break;
+                listed = await reopened.list({ prefix: '/notes/' }, { signal: AbortSignal.timeout(remaining) });
+            }
+            t.diagnostic(`Expected file set checked ${Date.now() - listStartedAt} ms after the first list request started.`);
+            assert.deepEqual(listed.files, expected);
+            const first = await reopened.list({ prefix: '/notes/', nameContains: '"draft":*?', delimiter: '/', limit: 1 }, options());
+            assert.deepEqual(first.prefixes, ['/notes/sub/']);
+            assert.deepEqual(first.files, []);
+            assert(first.cursor);
+            const last = await reopened.list({ cursor: first.cursor }, options());
+            assert.deepEqual(last, { files: [reference(original)], prefixes: [], consistency: 'eventual' });
+            assert.deepEqual(await reopened.list({ cursor: first.cursor }, options()), last);
+            assert.deepEqual((await reopened.list({ prefix: '/notes/', nameContains: 'also' }, options())).files, [reference(nested)]);
+        }
+
         assert.deepEqual(await reopened.read({ path }, options()), original);
         assert.equal(original.content, content);
         assert.deepEqual(original.metadata, { topic: 'synthetic' });
@@ -73,6 +112,7 @@ test('live file store writes, searches and reopens a fresh fork with verified cl
             }
             try {
                 await assert.rejects(client.collection(name).get(options()), error => statusOf(error) === 404);
+                t.diagnostic(`Temporary collection ${name} deletion verified with HTTP 404.`);
             } catch (error) {
                 const cleanup = safeFailure(`Deletion verification for ${name}`, error);
                 failure = failure ? new AggregateError([failure, cleanup], 'Smoke or cleanup verification failed.') : cleanup;
