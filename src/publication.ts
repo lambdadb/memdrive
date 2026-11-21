@@ -3,7 +3,7 @@ import { mergeCaptureJournal } from './merge-journal.js';
 import { applyMerge, advanceMergeSource, verifyMerge } from './merge-apply.js';
 import { confirmedMergeSource, initialMainRef, prepareMerge } from './merge-preflight.js';
 import { appliedId, bookkeepingId, completionId, parseOutcome, parseReservation, publicationLog, reservationId, returnOutcome,
-    tagFor, versionFor, type Applied, type Bookkeeping, type BoundRequest, type Completion, type Outcome, type Reservation } from './publication-log.js';
+    tagFor, versionFor, type BoundRequest, type Outcome, type PublicationRecord, type Reservation } from './publication-log.js';
 import { awaitMergeTag, refBackoff } from './refs.js';
 import { branchRef, type Handle, type ViewRef } from './storage-reads.js';
 import type { ConnectionOptions, MetadataSchema } from './types.js';
@@ -32,7 +32,7 @@ export function publication(client: ConnectionOptions['client'], content: Handle
     let slot = 1n;
     let active: Entry | undefined;
     let executing: string | undefined;
-    let unresolved: { requestId: string; record: Reservation | Completion | Applied | Bookkeeping } | undefined;
+    let unresolved: { requestId: string; record: PublicationRecord } | undefined;
     let unsettled: { requestId: string; cause: unknown } | undefined;
     let readTail = Promise.resolve();
     let mergeTail = Promise.resolve();
@@ -119,6 +119,9 @@ export function publication(client: ConnectionOptions['client'], content: Handle
     function refresh(signal?: AbortSignal) {
         const task = readTail.then(async () => {
             if (!await journal.exists(signal)) return;
+            const previous = unresolved;
+            if (previous && await journal.confirmed(previous.record, signal) && unresolved === previous)
+                unresolved = undefined;
             for (;;) {
                 if (!active) {
                     const record = await journal.read(reservationId(slot), signal);
@@ -165,11 +168,11 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         // applying during this operation. Recheck before releasing its result.
         const provisional = await operation(branchRef('main'))
             .then(value => ({ value } as const), cause => ({ cause } as const));
-        if (!await hasInitial(signal)) {
+        await refresh(signal);
+        if (published === initialVersion && !active && !await hasInitial(signal)) {
             if ('cause' in provisional) throw provisional.cause;
             return provisional.value;
         }
-        await refresh(signal);
         return operation(refFor(published));
     }
 
@@ -181,7 +184,7 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         await refresh(signal);
     }
 
-    function append(requestId: string, record: Reservation | Completion | Applied | Bookkeeping, signal?: AbortSignal) {
+    function append(requestId: string, record: PublicationRecord, signal?: AbortSignal) {
         unresolved = { requestId, record };
         return settleRecord(signal);
     }
@@ -261,21 +264,21 @@ export function publication(client: ConnectionOptions['client'], content: Handle
             throw new MemDriveError('MERGE_REQUEST_CONFLICT', 'The merge request ID is already bound to different input.', { details: { requestId } });
     }
 
-    function merge(request: BoundRequest, enqueueCapture: Writer['enqueueCapture'], signal?: AbortSignal) {
+    function merge(request: BoundRequest, { enqueueCapture, deferUserOperations }: Writer, signal?: AbortSignal) {
         const { requestId } = request;
-        // Reserve a position in the fork queue immediately. Do not wait for the
-        // main queue here, since its current merge may need this fork for bookkeeping.
+        // Capture independently of the main queue. Its current merge may
+        // need this fork for bookkeeping.
         const captureSource = () => enqueueCapture(async (branch, confirmSource) => {
             await refresh(signal);
-            if (unsettled) throw mergeBlocked(unsettled.requestId, unsettled.cause);
-            const blocking = active?.reservation.requestId ?? unresolved?.requestId;
-            if (blocking && blocking !== requestId && blocking !== executing) throw mergeBlocked(blocking);
             const existing = requests.get(requestId);
             if (existing) {
                 checkBinding(existing, request);
                 const tag = existing.reservation.sourceTag;
                 return tag === null ? null : confirmedMergeSource(content, tag);
             }
+            if (unsettled) throw mergeBlocked(unsettled.requestId, unsettled.cause);
+            const blocking = active?.reservation.requestId ?? unresolved?.requestId;
+            if (blocking && blocking !== requestId && blocking !== executing) throw mergeBlocked(blocking);
             await ensureJournal(signal);
             return capture(request, operation => operation(branch, confirmSource), signal);
         }, signal);
@@ -285,17 +288,21 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         const predecessor = sourceMerges.get(request.branch);
         const source = (predecessor ? predecessor.then(captureSource) : captureSource())
             .then(value => ({ value } as const), cause => ({ cause } as const));
+        if (predecessor) deferUserOperations(source);
 
         const result = enqueue(async () => {
             executing = requestId;
             try {
                 checkAbort(signal);
                 await refresh(signal);
+                const existing = requests.get(requestId);
+                if (existing) {
+                    checkBinding(existing, request);
+                    if (existing.outcome && existing !== active) return returnOutcome(existing.outcome, requestId);
+                }
                 if (active && active.reservation.requestId !== requestId) throw mergeBlocked(active.reservation.requestId);
                 if (unresolved && unresolved.requestId !== requestId) throw mergeBlocked(unresolved.requestId);
                 if (unsettled) throw mergeBlocked(unsettled.requestId, unsettled.cause);
-                const existing = requests.get(requestId);
-                if (existing) checkBinding(existing, request);
                 if (unresolved && 'requestId' in unresolved.record
                     && (unresolved.record.branch !== request.branch || unresolved.record.summary !== request.summary))
                     throw new MemDriveError('MERGE_REQUEST_CONFLICT', 'The merge request ID is already bound to different input.', { details: { requestId } });

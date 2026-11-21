@@ -184,7 +184,8 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         const existing = forks.get(fork);
         if (existing) return existing;
         const branch = forkPrefix + fork;
-        const { enqueueRef, enqueueCapture, write, diff } = writerFor(branch);
+        const writer = writerFor(branch);
+        const { enqueueRef, write, diff } = writer;
         const drive: WorkingFileDrive = Object.freeze({
             ...view(branchRef(branch), enqueueRef), at: Object.freeze({ kind: 'fork' as const, name: fork }), write, diff,
             merge(request: MergeRequest, options?: RequestOptions) {
@@ -192,7 +193,7 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
                 checkAbort(signal);
                 validateMergeRequest(request);
                 const bound = { requestId: request.requestId, summary: request.summary, branch };
-                return publishing.merge(bound, enqueueCapture, signal);
+                return publishing.merge(bound, writer, signal);
             },
         });
         forks.set(fork, drive);

@@ -34,7 +34,7 @@ const { hits, reranked } = await reopened.search({ query: 'Task context', limit:
 // The same file is available through { path: '/notes/context.md' }.
 ```
 
-`read` returns the original file or `null` when absent. Content can be empty and the SDK preserves whitespace and line endings. Paths are case-sensitive, absolute and slash-separated. Pass an array of up to 100 operations to write files in batches. Pass up to 100 distinct paths in `read({ paths })` to read existing files in request order. An existing path in the same fork rejects creation with `PATH_EXISTS`. Main is read-only and supplies the starting view for creating a fork. Working edits are scoped to that fork. A store can declare scalar metadata fields with `metadataSchema` and carry collection labels. File writes attach optional `metadata` and record the modification time.
+`read` returns the original file or `null` when absent. Content can be empty and the SDK preserves whitespace and line endings. Paths are case-sensitive, absolute and slash-separated. Pass an array of up to 100 operations to write files in batches. Pass up to 100 distinct paths in `read({ paths })` to read existing files in request order. An existing path in the same fork rejects creation with `PATH_EXISTS`. Main exposes the published file view and supplies the starting point for creating a fork. Working edits are scoped to that fork. A store can declare scalar metadata fields with `metadataSchema` and carry collection labels. File writes attach optional `metadata` and record the modification time.
 
 Search ranks file chunks with Bayesian lexical and vector retrieval. The store defaults to LambdaDB's `standard` analyzer and OpenAI's managed `text-embedding-3-small` embeddings. Set `textSearch.analyzers` when creating a store to select other supported analyzers. Text is currently split at paragraph, sentence or whitespace boundaries using an 800-code-point cap. Each hit carries the stable file ID, path, metadata and a chunk preview. When the chunk's location is verified against the exact original, the hit also includes a UTF-16 `range` that can be passed to JavaScript's `slice`.
 
@@ -90,6 +90,31 @@ for (const change of changes) {
 `diff()` reports one net change per file on a working fork. A create uses the current path and a delete reports the original baseline path as `previousPath`. An update uses the current path and includes `previousPath` when the path changed. Files created and deleted in the fork, and files restored to their original state, are omitted.
 
 Diff uses consistent reads and runs in the same queue as writes on the handle. Completed writes on that handle are visible to the scan, and later writes wait until the scan finishes. Use one active writer per fork. A previously unconfirmed request can still settle, and writes through another client or runtime can change the branch between pages. The result is an inspection of the working fork. It carries no durable snapshot or merge token.
+
+## Publish a working fork
+
+```ts
+const result = await work.merge({
+    requestId: 'research-2026-11-22',
+    summary: 'Add the task context and supporting notes',
+});
+
+const published = await main.read({ path: '/notes/context.md' });
+```
+
+`merge` captures the fork's net changes and publishes them to main. It returns the request ID, status (`published` or `unchanged`), and main version (for example, `v2`). Versions increase when a new view is published and can have gaps. A request ID is scoped to the store. Pass the same fork, ID, and summary to resume or retrieve its original result. Use a new ID to submit a revised change set.
+
+Merges queue against the latest published view. A conflicting file baseline or destination rejects the request with `MERGE_CONFLICT` and the affected file IDs and paths. Independent changes on main can coexist. Edits made on the source after capture stay on that fork. When multiple merges are queued on the same fork, the later capture waits for the earlier merge to advance its source baselines.
+
+Main reads, searches, lists, forks, and checkpoints select one published version. A completed merge becomes visible to existing SDK handles and new SDK clients after the journal records publication. Working views and named checkpoints keep their own contents. Direct LambdaDB reads of the writable `main` branch and older SDK versions can observe writes during application. Upgrade main readers before enabling merges.
+
+- `MERGE_RESUMABLE` identifies a paused request. Retry with its original ID and summary. If its main version is already published, the error includes `details.publishedVersion` and the retry completes the source bookkeeping.
+- `MERGE_BLOCKED` identifies the active request that prevents other publications. If a mutable native write has an unknown outcome, the host must fence the old writer and settle its in-flight operations before a replacement owner resumes it.
+- The SDK retries a definite rejection when pinning a merge's source or target tag for up to two minutes per stage. Cold collections can take longer to accept their first tag. A source deadline returns `MERGE_SOURCE_NOT_READY`; retry the request once the working snapshot is available. A target deadline is resumable. Pass a request `signal` to bound your wait.
+
+Run main publication and recovery through one exclusive host-owned writer per store across runtimes and client instances. Continue to enforce one writer per working fork, including its post-merge bookkeeping. Once the previous owner and its in-flight mutations have settled, the replacement owner can call `MemDrive.open({ client, name: 'workspace', recover: true })`. A normal `open` never resumes the merge. A paused merge continues to serve the previous published version until publication, and recovery continues from the retained request. Recovery does not automatically roll back the writable branch.
+
+MemDrive keeps its initial view, request captures, and published versions in reserved refs and creates an internal collection on the first merge. Give the writer permission to provision that collection and readers permission to inspect its records. Retain the SDK-owned refs and journal together while the store is in use. Earlier file stores are initialized on the first operation that needs a frozen main view. Native tag availability also applies to named checkpoints on an empty or cold view.
 
 ## List files
 

@@ -223,3 +223,52 @@ test('known cold tag rejections retry inside the public call while preserving th
     assert.equal(fixture.calls.filter(call => call.kind === 'upsert' && call.collection === name
         && call.request.branch === 'main').length, 1);
 });
+
+test('a same-fork merge captures after prior bookkeeping and before later queued user edits', async () => {
+    const { fixture, main } = await setup();
+    const work = await main.fork({ name: 'research' });
+    const saved = await work.write(file('/versioned', 'first'));
+    const applying = gate(), resume = gate();
+    fixture.beforeUpsert = async ({ branch, docs }) => {
+        if (branch === 'main' && docs.some(doc => doc.kind === 'file' && doc.body === 'first')) {
+            applying.resolve();
+            await resume.promise;
+        }
+    };
+    const first = work.merge(request('first'));
+    await applying.promise;
+    await work.write({ op: 'update', fileId: saved.fileId, content: 'second' });
+    const second = work.merge(request('second'));
+    const later = work.write({ op: 'update', fileId: saved.fileId, content: 'third' });
+    resume.resolve();
+    assert.deepEqual(await Promise.all([first, second]), [status('first', 'v1'), status('second', 'v2')]);
+    await later;
+    assert.equal((await main.read({ fileId: saved.fileId })).content, 'second');
+    assert.equal((await work.read({ fileId: saved.fileId })).content, 'third');
+    assert.deepEqual(await work.diff(), [{ op: 'update', fileId: saved.fileId, path: saved.path }]);
+});
+
+test('a temporarily unconfirmed bookkeeping record can settle without blocking subsequent publication', async () => {
+    const { fixture, main } = await setup();
+    const work = await main.fork({ name: 'research' });
+    await work.write(file('/first'));
+    let hideBookkeeping = false;
+    fixture.afterUpsert = ({ docs }) => {
+        if (docs[0].kind === 'merge-bookkeeping-v1' && docs[0].id === 'bookkeeping:1') {
+            hideBookkeeping = true;
+            throw new Error('Lost bookkeeping response');
+        }
+    };
+    fixture.beforeFetch = ({ ids, ref }) => {
+        if (hideBookkeeping && ref.name === 'main' && ids[0] === 'bookkeeping:1') {
+            hideBookkeeping = false;
+            return { isDocsInline: true, total: 0, docs: [] };
+        }
+    };
+    await assert.rejects(work.merge(request('first')), { code: 'MERGE_RESUMABLE',
+        details: { requestId: 'first', publishedVersion: 'v1' } });
+    assert.equal((await main.read({ path: '/first' })).content, '/first');
+    await work.write(file('/second'));
+    assert.deepEqual(await work.merge(request('second')), status('second', 'v2'));
+    assert.deepEqual(await work.merge(request('first')), status('first', 'v1'));
+});

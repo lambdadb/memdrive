@@ -117,6 +117,19 @@ export async function listChunkIds(handle: Handle, name: string, ref: ViewRef, f
 
 export function workingWriter(handle: Handle, name: string, branch: string, schema: MetadataSchema) {
     let queue = Promise.resolve();
+    let userBarrier: Promise<void> | undefined;
+
+    function deferUserOperations(until: Promise<unknown>) {
+        const barrier = until.then(() => undefined, () => undefined);
+        userBarrier = barrier;
+        void barrier.then(() => {
+            if (userBarrier === barrier) userBarrier = undefined;
+        });
+    }
+
+    function enqueueUser<T>(schedule: () => Promise<T>) {
+        return userBarrier ? userBarrier.then(schedule) : schedule();
+    }
     function enqueue<T>(operation: () => Promise<T>): Promise<T> {
         const result = queue.then(operation);
         queue = result.then(() => undefined, () => undefined);
@@ -169,7 +182,7 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
             ? { op: 'create' as const, records: await createRecords(operation, schema) }
             : editRequest(operation, schema)));
         void prepared.catch(() => {});
-        return enqueue(async () => {
+        return enqueueUser(() => enqueue(async () => {
             checkAbort(signal);
             requireBaselineSettled();
             const inputs = await prepared;
@@ -369,7 +382,7 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
                 }
             }
             return multi ? completed : completed[0]!;
-        });
+        }));
     }
     function enqueueCapture<T>(operation: (source: string, confirmSource: () => Promise<void>) => Promise<T>, signal?: AbortSignal) {
         return enqueue(async () => {
@@ -392,11 +405,12 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
     return {
         write,
         enqueueCapture,
+        deferUserOperations,
         enqueueRef<T>(operation: () => Promise<T>, signal?: AbortSignal) {
-            return enqueueCapture(async (_source, confirmSource) => {
+            return enqueueUser(() => enqueueCapture(async (_source, confirmSource) => {
                 await confirmSource();
                 return operation();
-            }, signal);
+            }, signal));
         },
         enqueueBaseline(operation: (branch: string) => Promise<void>, signal?: AbortSignal) {
             return enqueueCapture(async (source, confirmSource) => {
@@ -413,7 +427,7 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
         async diff(options?: RequestOptions) {
             const { signal } = operationOptions(options);
             checkAbort(signal);
-            return enqueue(() => diffFiles(handle, name, branch, signal));
+            return enqueueUser(() => enqueue(() => diffFiles(handle, name, branch, signal)));
         },
     };
 }

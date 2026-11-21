@@ -14,6 +14,7 @@ export type Outcome = { status: 'published' | 'unchanged'; version: string }
 export type Completion = RecordBase & Outcome & { kind: 'merge-result-v1'; completedAt: string };
 export type Applied = RecordBase & { kind: 'merge-applied-v1' };
 export type Bookkeeping = RecordBase & { kind: 'merge-bookkeeping-v1' };
+export type PublicationRecord = Reservation | Completion | Applied | Bookkeeping;
 
 export const versionFor = (slot: bigint) => `v${slot}`;
 export const tagFor = (version: string) => `md-main-${version}`;
@@ -125,14 +126,16 @@ export function publicationLog(content: Handle, internal: Handle, driveId: strin
         return doc;
     }
 
-    async function write(record: Reservation | Completion | Applied | Bookkeeping, signal?: AbortSignal) {
-        const matches = (observed: Record<string, unknown>) => Object.entries(record).every(([field, value]) =>
-            JSON.stringify(value) === JSON.stringify(observed[field]));
-        const existing = await read(record.id, signal);
-        if (existing) {
-            if (!matches(existing)) throw invalid();
-            return;
-        }
+    async function confirmed(record: PublicationRecord, signal?: AbortSignal) {
+        const observed = await read(record.id, signal);
+        if (!observed) return false;
+        if (!Object.entries(record).every(([field, value]) => JSON.stringify(value) === JSON.stringify(observed[field])))
+            throw invalid();
+        return true;
+    }
+
+    async function write(record: PublicationRecord, signal?: AbortSignal) {
+        if (await confirmed(record, signal)) return;
         checkAbort(signal);
         let cause;
         try {
@@ -141,8 +144,7 @@ export function publicationLog(content: Handle, internal: Handle, driveId: strin
             cause = error;
         }
         try {
-            const observed = await read(record.id, signal);
-            if (observed && matches(observed)) return;
+            if (await confirmed(record, signal)) return;
         } catch (error) {
             cause ??= error;
         }
@@ -150,5 +152,5 @@ export function publicationLog(content: Handle, internal: Handle, driveId: strin
             { cause, details: { record: record.id } });
     }
 
-    return { exists, ensure, read, write };
+    return { exists, ensure, read, confirmed, write };
 }
