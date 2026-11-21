@@ -1,0 +1,76 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { MemDrive } from '@functional-systems/memdrive';
+import { fileClient } from './helpers/file-client.mjs';
+
+const name = 'workspace';
+const request = requestId => ({ requestId, summary: `Publish ${requestId}` });
+const originalVector = [0.1, 0.2];
+const capturedVector = [0.3, 0.4];
+const laterVector = [0.5, 0.6];
+
+test('external vector publication replays the pinned vector and rebases later edits on the published vector', async () => {
+    const fixture = fileClient();
+    const main = await MemDrive.create({ client: fixture.client, name,
+        embedding: { mode: 'external', dimensions: 2, similarity: 'cosine', identity: 'fixture' } });
+    const work = await main.fork({ name: 'research' });
+    const { fileId } = await work.write({ op: 'create', path: '/notes', embedding: originalVector });
+    const id = `file:${fileId}`;
+    const state = fixture.collections.get(name);
+
+    function published(version) {
+        return state.tags.get(`md-main-${version}`).docs.get(id);
+    }
+
+    // A native vector fetch can return the shortest decimal encoding of float32.
+    fixture.afterUpsert = ({ docs }, persisted) => {
+        const vector = docs[0].embedding;
+        if (vector?.every((component, index) => component === Math.fround(capturedVector[index])))
+            persisted.get(id).embedding = capturedVector;
+    };
+
+    await work.merge(request('first'));
+    const stale = await main.fork({ name: 'stale' });
+    await work.write({ op: 'update', fileId, embedding: capturedVector });
+    assert.deepEqual(await work.diff(), [{ op: 'update', fileId, path: '/notes' }]);
+
+    fixture.beforeUpsert = ({ branch, docs }) => {
+        if (branch === 'main' && docs[0].id === id)
+            throw Object.assign(new Error('Rejected before dispatch'), { statusCode: 400 });
+    };
+    await assert.rejects(work.merge(request('replace')), { code: 'MERGE_RESUMABLE' });
+    await work.write({ op: 'update', fileId, embedding: laterVector });
+    assert.deepEqual(published('v1').embedding, originalVector.map(Math.fround));
+
+    fixture.beforeUpsert = undefined;
+    const reopened = await MemDrive.open({ client: { ...fixture.client }, name, at: { fork: 'research' } });
+    await reopened.merge(request('replace'));
+    assert.deepEqual(published('v2').embedding.map(Math.fround), capturedVector.map(Math.fround));
+    assert.deepEqual(await reopened.diff(), [{ op: 'update', fileId, path: '/notes' }]);
+
+    // Reverting only the vector clears the net change against the new baseline.
+    await reopened.write({ op: 'update', fileId, embedding: capturedVector });
+    assert.deepEqual(await reopened.diff(), []);
+    await stale.write({ op: 'update', fileId, embedding: laterVector });
+    await assert.rejects(stale.merge(request('stale')), { code: 'MERGE_CONFLICT',
+        details: { fileIds: [fileId], paths: [], requestId: 'stale' } });
+
+    await reopened.write({ op: 'update', fileId, newPath: '/renamed' });
+    const { version } = await reopened.merge(request('move'));
+    assert.equal(published(version).path, '/renamed');
+    assert.deepEqual(published(version).embedding.map(Math.fround), capturedVector.map(Math.fround));
+    assert.equal(state.tags.get(`md-main-${version}`).docs.size, 1);
+    for (const field of ['body', 'content', 'changed', 'baseline', 'fingerprint'])
+        assert.equal(Object.hasOwn(published(version), field), false);
+    const { path, ...reference } = await main.read({ fileId });
+    assert.equal(path, '/renamed');
+    assert.equal(Object.hasOwn(reference, 'embedding'), false);
+    assert.equal(Object.hasOwn(reference, 'content'), false);
+
+    await reopened.write({ op: 'delete', fileId });
+    assert.deepEqual(await reopened.diff(), [{ op: 'delete', fileId, previousPath: '/renamed' }]);
+    const deleted = await reopened.merge(request('delete'));
+    assert.equal(state.tags.get(`md-main-${deleted.version}`).docs.size, 0);
+    assert.equal(await main.read({ fileId }), null);
+    assert.deepEqual(await reopened.diff(), []);
+});

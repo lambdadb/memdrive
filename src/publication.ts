@@ -22,7 +22,7 @@ function mergeBlocked(requestId: string, cause?: unknown) {
 }
 
 export function publication(client: ConnectionOptions['client'], content: Handle, { name, driveId }: { name: string; driveId: string },
-    schema: MetadataSchema, writerFor: (branch: string) => Writer) {
+    schema: MetadataSchema, writerFor: (branch: string) => Writer, dimensions?: number) {
     const internal = client.collection(name);
     const journal = publicationLog(content, internal, driveId);
     const capture = mergeCaptureJournal(content, internal, { name, driveId }, { captureEmpty: true });
@@ -199,7 +199,7 @@ export function publication(client: ConnectionOptions['client'], content: Handle
             const target = tagRef(tagFor(version));
             const existing = entry.outcome ?? undefined;
             const plan = sourceTag === null ? undefined : await prepareMerge(content, content.collectionName, confirmedMergeSource(content, sourceTag),
-                refFor(priorVersion), schema, signal).catch(cause => {
+                refFor(priorVersion), schema, signal, dimensions).catch(cause => {
                 if (!(cause instanceof MemDriveError) || cause.code !== 'MERGE_CONFLICT' || existing) throw cause;
                 const { fileIds, paths } = cause.details as { fileIds: string[]; paths: string[] };
                 return { status: 'conflict' as const, fileIds, paths };
