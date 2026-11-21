@@ -81,6 +81,8 @@ export function fileClient() {
                     const direct = request.query.queryString;
                     if (direct?.defaultField === 'id' && direct.skipSyntax)
                         return response(source.filter(doc => doc.id === direct.query).slice(0, request.size), request.fields);
+                    if (request.query.queryString?.defaultField === 'id' && request.query.queryString.skipSyntax)
+                        return response(source.filter(doc => doc.id === request.query.queryString.query).slice(0, request.size), request.fields);
                     const [kind, path, exclude] = request.query.bool;
                     if (path?.queryString?.defaultField === 'changed') {
                         const overridden = await fixture.diffPage?.(request, options);
@@ -140,10 +142,12 @@ export function fileClient() {
                         calls.push({ kind: 'fetch', request: structuredClone(request) });
                         const docs = sourceDocs(request.ref);
                         const override = await fixture.beforeFetch?.(request, docs);
-                        return override ?? response(request.ids.map(id => docs.get(id)).filter(Boolean), request.fields);
+                        const selected = request.ids.map(id => docs.get(id)).filter(Boolean);
+                        return override ?? response(request.includeVectors ? selected.map(doc => doc.kind === 'chunk' && !doc.embedding
+                            ? { ...doc, embedding: new Array(1536).fill(1) } : doc) : selected, request.fields);
                     },
                     async upsert(request, options) {
-                        calls.push({ kind: 'upsert', request: structuredClone(request), retries: options?.retries });
+                        calls.push({ kind: 'upsert', collection: name, request: structuredClone(request), retries: options?.retries });
                         await fixture.beforeUpsert?.(request);
                         const docs = docsAt(request.branch);
                         for (const doc of request.docs) docs.set(doc.id, structuredClone(doc));
@@ -156,7 +160,7 @@ export function fileClient() {
                         for (const doc of request.docs) docs.set(doc.id, { ...docs.get(doc.id), ...structuredClone(doc) });
                     },
                     async delete(request, options) {
-                        calls.push({ kind: 'delete', request: structuredClone(request), retries: options?.retries });
+                        calls.push({ kind: 'delete', collection: name, request: structuredClone(request), retries: options?.retries });
                         const docs = docsAt(request.branch);
                         await fixture.beforeDelete?.(request, docs);
                         for (const id of request.ids) docs.delete(id);

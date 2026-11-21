@@ -1,5 +1,5 @@
 import type { LambdaDBClient } from '@functional-systems/lambdadb';
-import { create, open, type DriveFile, type CheckpointFileDrive, type FileChange, type DeleteFileResult, type SearchFilesResult, type ListFilesResult, type FileDrive, type OpenFileStoreOptions } from '@functional-systems/memdrive';
+import { create, open, type DriveFile, type CheckpointFileDrive, type FileChange, type DeleteFileResult, type SearchFilesResult, type ListFilesResult, type FileDrive, type MergeResult, type OpenFileStoreOptions } from '@functional-systems/memdrive';
 
 export async function fileConsumer(client: LambdaDBClient, options: OpenFileStoreOptions) {
     const main = await create({ client, name: 'workspace' });
@@ -27,6 +27,14 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     for (const change of changes) if (change.op === 'update' || change.op === 'delete') change.previousPath;
     // @ts-expect-error Diff is available only on working forks.
     await main.diff();
+    const merged: MergeResult = await reopened.merge({ requestId: 'batch-1', summary: 'Save the research' });
+    const mainVersion: string = merged.version;
+    void mainVersion;
+    await open({ client, name: 'workspace', recover: true });
+    // @ts-expect-error Publication is available only on working forks.
+    await main.merge({ requestId: 'batch-1', summary: 'Save the research' });
+    // @ts-expect-error Recovery is only available when opening main.
+    await open({ client, name: 'workspace', at: { fork: 'research' }, recover: true });
     const checkpoint: CheckpointFileDrive = await reopened.checkpoint({ name: 'saved' });
     const pinned: CheckpointFileDrive = await open({ client, name: 'workspace', at: { checkpoint: 'saved' } });
     await pinned.read({ fileId: created.fileId });
@@ -38,6 +46,8 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     await pinned.write({ op: 'delete', fileId: created.fileId });
     // @ts-expect-error Diff is only available on mutable forks.
     await pinned.diff();
+    // @ts-expect-error Checkpoint handles cannot publish.
+    await pinned.merge({ requestId: 'batch-1', summary: 'Save the research' });
     const selected: FileDrive = await open(options);
     if ('write' in selected) await selected.write({ op: 'create', path: '/another.md', content: '' });
     // @ts-expect-error Only a working fork has a write method.

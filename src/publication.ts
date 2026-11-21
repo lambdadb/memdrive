@@ -4,6 +4,7 @@ import { applyMerge, advanceMergeSource, verifyMerge } from './merge-apply.js';
 import { confirmedMergeSource, initialMainRef, prepareMerge } from './merge-preflight.js';
 import { appliedId, bookkeepingId, completionId, parseOutcome, parseReservation, publicationLog, reservationId, returnOutcome,
     tagFor, versionFor, type Applied, type Bookkeeping, type BoundRequest, type Completion, type Outcome, type Reservation } from './publication-log.js';
+import { awaitMergeTag, refBackoff } from './refs.js';
 import { branchRef, type Handle, type ViewRef } from './storage-reads.js';
 import type { ConnectionOptions, MetadataSchema } from './types.js';
 import type { workingWriter } from './writes.js';
@@ -15,21 +16,6 @@ function tagRef(name: string) {
     return { kind: 'tag' as const, name };
 }
 
-async function delay(ms: number, signal?: AbortSignal) {
-    checkAbort(signal);
-    await new Promise<void>((resolve, reject) => {
-        const cancel = () => {
-            clearTimeout(timer);
-            reject(new MemDriveError('ABORTED', 'Operation aborted.'));
-        };
-        const timer = setTimeout(() => {
-            signal?.removeEventListener('abort', cancel);
-            resolve();
-        }, ms);
-        signal?.addEventListener('abort', cancel, { once: true });
-    });
-}
-
 function mergeBlocked(requestId: string, cause?: unknown) {
     return new MemDriveError('MERGE_BLOCKED', 'A previous merge must settle before main can advance.',
         { cause, details: { requestId } });
@@ -39,12 +25,13 @@ export function publication(client: ConnectionOptions['client'], content: Handle
     schema: MetadataSchema, writerFor: (branch: string) => Writer) {
     const internal = client.collection(name);
     const journal = publicationLog(content, internal, driveId);
-    const capture = mergeCaptureJournal(content, internal, { name, driveId });
+    const capture = mergeCaptureJournal(content, internal, { name, driveId }, { captureEmpty: true });
     const initialVersion = 'v0';
     const requests = new Map<string, Entry>();
     let published = initialVersion;
     let slot = 1n;
     let active: Entry | undefined;
+    let executing: string | undefined;
     let unresolved: { requestId: string; record: Reservation | Completion | Applied | Bookkeeping } | undefined;
     let unsettled: { requestId: string; cause: unknown } | undefined;
     let readTail = Promise.resolve();
@@ -176,8 +163,12 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         if (published !== initialVersion || await hasInitial(signal)) return operation(refFor(published));
         // Older stores have no frozen v0. A merge may have pinned and started
         // applying during this operation. Recheck before releasing its result.
-        const provisional = await operation(branchRef('main'));
-        if (!await hasInitial(signal)) return provisional;
+        const provisional = await operation(branchRef('main'))
+            .then(value => ({ value } as const), cause => ({ cause } as const));
+        if (!await hasInitial(signal)) {
+            if ('cause' in provisional) throw provisional.cause;
+            return provisional.value;
+        }
         await refresh(signal);
         return operation(refFor(published));
     }
@@ -204,7 +195,7 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         try {
             const target = tagRef(tagFor(version));
             const existing = entry.outcome ?? undefined;
-            const plan = await prepareMerge(content, content.collectionName, confirmedMergeSource(content, sourceTag),
+            const plan = sourceTag === null ? undefined : await prepareMerge(content, content.collectionName, confirmedMergeSource(content, sourceTag),
                 refFor(priorVersion), schema, signal).catch(cause => {
                 if (!(cause instanceof MemDriveError) || cause.code !== 'MERGE_CONFLICT' || existing) throw cause;
                 const { fileIds, paths } = cause.details as { fileIds: string[]; paths: string[] };
@@ -212,7 +203,8 @@ export function publication(client: ConnectionOptions['client'], content: Handle
             });
             if (!entry.outcome) {
                 let outcome: Outcome;
-                if ('status' in plan) outcome = plan;
+                if (!plan) outcome = { status: 'unchanged', version: priorVersion };
+                else if ('status' in plan) outcome = plan;
                 else if (!plan.targets.length) outcome = { status: 'unchanged', version: priorVersion };
                 else {
                     if (!await hasTag(target.name, signal)) {
@@ -224,7 +216,7 @@ export function publication(client: ConnectionOptions['client'], content: Handle
                             await applyMerge(content, content.collectionName, plan, version, signal);
                             await append(requestId, { id, driveId, kind: 'merge-applied-v1' }, signal);
                         }
-                        await createTag(target.name, signal);
+                        await awaitMergeTag(() => createTag(target.name, signal), 'target', signal);
                     }
                     // Confirm both pinned lookup and indexed candidate visibility.
                     for (let attempt = 0; ; attempt++) {
@@ -232,17 +224,17 @@ export function publication(client: ConnectionOptions['client'], content: Handle
                             await verifyMerge(content, content.collectionName, plan, version, target, signal);
                             break;
                         } catch (cause) {
-                            if (attempt === 5 || !(cause instanceof MemDriveError) || cause.code !== 'MERGE_TARGET_NOT_READY')
+                            if (attempt === 5 || !(cause instanceof MemDriveError) || cause.code !== 'INVALID_RESULT')
                                 throw cause;
-                            await delay(250 * 2 ** attempt, signal);
+                            await refBackoff(250 * 2 ** attempt, signal);
                         }
                     }
                     outcome = { status: 'published', version };
                 }
-                await append(requestId, { id: completionId(slot), driveId, kind: 'merge-result-v1', ...outcome }, signal);
+                await append(requestId, { id: completionId(slot), driveId, kind: 'merge-result-v1', completedAt: new Date().toISOString(), ...outcome }, signal);
             }
 
-            if (entry.outcome?.status === 'published' && entry === active && !('status' in plan)) {
+            if (entry.outcome?.status === 'published' && entry === active && plan && !('status' in plan)) {
                 await advanceMergeSource(content, content.collectionName, plan, version, schema, writerFor(branch).enqueueBaseline, signal);
                 await append(requestId, { id: bookkeepingId(slot), driveId, kind: 'merge-bookkeeping-v1' }, signal);
             }
@@ -276,10 +268,13 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         const captureSource = () => enqueueCapture(async (branch, confirmSource) => {
             await refresh(signal);
             if (unsettled) throw mergeBlocked(unsettled.requestId, unsettled.cause);
+            const blocking = active?.reservation.requestId ?? unresolved?.requestId;
+            if (blocking && blocking !== requestId && blocking !== executing) throw mergeBlocked(blocking);
             const existing = requests.get(requestId);
             if (existing) {
                 checkBinding(existing, request);
-                return confirmedMergeSource(content, existing.reservation.sourceTag);
+                const tag = existing.reservation.sourceTag;
+                return tag === null ? null : confirmedMergeSource(content, tag);
             }
             await ensureJournal(signal);
             return capture(request, operation => operation(branch, confirmSource), signal);
@@ -292,38 +287,43 @@ export function publication(client: ConnectionOptions['client'], content: Handle
             .then(value => ({ value } as const), cause => ({ cause } as const));
 
         const result = enqueue(async () => {
-            checkAbort(signal);
-            await refresh(signal);
-            if (active && active.reservation.requestId !== requestId) throw mergeBlocked(active.reservation.requestId);
-            if (unresolved && unresolved.requestId !== requestId) throw mergeBlocked(unresolved.requestId);
-            if (unsettled) throw mergeBlocked(unsettled.requestId, unsettled.cause);
-            const existing = requests.get(requestId);
-            if (existing) checkBinding(existing, request);
-            if (unresolved && 'requestId' in unresolved.record
-                && (unresolved.record.branch !== request.branch || unresolved.record.summary !== request.summary))
-                throw new MemDriveError('MERGE_REQUEST_CONFLICT', 'The merge request ID is already bound to different input.', { details: { requestId } });
+            executing = requestId;
             try {
-                await settleRecord(signal);
-            } catch (cause) {
-                throw new MemDriveError('MERGE_RESUMABLE', 'Could not confirm the durable merge state. Retry the same request.',
-                    { cause, details: { requestId } });
-            }
-            let entry = requests.get(requestId);
-            if (!entry) {
-                const captured = await source;
-                if ('cause' in captured) throw captured.cause;
-                await ensureBootstrap(signal);
+                checkAbort(signal);
+                await refresh(signal);
+                if (active && active.reservation.requestId !== requestId) throw mergeBlocked(active.reservation.requestId);
+                if (unresolved && unresolved.requestId !== requestId) throw mergeBlocked(unresolved.requestId);
+                if (unsettled) throw mergeBlocked(unsettled.requestId, unsettled.cause);
+                const existing = requests.get(requestId);
+                if (existing) checkBinding(existing, request);
+                if (unresolved && 'requestId' in unresolved.record
+                    && (unresolved.record.branch !== request.branch || unresolved.record.summary !== request.summary))
+                    throw new MemDriveError('MERGE_REQUEST_CONFLICT', 'The merge request ID is already bound to different input.', { details: { requestId } });
                 try {
-                    await append(requestId, { id: reservationId(slot), driveId, kind: 'merge-reservation-v1', ...request,
-                        sourceTag: captured.value.name, priorVersion: published, version: versionFor(slot) }, signal);
+                    await settleRecord(signal);
                 } catch (cause) {
-                    throw new MemDriveError('MERGE_RESUMABLE', 'Could not confirm the merge reservation. Retry the same request.',
+                    throw new MemDriveError('MERGE_RESUMABLE', 'Could not confirm the durable merge state. Retry the same request.',
                         { cause, details: { requestId } });
                 }
-                entry = requests.get(requestId);
+                let entry = requests.get(requestId);
+                if (!entry) {
+                    const captured = await source;
+                    if ('cause' in captured) throw captured.cause;
+                    await ensureBootstrap(signal);
+                    try {
+                        await append(requestId, { id: reservationId(slot), driveId, kind: 'merge-reservation-v1', ...request,
+                            sourceTag: captured.value?.name ?? null, startedAt: new Date().toISOString(), priorVersion: published, version: versionFor(slot) }, signal);
+                    } catch (cause) {
+                        throw new MemDriveError('MERGE_RESUMABLE', 'Could not confirm the merge reservation. Retry the same request.',
+                            { cause, details: { requestId } });
+                    }
+                    entry = requests.get(requestId);
+                }
+                if (!entry) throw new MemDriveError('INVALID_RESULT', 'The merge reservation was not observed.');
+                return await finish(entry, signal);
+            } finally {
+                executing = undefined;
             }
-            if (!entry) throw new MemDriveError('INVALID_RESULT', 'The merge reservation was not observed.');
-            return finish(entry, signal);
         });
         const settled = result.then(() => undefined, () => undefined);
         sourceMerges.set(request.branch, settled);

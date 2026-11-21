@@ -1,4 +1,4 @@
-import { keysOnly } from './config.js';
+import { keysOnly, validDate } from './config.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, requireInput } from './errors.js';
 import { contentHash, resultDocs, validFileId, validPath, validText } from './records.js';
 import { branchRead, type Handle } from './storage-reads.js';
@@ -7,11 +7,11 @@ import type { MergeRequest, MergeResult } from './types.js';
 export type BoundRequest = MergeRequest & { branch: string };
 type RecordBase = { id: string; driveId: string };
 export type Reservation = RecordBase & BoundRequest & {
-    kind: 'merge-reservation-v1'; sourceTag: string; priorVersion: string; version: string;
+    kind: 'merge-reservation-v1'; sourceTag: string | null; startedAt: string; priorVersion: string; version: string;
 };
 export type Outcome = { status: 'published' | 'unchanged'; version: string }
     | { status: 'conflict'; fileIds: string[]; paths: string[] };
-export type Completion = RecordBase & Outcome & { kind: 'merge-result-v1' };
+export type Completion = RecordBase & Outcome & { kind: 'merge-result-v1'; completedAt: string };
 export type Applied = RecordBase & { kind: 'merge-applied-v1' };
 export type Bookkeeping = RecordBase & { kind: 'merge-bookkeeping-v1' };
 
@@ -33,18 +33,18 @@ export function validateMergeRequest(request: unknown): asserts request is Merge
 
 export function parseReservation(doc: Record<string, unknown>, slot: bigint, priorVersion: string): Reservation {
     if (doc.kind !== 'merge-reservation-v1' || doc.version !== versionFor(slot) || doc.priorVersion !== priorVersion
-        || !requestId(doc.requestId) || !summary(doc.summary) || !branch(doc.branch)
-        || typeof doc.sourceTag !== 'string' || !doc.sourceTag.startsWith('merge-capture-')
-        || !validFileId(doc.sourceTag.slice('merge-capture-'.length)))
+        || !validDate(doc.startedAt) || !requestId(doc.requestId) || !summary(doc.summary) || !branch(doc.branch)
+        || (doc.sourceTag !== null && (typeof doc.sourceTag !== 'string' || !doc.sourceTag.startsWith('merge-capture-')
+            || !validFileId(doc.sourceTag.slice('merge-capture-'.length)))))
         throw invalid();
-    const { kind, requestId: id, branch: sourceBranch, summary: message, sourceTag, version } = doc;
+    const { kind, requestId: id, branch: sourceBranch, summary: message, sourceTag, startedAt, version } = doc;
     return { id: reservationId(slot), driveId: doc.driveId as string, kind, requestId: id, summary: message,
-        branch: sourceBranch, sourceTag, priorVersion, version };
+        branch: sourceBranch, sourceTag, startedAt, priorVersion, version };
 }
 
 export function parseOutcome(doc: Record<string, unknown>, reservation: Reservation): Outcome {
-    if (doc.kind !== 'merge-result-v1') throw invalid();
-    if (doc.status === 'published' && doc.version === reservation.version
+    if (doc.kind !== 'merge-result-v1' || !validDate(doc.completedAt)) throw invalid();
+    if (doc.status === 'published' && doc.version === reservation.version && reservation.sourceTag !== null
         || doc.status === 'unchanged' && doc.version === reservation.priorVersion)
         return { status: doc.status, version: doc.version as string };
     if (doc.status === 'conflict' && Array.isArray(doc.fileIds) && doc.fileIds.every(validFileId)
