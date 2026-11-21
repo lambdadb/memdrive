@@ -188,7 +188,7 @@ test('live public merge publishes immutable views and resumes one interrupted re
         await search(oldMain, 'Alpine compass', moved.fileId, original);
         await verifyList(oldMain, [{ fileId: moved.fileId, path: '/working.txt' }, { fileId: removed.fileId, path: '/delete.txt' }]);
         const faultCheckpoint = await oldMain.checkpoint({ name: 'during-failure' }, options());
-        const faultFork = await faultCheckpoint.fork({ name: 'during-failure' }, options());
+        const faultFork = await oldMain.fork({ name: 'during-failure' }, options());
         await read(faultFork, '/working.txt', original);
         await read(faultFork, '/moved.txt', null);
         const unrelatedRequest = { requestId: randomUUID(), summary: 'Publish an unrelated file' };
