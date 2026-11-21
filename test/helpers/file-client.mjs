@@ -24,6 +24,7 @@ export function fileClient() {
                     : doc),
             })) });
             return {
+                collectionName: name,
                 async get() { return { collection: structuredClone(state().metadata) }; },
                 branches: {
                     async create({ branchName, source }, options) {
