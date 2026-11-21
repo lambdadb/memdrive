@@ -192,8 +192,11 @@ test('live public merge publishes immutable views and resumes one interrupted re
         await read(faultFork, '/working.txt', original);
         await read(faultFork, '/moved.txt', null);
         const unrelatedRequest = { requestId: randomUUID(), summary: 'Publish an unrelated file' };
+        const blockedFork = await freshFork('unrelated-edit');
         const beforeBlocked = mutations;
-        await assert.rejects((await freshFork('unrelated-edit')).merge(unrelatedRequest, options()), { code: 'MERGE_BLOCKED' });
+        await assert.rejects(blockedFork.merge(unrelatedRequest, options()), { code: 'MERGE_BLOCKED' });
+        // Drain this handle's source queue so a stray background capture is observable.
+        await blockedFork.diff(options());
         assert.equal(mutations, beforeBlocked, 'A blocked request sent a mutation.');
         await read(await freshMain(), '/unrelated.txt', null);
 
