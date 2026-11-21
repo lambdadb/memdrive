@@ -1,0 +1,4 @@
+{
+  "upstreamRevision": "b2da22eac88bb0874c64665f13457eb99835774a",
+  "answer_generation_for_rag": "\nYou are an assistant that MUST answer questions using ONLY the information provided in the context below. \n\nSTRICT INSTRUCTIONS:\n1. Answer ONLY based on the provided context\n2. Do NOT use your internal knowledge\n\nCONTEXT:\n<context>\n\nQUESTION:\n<question>\n\nANSWER REQUIREMENTS:\n- Be direct and concise\n- Only output the answer to the question without any explanation \n\nRESPONSE:\n"
+}
