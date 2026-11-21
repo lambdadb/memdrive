@@ -108,12 +108,14 @@ test('live public merge publishes immutable views and resumes one interrupted re
         assert(hits.some(hit => hit.content.includes(expected)), 'Published search omitted the expected source.');
         assert(hits.every(hit => hit.content.includes(expected)), 'Published search exposed a different source revision.');
     }
-    async function observeList(view, expected) {
+    async function verifyList(view, expected) {
         const listing = await view.list({}, options());
-        const paths = listing.files.map(file => file.path).sort();
-        const complete = JSON.stringify(paths) === JSON.stringify([...expected].sort());
-        t.diagnostic(`Published list returned ${paths.length}/${expected.length} expected paths; exact=${complete}; consistency=${listing.consistency}.`);
-        if (listing.consistency !== 'eventual') assert.deepEqual(paths, [...expected].sort());
+        const byPath = (a, b) => a.path.localeCompare(b.path);
+        const entries = listing.files.map(({ fileId, path }) => ({ fileId, path })).sort(byPath);
+        const wanted = [...expected].sort(byPath);
+        const complete = JSON.stringify(entries) === JSON.stringify(wanted);
+        t.diagnostic(`Published list returned ${entries.length}/${wanted.length} expected IDs and paths; exact=${complete}; consistency=${listing.consistency}.`);
+        assert.deepEqual(entries, wanted);
     }
 
     const client = native();
@@ -141,7 +143,7 @@ test('live public merge publishes immutable views and resumes one interrupted re
         await read(initial, '/working.txt', original);
         await read(initial, '/delete.txt', deletion);
         await search(initial, 'Alpine compass', moved.fileId, original);
-        await observeList(initial, ['/working.txt', '/delete.txt']);
+        await verifyList(initial, [{ fileId: moved.fileId, path: '/working.txt' }, { fileId: removed.fileId, path: '/delete.txt' }]);
         const retained = await initial.checkpoint({ name: 'initial-publication' }, options());
         const stale = await initial.fork({ name: 'conflicting-edit' }, options());
         const unrelated = await retained.fork({ name: 'unrelated-edit' }, options());
@@ -182,7 +184,7 @@ test('live public merge publishes immutable views and resumes one interrupted re
         await read(oldMain, '/delete.txt', deletion);
         await read(oldMain, newPath, null);
         await search(oldMain, 'Alpine compass', moved.fileId, original);
-        await observeList(oldMain, ['/working.txt', '/delete.txt']);
+        await verifyList(oldMain, [{ fileId: moved.fileId, path: '/working.txt' }, { fileId: removed.fileId, path: '/delete.txt' }]);
         const faultCheckpoint = await oldMain.checkpoint({ name: 'during-failure' }, options());
         const faultFork = await faultCheckpoint.fork({ name: 'during-failure' }, options());
         await read(faultFork, '/working.txt', original);
@@ -222,7 +224,7 @@ test('live public merge publishes immutable views and resumes one interrupted re
         await read(final, '/delete.txt', null);
         await read(final, newPath, '');
         await search(final, 'Alpine compass', moved.fileId, changed);
-        await observeList(final, ['/moved.txt', newPath]);
+        await verifyList(final, [{ fileId: moved.fileId, path: '/moved.txt' }, { fileId: edits[2].fileId, path: newPath }]);
         await read(retained, '/working.txt', original);
         await read(faultCheckpoint, '/delete.txt', deletion);
         await read(faultFork, '/working.txt', original);
@@ -263,7 +265,7 @@ test('live public merge publishes immutable views and resumes one interrupted re
                     await sleep(500);
                 }
                 assert(absent, 'Collection cleanup was not confirmed.');
-                t.diagnostic(`Owned fixture cleanup confirmed GET 404 for ${collection === name ? 'content' : 'journal'}.`);
+                t.diagnostic(`Owned fixture cleanup confirmed GET 404 for ${collection}.`);
             } catch (error) {
                 const cleanup = safeFailure('Fixture cleanup', error);
                 failure = failure ? new AggregateError([failure, cleanup]) : cleanup;
