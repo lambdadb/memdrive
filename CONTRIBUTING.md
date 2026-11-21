@@ -43,6 +43,11 @@ runs the live suite against the exact installed tarball. Set
 scenario, which owns and cleans up its content collection and merge journal.
 Document unperformed checks accurately.
 
+Set `MEMDRIVE_RUN_LIVE_EXTERNAL_VECTOR_TESTS=1` to also exercise external-vector
+writes, filters, checkpoints, and publication in the dedicated test project.
+This opt-in test creates an isolated file collection and its publication journal
+and verifies cleanup of both resources.
+
 ## Versions and releases
 
 See [RELEASING.md](RELEASING.md). Main pushes publish dev builds when the committed version is tagged on origin; otherwise they verify the intended release against production. Authorized GitHub Releases publish RC or stable versions. A local build or package check is not release authorization.

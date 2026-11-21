@@ -176,6 +176,7 @@ test('live external vectors preserve private application text and frozen vector 
         await nearest(fresh, [a.fileId, b.fileId]);
         const [filtered] = await nearest(fresh, [a.fileId], { limit: 3, filter: { and: [
             { field: 'metadata.topic', op: 'eq', value: topic }, { field: 'metadata.rank', op: 'gte', value: 10 },
+            { field: 'metadata.rank', op: 'lt', value: 13 },
         ] } });
         assert.equal(filtered.path, '/moved/a');
         assert.deepEqual(filtered.metadata, { topic, rank: 12 });
