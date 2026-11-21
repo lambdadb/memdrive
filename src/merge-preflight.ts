@@ -7,6 +7,8 @@ import type { MetadataSchema } from './types.js';
 
 type TagRef = Extract<ViewRef, { kind: 'tag' }>;
 type BranchRef = Extract<ViewRef, { kind: 'branch' }>;
+export const initialMainRef = { kind: 'branch', name: 'md-main-v0' } as const;
+type PublishedMain = TagRef | typeof initialMainRef;
 type SourceQueue = <T>(operation: () => Promise<T>, signal?: AbortSignal) => Promise<T>;
 type Candidate = NonNullable<ReturnType<typeof netChange>>;
 const confirmedCapture = Symbol('confirmed merge capture');
@@ -64,12 +66,12 @@ async function loadTargets(handle: Handle, name: string, source: TagRef, schema:
  * through application. For restart recovery, consume the
  * confirmed source returned by the durable capture journal.
  */
-export async function prepareMerge(handle: Handle, name: string, capture: MergeSource, publishedMain: TagRef,
+export async function prepareMerge(handle: Handle, name: string, capture: MergeSource, publishedMain: PublishedMain,
     schema: MetadataSchema, signal?: AbortSignal) {
-    if (capture[confirmedCapture] !== name || handle.collectionName !== name || publishedMain.kind !== 'tag')
-        throw new MemDriveError('INVALID_INPUT', 'Preparing a merge requires a confirmed source capture and the published main tag.');
+    if (capture[confirmedCapture] !== name || handle.collectionName !== name || publishedMain.kind !== 'tag' && publishedMain.name !== initialMainRef.name)
+        throw new MemDriveError('INVALID_INPUT', 'Preparing a merge requires a confirmed source capture and the published main version.');
     const source: TagRef = { kind: 'tag', name: capture.name };
-    const main: TagRef = { kind: 'tag', name: publishedMain.name };
+    const main: PublishedMain = { ...publishedMain };
     const targets = await loadTargets(handle, name, source, schema, signal);
     const destinationClaims = new Map<string, string>();
     const byId = new Map(targets.map(target => [target.change.fileId, target]));

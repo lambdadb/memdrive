@@ -1,7 +1,7 @@
 import { keysOnly } from './config.js';
 import { checkAbort, databaseError, MemDriveError, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
 import { bytes, decodeFileEntry, resultDocs, validPath } from './records.js';
-import type { ViewRef } from './storage-reads.js';
+import { afterId, readRef, viewRead, type RefSource } from './storage-reads.js';
 import type { ConnectionOptions, FileListEntry, ListFilesRequest, ListFilesResult, MetadataSchema, RequestOptions } from './types.js';
 
 type Handle = ReturnType<ConnectionOptions['client']['collection']>;
@@ -28,7 +28,7 @@ const legalText = (value: unknown): value is string => typeof value === 'string'
 const exceeded = () => new MemDriveError('LIST_SCAN_LIMIT', 'Listing exceeded the preview scan budget. Narrow the directory prefix and start again.');
 const cursorUnavailable = () => new MemDriveError('LIST_CURSOR_UNAVAILABLE', 'Listing cursor is unavailable on this handle. Start again without a cursor.');
 
-export function fileLister(handle: Handle, name: string, ref: ViewRef, schema: MetadataSchema) {
+export function fileLister(handle: Handle, name: string, source: RefSource, schema: MetadataSchema) {
     const scans = new Map<string, Scan>();
 
     function page(entries: Entry[], offset: number, limit: number): ListFilesResult {
@@ -85,51 +85,70 @@ export function fileLister(handle: Handle, name: string, ref: ViewRef, schema: M
             queryString: { query: `/.*${nameContains}.*/`, defaultField: 'fileName' }, occur: 'filter',
         });
 
-        const ids = new Set<string>(), paths = new Set<string>(), groups = new Set<string>(), tokens = new Set<string>();
-        const entries: Entry[] = [];
-        let pageToken: string | undefined;
-        let scannedRows = 0, retainedBytes = 0, projectedBytes = 0;
-        for (let pageIndex = 0; ; pageIndex++) {
-            if (pageIndex === maxScanPages) throw exceeded();
-            let response;
-            try {
-                response = await nativeRequest(() => handle.docs.list({ size: pageSize, pageToken, fields, ref, includeVectors: false,
-                    filter: { bool: clauses } }, nativeOptions(signal)), signal);
-            } catch (error) {
-                throw databaseError(error, 'Could not list files.');
-            }
-            checkAbort(signal);
-            const docs = resultDocs(response, name, pageSize);
-            scannedRows += docs.length;
-            if (scannedRows > maxScanRows) throw exceeded();
-            for (const doc of docs) {
-                const file = decodeFileEntry(doc, schema);
-                if (!file.path.startsWith(prefix) || !file.path.slice(file.path.lastIndexOf('/') + 1).includes(nameContains)
-                    || ids.has(file.fileId) || paths.has(file.path)) continue;
-                projectedBytes += bytes(file);
-                if (projectedBytes > maxBytes) throw exceeded();
-                ids.add(file.fileId);
-                paths.add(file.path);
-                // All drive paths start with '/'. At the root the delimiter
-                // groups by the first component, rather than grouping all files under '/'.
-                const nextSlash = delimiter === '/' ? file.path.indexOf('/', Math.max(1, prefix.length)) : -1;
-                const entry = nextSlash === -1 ? file : file.path.slice(0, nextSlash + 1);
-                if (typeof entry === 'string') {
-                    if (groups.has(entry)) continue;
-                    groups.add(entry);
+        const entries = await readRef(source, async ref => {
+            const published = 'read' in source;
+            const result: Entry[] = [];
+            let lastId: string | undefined;
+            const ids = new Set<string>(), paths = new Set<string>(), groups = new Set<string>(), tokens = new Set<string>();
+            let pageToken: string | undefined;
+            let scannedRows = 0, projectedBytes = 0;
+            for (let pageIndex = 0; ; pageIndex++) {
+                if (pageIndex === maxScanPages) throw exceeded();
+                let response;
+                try {
+                    response = await nativeRequest(async () => published
+                        ? handle.query({ size: pageSize, fields, ...viewRead(ref), sort: [{ id: 'asc' }],
+                            query: { bool: [...clauses, ...afterId(lastId)] } }, nativeOptions(signal))
+                        : handle.docs.list({ size: pageSize, pageToken, fields, ref, includeVectors: false,
+                            filter: { bool: clauses } }, nativeOptions(signal)), signal);
+                } catch (error) {
+                    throw databaseError(error, 'Could not list files.');
                 }
-                retainedBytes += bytes(entry);
-                entries.push(entry);
+                checkAbort(signal);
+                const docs = resultDocs(response, name, pageSize);
+                scannedRows += docs.length;
+                if (scannedRows > maxScanRows) throw exceeded();
+                for (const doc of docs) {
+                    const file = decodeFileEntry(doc, schema);
+                    if (published) {
+                        const id = doc.id as string;
+                        if (lastId !== undefined && id <= lastId)
+                            throw new MemDriveError('INVALID_RESULT', 'Published listing returned an unordered file record.');
+                        lastId = id;
+                    }
+                    if (!file.path.startsWith(prefix) || !file.path.slice(file.path.lastIndexOf('/') + 1).includes(nameContains)
+                        || ids.has(file.fileId) || paths.has(file.path)) continue;
+                    projectedBytes += bytes(file);
+                    if (projectedBytes > maxBytes) throw exceeded();
+                    ids.add(file.fileId);
+                    paths.add(file.path);
+                    // All drive paths start with '/'. At the root the delimiter
+                    // groups by the first component, rather than grouping all files under '/'.
+                    const nextSlash = delimiter === '/' ? file.path.indexOf('/', Math.max(1, prefix.length)) : -1;
+                    const entry = nextSlash === -1 ? file : file.path.slice(0, nextSlash + 1);
+                    if (typeof entry === 'string') {
+                        if (groups.has(entry)) continue;
+                        groups.add(entry);
+                    }
+                    result.push(entry);
+                }
+
+                if (published) {
+                    if (response.isDocsInline !== true || response.total !== docs.length)
+                        throw new MemDriveError('INVALID_RESULT', 'Published listing returned an incomplete file page.');
+                    if (docs.length < pageSize) break;
+                    continue;
+                }
+                const next: unknown = 'nextPageToken' in response ? response.nextPageToken : undefined;
+                if (next === undefined) break;
+                if (typeof next !== 'string' || !next.length || next.length > 16_384 || tokens.has(next))
+                    throw new MemDriveError('INVALID_RESULT', 'Native listing did not make progress.');
+                tokens.add(next);
+                pageToken = next;
             }
 
-            const next: unknown = response.nextPageToken;
-            if (next === undefined) break;
-            if (typeof next !== 'string' || !next.length || next.length > 16_384 || tokens.has(next))
-                throw new MemDriveError('INVALID_RESULT', 'Native listing did not make progress.');
-            tokens.add(next);
-            pageToken = next;
-        }
-
+            return result;
+        }, signal);
         entries.sort((a, b) => {
             const x = typeof a === 'string' ? a : a.path, y = typeof b === 'string' ? b : b.path;
             return x < y ? -1 : x > y ? 1 : 0;
@@ -138,6 +157,7 @@ export function fileLister(handle: Handle, name: string, ref: ViewRef, schema: M
         const result = page(entries, 0, limit);
         if (entries.length > limit) {
             const id = globalThis.crypto.randomUUID();
+            const retainedBytes = entries.reduce((total, entry) => total + bytes(entry), 0);
             let cachedBytes = [...scans.values()].reduce((sum, scan) => sum + scan.bytes, 0);
             while (scans.size >= maxScans || cachedBytes + retainedBytes > maxBytes) {
                 const oldest = scans.keys().next().value!;

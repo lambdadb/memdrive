@@ -5,6 +5,13 @@ import type { ConnectionOptions } from './types.js';
 export type Handle = ReturnType<ConnectionOptions['client']['collection']>;
 
 export type ViewRef = { kind: 'branch'; name: string } | { kind: 'tag'; name: string };
+export type RefSource = ViewRef | {
+    read<T>(operation: (ref: ViewRef) => Promise<T>, signal?: AbortSignal): Promise<T>;
+    pin(signal?: AbortSignal): Promise<ViewRef>;
+};
+export const pinRef = (source: RefSource, signal?: AbortSignal) => 'pin' in source ? source.pin(signal) : source;
+export const readRef = <T>(source: RefSource, operation: (ref: ViewRef) => Promise<T>, signal?: AbortSignal) =>
+    'read' in source ? source.read(operation, signal) : operation(source);
 export const branchRef = (name: string) => ({ kind: 'branch' as const, name });
 
 export function viewRead(ref: ViewRef) {
