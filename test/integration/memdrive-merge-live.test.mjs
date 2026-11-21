@@ -108,6 +108,26 @@ test('live public merge publishes immutable views and resumes one interrupted re
         assert(hits.some(hit => hit.content.includes(expected)), 'Published search omitted the expected source.');
         assert(hits.every(hit => hit.content.includes(expected)), 'Published search exposed a different source revision.');
     }
+    async function publishFirst(work, request) {
+        // A pristine fork or physical main may have accepted its first writes
+        // before a committed head exists. Exercise merge first and retry only
+        // the explicit cold-source error or a resumable publication of this ID.
+        const deadline = Date.now() + 150_000;
+        for (let attempt = 1; ; attempt++) {
+            try {
+                const result = await work.merge(request, options());
+                t.diagnostic(`First publication completed in ${attempt} same-request attempt(s).`);
+                return result;
+            } catch (error) {
+                const coldSource = error?.code === 'DATABASE_ERROR' && statusOf(error) === 400
+                    && error.message === 'Could not create the merge source.';
+                if (attempt === 1) t.diagnostic(`First publication call returned ${error.code ?? error.name}.`);
+                if ((!coldSource && error?.code !== 'MERGE_RESUMABLE') || Date.now() >= deadline) throw error;
+                await sleep(2_000);
+            }
+        }
+    }
+
     async function verifyList(view, expected) {
         const listing = await view.list({}, options());
         const byPath = (a, b) => a.path.localeCompare(b.path);
@@ -132,7 +152,7 @@ test('live public merge publishes immutable views and resumes one interrupted re
 
         phase = 'Publish the first merge from a new store';
         const first = { requestId: randomUUID(), summary: 'Publish synthetic originals' };
-        const firstResult = await work.merge(first, options());
+        const firstResult = await publishFirst(work, first);
         assert.equal(firstResult.requestId, first.requestId);
         assert.equal(firstResult.status, 'published');
         assert(typeof firstResult.version === 'string' && firstResult.version);
