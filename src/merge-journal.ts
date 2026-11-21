@@ -1,8 +1,9 @@
 import { keysOnly } from './config.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, requireInput } from './errors.js';
-import { captureMergeSource, confirmedMergeSource, type MergeSource, type SourceQueue } from './merge-preflight.js';
+import { captureMergeSource, confirmedMergeSource, type MergeSource } from './merge-preflight.js';
 import { contentHash, resultDocs, validFileId, validText } from './records.js';
 import { branchRead, type Handle } from './storage-reads.js';
+import type { workingWriter } from './writes.js';
 
 type CaptureRequest = { requestId: string; branch: string; summary: string };
 type Binding = CaptureRequest & { id: string; driveId: string; kind: 'merge-capture-v1'; fingerprint: string; tag: string };
@@ -56,12 +57,13 @@ export function mergeCaptureJournal(content: Handle, internal: Handle, collectio
     const pending = new Map<string, Binding>();
     let tail = Promise.resolve();
 
-    return function capture(request: CaptureRequest, enqueueSource: SourceQueue, signal?: AbortSignal): Promise<MergeSource> {
+    return function capture(request: CaptureRequest, enqueueSource: ReturnType<typeof workingWriter>['enqueueCapture'], signal?: AbortSignal): Promise<MergeSource> {
         checkAbort(signal);
         requireInput(keysOnly(request, ['requestId', 'branch', 'summary']) && validRequestId(request.requestId)
             && validBranch(request.branch) && validSummary(request.summary), 'Provide a merge request ID, working branch and summary.');
         const { requestId, branch, summary } = request;
-        return enqueueSource(() => {
+        return enqueueSource((sourceBranch, confirmSource) => {
+            requireInput(sourceBranch === branch, 'Provide the writer queue for the requested branch.');
             // The source queue orders capture against writes to its fork. This
             // queue serializes equal IDs across all forks of the drive.
             const result = tail.then(async () => {
@@ -81,6 +83,7 @@ export function mergeCaptureJournal(content: Handle, internal: Handle, collectio
 
                 let binding = uncertain;
                 if (!binding) {
+                    await confirmSource();
                     const tag = capturePrefix + globalThis.crypto.randomUUID();
                     const fingerprint = await fingerprintOf(branch, summary);
                     await captureMergeSource(content, { kind: 'branch', name: branch }, tag,

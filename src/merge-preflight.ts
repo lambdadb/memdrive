@@ -7,7 +7,7 @@ import type { MetadataSchema } from './types.js';
 
 type TagRef = Extract<ViewRef, { kind: 'tag' }>;
 type BranchRef = Extract<ViewRef, { kind: 'branch' }>;
-export type SourceQueue = <T>(operation: () => Promise<T>, signal?: AbortSignal) => Promise<T>;
+type SourceQueue = <T>(operation: () => Promise<T>, signal?: AbortSignal) => Promise<T>;
 type Candidate = NonNullable<ReturnType<typeof netChange>>;
 const confirmedCapture = Symbol('confirmed merge capture');
 export type MergeSource = Readonly<TagRef & { [confirmedCapture]: string }>;

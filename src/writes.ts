@@ -362,11 +362,10 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
             return multi ? completed : completed[0]!;
         });
     }
-    return {
-        write,
-        enqueueRef<T>(operation: () => Promise<T>, signal?: AbortSignal) {
-            return enqueue(async () => {
-                checkAbort(signal);
+    function enqueueCapture<T>(operation: (source: string, confirmSource: () => Promise<void>) => Promise<T>, signal?: AbortSignal) {
+        return enqueue(async () => {
+            checkAbort(signal);
+            return operation(branch, async () => {
                 for (const unsettled of pending) {
                     try { await confirm(unsettled.expected, signal); }
                     catch (cause) {
@@ -376,8 +375,18 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
                     }
                     pending.delete(unsettled);
                 }
-                return operation();
             });
+        });
+    }
+
+    return {
+        write,
+        enqueueCapture,
+        enqueueRef<T>(operation: () => Promise<T>, signal?: AbortSignal) {
+            return enqueueCapture(async (_source, confirmSource) => {
+                await confirmSource();
+                return operation();
+            }, signal);
         },
         async diff(options?: RequestOptions) {
             const { signal } = operationOptions(options);

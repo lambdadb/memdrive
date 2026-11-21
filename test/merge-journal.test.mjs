@@ -26,7 +26,7 @@ async function setup() {
 test('journal captures between working writes and a new owner can prepare the exact persisted capture', async () => {
     const { fixture, content, work, capture } = await setup();
     const first = work.write({ op: 'create', path: '/notes', content: 'first' });
-    const captured = capture(request, work.enqueueRef);
+    const captured = capture(request, work.enqueueCapture);
     const later = work.write({ op: 'create', path: '/later', content: 'second' });
     const file = await first;
     const source = await captured;
@@ -34,17 +34,18 @@ test('journal captures between working writes and a new owner can prepare the ex
     fixture.collections.get(name).branches.delete(request.branch);
 
     const reopened = mergeCaptureJournal(fixture.client.collection(name), fixture.client.collection(identity.name), identity);
-    const replay = await reopened(request, workingWriter(content, name, request.branch, {}).enqueueRef);
+    const replay = await reopened(request, workingWriter(content, name, request.branch, {}).enqueueCapture);
     assert.deepEqual(replay, source);
     const prepared = await prepareMerge(content, name, replay, published, {});
     assert.deepEqual(prepared.targets.map(target => target.file), [file]);
     const writes = fixture.calls.filter(call => call.kind === 'upsert' && call.request.docs[0].kind === 'merge-capture-v1');
     assert.equal(writes.length, 1);
     assert.deepEqual(writes[0].retries, { strategy: 'none' });
-    await assert.rejects(reopened({ ...request, summary: 'Changed summary' }, work.enqueueRef), { code: 'MERGE_REQUEST_CONFLICT' });
-    await assert.rejects(reopened({ ...request, branch: 'fork-another' }, work.enqueueRef), { code: 'MERGE_REQUEST_CONFLICT' });
+    await assert.rejects(reopened({ ...request, summary: 'Changed summary' }, work.enqueueCapture), { code: 'MERGE_REQUEST_CONFLICT' });
+    const another = workingWriter(content, name, 'fork-another', {});
+    await assert.rejects(reopened({ ...request, branch: 'fork-another' }, another.enqueueCapture), { code: 'MERGE_REQUEST_CONFLICT' });
     const wrongGeneration = mergeCaptureJournal(content, fixture.client.collection(identity.name), { ...identity, driveId: 'another-drive' });
-    await assert.rejects(wrongGeneration(request, work.enqueueRef), { code: 'INVALID_RESULT' });
+    await assert.rejects(wrongGeneration(request, work.enqueueCapture), { code: 'INVALID_RESULT' });
 });
 
 test('journal reconciles a lost acknowledgment and serializes duplicate requests across forks', async () => {
@@ -55,9 +56,9 @@ test('journal reconciles a lost acknowledgment and serializes duplicate requests
     fixture.afterUpsert = request => {
         if (request.docs[0].kind === 'merge-capture-v1') throw new Error('acknowledgment lost');
     };
-    const first = capture(request, work.enqueueRef);
-    const duplicate = capture(request, work.enqueueRef);
-    const competing = assert.rejects(capture({ ...request, branch: competingBranch }, other.enqueueRef), { code: 'MERGE_REQUEST_CONFLICT' });
+    const first = capture(request, work.enqueueCapture);
+    const duplicate = capture(request, work.enqueueCapture);
+    const competing = assert.rejects(capture({ ...request, branch: competingBranch }, other.enqueueCapture), { code: 'MERGE_REQUEST_CONFLICT' });
     const source = await first;
     assert.deepEqual(await duplicate, source);
     await competing;
@@ -76,10 +77,10 @@ test('a missing read after journal failure can only retry the identical captured
             if (attempts.length === 1) throw new Error('request was lost before acceptance');
         }
     };
-    await assert.rejects(capture(request, work.enqueueRef), { code: 'MERGE_CAPTURE_UNCONFIRMED' });
+    await assert.rejects(capture(request, work.enqueueCapture), { code: 'MERGE_CAPTURE_UNCONFIRMED' });
     await work.write({ op: 'update', fileId: file.fileId, content: 'after capture' });
-    await assert.rejects(capture({ ...request, summary: 'different' }, work.enqueueRef), { code: 'MERGE_REQUEST_CONFLICT' });
-    const source = await capture(request, work.enqueueRef);
+    await assert.rejects(capture({ ...request, summary: 'different' }, work.enqueueCapture), { code: 'MERGE_REQUEST_CONFLICT' });
+    const source = await capture(request, work.enqueueCapture);
     assert.equal(attempts.length, 2);
     assert.deepEqual(attempts[0], attempts[1]);
     const plan = await prepareMerge(content, name, source, published, {});
@@ -89,22 +90,22 @@ test('a missing read after journal failure can only retry the identical captured
 test('an unconfirmed tag or pristine source refusal never writes a binding', async () => {
     const { fixture, work, capture } = await setup();
     fixture.beforeTagCreate = () => { throw Object.assign(new Error('Source must have a snapshot'), { status: 400 }); };
-    await assert.rejects(capture(request, work.enqueueRef), { code: 'DATABASE_ERROR', status: 400 });
+    await assert.rejects(capture(request, work.enqueueCapture), { code: 'DATABASE_ERROR', status: 400 });
     fixture.beforeTagCreate = undefined;
     fixture.afterTagCreate = () => { throw new Error('acknowledgment lost'); };
-    await assert.rejects(capture(request, work.enqueueRef), { code: 'REF_CREATION_UNCONFIRMED' });
+    await assert.rejects(capture(request, work.enqueueCapture), { code: 'REF_CREATION_UNCONFIRMED' });
     assert.ok(!fixture.calls.some(call => call.kind === 'upsert'));
 });
 
 test('identically named stores in separate connections keep their capture bindings independent', async () => {
     const first = await setup();
     const second = await setup();
-    const one = await first.capture(request, first.work.enqueueRef);
-    const two = await second.capture({ ...request, summary: 'Separate store' }, second.work.enqueueRef);
+    const one = await first.capture(request, first.work.enqueueCapture);
+    const two = await second.capture({ ...request, summary: 'Separate store' }, second.work.enqueueCapture);
     assert.notEqual(one.name, two.name);
     assert.ok(first.fixture.collections.get(name).tags.has(one.name));
     assert.ok(!first.fixture.collections.get(name).tags.has(two.name));
-    await assert.rejects(first.capture({ ...request, summary: 'Separate store' }, first.work.enqueueRef),
+    await assert.rejects(first.capture({ ...request, summary: 'Separate store' }, first.work.enqueueCapture),
         { code: 'MERGE_REQUEST_CONFLICT' });
 });
 
@@ -115,4 +116,21 @@ test('distinct handles for the same content collection cannot be used as a journ
     assert.throws(() => mergeCaptureJournal(content, misrouted, { ...identity, name }), { code: 'INVALID_INPUT' });
     assert.throws(() => mergeCaptureJournal(content, internal, { ...identity, name: 'wrong-internal' }), { code: 'INVALID_INPUT' });
     assert.ok(!fixture.calls.some(call => call.kind === 'upsert'));
+});
+
+test('a confirmed binding replays despite an unconfirmed later source write', async () => {
+    const { fixture, work, capture } = await setup();
+    const source = await capture(request, work.enqueueCapture);
+    fixture.beforeUpsert = () => { throw new Error('response lost with working write unavailable'); };
+    await assert.rejects(work.write({ op: 'create', path: '/uncertain', content: '' }), { code: 'WRITE_UNCONFIRMED' });
+    const beforeReplay = fixture.calls.length;
+    assert.deepEqual(await capture(request, work.enqueueCapture), source);
+    const replayCalls = fixture.calls.slice(beforeReplay);
+    assert.equal(replayCalls.length, 1);
+    assert.equal(replayCalls[0].kind, 'fetch');
+    assert.equal(replayCalls[0].request.ref.name, 'main');
+
+    const tagCount = fixture.calls.filter(call => call.kind === 'tag-create').length;
+    await assert.rejects(capture({ ...request, requestId: 'new-request' }, work.enqueueCapture), { code: 'WRITE_UNCONFIRMED' });
+    assert.equal(fixture.calls.filter(call => call.kind === 'tag-create').length, tagCount);
 });
