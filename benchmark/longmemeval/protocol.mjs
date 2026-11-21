@@ -8,7 +8,7 @@ export const metadataSchema = {
     sessionId: { type: 'string', description: 'Original conversation session identifier.' },
     session: { type: 'number', description: 'One-based chronological session position.' },
     message: { type: 'number', description: 'Zero-based message position across this history.' },
-    date: { type: 'string', description: 'Original dataset session clock; timestamp interprets it as UTC.' },
+    timestamp: { type: 'string', description: 'Original dataset session clock interpreted as UTC.' },
 };
 export const integer = value => Number.isSafeInteger(value) && value >= 0;
 
@@ -39,8 +39,8 @@ export function prepareCase(row, config) {
         return session.map(turn => {
             assert(['user', 'assistant'].includes(turn.role)); assert.equal(typeof turn.content, 'string');
             const message = index++;
-            return { id: jsonHash([row.question_id, message]), content: turn.content, timestamp: time,
-                metadata: { role: turn.role, sessionId, session: sessionIndex + 1, message, date } };
+            return { path: `/sessions/${sessionIndex + 1}/messages/${message}.txt`, content: turn.content,
+                metadata: { role: turn.role, sessionId, session: sessionIndex + 1, message, timestamp: time } };
         });
     });
     let boundary = Math.max(0, messages.length - config.retrieval.recentMessagesIncludingQuestion + 1);
@@ -48,47 +48,55 @@ export function prepareCase(row, config) {
     if (boundary > 0 && messages[boundary].metadata.role === 'assistant'
         && messages[boundary - 1].metadata.role === 'user' && messages[boundary - 1].content.trim()) boundary--;
     return { id: row.question_id, question: row.question, questionTimestamp: timestamp(row.question_date), boundary,
-        mems: messages.slice(0, boundary).filter(mem => mem.content.trim()), recent: messages.slice(boundary) };
+        files: messages.slice(0, boundary).filter(file => file.content.trim()), recent: messages.slice(boundary) };
 }
 
-export const spanKey = span => JSON.stringify([span.memId, span.start, span.end]);
+export const fileIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+export const spanKey = span => JSON.stringify([span.fileId, span.start, span.end]);
 const splitSurrogate = (text, offset) => offset > 0 && offset < text.length
     && /[\uD800-\uDBFF]/.test(text[offset - 1]) && /[\uDC00-\uDFFF]/.test(text[offset]);
-export function validateSpan(span, prepared) {
-    const original = prepared.mems.find(mem => mem.id === span.memId);
+
+export function sourceFiles(prepared, fileIds) {
+    assert(Array.isArray(fileIds), 'Corpus file IDs must be an array');
+    assert.equal(fileIds.length, prepared.files.length, 'Corpus file ID count differs');
+    assert(fileIds.every(fileId => typeof fileId === 'string' && fileIdPattern.test(fileId)), 'Invalid corpus file ID');
+    assert.equal(new Set(fileIds).size, fileIds.length, 'Duplicate corpus file ID');
+    return new Map(prepared.files.map((file, i) => [fileIds[i], file]));
+}
+
+export function validateSpan(span, sources) {
+    const original = sources.get(span.fileId);
     assert(original, 'Evidence does not belong to the archived source');
+    assert.equal(span.path, original.path, 'Evidence file path differs');
     assert(integer(span.start) && integer(span.end) && span.start < span.end && span.end <= original.content.length,
         'Invalid evidence bounds');
     assert(!splitSurrogate(original.content, span.start) && !splitSurrogate(original.content, span.end), 'Split Unicode character');
     assert.equal(span.content, original.content.slice(span.start, span.end), 'Evidence text differs from source');
-    assert.equal(span.timestamp, original.timestamp, 'Evidence timestamp differs');
     assert.deepEqual(span.metadata, original.metadata, 'Evidence metadata differs');
-    return { memId: span.memId, start: span.start, end: span.end, content: span.content,
-        timestamp: span.timestamp, metadata: span.metadata };
+    return span;
 }
 
-export function resultSpans(name, result, prepared, resolveId = id => id, resolveEvidence) {
+export function resultSpans(name, result, sources) {
     if (!result.ok) return [];
-    const checkReference = (id, span) => {
-        if (resolveEvidence) assert.deepEqual(resolveEvidence(id), { memId: span.memId, start: span.start, end: span.end });
-        return span;
-    };
-    if (name === 'memdrive_recall') return result.value.results.flatMap(item => item.error ? []
-        : item.matches.map(match => {
-            assert(['mem', 'chunk'].includes(match.kind));
-            const span = validateSpan({ ...match, memId: resolveId(match.memId) }, prepared);
-            assert.equal(match.kind, span.start === 0 && span.end === prepared.mems.find(mem => mem.id === span.memId).content.length
-                ? 'mem' : 'chunk');
-            return checkReference(match.evidenceId, span);
-        }));
-    if (name === 'memdrive_read' || name === 'memdrive_list') return result.value.mems.map(mem => {
-        const { evidenceId, ...source } = mem;
-        mem = { ...(resolveEvidence ? source : mem), id: resolveId(mem.id) };
-        const original = prepared.mems.find(source => source.id === mem.id);
-        assert.deepEqual(mem, original, 'Read original differs from source');
-        return checkReference(evidenceId, validateSpan({ memId: mem.id, start: 0, end: mem.content.length, ...mem }, prepared));
+    assert(['search_files', 'read_file'].includes(name), 'Unexpected file tool result');
+    const values = name === 'search_files' ? result.value.hits : [result.value];
+    return values.flatMap(file => {
+        const { fileId, path, content, metadata, range } = file;
+        assert.equal(typeof content, 'string', 'Expected original or excerpt text');
+        const original = sources.get(fileId);
+        assert(original, 'Evidence does not belong to the archived source');
+        assert.equal(path, original.path, 'Evidence file path differs');
+        assert.deepEqual(metadata, original.metadata, 'Evidence metadata differs');
+        if (name === 'read_file') assert.equal(content, original.content, 'Read original differs from source');
+        // A range-free hit is attributable only when its text has a unique position in the original.
+        if (range !== undefined) {
+            assert(range && typeof range === 'object', 'Invalid evidence bounds');
+            return [validateSpan({ fileId, path, content, metadata, start: range.start, end: range.end }, sources)];
+        }
+        const start = original.content.indexOf(content);
+        if (!content || start < 0 || original.content.indexOf(content, start + 1) >= 0) return [];
+        return [validateSpan({ fileId, path, content, metadata, start, end: start + content.length }, sources)];
     });
-    return [];
 }
 
 export function selectEvidence(selection, available) {
@@ -96,14 +104,10 @@ export function selectEvidence(selection, available) {
     const byKey = new Map(available.map(span => [spanKey(span), span]));
     const selected = [], seen = new Set();
     for (const ref of selection.evidence) {
-        assert(ref && Object.keys(ref).every(key => ['memId', 'start', 'end'].includes(key)));
-        let span;
-        if (Object.keys(ref).length === 1 && typeof ref.memId === 'string') {
-            // Full originals are distinguishable from excerpts by their original length in metadata-free refs below.
-            span = available.find(item => item.memId === ref.memId && item.fullOriginal);
-        } else span = byKey.get(spanKey(ref));
+        assert(ref && Object.keys(ref).length === 3 && Object.keys(ref).every(key => ['fileId', 'start', 'end'].includes(key)),
+            'Expected file ID and range in evidence selection');
+        const key = spanKey(ref), span = byKey.get(key);
         assert(span, 'Selected evidence was not delivered to the model');
-        const key = spanKey(span);
         if (!seen.has(key)) { selected.push(span); seen.add(key); }
     }
     return selected;
@@ -114,24 +118,24 @@ function merged(spans) {
     const result = [];
     for (const span of sorted) {
         const last = result.at(-1);
-        if (last && last.memId === span.memId && span.start <= last.end) {
+        if (last && last.path === span.path && span.start <= last.end) {
             if (span.end > last.end) { last.content += span.content.slice(last.end - span.start); last.end = span.end; }
         } else result.push({ ...span });
     }
     return result;
 }
 function render(spans) {
-    return JSON.stringify(merged(spans).map(span => ({ memId: span.memId, role: span.metadata.role,
-        session: span.metadata.session, timestamp: span.timestamp, start: span.start, end: span.end, content: span.content })));
+    return JSON.stringify(merged(spans).map(span => ({ path: span.path, role: span.metadata.role,
+        session: span.metadata.session, timestamp: span.metadata.timestamp, start: span.start, end: span.end, content: span.content })));
 }
 export function context(prepared) {
     return { question: prepared.question, questionTimestamp: prepared.questionTimestamp,
-        recentDialogue: prepared.recent.map(mem => ({ role: mem.metadata.role, timestamp: mem.timestamp, content: mem.content })) };
+        recentDialogue: prepared.recent.map(file => ({ role: file.metadata.role, timestamp: file.metadata.timestamp, content: file.content })) };
 }
-export function packEvidence(prepared, ranked, config, countTokens) {
+export function packEvidence(prepared, ranked, config, countTokens, sources) {
     const admitted = [];
     for (const candidate of ranked) {
-        validateSpan(candidate, prepared);
+        validateSpan(candidate, sources);
         const next = [...admitted, candidate];
         if (countTokens(render(next)) <= config.retrieval.memoryTokens) admitted.push(candidate);
     }
@@ -146,23 +150,22 @@ function coverage(targets, spans) {
     if (!targets.length) return { annotatedTurns: 0, anyTurnRecall: null, fullTurnRecall: null };
     const joined = merged(spans);
     let any = 0, full = 0;
-    for (const mem of targets) {
-        const matches = joined.filter(span => span.memId === mem.id);
+    for (const file of targets) {
+        const matches = joined.filter(span => span.path === file.path);
         if (matches.length) any++;
-        if (matches.some(span => span.start === 0 && span.end === mem.content.length)) full++;
+        if (matches.some(span => span.start === 0 && span.end === file.content.length)) full++;
     }
     return { annotatedTurns: targets.length, anyTurnRecall: any / targets.length, fullTurnRecall: full / targets.length };
 }
 export function evidenceMetrics(row, prepared, stages) {
     if (row.question_id.endsWith('_abs')) return { applicable: false, reason: 'abstention' };
-    const all = [...prepared.mems, ...prepared.recent], goldIndexes = [];
+    const all = [...prepared.files, ...prepared.recent], goldIndexes = [];
     let index = 0;
     for (const session of row.haystack_sessions) for (const turn of session) { if (turn.has_answer === true) goldIndexes.push(index); index++; }
-    const gold = all.filter(mem => goldIndexes.includes(mem.metadata.message));
-    const archived = gold.filter(mem => mem.metadata.message < prepared.boundary);
-    const recent = prepared.recent.filter(mem => goldIndexes.includes(mem.metadata.message));
-    const recentSpans = prepared.recent.filter(mem => mem.content.length).map(mem => ({ memId: mem.id, start: 0,
-        end: mem.content.length, content: mem.content, metadata: mem.metadata, timestamp: mem.timestamp }));
+    const gold = all.filter(file => goldIndexes.includes(file.metadata.message));
+    const archived = gold.filter(file => file.metadata.message < prepared.boundary);
+    const recent = prepared.recent.filter(file => goldIndexes.includes(file.metadata.message));
+    const recentSpans = prepared.recent.filter(file => file.content.length).map(file => ({ ...file, start: 0, end: file.content.length }));
     const sessions = [...new Set(row.answer_session_ids ?? [])];
     return { applicable: true, recentAnnotatedTurns: recent.length, stages: Object.fromEntries(Object.entries(stages).map(([name, spans]) => {
         const combined = [...spans, ...recentSpans];

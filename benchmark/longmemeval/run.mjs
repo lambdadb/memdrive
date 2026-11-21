@@ -5,11 +5,9 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs, parseEnv } from 'node:util';
 import { get_encoding } from 'tiktoken';
-import { createTools } from 'memdrive-memory-baseline/tools';
-import { collectEvidence, canonicalToolDefinitions } from './agent.mjs';
-import { sdkCollector, sdkDefinitions } from './sdk-agent.mjs';
-import { prepareCase, metadataSchema, hash, jsonHash, packEvidence, evidenceMetrics, judgeRequest, verdict, integer } from './protocol.mjs';
-import { atomic, readJSON, exists, credentials, Journal, reuse, reuseDrive } from './runtime.mjs';
+import { collectEvidence, fileTools, runTool } from './agent.mjs';
+import { prepareCase, sourceFiles, hash, jsonHash, packEvidence, evidenceMetrics, judgeRequest, verdict, integer } from './protocol.mjs';
+import { atomic, readJSON, exists, credentials, readOnlyRequest, Journal, reuseDrive } from './runtime.mjs';
 import { dataset as loadDataset, questionPath, newUsage, lease, initialize, proof, ingestCorpus, cleanupCorpus } from './corpus.mjs';
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
@@ -18,18 +16,6 @@ const repository = path.resolve(directory, '../..');
 export const config = await readJSON(path.join(directory, 'config.json'));
 const rulesText = await readFile(path.join(directory, 'judge-rules.json'), 'utf8');
 
-export async function frozenTools(profile = config, mode = 'agentic') {
-    assert(!Object.hasOwn(profile, 'shortIds') && !Object.hasOwn(profile, 'evidenceIds'),
-        'Legacy alias settings require their matching historical runtime.');
-    const drive = {
-        describe: async () => ({ name: 'benchmark', labels: {}, metadataSchema, embedding: { mode: 'managed', provider: 'openai',
-            model: 'text-embedding-3-small', dimensions: 1536, similarity: 'cosine' }, textSearch: { analyzers: ['english'] } }),
-        recall: async () => { throw new Error('Definition-only handle'); },
-    };
-    if (mode === 'agentic' && profile.collectorImplementation === 'sdk') return sdkDefinitions(drive);
-    assert(['benchmark', 'sdk'].includes(profile.collectorImplementation));
-    return canonicalToolDefinitions((await createTools({ drive })).definitions);
-}
 async function treeFiles(directory) {
     const result = [];
     for (const item of await readdir(directory, { withFileTypes: true })) {
@@ -41,9 +27,10 @@ async function treeFiles(directory) {
 }
 export async function fingerprints() {
     const files = [path.join(repository, 'package.json'), path.join(repository, 'package-lock.json')];
-    files.push(...await treeFiles(path.join(repository, 'benchmark/longmemeval')));
+    files.push(...await treeFiles(path.join(repository, 'benchmark/longmemeval')),
+        ...await treeFiles(path.join(repository, 'dist/esm')));
     // Fingerprint actual installed runtime code as well as the dependency lock.
-    for (const name of ['memdrive-memory-baseline', '@functional-systems/lambdadb', 'tiktoken', 'zod']) {
+    for (const name of ['@functional-systems/lambdadb', 'tiktoken', 'zod']) {
         const packageRoot = path.join(repository, 'node_modules', name);
         files.push(...await treeFiles(packageRoot));
     }
@@ -61,7 +48,7 @@ export async function prepare(root, corpusRoot, mode, limit) {
         const ids = corpusProof.manifest.ids.slice(0, limit);
         const lock = { protocol: config.protocol, mode, ids, config, rulesText,
             corpus: { path: canonical, proofSha256: jsonHash(corpusProof) },
-            package: await readJSON(path.join(repository, 'package.json')), sources: await fingerprints(), tools: await frozenTools(config, mode),
+            package: await readJSON(path.join(repository, 'package.json')), sources: await fingerprints(), tools: fileTools(config),
             inputs: Object.fromEntries(ids.map(id => [id, jsonHash(prepareCase(rows.get(id), config))])) };
         const target = path.join(root, 'dataset.json'); assert(!await exists(target), 'Use a new run directory');
         try { await link(path.join(canonical, 'dataset.json'), target); }
@@ -73,7 +60,7 @@ export async function prepare(root, corpusRoot, mode, limit) {
 }
 async function checked(root) {
     const lock = await readJSON(path.join(root, 'lock.json')), profile = lock.config;
-    assert.equal(lock.protocol, 'memdrive-longmemeval-v2'); assert.equal(profile.protocol, lock.protocol);
+    assert.equal(lock.protocol, 'memdrive-longmemeval-files-v1'); assert.equal(profile.protocol, lock.protocol);
     assert.equal(new Set(lock.ids).size, lock.ids.length); assert(lock.ids.length > 0);
     assert(['single_pass', 'agentic'].includes(lock.mode));
     const current = await fingerprints();
@@ -81,7 +68,7 @@ async function checked(root) {
     const executable = files => Object.fromEntries(Object.entries(files).filter(([name]) =>
         !name.startsWith('benchmark/') || /\.mjs$/.test(name)));
     assert.deepEqual(executable(current), executable(lock.sources), 'Executable code changed; use the original checkout/runtime');
-    assert.deepEqual(await frozenTools(profile, lock.mode), lock.tools); assert.equal(hash(lock.rulesText), profile.rulesSha256);
+    assert.deepEqual(fileTools(profile), lock.tools); assert.equal(hash(lock.rulesText), profile.rulesSha256);
     const corpusProof = await readJSON(path.join(root, 'corpus-proof.json'));
     assert.equal(jsonHash(corpusProof), lock.corpus.proofSha256);
     const rows = await loadDataset(root, profile.dataset);
@@ -89,8 +76,9 @@ async function checked(root) {
     for (const id of lock.ids) {
         const prepared = prepareCase(rows.get(id), profile), entry = corpusProof.entries[id];
         assert.equal(jsonHash(prepared), lock.inputs[id], 'Prepared source changed');
-        assert.equal(jsonHash(prepared.mems), corpusProof.manifest.sources[id]);
+        assert.equal(jsonHash(prepared.files), corpusProof.manifest.sources[id]);
         assert.equal(entry.sourceHash, corpusProof.manifest.sources[id]);
+        sourceFiles(prepared, entry.fileIds);
         assert.deepEqual(entry.entry, { ...corpusProof.manifest.collections[id], absent: false });
     }
     return { lock, rows, binding: jsonHash(lock), corpusProof, rules: JSON.parse(lock.rulesText) };
@@ -159,26 +147,18 @@ export async function recall(root, keys, { fetcher = fetch, signal } = {}) {
                 const journal = new Journal({ root: qroot, config, binding, credentials: keys, state: q, save, fetcher, signal: questionSignal, readOnly: true });
                 const started = performance.now(); let retrievalStarted;
                 try {
-                    const sdk = lock.mode === 'agentic' && config.collectorImplementation === 'sdk';
+                    const sources = sourceFiles(prepared, corpusProof.entries[id].fileIds);
+                    const drive = await reuseDrive(journal, q.entry, sources, corpusProof.manifest.storage);
                     const events = [];
                     await atomic(path.join(qroot, 'tools.json'), events);
-                    const collectOptions = { prepared, config, countTokens, signal: questionSignal,
-                        ask: (request, round, signal) => journal.model('collector', request, `collector-${round}.json`, signal),
-                        onTool: async event => { events.push(event); await atomic(path.join(qroot, 'tools.json'), events); } };
-                    let collect;
-                    if (sdk) collect = await sdkCollector({ ...collectOptions, definitions: lock.tools,
-                        drive: await reuseDrive(journal, prepared, q.entry, corpusProof.manifest.storage),
-                        onOutcome: outcome => atomic(path.join(qroot, 'orchestration.json'), outcome) });
-                    else {
-                        const tools = await reuse(journal, prepared, q.entry, corpusProof.manifest.storage);
-                        assert.deepEqual(canonicalToolDefinitions(tools.definitions), lock.tools, 'Live tools differ from prepared definitions');
-                        collect = () => collectEvidence({ ...collectOptions, mode: lock.mode,
-                            tools: { definitions: lock.tools, execute: (...args) => tools.execute(...args) } });
-                    }
                     q.validationOperations = q.databaseOperations; q.validationMilliseconds = performance.now() - started;
                     q.phase = 'collect'; await save(); retrievalStarted = performance.now();
-                    const collected = await collect();
-                    const packed = packEvidence(prepared, collected.selected, config, countTokens);
+                    const collected = await collectEvidence({ mode: lock.mode, prepared, sources, config, countTokens,
+                        definitions: lock.tools, signal: questionSignal,
+                        executeTool: (name, args, { signal }) => runTool(drive, name, args, config, signal),
+                        ask: (request, round, signal) => journal.model('collector', request, `collector-${round}.json`, signal),
+                        onTool: async event => { events.push(event); await atomic(path.join(qroot, 'tools.json'), events); } });
+                    const packed = packEvidence(prepared, collected.selected, config, countTokens, sources);
                     await atomic(path.join(qroot, 'evidence.json'), { collected, packed,
                         metrics: evidenceMetrics(rows.get(id), prepared, { retrieved: collected.retrieved, delivered: collected.delivered, packed: packed.spans }) });
                     q.hasEvidence = true; q.status = 'recalled'; q.phase = 'recalled';
@@ -256,10 +236,13 @@ export async function verify(root) {
             for (let number = 1; number <= q.receiptNumber; number++) {
                 const receipt = await readJSON(path.join(qroot, `database/${number}.json`)); validateReceipt(receipt, binding);
                 assert.equal(receipt.request.kind, 'database');
-                const url = new URL(receipt.request.url), collectionPath = `/collections/${q.entry.collection}`;
-                assert(url.pathname.includes(collectionPath), 'Receipt escaped corpus collection');
-                assert(receipt.request.method === 'GET' || (receipt.request.method === 'POST'
-                    && /\/(query|docs\/(fetch|list))$/.test(url.pathname)), 'Evaluation contains a database mutation');
+                const url = new URL(receipt.request.url);
+                const projectMatch = /^(.*)\/projects\/([^/]+)\/(.*)$/.exec(url.pathname);
+                assert(projectMatch, 'Invalid database project URL');
+                assert.equal(jsonHash([url.origin + projectMatch[1], decodeURIComponent(projectMatch[2])]), state.connection,
+                    'Receipt escaped corpus project');
+                assert(projectMatch[3].split('/')[1] === q.entry.collection, 'Receipt escaped corpus collection');
+                assert(readOnlyRequest(receipt.request.method, projectMatch[3]), 'Evaluation contains a database mutation or an unexpected endpoint');
             }
             assert.equal(q.cleanupOperations, 0); assert.equal(q.entry.absent, false);
             const modelReceipts = new Map();
@@ -296,57 +279,30 @@ export async function verify(root) {
                 assert.equal(jsonHash([replayKeys.database, replayKeys.project]), state.connection);
                 const replayState = { databaseOperations: 0, cleanupOperations: 0, receiptNumber: 0, modelTokens: 0, models: {} };
                 const journal = new Journal({ root: qroot, config, binding, credentials: replayKeys, state: replayState,
-                    save: async () => {}, replay: true, readOnly: true, onReplayReceipt: receipt => { clock = receipt.completedAt; }, fetcher: async () => { throw new Error('Offline verification attempted network'); } });
-                const originalNow = Date.now;
-                let clock = Date.parse(firstReceipt.startedAt);
-                Date.now = () => clock;
-                try {
-                const sdk = lock.mode === 'agentic' && config.collectorImplementation === 'sdk';
-                const semantic = result => {
-                    const copy = structuredClone(result);
-                    if (copy.ok) {
-                        for (const item of copy.value.results ?? []) if (item.usage) delete item.usage.elapsedMs;
-                        if (copy.value.asOf) delete copy.value.asOf;
-                    }
-                    return copy;
-                };
-                let at = 0;
-                const ask = async (request, round) => {
-                    const receipt = modelReceipts.get(`collector-${round}.json`); assert(receipt);
-                    assert.equal(receipt.status, 'complete'); assert.equal(receipt.httpStatus, 200);
-                    assert.deepEqual(receipt.request.body, request); return JSON.parse(receipt.raw);
-                };
-                let collect;
-                if (sdk) collect = await sdkCollector({ prepared, config, countTokens, definitions: lock.tools, ask,
-                    drive: await reuseDrive(journal, prepared, q.entry, corpusProof.manifest.storage),
-                    now: () => events[at]?.startedAt,
-                    beforeTool: call => { const event = events[at]; assert(event); assert.equal(call.name, event.name);
-                        assert.deepEqual(call.arguments, event.args); assert(integer(event.startedAt)); clock = event.startedAt; },
-                    replayTool: entry => { const saved = events[at++];
-                        assert.deepEqual(semantic(entry.raw), semantic(saved.raw));
-                        assert.deepEqual(semantic(entry.delivered), semantic(saved.delivered)); return saved; },
-                    onOutcome: async outcome => { const saved = await readJSON(path.join(qroot, 'orchestration.json'));
-                        const stable = value => ({ ...value, usage: { ...value.usage, elapsedMs: 0 } });
-                        assert.deepEqual(stable(outcome), stable(saved)); },
-                });
-                else {
-                    const registry = await reuse(journal, prepared, q.entry, corpusProof.manifest.storage);
-                    assert.deepEqual(canonicalToolDefinitions(registry.definitions), lock.tools);
-                    collect = () => collectEvidence({ mode: lock.mode, prepared, config, countTokens, ask,
-                        now: () => events[at]?.startedAt,
-                        tools: { definitions: lock.tools, execute: async (name, args) => {
-                            const event = events[at++]; assert(event); assert.equal(event.name, name); assert.deepEqual(event.args, args);
-                            assert(integer(event.startedAt)); clock = event.startedAt;
-                            const actual = await registry.execute(name, args);
-                            assert.deepEqual(semantic(actual), semantic(event.raw), 'Tool result differs from native receipt replay');
-                            return event.raw;
-                        } } });
-                }
+                    save: async () => {}, replay: true, readOnly: true, fetcher: async () => { throw new Error('Offline verification attempted network'); } });
+                const sources = sourceFiles(prepared, corpusProof.entries[id].fileIds);
+                const drive = await reuseDrive(journal, q.entry, sources, corpusProof.manifest.storage);
                 assert.equal(replayState.databaseOperations, q.validationOperations, 'Validation operation count differs');
-                const replayed = await collect();
+                let at = 0;
+                const replayed = await collectEvidence({ mode: lock.mode, prepared, sources, config, countTokens,
+                    definitions: lock.tools, now: () => events[at]?.startedAt,
+                    executeTool: async (name, args) => {
+                        const event = events[at++]; assert(event); assert.equal(event.name, name); assert.deepEqual(event.args, args);
+                        assert(integer(event.startedAt));
+                        const actual = await runTool(drive, name, args, config);
+                        assert.deepEqual(actual, event.raw, 'Tool result differs from native receipt replay');
+                        return actual;
+                    },
+                    ask: async (request, round) => {
+                        const receipt = modelReceipts.get(`collector-${round}.json`); assert(receipt);
+                        assert.equal(receipt.status, 'complete'); assert.equal(receipt.httpStatus, 200);
+                        assert.deepEqual(receipt.request.body, request); return JSON.parse(receipt.raw);
+                    },
+                });
                 assert.equal(at, events.length); assert.deepEqual(replayed, saved.collected); assert.deepEqual(events, replayed.trace);
                 assert.equal(replayState.receiptNumber, q.receiptNumber, 'Unused or missing database receipts');
-                const packed = packEvidence(prepared, replayed.selected, config, countTokens);
+                assert.equal([...modelReceipts.keys()].filter(name => name.startsWith('collector-')).length, replayed.rounds);
+                const packed = packEvidence(prepared, replayed.selected, config, countTokens, sources);
                 assert.deepEqual(packed, saved.packed);
                 assert.deepEqual(saved.metrics, evidenceMetrics(rows.get(id), prepared,
                     { retrieved: replayed.retrieved, delivered: replayed.delivered, packed: packed.spans }));
@@ -361,7 +317,6 @@ export async function verify(root) {
                     assert.deepEqual(judgment.request.body, judgeRequest(rows.get(id), response.choices[0].message.content, config, rules));
                     assert.deepEqual(q.verdict, verdict(JSON.parse(judgment.raw), config));
                 }
-                } finally { Date.now = originalNow; }
             } else assert(!q.hasEvidence && q.status !== 'scored' && q.status !== 'recalled', 'Question lacks saved evidence');
             assert.equal(q.hasEvidence, await exists(path.join(qroot, 'evidence.json')));
             assert(['scored', 'failed', 'collecting', 'recalled'].includes(q.status));
