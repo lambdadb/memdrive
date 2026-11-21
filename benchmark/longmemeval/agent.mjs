@@ -1,24 +1,42 @@
 import assert from 'node:assert/strict';
-import { context, resultSpans, selectEvidence, spanKey } from './protocol.mjs';
+import { context, fileIdPattern, resultSpans, selectEvidence, spanKey } from './protocol.mjs';
 
-export function canonicalToolDefinitions(definitions) {
-    const visit = value => {
-        if (Array.isArray(value)) return value.map(visit);
-        if (!value || typeof value !== 'object') return value;
-        return Object.fromEntries(Object.entries(value).map(([key, item]) => [key,
-            key === 'enum' && Array.isArray(item) ? item.map(visit).sort((a, b) => JSON.stringify(a) < JSON.stringify(b) ? -1 : JSON.stringify(a) > JSON.stringify(b) ? 1 : 0) : visit(item)]));
-    };
-    return definitions.map(tool => ({ ...tool, inputSchema: visit(tool.inputSchema), outputSchema: visit(tool.outputSchema) }));
+const functionTool = (name, description, properties, required) => ({ type: 'function', name, description,
+    parameters: { type: 'object', properties, required, additionalProperties: false }, strict: false });
+
+export function fileTools(config) {
+    return [
+        functionTool('search_files', 'Search archived files and return attributed excerpts.',
+            { query: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: config.retrieval.limit } }, ['query']),
+        functionTool('read_file', 'Read the full original of a file returned by search.',
+            { fileId: { type: 'string' } }, ['fileId']),
+    ];
 }
 
-export function modelTools(definitions) {
-    assert(definitions.every(tool => tool.annotations.readOnlyHint && !tool.annotations.destructiveHint), 'Only read-only tools are allowed');
-    return definitions.map(tool => ({ type: 'function', name: tool.name, description: tool.description,
-        parameters: tool.inputSchema, strict: false }));
+const toolError = (code, message) => ({ ok: false, error: { code, message } });
+
+export async function runTool(drive, name, args, config, signal) {
+    if (args && typeof args === 'object' && !Array.isArray(args)) {
+        const keys = Object.keys(args);
+        if (name === 'search_files' && keys.every(key => ['query', 'limit'].includes(key))
+            && typeof args.query === 'string' && args.query.trim()) {
+            const limit = args.limit === undefined ? config.retrieval.limit : args.limit;
+            if (Number.isSafeInteger(limit) && limit > 0 && limit <= config.retrieval.limit) {
+                const value = await drive.search({ query: args.query, limit, rerank: config.retrieval.rerank }, { signal });
+                return { ok: true, value };
+            }
+        }
+        if (name === 'read_file' && keys.length === 1 && typeof args.fileId === 'string' && fileIdPattern.test(args.fileId)) {
+            const value = await drive.read({ fileId: args.fileId }, { signal });
+            return value === null ? toolError('FILE_NOT_FOUND', 'The file was not found.') : { ok: true, value };
+        }
+    }
+    return toolError('INVALID_TOOL_REQUEST', 'Use the declared file tools and arguments.');
 }
+
 const unique = spans => [...new Map(spans.map(span => [spanKey(span), span])).values()];
 
-export async function collectEvidence({ mode, tools, prepared, config, countTokens, ask, signal, onTool = async () => {}, now = Date.now }) {
+export async function collectEvidence({ mode, definitions, executeTool, prepared, sources, config, countTokens, ask, signal, onTool = async () => {}, now = Date.now }) {
     assert(['single_pass', 'agentic'].includes(mode));
     const trace = [], retrieved = [], delivered = [];
     let calls = 0;
@@ -26,36 +44,42 @@ export async function collectEvidence({ mode, tools, prepared, config, countToke
         assert(++calls <= config.limits.toolCalls, 'Tool-call budget exhausted');
         signal?.throwIfAborted();
         const startedAt = now();
-        const raw = await tools.execute(name, args, { signal });
-        const spans = resultSpans(name, raw, prepared).map(span => ({ ...span,
-            ...(['memdrive_read', 'memdrive_list'].includes(name) ? { fullOriginal: true } : {}) }));
+        const raw = await executeTool(name, args, { signal });
+        const spans = resultSpans(name, raw, sources);
         retrieved.push(...spans);
-        const tooLarge = countTokens(JSON.stringify(raw)) > config.limits.toolResultTokens;
-        const result = tooLarge ? { ok: false, error: { code: 'BENCHMARK_RESULT_LIMIT',
-            message: 'Result exceeds the benchmark delivery budget. No result text was delivered. Use smaller or more targeted requests.' } } : raw;
+        const delivery = !raw.ok ? raw : { ok: true, spans };
+        if (raw.ok && name === 'search_files') {
+            const attributed = new Set(spans.map(span => span.fileId));
+            const otherFiles = new Map(raw.value.hits.filter(hit => !attributed.has(hit.fileId))
+                .map(({ fileId, path }) => [fileId, { fileId, path }]));
+            Object.assign(delivery, { reranked: raw.value.reranked, otherFiles: [...otherFiles.values()] });
+        }
+        const tooLarge = countTokens(JSON.stringify(delivery)) > config.limits.toolResultTokens;
+        const result = tooLarge ? toolError('BENCHMARK_RESULT_LIMIT',
+            'Result exceeds the benchmark delivery budget. No result text was delivered. Use smaller or more targeted requests.') : delivery;
         if (!tooLarge) delivered.push(...spans);
         const event = { callId, name, args, startedAt, raw, delivered: result };
         trace.push(event); await onTool(event);
         return result;
     };
     if (mode === 'single_pass') {
-        await execute('memdrive_recall', { requests: [{ query: `User: [Question date: ${prepared.questionTimestamp}]\n${prepared.question}`,
-            limit: config.retrieval.limit }] }, 'single_pass');
-        assert(trace[0].raw.ok && trace[0].raw.value.results.every(result => !result.error), 'Single-pass recall failed');
+        await execute('search_files', { query: `User: [Question date: ${prepared.questionTimestamp}]\n${prepared.question}`,
+            limit: config.retrieval.limit }, 'single_pass');
+        assert(trace[0].raw.ok, 'Single-pass file search failed');
         assert(trace[0].delivered.ok, 'Single-pass result exceeds delivery budget');
         return { trace, retrieved: unique(retrieved), delivered: unique(delivered), selected: unique(delivered), rounds: 0 };
     }
     assert.equal(config.collectorTransport, 'openai-responses');
     const input = [{ role: 'system', content: config.prompts.collect },
         { role: 'user', content: JSON.stringify(context(prepared)) }];
-    const definitions = modelTools(tools.definitions), ids = new Set();
+    const ids = new Set();
     for (let round = 0; round < config.limits.rounds; round++) {
         const request = { model: config.model.model, reasoning: { effort: config.model.reasoning_effort },
             max_output_tokens: config.model.max_completion_tokens, store: false, include: ['reasoning.encrypted_content'],
             input: structuredClone(input), tools: definitions, parallel_tool_calls: false };
         assert(countTokens(JSON.stringify(request)) + request.max_output_tokens <= config.limits.contextTokens,
             'Agent context budget exhausted');
-        const response = await ask(request, round);
+        const response = await ask(request, round, signal);
         assert.equal(response.status, 'completed', 'Collector response incomplete or failed');
         assert(Array.isArray(response.output) && response.output.every(item => ['reasoning', 'function_call', 'message'].includes(item.type)),
             'Unexpected collector output item');

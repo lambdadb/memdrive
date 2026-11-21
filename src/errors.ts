@@ -1,16 +1,14 @@
-import type { RequestOptions, Usage } from './types.js';
+import type { RequestOptions } from './types.js';
 
 export class MemDriveError extends Error {
     declare code: string;
-    declare details?: Record<string, unknown> | undefined;
-    declare usage?: Usage | undefined;
+    declare readonly details?: Record<string, unknown> | undefined;
     declare status?: number | undefined;
-    constructor(code: string, message: string, { cause, details, usage }: { cause?: unknown; details?: Record<string, unknown> | undefined; usage?: Usage | undefined } = {}) {
+    constructor(code: string, message: string, { cause, details }: { cause?: unknown; details?: Record<string, unknown> | undefined } = {}) {
         super(message, cause === undefined ? undefined : { cause });
         this.name = 'MemDriveError';
         this.code = code;
         if (details !== undefined) this.details = details;
-        if (usage !== undefined) this.usage = usage;
     }
 }
 
@@ -32,9 +30,25 @@ export function checkAbort(signal?: AbortSignal) {
     if (signal?.aborted) throw new MemDriveError('ABORTED', 'Operation aborted.');
 }
 
-export function abortError(cause: unknown, signal?: AbortSignal): unknown {
+function abortError(cause: unknown, signal?: AbortSignal): unknown {
     const error = cause as { code?: string; name?: string } | undefined;
     if (error?.code === 'ABORTED') return cause;
     return signal?.aborted || error?.name === 'AbortError'
         ? new MemDriveError('ABORTED', 'Operation aborted.', { cause }) : cause;
 }
+
+export function databaseError(error: unknown, message: string): MemDriveError {
+    if (error instanceof MemDriveError) return error;
+    const result = new MemDriveError('DATABASE_ERROR', message, { cause: error });
+    const remote = error as { statusCode?: unknown; status?: unknown; httpStatus?: unknown } | null | undefined;
+    const status = remote?.statusCode ?? remote?.status ?? remote?.httpStatus;
+    if (typeof status === 'number' && Number.isInteger(status)) result.status = status;
+    return result;
+}
+
+export async function nativeRequest<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    checkAbort(signal);
+    try { return await operation(); }
+    catch (cause) { throw abortError(cause, signal); }
+}
+export const nativeOptions = (signal?: AbortSignal) => signal === undefined ? {} : { signal };

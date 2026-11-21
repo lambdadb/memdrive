@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile, writeFile, mkdir, rm, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { prepareCase, hash, jsonHash } from './protocol.mjs';
+import { prepareCase, hash, jsonHash, sourceFiles } from './protocol.mjs';
 import { readJSON, atomic, exists, Journal, ingest, cleanup, storageProfile } from './runtime.mjs';
 
 export const questionPath = (root, id) => path.join(root, 'questions', hash(id));
@@ -29,10 +29,10 @@ export function selectedIds(manifest, limit) {
     return manifest.ids.slice(0, limit);
 }
 export function compatible(manifest, rows, config, ids = manifest.ids) {
-    assert.equal(manifest.protocol, 'longmemeval-corpus-v1');
+    assert.equal(manifest.protocol, 'longmemeval-file-corpus-v1');
     assert.deepEqual(manifest.dataset, config.dataset, 'Corpus dataset differs; use another corpus');
     assert.deepEqual(manifest.storage, storageProfile(), 'Corpus storage settings differ; use another corpus');
-    for (const id of ids) assert.equal(jsonHash(prepareCase(rows.get(id), config).mems), manifest.sources[id],
+    for (const id of ids) assert.equal(jsonHash(prepareCase(rows.get(id), config).files), manifest.sources[id],
         'Corpus archived originals differ; use another corpus');
 }
 export async function initialize(root, config) {
@@ -41,9 +41,9 @@ export async function initialize(root, config) {
         const manifest = await readJSON(file); compatible(manifest, rows, config); return { manifest, rows };
     }
     const owner = hash(randomBytes(32)), ids = [...rows.keys()].sort();
-    const manifest = { protocol: 'longmemeval-corpus-v1', owner, dataset: config.dataset, storage: storageProfile(), ids,
-        sources: Object.fromEntries(ids.map(id => [id, jsonHash(prepareCase(rows.get(id), config).mems)])),
-        collections: Object.fromEntries(ids.map(id => [id, { collection: `mdlme_${randomBytes(12).toString('hex')}`,
+    const manifest = { protocol: 'longmemeval-file-corpus-v1', owner, dataset: config.dataset, storage: storageProfile(), ids,
+        sources: Object.fromEntries(ids.map(id => [id, jsonHash(prepareCase(rows.get(id), config).files)])),
+        collections: Object.fromEntries(ids.map(id => [id, { collection: `mdflme_${randomBytes(12).toString('hex')}`,
             owner, scope: jsonHash([owner, id]) }])), lifecycle: { limits: config.limits } };
     await writeFile(file, JSON.stringify(manifest, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
     return { manifest, rows };
@@ -67,6 +67,7 @@ export async function ingestCorpus(root, config, keys, limit, { fetcher = fetch,
             const existing = state.questions[id];
             if (existing?.status === 'ready') {
                 assert.equal(existing.sourceHash, manifest.sources[id]); assert.deepEqual(existing.entry, { ...manifest.collections[id], absent: false });
+                sourceFiles(prepareCase(rows.get(id), config), existing.fileIds);
                 continue;
             }
             assert(!existing, 'Prior ingestion is incomplete or failed; inspect receipts and explicitly clean the corpus, never retry ambiguous writes');
@@ -75,7 +76,7 @@ export async function ingestCorpus(root, config, keys, limit, { fetcher = fetch,
             const journal = new Journal({ root: questionPath(canonical, id), config, binding: state.binding, credentials: keys, state: q, save, fetcher,
                 signal: AbortSignal.any([phaseSignal, AbortSignal.timeout(config.limits.questionSeconds * 1000)]) });
             try {
-                await ingest(journal, prepareCase(rows.get(id), config), q.entry, manifest.storage);
+                q.fileIds = await ingest(journal, prepareCase(rows.get(id), config), q.entry, manifest.storage);
                 q.status = 'ready'; q.readyAt = new Date().toISOString(); await save();
             } catch (error) { q.status = 'failed'; await save(); throw error; }
         }
@@ -90,7 +91,8 @@ export async function proof(root, config, limit) {
     const entries = Object.fromEntries(ids.map(id => {
         const q = state.questions[id]; assert.equal(q?.status, 'ready', `Corpus question is not ready: ${id}`);
         assert.equal(q.sourceHash, manifest.sources[id]); assert.deepEqual(q.entry, { ...manifest.collections[id], absent: false });
-        return [id, { sourceHash: q.sourceHash, entry: q.entry, readyAt: q.readyAt }];
+        sourceFiles(prepareCase(rows.get(id), config), q.fileIds);
+        return [id, { sourceHash: q.sourceHash, entry: q.entry, fileIds: q.fileIds, readyAt: q.readyAt }];
     }));
     return { manifest, connection: state.connection, entries };
 }
@@ -98,6 +100,7 @@ export async function cleanupCorpus(root, keys, { fetcher = fetch } = {}) {
     return lease(root, async canonical => {
         // No current dataset, evaluation config, or source fingerprint is required to delete explicitly owned resources.
         const manifest = await readJSON(path.join(canonical, 'corpus.json')), state = await corpusState(canonical, manifest);
+        assert.equal(manifest.protocol, 'longmemeval-file-corpus-v1', 'Use the matching runtime to clean this corpus');
         assert.equal(state.connection, keys.connection, 'Corpus connection differs');
         const save = () => atomic(path.join(canonical, 'corpus-state.json'), state);
         state.retired = true; await save();

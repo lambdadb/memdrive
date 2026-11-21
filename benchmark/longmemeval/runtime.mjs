@@ -2,10 +2,9 @@ import assert from 'node:assert/strict';
 import { readFile, writeFile, rename, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { LambdaDBClient, HTTPClient } from '@functional-systems/lambdadb';
-import { create, open } from '@functional-systems/memdrive';
+import { MemDrive } from '@functional-systems/memdrive';
 import { get_encoding } from 'tiktoken';
-import { createTools } from '@functional-systems/memdrive/tools';
-import { jsonHash, metadataSchema, integer } from './protocol.mjs';
+import { jsonHash, metadataSchema, integer, sourceFiles } from './protocol.mjs';
 
 export const readJSON = async file => JSON.parse(await readFile(file, 'utf8'));
 export async function atomic(file, value) {
@@ -33,9 +32,14 @@ export function credentials(env, databaseRequired = true) {
         connection: jsonHash([database, project]) };
 }
 
+export function readOnlyRequest(method, projectPath) {
+    return (method === 'GET' && /^collections\/[^/]+(?:\/branches)?$/.test(projectPath))
+        || (method === 'POST' && /^collections\/[^/]+\/(?:query|docs\/fetch)$/.test(projectPath));
+}
+
 export class Journal {
-    constructor({ root, config, binding, credentials: keys, state, save, fetcher = fetch, signal, replay = false, onReplayReceipt = () => {}, readOnly = false }) {
-        Object.assign(this, { root, config, binding, keys, state, save, fetcher, signal, replay, onReplayReceipt, readOnly });
+    constructor({ root, config, binding, credentials: keys, state, save, fetcher = fetch, signal, replay = false, readOnly = false }) {
+        Object.assign(this, { root, config, binding, keys, state, save, fetcher, signal, replay, readOnly });
     }
     async request({ file, url, body, key, kind, method = 'POST', cleanup = false, signal: callerSignal }) {
         const request = { kind, method, url, body: body ?? null }, requestHash = jsonHash(request);
@@ -43,7 +47,6 @@ export class Journal {
             const receipt = await readJSON(file);
             assert.equal(receipt.binding, this.binding); assert.equal(receipt.requestHash, requestHash);
             assert.equal(receipt.status, 'complete', 'An interrupted or failed request cannot be replayed automatically');
-            this.onReplayReceipt(receipt);
             return receipt;
         }
         assert(!this.replay, 'Missing recorded request during offline replay');
@@ -113,9 +116,8 @@ export class Journal {
         const prefix = `${baseUrl}/projects/${encodeURIComponent(projectName)}/`;
         const fetcher = async request => {
             assert(request.url.startsWith(prefix), 'Database request escaped the configured project');
-            if (this.readOnly) assert((request.method === 'GET' && /\/collections\/[^/]+$/.test(new URL(request.url).pathname))
-                || (request.method === 'POST' && /\/(query|docs\/(fetch|list))$/.test(new URL(request.url).pathname)),
-                'Evaluation attempted a database mutation');
+            if (this.readOnly) assert(readOnlyRequest(request.method, new URL(request.url).pathname.slice(new URL(prefix).pathname.length)),
+                'Evaluation attempted a database mutation or an unexpected endpoint');
             if (cleanup) {
                 assert(this.state.cleanupOperations < this.config.limits.cleanupOperations, 'Cleanup operation budget exhausted');
                 this.state.cleanupOperations++;
@@ -136,7 +138,7 @@ export class Journal {
     }
 }
 
-export const storageProfile = () => ({ source: 'longmemeval-original-messages-v1', metadataSchema,
+export const storageProfile = () => ({ source: 'longmemeval-message-files-v1', fork: 'corpus', metadataSchema,
     embedding: { mode: 'managed', provider: 'openai', model: 'text-embedding-3-small', dimensions: 1536, similarity: 'cosine' },
     textSearch: { analyzers: ['english'] } });
 
@@ -147,37 +149,51 @@ function validateDescriptor(descriptor, entry, profile) {
     assert.deepEqual(descriptor.embedding, profile.embedding, 'Corpus embedding configuration differs');
     assert.deepEqual(descriptor.textSearch, profile.textSearch, 'Corpus text search configuration differs');
 }
-async function validateOriginals(drive, journal, prepared) {
-    for (let index = 0; index < prepared.mems.length; index += 100) {
-        const expected = prepared.mems.slice(index, index + 100);
-        const read = await drive.read({ ids: expected.map(mem => mem.id) }, { signal: journal.signal });
-        assert.deepEqual(read.mems, expected, 'Stored original readback differs');
+async function validateOriginals(drive, journal, sources) {
+    let batch = [], bytes = 0;
+    const readBatch = async () => {
+        if (!batch.length) return;
+        const files = await drive.read({ paths: batch.map(([, file]) => file.path) }, { signal: journal.signal });
+        const originals = files.map(({ fileId, path, content, metadata }) => ({ fileId, path, content, metadata }));
+        assert.deepEqual(originals, batch.map(([fileId, file]) => ({ fileId, ...file })), 'Stored original readback differs');
+        batch = []; bytes = 0;
+    };
+    for (const item of sources) {
+        const size = Buffer.byteLength(JSON.stringify(item[1]));
+        if (batch.length === 20 || bytes + size > 500_000) await readBatch();
+        batch.push(item);
+        bytes += size;
     }
+    await readBatch();
 }
+
 export async function ingest(journal, prepared, entry, profile = storageProfile()) {
-    const drive = await create({ client: journal.native(), name: entry.collection, metadataSchema: profile.metadataSchema, maxConcurrentRequests: 1,
-        description: 'Reusable LongMemEval conversation history.', labels: { 'eval.owner': entry.owner, 'eval.scope': entry.scope },
-        embedding: { mode: 'managed' }, textSearch: profile.textSearch }, { signal: journal.signal });
-    validateDescriptor(await drive.describe({ signal: journal.signal }), entry, profile);
-    // Bound the number of originals in each managed-embedding request.
-    for (let index = 0; index < prepared.mems.length; index += 20)
-        await drive.remember({ mems: prepared.mems.slice(index, index + 20) }, { signal: journal.signal });
-    await validateOriginals(drive, journal, prepared);
-    return createTools({ drive }, { signal: journal.signal });
+    const options = { signal: journal.signal };
+    const main = await MemDrive.create({ client: journal.native(), name: entry.collection, metadataSchema: profile.metadataSchema,
+        labels: { 'eval.owner': entry.owner, 'eval.scope': entry.scope }, textSearch: profile.textSearch }, options);
+    validateDescriptor(await main.describe(options), entry, profile);
+    const drive = await main.fork({ name: profile.fork }, options);
+    const fileIds = [];
+    for (let index = 0; index < prepared.files.length; index += 20) {
+        const batch = prepared.files.slice(index, index + 20);
+        const created = await drive.write(batch.map(file => ({ op: 'create', ...file })), options);
+        assert.deepEqual(created.map(file => file.path), batch.map(file => file.path), 'File creation paths differ');
+        fileIds.push(...created.map(file => file.fileId));
+    }
+    await validateOriginals(drive, journal, sourceFiles(prepared, fileIds));
+    return fileIds;
 }
-export async function reuseDrive(journal, prepared, entry, profile = storageProfile()) {
-    const drive = await open({ client: journal.native(), name: entry.collection, maxConcurrentRequests: 1 }, { signal: journal.signal });
-    validateDescriptor(await drive.describe({ signal: journal.signal }), entry, profile);
-    await validateOriginals(drive, journal, prepared);
+
+export async function reuseDrive(journal, entry, sources, profile) {
+    const options = { signal: journal.signal };
+    const drive = await MemDrive.open({ client: journal.native(), name: entry.collection, at: { fork: profile.fork } }, options);
+    validateDescriptor(await drive.describe(options), entry, profile);
+    await validateOriginals(drive, journal, sources);
     return drive;
-}
-export async function reuse(journal, prepared, entry, profile = storageProfile()) {
-    const drive = await reuseDrive(journal, prepared, entry, profile);
-    return createTools({ drive }, { signal: journal.signal });
 }
 
 export async function cleanup(journal, entry) {
-    assert(/^mdlme_[a-f0-9]{24}$/.test(entry.collection));
+    assert(/^mdflme_[a-f0-9]{24}$/.test(entry.collection));
     assert(/^[a-f0-9]{64}$/.test(entry.owner) && /^[a-f0-9]{64}$/.test(entry.scope));
     if (entry.absent) return;
     const handle = journal.native(true).collection(entry.collection);

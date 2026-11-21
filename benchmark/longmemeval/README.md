@@ -1,27 +1,23 @@
 # LongMemEval-S with MemDrive
 
-Ingest a reusable corpus once, then run independent retrieval experiments against
-it. Each LongMemEval question retains its own isolated history collection; no
-question can search another question's memories. Successful, failed and aborted
-evaluation runs retain these collections. Only explicit corpus cleanup deletes
-them.
+This benchmark uses the public `@functional-systems/memdrive` file SDK built
+from this checkout. It creates one isolated file store per question and writes
+archived turns as files on its `corpus` fork. Independent runs reuse that fork
+until explicit corpus cleanup.
 
 | Mode | Evidence collection |
 | --- | --- |
-| `single_pass` | One question-only recall with limit 50 and SDK-default hybrid retrieval/reranking |
-| `agentic` | A model chooses among the five read-only `createTools()` operations, then selects previously delivered evidence |
+| `single_pass` | One hybrid file search using the question and date, with reranking and a limit of 50 |
+| `agentic` | A model uses read-only search and read tools and selects previously delivered file spans |
 
-These are benchmark modes, not SDK options. Evidence collection and optional
-answer generation use separate model contexts. The same answer packing and judge
-apply to both modes; this is not a same-agent end-to-end conversation evaluation.
-No live benchmark score is included, and historical SillyMemory scores must not
-be relabelled as MemDrive results.
+The benchmark owns the tool definitions, collection loop and model requests.
+Both modes use the same answer context, packing rules and judge. Collector and
+answer contexts are separate. Historical results from memory-based benchmarks
+retain their original protocol and runtime.
 
 ## Ingest once
 
-Use Node.js 20.12+ from the repository root. Live three-question smoke checks
-exercise ingestion and single-pass retrieval; they do not establish full-cohort
-quality or model-provider compatibility for every configuration.
+Use Node.js 20.12+ from the repository root. Build the SDK before running the benchmark.
 
 ```sh
 npm ci
@@ -38,7 +34,7 @@ sorted IDs (default 10), verifies original readback, then marks each entry ready
 A matching ready entry is skipped without create, upsert, embedding or any other
 native request. To grow the same corpus, run `ingest --limit 500`; the first ten
 ready collections are preserved and only missing entries are created.
-Ingestion submits at most 20 originals per public `remember()` call to bound
+Ingestion submits at most 20 originals per public batched `write()` call to bound
 managed-embedding request size. A failed batch stops ingestion without retrying
 or deleting the possibly accepted data; retain its receipts for inspection.
 
@@ -48,8 +44,9 @@ Collector/answer models, prompts, query limits, judge settings and run-code hash
 are not corpus compatibility requirements. Changes that alter stored originals
 or storage settings reject reuse and require a different corpus. The public
 `open()` operation also validates MemDrive's stored format on every reuse.
-Mutable readiness/deletion state and ingestion HTTP receipts live separately;
-cleanup never rewrites the immutable manifest.
+Readiness state records the SDK-assigned file IDs in original order after
+readback. Deletion state and ingestion HTTP receipts live alongside that
+mapping. Cleanup leaves the immutable manifest intact.
 
 ## Repeat retrieval independently
 
@@ -67,15 +64,13 @@ node benchmark/longmemeval/run.mjs verify --root artifacts/lme-agent-1
 sorted IDs, a smoke cohort rather than a stratified or held-out sample. Both
 modes with the same limit use the same IDs. Each run freezes its own settings,
 prompts, judge rules, executable/runtime fingerprints and public tool definitions.
-Only JSON Schema enum ordering is canonicalized, because native metadata field
-order can vary. Actual enum values and other array ordering must still match;
-collector requests use the frozen definitions and execute the public tools.
+The collector receives the frozen tool definitions.
 To change settings, edit `config.json` and prepare a new run directory against the
 same corpus. Existing runs continue to use their frozen settings.
 
 `recall` never creates, writes or deletes collections. It opens the existing
-collection, checks ownership/schema/embedding/analyzers, and reads all expected
-originals back before collecting evidence. Validation database operations and
+corpus fork, checks ownership/schema/embedding/analyzers, and reads all expected
+originals by path in bounded batches, checking their file IDs before collecting evidence. Validation database operations and
 elapsed time are reported separately from retrieval operations/time. Reuse
 removes repeated ingestion and embedding, not these integrity reads. This proves
 expected originals match; it does not prove absence of externally injected data
@@ -128,30 +123,31 @@ Dataset revision: `98d7416c24c778c2fee6e6f3006e7a073259d48f` of
 `xiaowu0162/longmemeval-cleaned`; SHA-256:
 `d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442`.
 
-Stored Mems preserve literal message bodies, roles, session identifiers and global
-message positions. Calendar-validated session clocks are interpreted as UTC;
-original date strings remain metadata. These are conversation times, not inferred
-event dates. At least five recent messages including the question remain outside
-the index, aligned at an adjacent user/assistant pair. Both answer conditions get
-the same recent context. Answers, `has_answer` and `answer_session_ids` are
-available only to evaluation, never to storage, the collector or answer model.
-No SillyTavern escaping or application prompt machinery is imported.
+Each nonblank archived turn is stored as a text file at
+`/sessions/<session>/messages/<message>.txt`. The filename uses the zero-based
+position across the conversation. Files preserve literal message bodies and
+include role, session ID, positions and calendar-validated session timestamps
+interpreted as UTC in metadata. Recent dialogue remains outside the index. The
+boundary includes at least five messages counting the question and keeps a
+preceding user/assistant pair together. Answers and evidence annotations enter
+only scoring and coverage calculations.
 
-Managed embeddings, English hybrid search and SDK-default reranking are used.
-Database operations are serialized with one SDK request slot. Tool batches still
-accept up to five searches; model-chosen queries, filters, limits and reranking
-options are recorded without rewriting. Baseline limit 50 is not a constraint on
-the agent's search work; the tool recall default is 10.
+Both modes use managed embeddings, English text analysis and reranked hybrid
+search. The agent may reduce the search limit from the configured ceiling.
+Read returns a full original by file ID. Search evidence uses the SDK's UTF-16
+ranges when present. The benchmark checks the file ID, path, metadata, text and
+range against the frozen source before delivery. If the SDK omits a range, the
+benchmark attributes text only when it occurs exactly once in the original.
+Unattributed snippets remain in raw receipts and are omitted from the model's
+evidence. The collector can read their originals by file ID.
 
-The collector sees unchanged public tool results unless a result exceeds 16,000
-`cl100k_base` tokens. Then it receives a size-limit error and none of that result's
-text; the raw return remains in diagnostics. Selection is a JSON response naming
-exact previously delivered recall spans or complete read/list originals, not an
-extra SDK tool. The final 4,096-token serialized evidence block admits candidates
-in selected order, merges overlapping/adjacent spans, and presents them
-chronologically. Whole candidates that do not fit are skipped, never silently
-clipped. Instructions, recent dialogue and the question are outside this evidence
-allocation and included in provider answer-input usage.
+If a tool result exceeds 16,000 `cl100k_base` tokens, the collector receives a size
+error and none of that result's evidence. The collector returns
+`{"evidence":[{"fileId":"...","start":0,"end":123}]}`, copying exact references
+to delivered spans. Full-file reads use the same reference format. The final
+4,096-token serialized evidence block admits whole candidates in selected
+order, merges overlapping or adjacent spans and presents them chronologically.
+The question and recent dialogue sit outside the evidence budget.
 
 ## Limits, failures and explicit cleanup
 
@@ -196,16 +192,15 @@ Removing the corpus's original local files does not remove these run inputs.
 `verify` replays public `open`, descriptor/read validation and tools against run
 HTTP receipts; it does not replay ingestion or require any live collection. It
 checks source equality, reconstructs collector and answer requests, packing,
-judge inputs, usage and summaries. Cache time is replayed from saved timestamps;
-the serial verifier restores its clock on failure. Runtime elapsed values and
-count fetch timestamps are excluded from semantic tool-output comparison.
+judge inputs, usage and summaries. The same file operations and arguments
+are replayed against recorded native HTTP responses.
 
 Frozen configuration and judge-rule snapshots remain authoritative even after
-current settings change. Executable SDK/runner/dependency code must still match
-the run's fingerprints; use the recorded checkout/runtime if that code changes.
-Receipts provide local audit consistency, not provider attestation or a frozen
-server implementation. Legacy v1 one-shot artifacts are not adopted as reusable
-corpora; retain their original checkout for verification.
+current settings change. The built file SDK, runner and dependencies must match the run fingerprints.
+The file corpus format is `longmemeval-file-corpus-v1`; the run and file evidence
+format is `memdrive-longmemeval-files-v1`. Use the matching historical checkout
+to verify or clean up earlier memory corpora and runs. Receipts verify local
+audit consistency and do not attest provider behavior.
 
 `summary.json` separates retrieval completion from scoring completion. A completed
 scored run includes operational failures in the frozen question denominator;
@@ -238,34 +233,3 @@ cleanup, failure accounting and offline replay after deletion. Installed-package
 consumer checks remain offline. Benchmark code, datasets and receipts stay
 outside the published npm package; no live answer-quality claim follows from
 unit or package tests.
-
-### External and SDK collector boundaries
-
-`collectorImplementation: "benchmark"` is the default external collector. It
-consumes canonical IDs and exact spans from public `createTools` and selects
-`{"evidence":[{"memId":"...","start":0,"end":123}]}`. Public tools expose no
-alias settings or resolvers. The removed `shortIds`/`evidenceIds` run keys are
-rejected even when false; historical runs require their retained runtime snapshot.
-Dataset/corpus identity is unchanged and existing ready collections are reusable.
-
-Set frozen `collectorImplementation: "sdk"` for agentic runs to use the public
-retriever. Its model adapter receives internal m/e reference tools and selects
-`{"evidence":["e1"]}`. Public selected evidence remains canonical. Preparation
-freezes those internal model definitions using a local empty-selection adapter
-probe through the public API; it performs no data or provider request. Live
-collection and offline replay compare the actual supplied model definitions with
-that frozen contract. `single_pass` always freezes canonical public tools,
-regardless of the collector implementation setting.
-
-`sdk-agent.mjs` owns Responses transport, application context and raw receipts.
-Canonical source auditing uses host record events from the public retriever;
-benchmark code imports no SDK internal modules. `orchestration.json` records
-completion/accounting, while native Journal counts remain authoritative for HTTP
-operations. Evidence packing, answering and judging stay separate. Oversized
-undelivered references are not eligible for selection.
-
-The external collector and SDK collector now differ in ID representation and
-selection protocol as well as loop ownership. A comparison does not isolate
-orchestration overhead. Earlier fixed-trace alias experiments and live results
-remain historical evidence, replayable with their exact source snapshots; this
-boundary cleanup does not establish a new performance or quality result.

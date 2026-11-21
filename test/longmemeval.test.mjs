@@ -1,195 +1,108 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile } from 'node:fs/promises';
-import { nativeFixture, row, keys } from './helpers/longmemeval-http.mjs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { create } from '@functional-systems/memdrive';
-import { createTools } from '@functional-systems/memdrive/tools';
-import { memdriveClient } from './helpers/memdrive-client.mjs';
-import { prepareCase, timestamp, metadataSchema, packEvidence, evidenceMetrics, validateSpan, resultSpans, jsonHash } from '../benchmark/longmemeval/protocol.mjs';
-import { collectEvidence, canonicalToolDefinitions } from '../benchmark/longmemeval/agent.mjs';
-import { Journal, ingest, reuse, cleanup, readJSON } from '../benchmark/longmemeval/runtime.mjs';
+import { row, keys } from './helpers/longmemeval-http.mjs';
+import { prepareCase, timestamp, packEvidence, evidenceMetrics, resultSpans, sourceFiles, jsonHash } from '../benchmark/longmemeval/protocol.mjs';
+import { collectEvidence, fileTools, runTool } from '../benchmark/longmemeval/agent.mjs';
+import { Journal, readJSON } from '../benchmark/longmemeval/runtime.mjs';
+
 const config = JSON.parse(await readFile(new URL('../benchmark/longmemeval/config.json', import.meta.url)));
-
-const textCount = text => text.length;
-async function toolsFor(prepared) {
-    const fixture = memdriveClient(); fixture.search = (_request, docs) => docs;
-    const drive = await create({ client: fixture.client, name: 'benchmark_test', metadataSchema, textSearch: { analyzers: ['english'] } });
-    await drive.remember({ mems: prepared.mems });
-    return createTools({ drive });
-}
-const response = (text, calls) => ({ status: 'completed', output: calls
-    ?? [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] }] });
-const call = (id, name, args) => ({ id: 'item-' + id, call_id: id, type: 'function_call', name, arguments: JSON.stringify(args) });
-
-test('tool schema comparison ignores only enum ordering and retains actual schema changes', () => {
-    const definitions = [{ name: 'test', inputSchema: { enum: ['b', 'a'], oneOf: [{ const: 2 }, { const: 1 }] }, outputSchema: {} }];
-    const reordered = structuredClone(definitions); reordered[0].inputSchema.enum.reverse();
-    assert.deepEqual(canonicalToolDefinitions(reordered), canonicalToolDefinitions(definitions));
-    reordered[0].inputSchema.enum.push('c');
-    assert.throws(() => assert.deepEqual(canonicalToolDefinitions(reordered), canonicalToolDefinitions(definitions)));
-    const alternatives = structuredClone(definitions); alternatives[0].inputSchema.oneOf.reverse();
-    assert.throws(() => assert.deepEqual(canonicalToolDefinitions(alternatives), canonicalToolDefinitions(definitions)));
-    assert.deepEqual(definitions[0].inputSchema.enum, ['b', 'a']);
-});
-
-test('source adaptation keeps literal text, pairs and dates while excluding answer annotations', () => {
-    const input = row(), prepared = prepareCase(input, config);
-    assert.equal(prepared.boundary, 2); assert.equal(prepared.mems[0].content, input.haystack_sessions[0][0].content);
-    assert.equal(prepared.mems[0].timestamp, '2023-01-02T10:00:00.000Z');
-    input.answer = 'secret-reference'; input.answer_session_ids = ['hidden']; input.haystack_sessions[0][0].has_answer = false;
-    assert.deepEqual(prepareCase(input, config), prepared);
-    assert.throws(() => timestamp('2023/02/29 (Wed) 10:00'));
-    assert.throws(() => timestamp('2024/02/29 (Thu) 24:00'));
-    assert.equal(timestamp('2024/02/29 (Thu) 23:00'), '2024-02-29T23:00:00.000Z');
-});
-
-test('external collector uses canonical IDs through search and original reads', async () => {
-    const prepared = prepareCase(row(), config), tools = await toolsFor(prepared);
-    let round = 0;
-    const collected = await collectEvidence({ mode: 'agentic', tools, prepared, config, countTokens: textCount,
-        ask: async request => {
-            if (round++ === 0) return response(null, [call('search', 'memdrive_recall', { requests: [{ query: 'key' }] })]);
-            const result = JSON.parse(request.input.at(-1).output);
-            if (round === 2) {
-                assert.equal(result.value.results[0].matches[0].memId, prepared.mems[0].id);
-                return response(null, [call('read', 'memdrive_read', { ids: [prepared.mems[0].id] })]);
-            }
-            assert.equal(result.value.mems[0].id, prepared.mems[0].id);
-            return response(JSON.stringify({ evidence: [{ memId: prepared.mems[0].id }] }));
-        } });
-    assert.equal(collected.trace[0].raw.value.results[0].matches[0].memId, prepared.mems[0].id);
-    assert.equal(collected.selected[0].memId, prepared.mems[0].id);
-    assert.equal(packEvidence(prepared, collected.selected, config, textCount).spans[0].memId, prepared.mems[0].id);
-});
-
-test('public tools collect only delivered source spans and pack them within a common budget', async () => {
-    const prepared = prepareCase(row(), config), tools = await toolsFor(prepared);
-    const original = prepared.mems[0];
-    let round = 0;
-    const reasoning = { type: 'reasoning', id: 'reasoning-1', encrypted_content: 'opaque-test-state', summary: [] };
-    const commentary = { type: 'message', id: 'commentary-1', role: 'assistant', status: 'completed', phase: 'commentary',
-        content: [{ type: 'output_text', text: 'Searching the archive.', annotations: [] }] };
-    const collected = await collectEvidence({ mode: 'agentic', tools, prepared, config, countTokens: textCount,
-        ask: async request => {
-            assert(request.tools.every(tool => !tool.name.includes('remember') && tool.strict === false));
-            assert.equal(request.store, false); assert.deepEqual(request.include, ['reasoning.encrypted_content']);
-            assert.equal(request.reasoning.effort, 'low'); assert.equal(request.max_output_tokens, 4096);
-            if (round++ === 0) return response(null, [reasoning, commentary, call('r', 'memdrive_recall', { requests: [{ query: 'key' }] })]);
-            assert.deepEqual(request.input.slice(2, 4), [reasoning, commentary]);
-            assert.equal(request.input[5].type, 'function_call_output'); assert.equal(request.input[5].call_id, 'r');
-            if (round === 2) return response(null, [call('read', 'memdrive_read', { ids: [original.id] })]);
-            return response(JSON.stringify({ evidence: [{ memId: original.id }] }));
-        } });
-    assert.equal(collected.selected.length, 1); assert.equal(collected.rounds, 3);
-    const packed = packEvidence(prepared, collected.selected, config, textCount);
-    assert(packed.memoryTokens <= 4096); assert.equal(packed.spans[0].content, original.content);
-    const metrics = evidenceMetrics(row(), prepared, { packed: packed.spans });
-    assert.equal(metrics.stages.packed.archived.fullTurnRecall, 1);
-    const small = { ...config, retrieval: { ...config.retrieval, memoryTokens: 10 } };
-    assert.equal(packEvidence(prepared, collected.selected, small, textCount).spans.length, 0);
-    await assert.rejects(collectEvidence({ mode: 'agentic', tools, prepared, config, countTokens: textCount,
-        ask: async () => response(JSON.stringify({ evidence: [{ memId: original.id }] })) }), /not delivered/);
-});
-
-test('Responses collector rejects incomplete generation and duplicate call IDs without retry', async () => {
-    const prepared = prepareCase(row(), config), tools = await toolsFor(prepared);
-    let asked = 0, executed = 0;
-    const tracked = { definitions: tools.definitions, execute: async (...args) => { executed++; return tools.execute(...args); } };
-    await assert.rejects(collectEvidence({ mode: 'agentic', tools: tracked, prepared, config, countTokens: textCount,
-        ask: async () => { asked++; return { ...response('{"evidence":[]}'), status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } }; } }), /incomplete/);
-    assert.equal(asked, 1); assert.equal(executed, 0);
-    await assert.rejects(collectEvidence({ mode: 'agentic', tools: tracked, prepared, config, countTokens: textCount,
-        ask: async () => response(null, [call('same', 'memdrive_read', { ids: [prepared.mems[0].id] })]) }), /Invalid tool call ID/);
-    assert.equal(executed, 1);
-});
-
-test('oversized read becomes an explicit undelivered tool error without fabricated evidence', async () => {
-    const input = row(); input.haystack_sessions[0][0].content = 'Cedar '.repeat(500);
-    const prepared = prepareCase(input, config), tools = await toolsFor(prepared);
-    const limited = { ...config, limits: { ...config.limits, toolResultTokens: 1600 } };
-    let round = 0;
-    const collected = await collectEvidence({ mode: 'agentic', tools, prepared, config: limited, countTokens: textCount,
-        ask: async request => {
-            if (round++ === 0) return response(null, [call('read', 'memdrive_read', { ids: [prepared.mems[0].id] })]);
-            assert.equal(JSON.parse(request.input.at(-1).output).error.code, 'BENCHMARK_RESULT_LIMIT');
-            return response('{"evidence":[]}');
-        } });
-    assert.equal(collected.retrieved.length, 1); assert.equal(collected.delivered.length, 0);
-    assert.equal(collected.selected.length, 0);
-});
-
-test('source coverage does not mistake an excerpt for full evidence or missing annotations for zero recall', () => {
-    const input = row(), prepared = prepareCase(input, config), mem = prepared.mems[0];
-    const partial = { memId: mem.id, start: 0, end: 3, content: mem.content.slice(0, 3), metadata: mem.metadata, timestamp: mem.timestamp };
-    const metrics = evidenceMetrics(input, prepared, { retrieved: [partial] });
-    assert.equal(metrics.stages.retrieved.archived.anyTurnRecall, 1);
-    assert.equal(metrics.stages.retrieved.archived.fullTurnRecall, 0);
-    input.haystack_sessions[0][0].has_answer = false;
-    assert.equal(evidenceMetrics(input, prepared, { retrieved: [] }).stages.retrieved.archived.anyTurnRecall, null);
-    input.question_id += '_abs'; assert.equal(evidenceMetrics(input, prepared, {}).applicable, false);
-    assert.throws(() => validateSpan({ ...partial, content: 'forged' }, prepared), /differs/);
-    assert.throws(() => validateSpan({ ...partial, start: 4, end: 5, content: mem.content.slice(4, 5) }, prepared), /Unicode/);
-});
-
-
-
 const state = () => ({ databaseOperations: 0, cleanupOperations: 0, receiptNumber: 0, modelTokens: 0, models: {} });
+const fileId = '00000000-0000-4000-8000-000000000001';
+const otherId = '00000000-0000-4000-8000-000000000002';
+const response = output => ({ status: 'completed', output });
+const call = (id, name, args) => ({ id: 'item-' + id, call_id: id, type: 'function_call', name, arguments: JSON.stringify(args) });
+const select = evidence => response([{ type: 'message', role: 'assistant', status: 'completed',
+    content: [{ type: 'output_text', text: JSON.stringify({ evidence }) }] }]);
 
-test('native SDK ingestion/readback/tool execution and owned cleanup record replayable HTTP receipts', async () => {
-    const root = await mkdtemp(path.join(tmpdir(), 'memdrive-lme-'));
-    try {
-        const wire = nativeFixture(), q = state(), prepared = prepareCase(row(), config);
-        const entry = { collection: 'mdlme_' + 'a'.repeat(24), owner: 'b'.repeat(64), scope: 'c'.repeat(64), absent: false };
-        const journal = new Journal({ root, config, binding: 'test', credentials: keys, state: q, save: async () => {}, fetcher: wire.fetcher });
-        const tools = await ingest(journal, prepared, entry);
-        const result = await collectEvidence({ mode: 'single_pass', tools, prepared, config, countTokens: textCount });
-        assert.equal(result.selected.length, 2);
-        const beforeReuse = wire.requests.length;
-        const reused = await collectEvidence({ mode: 'single_pass', tools: await reuse(journal, prepared, entry), prepared, config, countTokens: textCount });
-        assert.deepEqual(reused.selected, result.selected);
-        assert(wire.requests.slice(beforeReuse).every(request => request.method !== 'DELETE'
-            && !request.pathname.endsWith('/collections') && !request.pathname.endsWith('/docs/upsert')));
-        await cleanup(journal, entry); assert(entry.absent); assert.equal(wire.collection, undefined);
-        const replayState = state();
-        const replay = new Journal({ root, config, binding: 'test', credentials: keys, state: replayState, save: async () => {}, replay: true,
-            fetcher: async () => { throw new Error('Network forbidden'); } });
-        const replayTools = await ingest(replay, prepared, entry);
-        const repeated = await collectEvidence({ mode: 'single_pass', tools: replayTools, prepared, config, countTokens: textCount });
-        assert.deepEqual(repeated.selected, result.selected);
-        const replayedReuse = await collectEvidence({ mode: 'single_pass', tools: await reuse(replay, prepared, entry), prepared, config, countTokens: textCount });
-        assert.deepEqual(replayedReuse.selected, reused.selected);
-        await cleanup(replay, { ...entry, absent: false });
-        assert.equal(q.receiptNumber, replayState.receiptNumber);
-        for (let i = 1; i <= q.receiptNumber; i++) assert(!JSON.stringify(await readJSON(path.join(root, `database/${i}.json`))).includes(keys.databaseKey));
-    } finally { await rm(root, { recursive: true, force: true }); }
+function fixture(input = row(), configOverride = config) {
+    const prepared = prepareCase(input, configOverride);
+    const file = { ...prepared.files[0], fileId };
+    const sources = sourceFiles(prepared, [fileId, otherId]);
+    return { file, options: { mode: 'agentic', definitions: fileTools(configOverride), prepared, sources,
+        config: configOverride, countTokens: text => text.length } };
+}
+
+test('source adaptation preserves literal messages and calendar timestamps without evaluation annotations', () => {
+    const input = row(), prepared = prepareCase(input, config);
+    assert.equal(prepared.boundary, 2);
+    assert.equal(prepared.files[0].content, input.haystack_sessions[0][0].content);
+    assert.equal(prepared.files[0].path, '/sessions/1/messages/0.txt');
+    assert.equal(prepared.files[0].metadata.timestamp, '2023-01-02T10:00:00.000Z');
+    assert.equal(prepared.recent.length, 4);
+    assert.doesNotMatch(JSON.stringify(prepared), /has_answer|answer_session_ids|single-session-user/);
+    assert.throws(() => timestamp('2023/02/29 (Wed) 10:00'), /Invalid calendar/);
+    assert.throws(() => sourceFiles(prepared, [fileId, fileId]), /Duplicate/);
 });
 
-test('ingestion batches originals and stops without retrying an uncertain batch', async () => {
-    const root = await mkdtemp(path.join(tmpdir(), 'memdrive-lme-batches-'));
-    try {
-        const original = prepareCase(row(), config).mems[0];
-        const prepared = { mems: Array.from({ length: 41 }, (_, index) => ({ ...original, id: 'original-' + index })) };
-        const entry = { collection: 'mdlme_' + 'a'.repeat(24), owner: 'b'.repeat(64), scope: 'c'.repeat(64), absent: false };
-        for (const fail of [false, true]) {
-            const wire = nativeFixture(), q = state(); let attempts = 0;
-            const journal = new Journal({ root: path.join(root, String(fail)), config, binding: 'test', credentials: keys, state: q,
-                save: async () => {}, fetcher: async (url, options) => {
-                    if (url.endsWith('/docs/upsert') && ++attempts === 2 && fail) throw new Error('Uncertain batch');
-                    return wire.fetcher(url, options);
-                } });
-            if (fail) await assert.rejects(ingest(journal, prepared, entry), /write failed/);
-            else await ingest(journal, prepared, entry);
-            assert.equal(attempts, fail ? 2 : 3);
-            const writes = wire.requests.filter(request => request.pathname.endsWith('/docs/upsert'));
-            const originals = writes.map(request => request.body.docs.filter(doc => doc.kind === 'mem'));
-            assert.deepEqual(originals.map(batch => batch.length), fail ? [20] : [20, 20, 1]);
-            assert.deepEqual(originals.flat().map(doc => doc.memId), prepared.mems.slice(0, fail ? 20 : 41).map(mem => mem.id));
-            assert.equal(wire.collections.size, 1); assert(!wire.requests.some(request => request.method === 'DELETE'));
-            if (fail) assert.equal((await readJSON(path.join(journal.root, 'database', q.receiptNumber + '.json'))).status, 'uncertain');
-        }
-    } finally { await rm(root, { recursive: true, force: true }); }
+test('file identity, metadata and UTF-16 ranges are verified before evidence can be selected or packed', () => {
+    const input = row(), { file, options: { sources, prepared } } = fixture(input);
+    const hit = { ...file, content: '🧭 key', range: { start: 4, end: 10 } };
+    const spans = hit => resultSpans('search_files', { ok: true, value: { hits: [hit] } }, sources);
+    const [span] = spans(hit);
+    assert.equal(span.content, '🧭 key');
+    assert.equal(span.start, 4);
+    assert.deepEqual(spans({ ...hit, range: undefined }), [span]);
+    assert.deepEqual(spans({ ...hit, range: undefined, content: 'not in original' }), []);
+    assert.throws(() => spans({ ...hit, range: { start: 5, end: 10 } }), /Split Unicode/);
+    assert.throws(() => spans({ ...hit, content: 'wrong' }), /differs from source/);
+    assert.throws(() => spans({ ...hit, path: '/foreign.txt' }), /file path differs/);
+    assert.throws(() => spans({ ...hit, fileId: otherId }), /file path differs/);
+    assert.throws(() => spans({ ...hit, metadata: { ...hit.metadata, timestamp: 'wrong' } }), /metadata differs/);
+    const packed = packEvidence(prepared, [span], config, text => text.length, sources);
+    assert.deepEqual(packed.spans, [span]);
+    const metrics = evidenceMetrics(input, prepared, { packed: packed.spans });
+    assert.equal(metrics.stages.packed.archived.anyTurnRecall, 1);
+    assert.equal(metrics.stages.packed.archived.fullTurnRecall, 0);
+    delete input.haystack_sessions[0][0].has_answer;
+    assert.equal(evidenceMetrics(input, prepared, { packed: packed.spans }).stages.packed.archived.anyTurnRecall, null);
+    input.question_id += '_abs';
+    assert.equal(evidenceMetrics(input, prepared, { packed: packed.spans }).applicable, false);
+});
+
+test('oversized evidence stays in retrieval accounting and cannot be selected', async () => {
+    const limited = { ...config, limits: { ...config.limits, toolResultTokens: 30 } };
+    const { file, options } = fixture(row(), limited);
+    const executeTool = async () => ({ ok: true, value: file });
+    const ask = evidence => async (request, round) => {
+        if (round === 0) return response([call('read', 'read_file', { fileId })]);
+        const delivered = JSON.parse(request.input.at(-1).output);
+        assert.equal(delivered.error.code, 'BENCHMARK_RESULT_LIMIT');
+        assert(!JSON.stringify(delivered).includes(file.content));
+        return select(evidence);
+    };
+    const empty = await collectEvidence({ ...options, executeTool, ask: ask([]) });
+    assert.equal(empty.retrieved.length, 1);
+    assert.deepEqual(empty.delivered, []);
+    assert.deepEqual(empty.selected, []);
+    await assert.rejects(collectEvidence({ ...options, executeTool, ask: ask([{ fileId, start: 0, end: file.content.length }]) }),
+        /Selected evidence was not delivered/);
+});
+
+test('the collector preserves opaque Responses state and rejects incomplete responses or duplicate tool calls', async () => {
+    const { options } = fixture();
+    const executeTool = async () => ({ ok: true, value: { hits: [], reranked: false } });
+    const reasoning = { type: 'reasoning', id: 'r1', encrypted_content: 'test-state' };
+    const first = response([reasoning, call('search-1', 'search_files', { query: 'key' })]);
+    await assert.rejects(collectEvidence({ ...options, executeTool, ask: async () => ({ status: 'incomplete' }) }), /incomplete/);
+    await assert.rejects(collectEvidence({ ...options, executeTool, ask: async (request, round) => {
+        if (round) assert.deepEqual(request.input[2], reasoning);
+        return first;
+    } }), /Invalid tool call ID/);
+});
+
+test('file tool input validation stays local and forwards cancellation to the SDK', async () => {
+    const controller = new AbortController();
+    const drive = { search: async (request, { signal }) => {
+        assert.deepEqual(request, { query: 'key', limit: 1, rerank: true });
+        assert.equal(signal, controller.signal);
+        return { hits: [], reranked: false };
+    } };
+    assert.equal((await runTool(drive, 'search_files', { query: 'key', limit: 51 }, config)).ok, false);
+    assert.equal((await runTool(drive, 'delete_file', { fileId }, config)).ok, false);
+    assert.equal((await runTool(drive, 'search_files', { query: 'key', limit: 1 }, config, controller.signal)).ok, true);
 });
 
 test('budgets reject before dispatch and leave receipt counters consistent', async () => {
@@ -199,7 +112,7 @@ test('budgets reject before dispatch and leave receipt counters consistent', asy
         const journal = new Journal({ root, config: limited, binding: 'test', credentials: keys, state: q, save: async () => {},
             fetcher: async () => { throw new Error('Unexpected dispatch'); } });
         await assert.rejects(journal.model('answer', { ...config.model, messages: [] }, 'answer.json'), /budget/);
-        await assert.rejects(journal.native().collection('mdlme_' + 'a'.repeat(24)).get(), /budget|operation/i);
+        await assert.rejects(journal.native().collection('mdflme_' + 'a'.repeat(24)).get(), /budget|operation/i);
         assert.equal(q.receiptNumber, 0); assert.equal(q.databaseOperations, 0); assert.equal(q.modelTokens, 0);
     } finally { await rm(root, { recursive: true, force: true }); }
 });
@@ -249,7 +162,7 @@ test('aborted attempts record nondispatched receipts without counter gaps', asyn
         const journal = new Journal({ root, config, binding: 'test', credentials: keys, state: q, save: async () => {}, signal: controller.signal,
             fetcher: async () => { dispatched++; throw new Error('Unexpected dispatch'); } });
         await assert.rejects(journal.model('answer', { ...config.model, messages: [] }, 'answer.json'));
-        await assert.rejects(journal.native().collection('mdlme_' + 'a'.repeat(24)).get());
+        await assert.rejects(journal.native().collection('mdflme_' + 'a'.repeat(24)).get());
         assert.equal(dispatched, 0); assert.equal(q.models.answer.calls, 1);
         assert.equal(q.receiptNumber, q.databaseOperations);
         assert.equal((await readJSON(path.join(root, 'answer.json'))).status, 'aborted');
@@ -259,29 +172,4 @@ test('aborted attempts record nondispatched receipts without counter gaps', asyn
         assert.equal(dispatched, 0);
         assert.equal((await readJSON(path.join(root, 'collector-0.json'))).status, 'aborted');
     } finally { await rm(root, { recursive: true, force: true }); }
-});
-
-test('SDK collector adapter preserves known usage on malformed output and forwards cancellation', async () => {
-    const { sdkCollector, sdkDefinitions } = await import('../benchmark/longmemeval/sdk-agent.mjs');
-    const prepared = prepareCase(row(), config), fixture = memdriveClient();
-    const drive = await create({ client: fixture.client, name: 'adapter_test', metadataSchema });
-    await drive.remember({ mems: prepared.mems });
-    const definitions = await sdkDefinitions(drive);
-    const profile = { ...config, collectorImplementation: 'sdk' };
-    let outcome;
-    const collect = await sdkCollector({ drive, prepared, config: profile, definitions, countTokens: () => 1,
-        ask: async (_request, _round, signal) => { assert(signal instanceof AbortSignal);
-            return { ...response('invalid JSON'), usage: { input_tokens: 7, output_tokens: 3 } }; },
-        onOutcome: value => { outcome = value; } });
-    await assert.rejects(collect(), /SDK retrieval stopped/);
-    assert.equal(outcome.completion.status, 'failed'); assert.equal(outcome.usage.unknownUsageCalls, 0);
-    assert.equal(outcome.usage.inputTokens, 7); assert.equal(outcome.usage.outputTokens, 3);
-    const controller = new AbortController(); let forwarded;
-    const cancelled = await sdkCollector({ drive, prepared, config: profile, definitions, countTokens: () => 1,
-        signal: controller.signal, ask: async (_request, _round, signal) => {
-            forwarded = signal; controller.abort(); signal.throwIfAborted();
-        }, onOutcome: value => { outcome = value; } });
-    await assert.rejects(cancelled(), /SDK retrieval stopped/);
-    assert.equal(forwarded.aborted, true); assert.equal(outcome.completion.status, 'aborted');
-    assert.equal(outcome.usage.modelCalls, 1); assert.equal(outcome.usage.unknownUsageCalls, 1);
 });

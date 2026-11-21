@@ -1,8 +1,7 @@
 // Exact source partitions: UTF-16 offsets for slice(), a Unicode-code-point cap.
 // English sentence detection is deliberate; other languages are not optimized.
-export const CHUNKING_POLICY = 'boundary-v1';
-export function chunkSpans(text: string, limit = 800): Array<{start: number; end: number; text: string}> {
-    if (!Number.isInteger(limit) || limit < 1) throw new RangeError('Chunk limit must be a positive integer.');
+export function chunkSpans(text: string): Array<{start: number; end: number; text: string}> {
+    const limit = 800;
     const offsets = [0];
     for (const char of text) offsets.push(offsets.at(-1)! + char.length);
     const paragraphs = [...text.matchAll(/\r?\n[\t ]*\r?\n(?:\s*\r?\n)*/gu)].map(m => m.index + m[0].length);

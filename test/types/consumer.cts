@@ -1,12 +1,8 @@
-import { create, open, list, MemDriveError } from '@functional-systems/memdrive';
-import { LambdaDBClient } from '@functional-systems/lambdadb';
+import type { LambdaDBClient } from '@functional-systems/lambdadb';
+import { MemDrive, type MainFileDrive, type WorkingFileDrive } from '@functional-systems/memdrive';
 
-async function consume() {
-    const client = new LambdaDBClient({ baseUrl: 'https://example.invalid', projectName: 'sample', projectApiKey: 'synthetic' });
-    const drive = await create({ client, name: 'sample', metadataSchema: {} });
-    await drive.recall({ query: 'What changed?' });
-    await open({ client, name: 'sample' });
-    await list({ client });
-    return new MemDriveError('INVALID_INPUT', 'Example');
+export async function commonJsConsumer(client: LambdaDBClient) {
+    const main: MainFileDrive = await MemDrive.open({ client, name: 'workspace' });
+    const fork: WorkingFileDrive = await main.fork({ name: 'research' });
+    return fork.write({ op: 'create', path: '/note.md', content: '# Note' });
 }
-void consume;
