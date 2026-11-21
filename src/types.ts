@@ -53,6 +53,31 @@ export interface CreateFileRequest {
     metadata?: Metadata | undefined;
 }
 
+export interface TextEdit {
+    oldText: string;
+    newText: string;
+}
+
+export type UpdateFileRequest = {
+    op: 'update';
+    fileId: string;
+    newPath?: string | undefined;
+    metadata?: Metadata | undefined;
+} & (
+    { content?: string | undefined; edits?: never }
+    | { content?: never; edits: TextEdit[] }
+);
+
+export interface DeleteFileRequest {
+    op: 'delete';
+    fileId: string;
+}
+export interface DeleteFileResult {
+    fileId: string;
+}
+export type WriteFileRequest = CreateFileRequest | UpdateFileRequest | DeleteFileRequest;
+export type WriteFileResult = DriveFile | DeleteFileResult;
+
 interface FileView {
     readonly name: string;
     list(request?: ListFilesRequest, options?: RequestOptions): Promise<ListFilesResult>;
@@ -69,8 +94,11 @@ export interface MainFileDrive extends FileView {
 
 export interface WorkingFileDrive extends FileView {
     readonly at: { readonly kind: 'fork'; readonly name: string };
-    write(request: CreateFileRequest, options?: RequestOptions): Promise<DriveFile>;
-    write(request: CreateFileRequest[], options?: RequestOptions): Promise<DriveFile[]>;
+    write(request: CreateFileRequest | UpdateFileRequest, options?: RequestOptions): Promise<DriveFile>;
+    write(request: DeleteFileRequest, options?: RequestOptions): Promise<DeleteFileResult>;
+    write(request: WriteFileRequest, options?: RequestOptions): Promise<WriteFileResult>;
+    write(request: (CreateFileRequest | UpdateFileRequest)[], options?: RequestOptions): Promise<DriveFile[]>;
+    write(request: WriteFileRequest[], options?: RequestOptions): Promise<WriteFileResult[]>;
 }
 
 export type FileDrive = MainFileDrive | WorkingFileDrive;

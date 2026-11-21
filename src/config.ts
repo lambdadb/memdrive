@@ -63,7 +63,7 @@ export function metadataValues(value: unknown, schema: MetadataSchema): Metadata
             case 'datetime': return validDate(item);
         }
     }), 'Metadata values must match their declared scalar types. Datetimes use ISO UTC with milliseconds.');
-    return { ...value } as Metadata;
+    return Object.keys(value).length ? { ...value } as Metadata : undefined;
 }
 
 export function storeConfiguration(options: CreateFileStoreOptions) {

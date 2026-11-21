@@ -1,5 +1,5 @@
 import type { LambdaDBClient } from '@functional-systems/lambdadb';
-import { create, open, type DriveFile, type SearchFilesResult, type ListFilesResult, type FileDrive, type OpenFileStoreOptions } from '@functional-systems/memdrive';
+import { create, open, type DriveFile, type DeleteFileResult, type SearchFilesResult, type ListFilesResult, type FileDrive, type OpenFileStoreOptions } from '@functional-systems/memdrive';
 
 export async function fileConsumer(client: LambdaDBClient, options: OpenFileStoreOptions) {
     const main = await create({ client, name: 'workspace' });
@@ -9,6 +9,12 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     const file: DriveFile | null = await reopened.read({ fileId: created.fileId });
     const batch: DriveFile[] = await reopened.write([{ op: 'create', path: '/batch.txt', content: 'Batch' }]);
     await reopened.read({ paths: batch.map(item => item.path) });
+    const update: DriveFile = await reopened.write({ op: 'update', fileId: created.fileId, newPath: '/renamed.md',
+        edits: [{ oldText: 'before', newText: 'after' }] });
+    const deleted: DeleteFileResult = await reopened.write({ op: 'delete', fileId: update.fileId });
+    await reopened.write([{ op: 'update', fileId: deleted.fileId, content: '' }, { op: 'delete', fileId: deleted.fileId }]);
+    // @ts-expect-error Choose a full replacement or exact edits.
+    await reopened.write({ op: 'update', fileId: update.fileId, content: '', edits: [] });
     const listed: ListFilesResult = await reopened.list({ prefix: '/notes/', delimiter: '/', limit: 2 });
     if (listed.cursor) await reopened.list({ cursor: listed.cursor });
     // @ts-expect-error A continuation inherits its original options.

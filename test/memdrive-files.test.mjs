@@ -93,7 +93,7 @@ test('an uncertain create response is inspectable and a queued retry cannot dupl
         return true;
     });
     await assert.rejects(fork.write(request('/a.txt', 'duplicate')), { code: 'WRITE_UNCONFIRMED',
-        details: { fileId: details.fileId, path: details.path } });
+        details: { fileId: details.fileId, path: details.path, targets: [{ fileId: details.fileId, path: details.path }], stage: 'write-original' } });
     assert.equal(calls.filter(call => call.kind === 'upsert').length, 1);
     releasePending();
     assert.equal((await fork.read({ fileId: details.fileId })).content, 'exact');
@@ -341,4 +341,205 @@ test('listing fails closed for invalid input, aborts, nonprogress, and scan over
         nextPageToken: String(Number(pageToken ?? 0) + 1),
     });
     await assert.rejects(work.list(), { code: 'LIST_SCAN_LIMIT' });
+});
+
+test('working edits preserve identity, resolve substitutions against the original, and replace metadata', async () => {
+    const fixture = fileClient();
+    const main = await create({ client: fixture.client, name: 'workspace', metadataSchema: { topic: { type: 'string' } } });
+    const work = await main.fork({ name: 'research' });
+    const first = await work.write({ ...request('/notes/a.txt', 'The 😀 sky is gray. The sea is blue.\r\n'), metadata: { topic: 'test' } });
+    const docs = fixture.collections.get('workspace').branches.get('fork-research').docs;
+    const originalChunkIds = [...docs.values()].filter(doc => doc.kind === 'chunk').map(doc => doc.id);
+
+    const moved = await work.write({ op: 'update', fileId: first.fileId, newPath: '/archive/"draft".txt' });
+    assert.equal(moved.fileId, first.fileId);
+    assert.equal(moved.content, first.content);
+    assert.deepEqual(moved.metadata, first.metadata);
+    assert.equal(await work.read({ path: first.path }), null);
+    assert.deepEqual(await work.read({ path: moved.path }), moved);
+    const move = fixture.calls.find(call => call.kind === 'update');
+    assert(move.request.docs.every(doc => !Object.hasOwn(doc, 'body') && !Object.hasOwn(doc, 'content')));
+    assert.deepEqual([...docs.values()].filter(doc => doc.kind === 'chunk').map(doc => doc.id), originalChunkIds);
+
+    const changed = await work.write({ op: 'update', fileId: first.fileId, metadata: {}, edits: [
+        { oldText: 'blue', newText: 'navy' },
+        { oldText: 'gray', newText: 'blue' },
+    ] });
+    assert.equal(changed.content, 'The 😀 sky is blue. The sea is navy.\r\n');
+    assert.equal(Object.hasOwn(changed, 'metadata'), false);
+    assert.deepEqual(await work.read({ fileId: first.fileId }), changed);
+    assert(originalChunkIds.every(id => !docs.has(id)));
+    const ranked = await work.search({ query: 'navy', rerank: false });
+    assert.deepEqual(ranked.hits, [{ ...changed, range: { start: 0, end: changed.content.length } }]);
+
+    const empty = await work.write({ op: 'update', fileId: first.fileId, content: '' });
+    assert.equal(empty.content, '');
+    assert.equal([...docs.values()].filter(doc => doc.kind === 'chunk').length, 0);
+    assert.deepEqual(await work.write({ op: 'delete', fileId: first.fileId }), { fileId: first.fileId });
+    assert.deepEqual(await work.write({ op: 'delete', fileId: first.fileId }), { fileId: first.fileId });
+    assert.equal(await work.read({ fileId: first.fileId }), null);
+    assert(fixture.calls.filter(call => ['upsert', 'update', 'delete'].includes(call.kind)).every(call =>
+        call.request.branch === 'fork-research' && call.retries.strategy === 'none'));
+});
+
+test('edit conflicts and invalid operations fail before the first mutation of a mixed batch', async () => {
+    const fixture = fileClient();
+    const main = await create({ client: fixture.client, name: 'workspace' });
+    const work = await main.fork({ name: 'research' });
+    const [a, b] = await work.write([request('/a', 'aaa abcdef'), request('/b', 'source')]);
+    const writes = () => fixture.calls.filter(call => ['upsert', 'update', 'delete'].includes(call.kind)).length;
+    const before = writes();
+    const edit = edits => ({ op: 'update', fileId: a.fileId, edits });
+    await assert.rejects(work.write([request('/new'), edit([{ oldText: 'aa', newText: 'b' }])]), { code: 'EDIT_CONFLICT' });
+    await assert.rejects(work.write(edit([{ oldText: 'abc', newText: 'x' }, { oldText: 'cdef', newText: 'y' }])), { code: 'EDIT_CONFLICT' });
+    await assert.rejects(work.write(edit([{ oldText: 'absent', newText: '' }])), { code: 'EDIT_CONFLICT' });
+    await assert.rejects(work.write(edit([{ oldText: 'abc', newText: 'x' }, { oldText: 'abc', newText: 'y' }])), { code: 'INVALID_INPUT' });
+    await assert.rejects(work.write({ ...edit([{ oldText: 'abc', newText: 'x' }]), content: 'other' }), { code: 'INVALID_INPUT' });
+    await assert.rejects(work.write([{ op: 'delete', fileId: a.fileId }, { op: 'update', fileId: a.fileId, content: 'new' }]), { code: 'INVALID_INPUT' });
+    await assert.rejects(work.write([{ op: 'delete', fileId: a.fileId }, { op: 'update', fileId: b.fileId, newPath: '/a' }]), { code: 'PATH_EXISTS' });
+    await assert.rejects(work.write([{ op: 'update', fileId: a.fileId, newPath: '/same' }, request('/same')]), { code: 'INVALID_INPUT' });
+    assert.equal(writes(), before);
+    assert.equal(await work.read({ path: '/new' }), null);
+    assert.deepEqual(await work.read({ fileId: a.fileId }), a);
+
+    const [created, updated, deleted] = await work.write([
+        request('/new', 'new'), { op: 'update', fileId: b.fileId, content: 'changed' }, { op: 'delete', fileId: a.fileId },
+    ]);
+    assert.equal(created.path, '/new');
+    assert.equal(updated.content, 'changed');
+    assert.deepEqual(deleted, { fileId: a.fileId });
+    await assert.rejects(work.write({ op: 'update', fileId: a.fileId, content: 'later' }), { code: 'FILE_NOT_FOUND' });
+});
+
+test('lost update acknowledgements fence an unchanged original and resume when its revision is observed', async () => {
+    const fixture = fileClient();
+    const main = await create({ client: fixture.client, name: 'workspace' });
+    const work = await main.fork({ name: 'research' });
+    const file = await work.write(request('/a', 'first'));
+    const docs = fixture.collections.get('workspace').branches.get('fork-research').docs;
+    let release;
+    fixture.beforeUpsert = request => {
+        release = () => { for (const doc of request.docs) docs.set(doc.id, doc); };
+        throw new Error('Response lost');
+    };
+    const update = { op: 'update', fileId: file.fileId, content: 'second' };
+    await assert.rejects(work.write(update), { code: 'WRITE_UNCONFIRMED' });
+    assert.equal((await work.read({ fileId: file.fileId })).content, 'first');
+    await assert.rejects(work.write(update), { code: 'WRITE_UNCONFIRMED' });
+    release();
+    fixture.beforeUpsert = undefined;
+    const recovered = await work.write(update);
+    assert.equal(recovered.content, 'second');
+    assert.equal([...docs.values()].filter(doc => doc.kind === 'chunk').length, 1);
+});
+
+test('an applied update or deletion resumes chunk cleanup after reopening', async () => {
+    const fixture = fileClient();
+    const main = await create({ client: fixture.client, name: 'workspace' });
+    const work = await main.fork({ name: 'research' });
+    const file = await work.write(request('/a', 'first'));
+    const orig = fixture.collections.get('workspace').branches.get('fork-research').docs;
+    const oldChunks = [...orig.values()].filter(doc => doc.kind === 'chunk').map(doc => doc.id);
+    const reject = () => { throw Object.assign(new Error('Rejected'), { statusCode: 400 }); };
+    fixture.beforeDelete = reject;
+    await assert.rejects(work.write({ op: 'update', fileId: file.fileId, content: 'second' }), error =>
+        error.status === 400 && error.details.stage === 'cleanup-chunks' && error.details.appliedFileIds.includes(file.fileId));
+    assert.equal((await work.read({ fileId: file.fileId })).content, 'second');
+    assert(oldChunks.every(id => orig.has(id)));
+    assert.deepEqual((await work.search({ query: 'first', rerank: false })).hits.map(hit => hit.content), ['second']);
+    fixture.beforeDelete = undefined;
+    const reopened = await open({ client: { ...fixture.client }, name: 'workspace', at: { fork: 'research' } });
+    const restored = await reopened.write({ op: 'update', fileId: file.fileId, content: 'second' });
+    assert.equal(restored.content, 'second');
+    assert(oldChunks.every(id => !orig.has(id)));
+
+    fixture.beforeDelete = reject;
+    await assert.rejects(reopened.write({ op: 'delete', fileId: file.fileId }), error =>
+        error.status === 400 && error.details.stage === 'cleanup-chunks' && error.details.appliedFileIds.includes(file.fileId));
+    assert.equal(await reopened.read({ fileId: file.fileId }), null);
+    assert.equal((await reopened.search({ query: 'second', rerank: false })).hits.length, 0);
+    fixture.beforeDelete = undefined;
+    const retry = await open({ client: { ...fixture.client }, name: 'workspace', at: { fork: 'research' } });
+    await retry.write({ op: 'delete', fileId: file.fileId });
+    assert.equal(orig.size, 0);
+});
+
+test('a lost cleanup request can be retried on the same live handle', async () => {
+    const fixture = fileClient();
+    const main = await create({ client: fixture.client, name: 'workspace' });
+    const work = await main.fork({ name: 'research' });
+    const file = await work.write(request('/a', 'first'));
+    const docs = fixture.collections.get('workspace').branches.get('fork-research').docs;
+    const oldId = [...docs.values()].find(doc => doc.kind === 'chunk').id;
+    fixture.beforeDelete = () => { throw new Error('Lost before applying'); };
+    const change = { op: 'update', fileId: file.fileId, content: 'second' };
+    await assert.rejects(work.write(change), error =>
+        error.code === 'WRITE_UNCONFIRMED' && error.details.stage === 'cleanup-chunks');
+    assert(docs.has(oldId));
+    assert.equal((await work.read({ fileId: file.fileId })).content, 'second');
+    fixture.beforeDelete = undefined;
+    assert.equal((await work.write(change)).content, 'second');
+    assert.equal(docs.has(oldId), false);
+});
+
+test('reintroducing identical text uses new chunk IDs even if an earlier delete is replayed', async () => {
+    const fixture = fileClient();
+    const main = await create({ client: fixture.client, name: 'workspace' });
+    const work = await main.fork({ name: 'research' });
+    const file = await work.write(request('/a', 'first'));
+    await work.write({ op: 'update', fileId: file.fileId, content: 'second' });
+    const deletion = fixture.calls.find(call => call.kind === 'delete').request;
+    await work.write({ op: 'update', fileId: file.fileId, content: 'first' });
+    await fixture.client.collection('workspace').docs.delete(deletion);
+    const hits = (await work.search({ query: 'first', rerank: false })).hits;
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].content, 'first');
+});
+
+test('an inherited published baseline is preserved through edits and a backed tombstone', async () => {
+    const fixture = fileClient();
+    const main = await create({ client: fixture.client, name: 'workspace' });
+    const work = await main.fork({ name: 'research' });
+    const file = await work.write(request('/published', 'source'));
+    const docs = fixture.collections.get('workspace').branches.get('fork-research').docs;
+    const key = `file:${file.fileId}`;
+    docs.get(key).version = 'published-version';
+    delete docs.get(key).changed;
+
+    await work.write({ op: 'update', fileId: file.fileId, newPath: '/working', content: 'working' });
+    const baseline = docs.get(key).baseline;
+    assert.equal(baseline.version, 'published-version');
+    assert.equal(baseline.path, '/published');
+    assert.match(baseline.fingerprint, /^[0-9a-f]{64}$/);
+    await work.write({ op: 'update', fileId: file.fileId, newPath: file.path, content: file.content });
+    assert.deepEqual(docs.get(key).baseline, baseline);
+    assert.equal(docs.get(key).changed, false);
+
+    await work.write({ op: 'delete', fileId: file.fileId });
+    assert.deepEqual(docs.get(key).baseline, baseline);
+    assert.equal(docs.get(key).kind, 'tombstone');
+    assert.equal(docs.size, 1);
+    const reopened = await open({ client: { ...fixture.client }, name: 'workspace', at: { fork: 'research' } });
+    assert.equal(await reopened.read({ fileId: file.fileId }), null);
+    assert.equal(await reopened.read({ path: file.path }), null);
+    assert.deepEqual(await reopened.write({ op: 'delete', fileId: file.fileId }), { fileId: file.fileId });
+    assert.equal(docs.size, 1);
+});
+
+test('edit preflight rejects an ambiguous identity and cancellation after dispatch leaves a recoverable revision', async () => {
+    const fixture = fileClient();
+    const main = await create({ client: fixture.client, name: 'workspace' });
+    const work = await main.fork({ name: 'research' });
+    const [file, other] = await work.write([request('/a', 'before'), request('/b', 'other')]);
+    const update = { op: 'update', fileId: file.fileId, content: 'after' };
+    fixture.beforeFetch = (_request, docs) => ({ isDocsInline: true, total: 1,
+        docs: [{ collection: 'workspace', doc: docs.get(`file:${other.fileId}`) }] });
+    await assert.rejects(work.write(update), { code: 'INVALID_RESULT' });
+    fixture.beforeFetch = undefined;
+    const controller = new AbortController();
+    fixture.afterUpsert = () => controller.abort();
+    await assert.rejects(work.write(update, { signal: controller.signal }), error =>
+        error.code === 'WRITE_UNCONFIRMED' && error.details.stage === 'write-original');
+    fixture.afterUpsert = undefined;
+    assert.deepEqual(await work.read({ fileId: file.fileId }), await work.write(update));
 });
