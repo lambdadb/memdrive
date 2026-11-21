@@ -92,8 +92,14 @@ export interface MainFileDrive extends FileView {
     fork(request: { name: string }, options?: RequestOptions): Promise<WorkingFileDrive>;
 }
 
+export type FileChange =
+    | { op: 'create'; fileId: string; path: string }
+    | { op: 'update'; fileId: string; path: string; previousPath?: string | undefined }
+    | { op: 'delete'; fileId: string; previousPath: string };
+
 export interface WorkingFileDrive extends FileView {
     readonly at: { readonly kind: 'fork'; readonly name: string };
+    diff(options?: RequestOptions): Promise<FileChange[]>;
     write(request: CreateFileRequest | UpdateFileRequest, options?: RequestOptions): Promise<DriveFile>;
     write(request: DeleteFileRequest, options?: RequestOptions): Promise<DeleteFileResult>;
     write(request: WriteFileRequest, options?: RequestOptions): Promise<WriteFileResult>;

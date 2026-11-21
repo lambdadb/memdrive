@@ -53,6 +53,20 @@ A batch can mix up to 100 `create`, `update`, and `delete` operations and return
 
 The SDK confirms the original revision and chunk changes with consistent branch reads. A failed batch may already have applied some files. Error details identify the stage, affected IDs, and any confirmed original changes or completed operations. Check the original before repeating an exact edit after `WRITE_UNCONFIRMED`. The same handle fences another operation that could conflict with an unconfirmed write. Before retrying on a replacement handle, ensure the previous writer has stopped and its outstanding writes have settled. Reissuing an update with the current path and content can finish stale-chunk cleanup. Reissuing a delete can finish removing physically retained chunks and the deleted file's internal record.
 
+
+## Review working changes
+
+```ts
+const changes = await work.diff();
+for (const change of changes) {
+    console.log(change.op, change.fileId, change.op === 'delete' ? change.previousPath : change.path);
+}
+```
+
+`diff()` reports one net change per file on a working fork. A create uses the current path and a delete reports the original baseline path as `previousPath`. An update uses the current path and includes `previousPath` when the path changed. Files created and deleted in the fork, and files restored to their original state, are omitted.
+
+Diff uses consistent reads and runs in the same queue as writes on the handle. Completed writes on that handle are visible to the scan, and later writes wait until the scan finishes. Use one active writer per fork. A previously unconfirmed request can still settle, and writes through another client or runtime can change the branch between pages. The result is an inspection of the working fork. It carries no durable snapshot or merge token.
+
 ## List files
 
 ```ts

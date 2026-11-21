@@ -1,5 +1,5 @@
 import type { LambdaDBClient } from '@functional-systems/lambdadb';
-import { create, open, type DriveFile, type DeleteFileResult, type SearchFilesResult, type ListFilesResult, type FileDrive, type OpenFileStoreOptions } from '@functional-systems/memdrive';
+import { create, open, type DriveFile, type FileChange, type DeleteFileResult, type SearchFilesResult, type ListFilesResult, type FileDrive, type OpenFileStoreOptions } from '@functional-systems/memdrive';
 
 export async function fileConsumer(client: LambdaDBClient, options: OpenFileStoreOptions) {
     const main = await create({ client, name: 'workspace' });
@@ -23,6 +23,10 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     listed.files[0]?.content;
     const ranked: SearchFilesResult = await reopened.search({ query: 'Task context', rerank: { onFailure: 'returnOriginal' } });
     ranked.hits[0]?.range?.start;
+    const changes: FileChange[] = await reopened.diff({ signal: new AbortController().signal });
+    for (const change of changes) if (change.op === 'update' || change.op === 'delete') change.previousPath;
+    // @ts-expect-error Diff is available only on working forks.
+    await main.diff();
     const selected: FileDrive = await open(options);
     if ('write' in selected) await selected.write({ op: 'create', path: '/another.md', content: '' });
     // @ts-expect-error Only a working fork has a write method.

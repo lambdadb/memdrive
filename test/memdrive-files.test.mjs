@@ -601,3 +601,129 @@ test('move scans every page of persisted chunk IDs with the same hash and writes
     assert.equal(new Set(patches.map(doc => doc.id)).size, 1002);
     assert([...docs.values()].every(doc => doc.path === '/new.txt'));
 });
+
+test('working diff reports net creates, body edits, moves and deletions using only changed originals', async () => {
+    const fixture = fileClient();
+    const { client, calls, collections } = fixture;
+    const main = await create({ client, name: 'workspace' });
+    assert.equal('diff' in main, false);
+    const work = await main.fork({ name: 'research' });
+    const alternate = await main.fork({ name: 'alternate' });
+    assert.deepEqual(await work.diff(), []);
+    const [created, moved, body, deleted, restored, removed, interrupted] = await work.write([
+        request('/create', 'created'), request('/move', 'move'), request('/body', 'old'),
+        request('/delete', 'remove'), request('/restore', 'baseline'), request('/gone', ''), request('/interrupted', 'unfinished'),
+    ]);
+    const docs = collections.get('workspace').branches.get('fork-research').docs;
+    for (const file of [moved, body, deleted, restored]) {
+        const record = docs.get(`file:${file.fileId}`);
+        delete record.changed;
+        record.version = 'published';
+    }
+    await work.write([
+        { op: 'update', fileId: created.fileId, newPath: '/created-moved' },
+        { op: 'update', fileId: moved.fileId, newPath: '/moved-once' },
+        { op: 'update', fileId: body.fileId, content: 'new' },
+        { op: 'update', fileId: deleted.fileId, newPath: '/previously-moved' },
+        { op: 'update', fileId: restored.fileId, content: 'edited' },
+        { op: 'delete', fileId: removed.fileId },
+    ]);
+    await work.write([
+        { op: 'update', fileId: moved.fileId, newPath: '/moved-again' },
+        { op: 'delete', fileId: deleted.fileId },
+        { op: 'update', fileId: restored.fileId, content: restored.content },
+    ]);
+    fixture.beforeDelete = () => { throw Object.assign(new Error('Chunk cleanup rejected'), { statusCode: 400 }); };
+    await assert.rejects(work.write({ op: 'delete', fileId: interrupted.fileId }), { code: 'DATABASE_ERROR' });
+    fixture.beforeDelete = undefined;
+    // Defensive equality also omits an exact revert if the candidate was marked changed.
+    docs.get(`file:${restored.fileId}`).changed = true;
+    await alternate.write(request('/other-fork'));
+    const reusedPath = await work.write(request('/delete'));
+
+    const reopened = await open({ client: { ...client }, name: 'workspace', at: { fork: 'research' } });
+    const before = calls.length;
+    const expected = [
+        { op: 'create', fileId: created.fileId, path: '/created-moved' },
+        { op: 'update', fileId: moved.fileId, path: '/moved-again', previousPath: '/move' },
+        { op: 'update', fileId: body.fileId, path: '/body' },
+        { op: 'delete', fileId: deleted.fileId, previousPath: '/delete' },
+        { op: 'create', fileId: reusedPath.fileId, path: '/delete' },
+    ].sort((a, b) => a.fileId.localeCompare(b.fileId));
+    assert.deepEqual(await reopened.diff(), expected);
+    const call = calls.slice(before);
+    assert.equal(call.length, 1);
+    assert.equal(call[0].kind, 'query');
+    assert.equal(call[0].request.consistentRead, true);
+    assert.equal(call[0].request.includeVectors, false);
+    assert.deepEqual(call[0].request.ref, { kind: 'branch', name: 'fork-research' });
+    assert.deepEqual(call[0].request.fields.include, ['id', 'kind', 'fileId', 'path', 'changed', 'baseline', 'fingerprint', 'version']);
+    assert.deepEqual((await alternate.diff()).map(change => change.path), ['/other-fork']);
+});
+
+test('diff pages across the generated ID boundary and queues following writes', async () => {
+    const fixture = fileClient();
+    const main = await create({ client: fixture.client, name: 'workspace' });
+    const work = await main.fork({ name: 'research' });
+    const docs = fixture.collections.get('workspace').branches.get('fork-research').docs;
+    const synthetic = Array.from({ length: 1001 }, (_, i) => {
+        const fileId = `00000000-0000-4000-8000-${i.toString(16).padStart(12, '0')}`;
+        return { fileId, id: `file:${fileId}`, kind: 'file', changed: true, path: `/synthetic/${i}` };
+    });
+    for (const doc of [...synthetic].reverse()) docs.set(doc.id, doc);
+    let entered, release;
+    const active = new Promise(resolve => { entered = resolve; });
+    const pause = new Promise(resolve => { release = resolve; });
+    fixture.diffPage = async request => {
+        if (request.query.bool.length === 2) { entered(); await pause; }
+    };
+    const scanning = work.diff();
+    await active;
+    const queued = work.write(request('/queued'));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(fixture.calls.some(call => call.kind === 'upsert'), false);
+    release();
+    const changes = await scanning;
+    await queued;
+    assert.deepEqual(changes, synthetic.map(({ fileId, path }) => ({ op: 'create', fileId, path })));
+    const scans = fixture.calls.filter(call => call.kind === 'query' && call.request.sort);
+    assert.equal(scans.length, 2);
+    assert.equal(scans[1].request.query.bool[2].queryString.query, `{${synthetic[999].id} TO *}`);
+    fixture.diffPage = undefined;
+    assert.equal((await work.diff()).length, 1002);
+});
+
+test('diff rejects invalid records, nonprogress and incomplete pages and recovers after abort', async () => {
+    const fixture = fileClient();
+    const main = await create({ client: fixture.client, name: 'workspace' });
+    const work = await main.fork({ name: 'research' });
+    await work.write(request('/a'));
+    const records = fixture.collections.get('workspace').branches.get('fork-research').docs;
+    const original = [...records.values()][0];
+    const wrap = (...docs) => ({ isDocsInline: true, total: docs.length, docs: docs.map(doc => ({ collection: 'workspace', doc })) });
+    for (const invalid of [
+        { ...original, kind: 'chunk' },
+        { ...original, changed: false },
+        { ...original, id: 'wrong' },
+        { ...original, baseline: { version: 'v1', path: '/before', fingerprint: 'bad' } },
+        { ...original, version: 'v1' },
+        { ...original, baseline: { version: 'v1', path: '/before', fingerprint: '0'.repeat(64) }, fingerprint: '0'.repeat(64) },
+    ]) {
+        fixture.diffPage = () => wrap(invalid);
+        await assert.rejects(work.diff(), { code: 'INVALID_RESULT' });
+    }
+    fixture.diffPage = () => wrap(original, original);
+    await assert.rejects(work.diff(), { code: 'INVALID_RESULT' });
+    fixture.diffPage = () => ({ ...wrap(original), total: 2 });
+    await assert.rejects(work.diff(), { code: 'INVALID_RESULT' });
+    const controller = new AbortController();
+    fixture.diffPage = (_request, options) => {
+        assert.strictEqual(options.signal, controller.signal);
+        controller.abort();
+        return wrap(original);
+    };
+    await assert.rejects(work.diff({ signal: controller.signal }), { code: 'ABORTED' });
+    fixture.diffPage = undefined;
+    assert.deepEqual(await work.diff(), [{ op: 'create', fileId: original.fileId, path: '/a' }]);
+    await assert.rejects(work.diff({ limit: 1 }), { code: 'INVALID_INPUT' });
+});

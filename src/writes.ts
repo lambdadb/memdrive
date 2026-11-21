@@ -1,7 +1,8 @@
 import { editRequest, planEdit } from './edits.js';
+import { diffFiles } from './diff.js';
 import { checkAbort, databaseError, MemDriveError, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
 import { bytes, createRecords, fileOriginal, originalId, resultDocs, validFileId } from './records.js';
-import { branchRead, fetchOriginals, pathQuery, type Handle } from './storage-reads.js';
+import { afterId, branchRead, fetchOriginals, pathQuery, type Handle } from './storage-reads.js';
 import type { CreateFileRequest, DeleteFileRequest, DeleteFileResult, DriveFile, MetadataSchema, RequestOptions, UpdateFileRequest,
     WriteFileRequest, WriteFileResult } from './types.js';
 
@@ -80,7 +81,12 @@ const generationPattern = (fileId: string, generation?: string) =>
 const chunkFields = { include: ['id', 'kind', 'fileId'] };
 
 export function workingWriter(handle: Handle, name: string, branch: string, schema: MetadataSchema) {
-    let writes = Promise.resolve();
+    let queue = Promise.resolve();
+    function enqueue<T>(operation: () => Promise<T>): Promise<T> {
+        const result = queue.then(operation);
+        queue = result.then(() => undefined, () => undefined);
+        return result;
+    }
     const pending = new Set<Pending>();
     const branchSettings = branchRead(branch);
 
@@ -115,13 +121,10 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
         const ids: string[] = [];
         let after: string | undefined;
         for (let page = 0; page <= maximumCleanupBatches; page++) {
-            const cursor = after === undefined ? [] : [
-                { queryString: { query: `{${after} TO *}`, defaultField: 'id' }, occur: 'filter' },
-            ];
             let response;
             try {
                 response = await nativeRequest(() => handle.query({ ...branchSettings, size: maximumRequestDocuments,
-                    fields: chunkFields, sort: [{ id: 'asc' }], query: { bool: [chunkKind, match, ...cursor] },
+                    fields: chunkFields, sort: [{ id: 'asc' }], query: { bool: [chunkKind, match, ...afterId(after)] },
                 }, nativeOptions(signal)), signal);
             } catch (cause) {
                 throw databaseError(cause, 'Could not read the file’s current chunk IDs.');
@@ -159,7 +162,7 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
             ? { op: 'create' as const, records: await createRecords(operation, schema) }
             : editRequest(operation, schema)));
         void prepared.catch(() => {});
-        const work = writes.then(async () => {
+        return enqueue(async () => {
             checkAbort(signal);
             const inputs = await prepared;
             const targetIds = inputs.flatMap(input => input.op === 'create' ? [] : [input.fileId]);
@@ -359,8 +362,13 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
             }
             return multi ? completed : completed[0]!;
         });
-        writes = work.then(() => undefined, () => undefined);
-        return work;
     }
-    return write;
+    return {
+        write,
+        async diff(options?: RequestOptions) {
+            const { signal } = operationOptions(options);
+            checkAbort(signal);
+            return enqueue(() => diffFiles(handle, name, branch, signal));
+        },
+    };
 }
