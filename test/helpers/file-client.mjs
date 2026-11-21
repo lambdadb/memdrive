@@ -9,12 +9,15 @@ export function fileClient() {
             if (collections.has(request.collectionName)) fail(409, 'Collection already exists');
             collections.set(request.collectionName, {
                 metadata: structuredClone({ ...request, defaultBranchName: 'main' }),
-                branches: new Map([['main', { docs: new Map() }]]),
+                branches: new Map([['main', { docs: new Map() }]]), tags: new Map(),
             });
         },
         collection(name) {
             const state = () => collections.get(name) ?? fail(404, 'Collection missing');
             const docsAt = branch => (state().branches.get(branch) ?? fail(404, 'Branch missing')).docs;
+            const sourceDocs = ref => ref.kind === 'tag'
+                ? (state().tags.get(ref.name) ?? fail(404, 'Checkpoint missing')).docs : docsAt(ref.name);
+            const copyView = ref => new Map(structuredClone([...sourceDocs(ref)]));
             const response = (docs, fields) => ({ isDocsInline: true, total: docs.length, docs: docs.map(doc => ({
                 collection: name, score: 0.8, doc: structuredClone(fields?.include
                     ? Object.fromEntries(fields.include.filter(key => Object.hasOwn(doc, key)).map(key => [key, doc[key]]))
@@ -23,18 +26,35 @@ export function fileClient() {
             return {
                 async get() { return { collection: structuredClone(state().metadata) }; },
                 branches: {
-                    async create({ branchName, source }) {
+                    async create({ branchName, source }, options) {
+                        calls.push({ kind: 'branch-create', request: { branchName, source }, retries: options?.retries });
                         if (state().branches.has(branchName)) fail(409, 'Branch already exists');
-                        state().branches.set(branchName, { docs: new Map(docsAt(source.name)) });
+                        state().branches.set(branchName, { docs: copyView(source) });
                         return { branch: { name: branchName } };
                     },
                     async list() {
                         return { branches: [...state().branches.keys()].map(name => ({ name })) };
                     },
                 },
+                tags: {
+                    async create({ tagName, source }, options) {
+                        calls.push({ kind: 'tag-create', request: { tagName, source }, retries: options?.retries });
+                        await fixture.beforeTagCreate?.(tagName, source);
+                        if (state().tags.has(tagName)) fail(409, 'Tag already exists');
+                        const tag = { name: tagName };
+                        state().tags.set(tagName, { tag, docs: copyView(source) });
+                        await fixture.afterTagCreate?.(tag);
+                        return { tag };
+                    },
+                    async get(tagName) {
+                        calls.push({ kind: 'tag-get', tagName });
+                        const override = await fixture.getTag?.(tagName);
+                        return override ?? { tag: (state().tags.get(tagName) ?? fail(404, 'Checkpoint missing')).tag };
+                    },
+                },
                 async query(request, options) {
                     calls.push({ kind: 'query', request: structuredClone(request) });
-                    const source = [...docsAt(request.ref.name).values()];
+                    const source = [...sourceDocs(request.ref).values()];
                     if (request.query.bayesian) {
                         const candidates = source.filter(doc => doc.kind === 'chunk');
                         const docs = (fixture.rank?.(candidates, request) ?? candidates).slice(0, request.size);
@@ -76,7 +96,7 @@ export function fileClient() {
                         calls.push({ kind: 'list', request: structuredClone(request), signal: options?.signal });
                         if (fixture.listPage) return fixture.listPage(request);
                         const filters = request.filter.bool;
-                        const docs = [...docsAt(request.ref.name).values()].filter(doc => filters.every(({ queryString }) => {
+                        const docs = [...sourceDocs(request.ref).values()].filter(doc => filters.every(({ queryString }) => {
                             const { query, defaultField } = queryString;
                             if (defaultField === 'fileName') return doc.fileName.includes(query.slice(3, -3));
                             const expected = JSON.parse(query);
@@ -89,7 +109,7 @@ export function fileClient() {
                     },
                     async fetch(request) {
                         calls.push({ kind: 'fetch', request: structuredClone(request) });
-                        const docs = docsAt(request.ref.name);
+                        const docs = sourceDocs(request.ref);
                         const override = await fixture.beforeFetch?.(request, docs);
                         return override ?? response(request.ids.map(id => docs.get(id)).filter(Boolean), request.fields);
                     },

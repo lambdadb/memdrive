@@ -9,8 +9,11 @@ export interface RequestOptions {
     signal?: AbortSignal | undefined;
 }
 
+export type ForkSelection = { fork: string; checkpoint?: never };
+export type CheckpointSelection = { checkpoint: string; fork?: never };
+
 export interface OpenFileStoreOptions extends ConnectionOptions {
-    at?: { fork: string } | undefined;
+    at?: ForkSelection | CheckpointSelection | undefined;
 }
 
 export interface FileListEntry {
@@ -80,6 +83,8 @@ export type WriteFileResult = DriveFile | DeleteFileResult;
 
 interface FileView {
     readonly name: string;
+    fork(request: { name: string }, options?: RequestOptions): Promise<WorkingFileDrive>;
+    checkpoint(request: { name: string }, options?: RequestOptions): Promise<CheckpointFileDrive>;
     list(request?: ListFilesRequest, options?: RequestOptions): Promise<ListFilesResult>;
     describe(options?: RequestOptions): Promise<FileStoreDescription>;
     search(request: SearchFilesRequest, options?: RequestOptions): Promise<SearchFilesResult>;
@@ -89,7 +94,10 @@ interface FileView {
 
 export interface MainFileDrive extends FileView {
     readonly at: { readonly kind: 'main' };
-    fork(request: { name: string }, options?: RequestOptions): Promise<WorkingFileDrive>;
+}
+
+export interface CheckpointFileDrive extends FileView {
+    readonly at: { readonly kind: 'checkpoint'; readonly name: string };
 }
 
 export type FileChange =
@@ -107,7 +115,7 @@ export interface WorkingFileDrive extends FileView {
     write(request: WriteFileRequest[], options?: RequestOptions): Promise<WriteFileResult[]>;
 }
 
-export type FileDrive = MainFileDrive | WorkingFileDrive;
+export type FileDrive = MainFileDrive | WorkingFileDrive | CheckpointFileDrive;
 
 export type MetadataType = 'string' | 'number' | 'boolean' | 'datetime';
 export type Metadata = Record<string, string | number | boolean>;

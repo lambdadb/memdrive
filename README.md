@@ -4,6 +4,15 @@ TypeScript file SDK backed by LambdaDB. MemDrive accepts an initialized LambdaDB
 
 The package is `@functional-systems/memdrive`, licensed under Apache-2.0. It supports ESM, CommonJS, TypeScript, Node.js 20.12+, and browser bundlers.
 
+Install the matching LambdaDB client when your application constructs its own `LambdaDBClient`.
+
+```sh
+npm install @functional-systems/lambdadb@0.13.0
+```
+
+Checkpoint lookup and checkpoint-sourced forks require LambdaDB with the versioned reference API supported by client 0.13.0. An older self-hosted deployment can fail ref response validation if it omits fields required by this client.
+
+
 ## File stores
 
 Use `@functional-systems/memdrive` to create a text file store and save exact originals on a working fork. These stores use a dedicated layout and require a fresh collection name.
@@ -53,6 +62,21 @@ A batch can mix up to 100 `create`, `update`, and `delete` operations and return
 
 The SDK confirms the original revision and chunk changes with consistent branch reads. A failed batch may already have applied some files. Error details identify the stage, affected IDs, and any confirmed original changes or completed operations. Check the original before repeating an exact edit after `WRITE_UNCONFIRMED`. The same handle fences another operation that could conflict with an unconfirmed write. Before retrying on a replacement handle, ensure the previous writer has stopped and its outstanding writes have settled. Reissuing an update with the current path and content can finish stale-chunk cleanup. Reissuing a delete can finish removing physically retained chunks and the deleted file's internal record.
 
+
+## Save a checkpoint
+
+```ts
+const saved = await work.checkpoint({ name: 'before-cleanup' });
+const pinned = await MemDrive.open({ client, name: 'workspace', at: { checkpoint: 'before-cleanup' } });
+const original = await pinned.read({ fileId: file.fileId });
+const child = await saved.fork({ name: 'recheck' });
+```
+
+A named checkpoint pins the selected view and serves read, search, and list from that pin. Forking any view makes a separate editable branch from that source. A fork and a checkpoint may share the same name, and `open` selects one with `at.fork` or `at.checkpoint`. Names are scoped to the store. Checkpoint names use 3–41 letters, digits, underscores, or hyphens.
+
+Checkpoint and child fork creation from a working fork run in its local write queue. If a source write is still unconfirmed, resolve that outcome before capturing the fork. The SDK sends one creation request for each call. A rejected checkpoint request preserves the underlying LambdaDB error and HTTP status. If creation returns `REF_CREATION_UNCONFIRMED`, pause source mutations and open the named reference to check whether it exists. If the exact cutoff matters, compare the contents with your expected state before using the reference. The name alone cannot establish which request won or when it captured the source.
+
+Checkpoint search and exact reads use LambdaDB's tag read semantics. Listing retains the eventual preview behavior described below, including on a recently created checkpoint. For live validation of a prepared working view and retained state after source deletion, set `MEMDRIVE_RUN_LIVE_CHECKPOINT_TESTS=1` when running the live suite against a dedicated test project.
 
 ## Review working changes
 

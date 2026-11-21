@@ -1,7 +1,6 @@
 // Scripted native HTTP responses for the benchmark SDK call sequence.
 export function nativeFixture() {
     const collections = new Map(), requests = [];
-    const branch = name => ({ name, parentBranch: null, headSnapshot: null, parentSnapshot: null, createdAt: 0 });
     const fetcher = async (url, options) => {
         const pathname = new URL(url).pathname, body = options.body ? JSON.parse(options.body) : undefined;
         requests.push({ pathname, method: options.method, body });
@@ -23,6 +22,11 @@ export function nativeFixture() {
             return response({ message: 'deleted' });
         }
         if (pathname.endsWith('/branches')) {
+            const branch = name => {
+                const numDocs = branches.get(name).docs.size;
+                return { name, parentBranch: null, headSnapshot: numDocs ? { snapshotId: 'synthetic', snapshotCommittedAt: 0 } : null,
+                    parentSnapshot: null, createdAt: 0, dataUpdatedAt: numDocs ? 0 : null, numDocs, indexConfigs: collection.indexConfigs };
+            };
             if (options.method === 'GET') return response({ branches: [...branches.keys()].map(branch) });
             const { branchName, source } = body;
             branches.set(branchName, { docs: new Map(branches.get(source.name).docs) });

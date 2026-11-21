@@ -1,6 +1,7 @@
 import { keysOnly } from './config.js';
 import { checkAbort, databaseError, MemDriveError, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
 import { bytes, decodeFileEntry, resultDocs, validPath } from './records.js';
+import type { ViewRef } from './storage-reads.js';
 import type { ConnectionOptions, FileListEntry, ListFilesRequest, ListFilesResult, MetadataSchema, RequestOptions } from './types.js';
 
 type Handle = ReturnType<ConnectionOptions['client']['collection']>;
@@ -27,9 +28,8 @@ const legalText = (value: unknown): value is string => typeof value === 'string'
 const exceeded = () => new MemDriveError('LIST_SCAN_LIMIT', 'Listing exceeded the preview scan budget. Narrow the directory prefix and start again.');
 const cursorUnavailable = () => new MemDriveError('LIST_CURSOR_UNAVAILABLE', 'Listing cursor is unavailable on this handle. Start again without a cursor.');
 
-export function fileLister(handle: Handle, name: string, branch: string, schema: MetadataSchema) {
+export function fileLister(handle: Handle, name: string, ref: ViewRef, schema: MetadataSchema) {
     const scans = new Map<string, Scan>();
-    const ref = { kind: 'branch' as const, name: branch };
 
     function page(entries: Entry[], offset: number, limit: number): ListFilesResult {
         const files: FileListEntry[] = [], prefixes: string[] = [];

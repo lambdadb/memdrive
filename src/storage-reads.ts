@@ -4,9 +4,15 @@ import type { ConnectionOptions } from './types.js';
 
 export type Handle = ReturnType<ConnectionOptions['client']['collection']>;
 
-export const branchRead = (branch: string) => ({
-    ref: { kind: 'branch' as const, name: branch }, consistentRead: true, includeVectors: false,
-});
+export type ViewRef = { kind: 'branch'; name: string } | { kind: 'tag'; name: string };
+export const branchRef = (name: string) => ({ kind: 'branch' as const, name });
+
+export function viewRead(ref: ViewRef) {
+    return ref.kind === 'branch'
+        ? { ref, consistentRead: true as const, includeVectors: false }
+        : { ref, consistentRead: false as const, includeVectors: false };
+}
+export const branchRead = (branch: string) => viewRead(branchRef(branch));
 
 const kindClause = { queryString: { query: '"file"', defaultField: 'kind' }, occur: 'filter' };
 const pathClause = (path: string) => ({ queryString: { query: JSON.stringify(path), defaultField: 'path' } });
@@ -24,11 +30,11 @@ export const afterId = (id: string | undefined) => id === undefined ? [] : [
     { queryString: { query: `{${id} TO *}`, defaultField: 'id' }, occur: 'filter' },
 ];
 
-export async function fetchOriginals(handle: Handle, name: string, branch: string, fileIds: string[], signal?: AbortSignal) {
+export async function fetchOriginals(handle: Handle, name: string, ref: ViewRef, fileIds: string[], signal?: AbortSignal) {
     if (!fileIds.length) return new Map<string, Record<string, unknown>>();
     let response;
     try {
-        response = await nativeRequest(() => handle.docs.fetch({ ids: fileIds.map(originalId), ...branchRead(branch) }, nativeOptions(signal)), signal);
+        response = await nativeRequest(() => handle.docs.fetch({ ids: fileIds.map(originalId), ...viewRead(ref) }, nativeOptions(signal)), signal);
     } catch (cause) {
         throw databaseError(cause, 'Could not read file originals.');
     }

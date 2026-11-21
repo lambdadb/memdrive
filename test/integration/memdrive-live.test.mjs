@@ -6,6 +6,7 @@ import { HTTPClient, LambdaDBClient } from '@functional-systems/lambdadb';
 import { MemDrive } from '@functional-systems/memdrive';
 
 const enabled = process.env.MEMDRIVE_RUN_LIVE_TESTS === '1';
+const verifyCheckpoints = process.env.MEMDRIVE_RUN_LIVE_CHECKPOINT_TESTS === '1';
 const verifyListConvergence = process.env.MEMDRIVE_RUN_LIVE_LIST_TESTS === '1';
 const required = ['LAMBDADB_BASE_URL', 'LAMBDADB_PROJECT_NAME', 'LAMBDADB_PROJECT_API_KEY'];
 const options = () => ({ signal: AbortSignal.timeout(60_000) });
@@ -39,6 +40,8 @@ test('live file store writes, searches, lists and reopens a fresh fork with veri
         const main = await MemDrive.create({ client, name, metadataSchema: { topic: { type: 'string' } } }, options());
         assert.equal('write' in main, false);
         assert.equal('diff' in main, false);
+        await assert.rejects(MemDrive.open({ client, name, at: { checkpoint: 'never-created' } }, options()),
+            { code: 'CHECKPOINT_NOT_FOUND', status: 404 });
         assert.deepEqual(await main.list({}, options()), { files: [], prefixes: [], consistency: 'eventual' });
         const fork = await main.fork({ name: 'research' }, options());
         const path = '/notes/한글 "draft":*?.md';
@@ -133,6 +136,59 @@ test('live file store writes, searches, lists and reopens a fresh fork with veri
         assert.deepEqual(await reopened.diff(options()), additions.filter(change => change.fileId !== changed.fileId));
         assert.equal((await native.docs.fetch({ ...branchRead, ids: newIds }, options())).docs.length, 0);
         assert.deepEqual(await reopened.write({ op: 'delete', fileId: changed.fileId }, options()), { fileId: changed.fileId });
+
+        if (verifyCheckpoints) {
+            const sample = await reopened.write({
+                op: 'create', path: '/checkpoint.txt', content: 'Synthetic reference retained in the checkpoint.',
+            }, options());
+            // Seed a published-style original in this disposable store for the tombstone assertion.
+            await native.docs.update({ branch: 'fork-research', docs: [{
+                id: `file:${nested.fileId}`, version: 'synthetic-base', changed: false,
+            }] }, options());
+            await reopened.write({ op: 'delete', fileId: nested.fileId }, options());
+
+            // The setup waits for observable file state before calling checkpoint once.
+            const deadline = Date.now() + 150_000;
+            let prepared = false;
+            for (let remaining = deadline - Date.now(); remaining > 0; remaining = deadline - Date.now()) {
+                const listed = await reopened.list({}, { signal: AbortSignal.timeout(remaining) });
+                prepared = listed.files.some(file => file.fileId === sample.fileId)
+                    && !listed.files.some(file => file.fileId === nested.fileId);
+                if (prepared) break;
+                await sleep(Math.min(5_000, Math.max(0, deadline - Date.now())));
+            }
+            assert(prepared, 'Checkpoint fixture did not reach the expected list state.');
+            const checkpoint = await reopened.checkpoint({ name: 'retained' }, options());
+            assert.equal('write' in checkpoint, false);
+            const directChild = await reopened.fork({ name: 'from-working' }, options());
+            assert.deepEqual(await directChild.read({ fileId: sample.fileId }, options()), sample);
+            assert.equal(await directChild.read({ fileId: nested.fileId }, options()), null);
+            const movedSource = await reopened.write({ op: 'update', fileId: sample.fileId, newPath: '/after-checkpoint.txt' }, options());
+            assert.deepEqual(await checkpoint.read({ paths: [sample.path, movedSource.path] }, options()), [sample]);
+            await native.branches.delete('fork-research', options());
+            await assert.rejects(native.branches.get('fork-research', options()), error => statusOf(error) === 404);
+            t.diagnostic('Working source deletion verified before reopening and forking the checkpoint.');
+
+            const pinned = await MemDrive.open({ client: new LambdaDBClient(connection), name,
+                at: { checkpoint: 'retained' } }, options());
+            assert.deepEqual(await pinned.read({ fileId: sample.fileId }, options()), sample);
+            assert.equal((await pinned.list({}, options())).consistency, 'eventual');
+            const child = await pinned.fork({ name: 'from-checkpoint' }, options());
+            assert.deepEqual(await child.read({ fileId: sample.fileId }, options()), sample);
+            assert.deepEqual(await child.write({ op: 'update', fileId: sample.fileId, newPath: '/child-only.txt' }, options()),
+                await child.read({ path: '/child-only.txt' }, options()));
+            assert.deepEqual(await pinned.read({ fileId: sample.fileId }, options()), sample);
+            assert.equal(await pinned.read({ fileId: nested.fileId }, options()), null);
+            assert.equal(await child.read({ fileId: nested.fileId }, options()), null);
+            assert.deepEqual((await child.diff(options())).find(change => change.fileId === nested.fileId),
+                { op: 'delete', fileId: nested.fileId, previousPath: nested.path });
+            const rankedPin = await pinned.search({ query: 'Synthetic reference', rerank: false }, options());
+            assert.deepEqual(rankedPin.hits, [{ ...sample, range: { start: 0, end: sample.content.length } }]);
+            const copied = await pinned.checkpoint({ name: 'copied' }, options());
+            assert.deepEqual(await copied.read({ fileId: sample.fileId }, options()), sample);
+        } else {
+            t.diagnostic('Checkpoint capture and fork validation are opt-in through MEMDRIVE_RUN_LIVE_CHECKPOINT_TESTS=1.');
+        }
     } catch (error) {
         collision = error?.code === 'STORE_EXISTS';
         failure = safeFailure('File store smoke', error);

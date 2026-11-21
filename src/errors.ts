@@ -52,3 +52,5 @@ export async function nativeRequest<T>(operation: () => Promise<T>, signal?: Abo
     catch (cause) { throw abortError(cause, signal); }
 }
 export const nativeOptions = (signal?: AbortSignal) => signal === undefined ? {} : { signal };
+
+export const mutationOptions = (signal?: AbortSignal) => ({ ...nativeOptions(signal), retries: { strategy: 'none' as const } });

@@ -1,5 +1,5 @@
 import type { LambdaDBClient } from '@functional-systems/lambdadb';
-import { create, open, type DriveFile, type FileChange, type DeleteFileResult, type SearchFilesResult, type ListFilesResult, type FileDrive, type OpenFileStoreOptions } from '@functional-systems/memdrive';
+import { create, open, type DriveFile, type CheckpointFileDrive, type FileChange, type DeleteFileResult, type SearchFilesResult, type ListFilesResult, type FileDrive, type OpenFileStoreOptions } from '@functional-systems/memdrive';
 
 export async function fileConsumer(client: LambdaDBClient, options: OpenFileStoreOptions) {
     const main = await create({ client, name: 'workspace' });
@@ -27,6 +27,17 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     for (const change of changes) if (change.op === 'update' || change.op === 'delete') change.previousPath;
     // @ts-expect-error Diff is available only on working forks.
     await main.diff();
+    const checkpoint: CheckpointFileDrive = await reopened.checkpoint({ name: 'saved' });
+    const pinned: CheckpointFileDrive = await open({ client, name: 'workspace', at: { checkpoint: 'saved' } });
+    await pinned.read({ fileId: created.fileId });
+    await checkpoint.fork({ name: 'from-saved' });
+    await reopened.fork({ name: 'nested' });
+    // @ts-expect-error Choose exactly one named view.
+    await open({ client, name: 'workspace', at: { checkpoint: 'saved', fork: 'research' } });
+    // @ts-expect-error Checkpoints do not mutate content.
+    await pinned.write({ op: 'delete', fileId: created.fileId });
+    // @ts-expect-error Diff is only available on mutable forks.
+    await pinned.diff();
     const selected: FileDrive = await open(options);
     if ('write' in selected) await selected.write({ op: 'create', path: '/another.md', content: '' });
     // @ts-expect-error Only a working fork has a write method.
