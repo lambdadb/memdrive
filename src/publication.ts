@@ -1,5 +1,5 @@
 import { keysOnly } from './config.js';
-import { changedFiles } from './diff.js';
+import { historyRetention, type RetainedPublication } from './history-retention.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, requireInput } from './errors.js';
 import { mergeCaptureJournal } from './merge-journal.js';
 import { applyMerge, advanceMergeSource, verifyMerge } from './merge-apply.js';
@@ -12,13 +12,11 @@ import type { ConnectionOptions, FileHistoryEntry, FileHistoryRequest, FileHisto
 import type { workingWriter } from './writes.js';
 
 type Writer = ReturnType<typeof workingWriter>;
-type Entry = { slot: bigint; reservation: Reservation; outcome?: Outcome };
-type Publication = Pick<FileHistoryEntry, 'version' | 'publishedAt' | 'summary'> & { sourceTag: string };
+type Entry = { slot: bigint; reservation: Reservation; outcome?: Outcome & { completedAt: string } };
 type HistoryPage = { start: number; end: number; limit: number; throughVersion: string };
 
 const historyCursorLifetime = 5 * 60 * 1000;
 const historyCursorLimit = 64;
-const historyFileLimit = 100;
 
 function tagRef(name: string) {
     return { kind: 'tag' as const, name };
@@ -36,7 +34,8 @@ export function publication(client: ConnectionOptions['client'], content: Handle
     const capture = mergeCaptureJournal(content, internal, { name, driveId }, { captureEmpty: true });
     const initialVersion = 'v0';
     const requests = new Map<string, Entry>();
-    const publications: Publication[] = [];
+    const publications: RetainedPublication[] = [];
+    const retained = historyRetention(content, journal, driveId, hasTag);
     const positions = new Map([[initialVersion, 0]]);
     const cursors = new Map<string, HistoryPage & { expiresAt: number }>();
     let published = initialVersion;
@@ -211,30 +210,8 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         const { start, end, limit, throughVersion } = page;
         const stop = Math.min(start + limit, end);
         const entries: FileHistoryEntry[] = [];
-        for (const { version, publishedAt, summary, sourceTag } of publications.slice(start, stop)) {
-            const unavailable = () => new MemDriveError('HISTORY_UNAVAILABLE',
-                'The retained merge capture is missing. Reread the current drive if you need current file state.', { details: { version } });
-            const fileIds: string[] = [];
-            let fileIdsTruncated = false;
-            try {
-                for await (const { change } of changedFiles(content, content.collectionName, tagRef(sourceTag), signal)) {
-                    if (fileIds.length === historyFileLimit) {
-                        fileIdsTruncated = true;
-                        break;
-                    }
-                    fileIds.push(change.fileId);
-                }
-            } catch (cause) {
-                if (cause instanceof MemDriveError && cause.status === 404 && !await hasTag(sourceTag, signal))
-                    throw unavailable();
-                throw cause;
-            }
-            if (!fileIds.length) {
-                if (!await hasTag(sourceTag, signal)) throw unavailable();
-                throw new MemDriveError('INVALID_RESULT', 'A published merge capture contained no changed files.');
-            }
-            entries.push({ version, publishedAt, summary, fileIds, fileIdsTruncated });
-        }
+        for (const publication of publications.slice(start, stop))
+            entries.push(await retained.entry(publication, signal));
         checkAbort(signal);
         const result: FileHistoryResult = { entries, throughVersion };
         if (stop < end) {
@@ -448,12 +425,20 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         });
     }
 
-    async function assertIdle(signal?: AbortSignal) {
+    async function assertIdle(signal?: AbortSignal, allowCleanupRetry = false) {
+        if (!allowCleanupRetry) retained.assertSettled();
         await refresh(signal);
         const blocking = active?.reservation.requestId ?? unresolved?.requestId ?? unsettled?.requestId ?? executing;
         if (blocking) throw mergeBlocked(blocking);
         if (sourceMerges.size) throw new MemDriveError('STORE_BUSY', 'A merge capture is still in progress.');
     }
 
-    return { main: { read, pin }, merge, recover, status, history, assertIdle, initialize: ensureBootstrap };
+    async function pruneHistory(configuration: { retentionInDays: number; dryRun: boolean; limit: number }, signal?: AbortSignal) {
+        await assertIdle(signal, true);
+        const completed = [...requests.values()].flatMap(({ reservation, outcome }) => outcome ? [{ reservation, outcome }] : []);
+        return retained.prune(publications, completed, configuration, signal);
+    }
+
+    return { main: { read, pin }, merge, recover, status, history, assertIdle, pruneHistory,
+        assertCleanupSettled: retained.assertSettled, initialize: ensureBootstrap };
 }

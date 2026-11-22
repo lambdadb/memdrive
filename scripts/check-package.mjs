@@ -66,7 +66,8 @@ try {
     copyFileSync(join(root, 'test/lifecycle.test.mjs'), join(temporary, 'test/lifecycle.test.mjs'));
     copyFileSync(join(root, 'test/read-range.test.mjs'), join(temporary, 'test/read-range.test.mjs'));
     copyFileSync(join(root, 'test/retention.test.mjs'), join(temporary, 'test/retention.test.mjs'));
-    run(process.execPath, ['--test', 'test/memdrive-files.test.mjs', 'test/file-tools.test.mjs', 'test/lifecycle.test.mjs', 'test/read-range.test.mjs', 'test/retention.test.mjs']);
+    copyFileSync(join(root, 'test/history-retention.test.mjs'), join(temporary, 'test/history-retention.test.mjs'));
+    run(process.execPath, ['--test', 'test/memdrive-files.test.mjs', 'test/file-tools.test.mjs', 'test/lifecycle.test.mjs', 'test/read-range.test.mjs', 'test/retention.test.mjs', 'test/history-retention.test.mjs']);
     // Core consumers above work without the optional native package. Test its
     // separate entry point only after explicitly installing the pinned backend.
     run('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund', '--save-exact', 'docling.rs@2.85.0']);
