@@ -1,21 +1,20 @@
-import { validDate } from './config.js';
 import { checkAbort, databaseError, MemDriveError, nativeRequest, requireInput } from './errors.js';
 
 type CreatedRef = { kind: 'fork' | 'checkpoint' | 'merge source'; name: string };
 
 const rejected = new Set([400, 401, 403, 404, 409, 422, 429]);
 
-export function validateRefTime(asOf: unknown, checkpoint: boolean): asserts asOf is string | undefined {
-    requireInput(asOf === undefined || !checkpoint && validDate(asOf) && Date.parse(asOf) <= Date.now(),
-        'asOf requires a nonfuture UTC ISO timestamp with milliseconds on main or a working fork.');
+export function validateRefVersion(version: unknown, main: boolean): asserts version is string | undefined {
+    requireInput(version === undefined || main && typeof version === 'string' && /^v(0|[1-9][0-9]*)$/.test(version),
+        'version is supported only on main and must identify a publication, such as v3 or the initial v0.');
 }
 
-export function historicalViewUnavailable(asOf: string, cause?: unknown) {
-    return new MemDriveError('HISTORICAL_VIEW_UNAVAILABLE', 'The requested historical view is unavailable or no longer retained.',
-        { cause, details: { asOf } });
+export function historicalViewUnavailable(version: string, cause?: unknown) {
+    return new MemDriveError('HISTORICAL_VIEW_UNAVAILABLE', 'The requested main version is unavailable or no longer retained.',
+        { cause, details: { version } });
 }
 
-export async function createRef<T>(pending: Set<string>, ref: CreatedRef, signal: AbortSignal | undefined, submit: () => Promise<T>, valid: (result: T) => boolean, asOf?: string) {
+export async function createRef<T>(pending: Set<string>, ref: CreatedRef, signal: AbortSignal | undefined, submit: () => Promise<T>, valid: (result: T) => boolean, version?: string) {
     const { kind, name } = ref;
     const key = `${kind}:${name}`;
     checkAbort(signal);
@@ -33,8 +32,8 @@ export async function createRef<T>(pending: Set<string>, ref: CreatedRef, signal
         const error = databaseError(cause, `Could not create the ${kind}.`);
         if (!rejected.has(error.status ?? 0)) throw unconfirmed(cause);
         pending.delete(key);
-        if (asOf !== undefined && (error.status === 400 || error.status === 404)) {
-            const unavailable = historicalViewUnavailable(asOf, cause);
+        if (version !== undefined && (error.status === 400 || error.status === 404)) {
+            const unavailable = historicalViewUnavailable(version, cause);
             unavailable.status = error.status;
             throw unavailable;
         }

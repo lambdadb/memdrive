@@ -139,12 +139,12 @@ type ViewSearchResult<Mode extends EmbeddingMode> = Mode extends 'external' ? Se
 
 export interface FileRefEntry { name: string }
 
-interface FileView<Mode extends EmbeddingMode> {
+interface FileView<Mode extends EmbeddingMode, RefRequest extends CreateFileRefRequest = CreateFileRefRequest> {
     readonly name: string;
     listForks(options?: RequestOptions): Promise<FileRefEntry[]>;
     listCheckpoints(options?: RequestOptions): Promise<FileRefEntry[]>;
-    fork(request: CreateFileRefRequest, options?: RequestOptions): Promise<WorkingFileDrive<Mode>>;
-    checkpoint(request: CreateFileRefRequest, options?: RequestOptions): Promise<CheckpointFileDrive<Mode>>;
+    fork(request: RefRequest, options?: RequestOptions): Promise<WorkingFileDrive<Mode>>;
+    checkpoint(request: RefRequest, options?: RequestOptions): Promise<CheckpointFileDrive<Mode>>;
     list(request?: ListFilesRequest, options?: RequestOptions): Promise<ListFilesResult>;
     describe(options?: RequestOptions): Promise<FileStoreDescription<Mode>>;
     status(options?: RequestOptions): Promise<FileStoreStatus>;
@@ -157,14 +157,18 @@ interface FileView<Mode extends EmbeddingMode> {
     read(request: { paths: string[] }, options?: RequestOptions): Promise<ViewFile<Mode>[]>;
 }
 
-/** Create a named ref from the bound view, optionally at a retained past time. */
+/** Create a named ref from the currently bound view. */
 export interface CreateFileRefRequest {
     name: string;
-    /** UTC ISO timestamp (YYYY-MM-DDTHH:mm:ss.sssZ). Not supported on checkpoint views. */
-    asOf?: string | undefined;
 }
 
-export interface MainFileDrive<Mode extends EmbeddingMode = 'managed'> extends FileView<Mode> {
+/** Create a ref from main, optionally selecting an exact retained publication. */
+export interface CreateMainFileRefRequest extends CreateFileRefRequest {
+    /** A main version such as v3, or the retained initial v0. Only supported on main. */
+    version?: string | undefined;
+}
+
+export interface MainFileDrive<Mode extends EmbeddingMode = 'managed'> extends FileView<Mode, CreateMainFileRefRequest> {
     readonly at: { readonly kind: 'main' };
     configure(request: { retentionInDays: number }, options?: RequestOptions): Promise<FileStoreDescription<Mode>>;
 }

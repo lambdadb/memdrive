@@ -124,8 +124,8 @@ The default suite also creates a separate structured-text store using local
 Docling Hybrid and a synthetic tokenizer. It verifies exact originals, rendered
 search previews, publication and a checkpoint of the confirmed published tag
 without a parser on the reopened reader. After a second publication it verifies
-main historical forks/checkpoints using the first publication time and working
-refs using a native committed-snapshot time. It then destroys the content store
+main historical forks/checkpoints using the first publication version and a fork
+from an explicit saved working checkpoint. It also rejects the removed `asOf` input. It then destroys the content store
 and its publication journal. Publication gets its full cold-snapshot wait budget;
 immediate checkpoint creation after a first write remains a separate backend
 readiness check. Failure output names the stage and HTTP status without request

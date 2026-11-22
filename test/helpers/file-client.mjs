@@ -25,8 +25,7 @@ export function fileClient() {
             const docsAt = branch => (state().branches.get(branch) ?? fail(404, 'Branch missing')).docs;
             const sourceDocs = ref => ref.kind === 'tag'
                 ? (state().tags.get(ref.name) ?? fail(404, 'Checkpoint missing')).docs : docsAt(ref.name);
-            const copyView = ref => new Map(structuredClone([...(ref.asOf === undefined ? sourceDocs(ref)
-                : fixture.snapshotAt?.(name, ref) ?? fail(404, 'Historical snapshot missing'))]));
+            const copyView = ref => new Map(structuredClone([...sourceDocs(ref)]));
             const response = (docs, fields) => ({ isDocsInline: true, total: docs.length, docs: docs.map(doc => ({
                 collection: name, score: 0.8, doc: structuredClone(fields?.include
                     ? Object.fromEntries(fields.include.filter(key => Object.hasOwn(doc, key)).map(key => [key, doc[key]]))

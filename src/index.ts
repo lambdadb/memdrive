@@ -10,8 +10,8 @@ import { searchQuery, validateReranking, vectorSearchQuery } from './search.js';
 import { fileLister } from './list.js';
 import { fileTextFinder } from './find-text.js';
 import { textChunker } from './text-chunks.js';
-import type { CreateFileRefRequest, DoclingChunker } from './types.js';
-import { createRef, validateRefTime } from './refs.js';
+import type { CreateMainFileRefRequest, DoclingChunker } from './types.js';
+import { createRef, validateRefVersion } from './refs.js';
 import { rangeKeys, readRange, validateReadRange } from './read-range.js';
 import type { DriveFile, FileReadPage, ReadFileRangeRequest } from './types.js';
 import { deletingFormat, deleteReference, destroyStore, guardView, lifecycle } from './lifecycle.js';
@@ -285,44 +285,46 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
                 checkAbort(signal);
                 return publishing.history(request, signal);
             },
-            async fork(request: CreateFileRefRequest, options?: RequestOptions) {
+            async fork(request: CreateMainFileRefRequest, options?: RequestOptions) {
                 const { signal } = operationOptions(options);
                 checkAbort(signal);
-                requireInput(keysOnly(request, ['name', 'asOf']) && validForkName(request.name),
+                requireInput(keysOnly(request, at.kind === 'main' ? ['name', 'version'] : ['name']),
+                    at.kind === 'main' ? 'fork accepts name and optional version.' : 'fork accepts only name on this view.');
+                requireInput(validForkName(request.name),
                     'Fork name must be 3–47 letters, digits, underscores or hyphens and cannot be main.');
-                const { asOf } = request;
-                validateRefTime(asOf, at.kind === 'checkpoint');
+                const { version } = request;
+                validateRefVersion(version, at.kind === 'main');
                 const fork = request.name;
                 assertRefAvailable('fork', fork);
                 const branchName = forkPrefix + fork;
                 const create = async () => {
-                    const ref = asOf === undefined ? await pinRef(source, signal)
-                        : at.kind === 'main' ? await publishing.pinAt(asOf, signal)
-                        : { kind: 'branch' as const, name: forkPrefix + at.name, asOf: Date.parse(asOf) };
+                    const ref = version === undefined ? await pinRef(source, signal)
+                        : await publishing.pinVersion(version, signal);
                     await createRef(pendingRefs, { kind: 'fork', name: fork }, signal,
                         () => handle.branches.create({ branchName, source: ref }, mutationOptions(signal)),
-                        response => response?.branch?.name === branchName, asOf);
+                        response => response?.branch?.name === branchName, version);
                     return working(fork);
                 };
                 return enqueueRef ? enqueueRef(create, signal) : create();
             },
-            async checkpoint(request: CreateFileRefRequest, options?: RequestOptions) {
+            async checkpoint(request: CreateMainFileRefRequest, options?: RequestOptions) {
                 const { signal } = operationOptions(options);
                 checkAbort(signal);
-                requireInput(keysOnly(request, ['name', 'asOf']) && validCheckpointName(request.name),
+                requireInput(keysOnly(request, at.kind === 'main' ? ['name', 'version'] : ['name']),
+                    at.kind === 'main' ? 'checkpoint accepts name and optional version.' : 'checkpoint accepts only name on this view.');
+                requireInput(validCheckpointName(request.name),
                     'Checkpoint name must be 3–41 letters, digits, underscores or hyphens.');
-                const { asOf } = request;
-                validateRefTime(asOf, at.kind === 'checkpoint');
+                const { version } = request;
+                validateRefVersion(version, at.kind === 'main');
                 const checkpoint = request.name;
                 assertRefAvailable('checkpoint', checkpoint);
                 const tagName = checkpointPrefix + checkpoint;
                 const create = async () => {
-                    const ref = asOf === undefined ? await pinRef(source, signal)
-                        : at.kind === 'main' ? await publishing.pinAt(asOf, signal)
-                        : { kind: 'branch' as const, name: forkPrefix + at.name, asOf: Date.parse(asOf) };
+                    const ref = version === undefined ? await pinRef(source, signal)
+                        : await publishing.pinVersion(version, signal);
                     await createRef(pendingRefs, { kind: 'checkpoint', name: checkpoint }, signal,
                         () => handle.tags.create({ tagName, source: ref }, mutationOptions(signal)),
-                        response => response?.tag?.name === tagName, asOf);
+                        response => response?.tag?.name === tagName, version);
                     return pinned(checkpoint);
                 };
                 return enqueueRef ? enqueueRef(create, signal) : create();
