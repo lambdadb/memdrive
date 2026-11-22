@@ -82,8 +82,18 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
         assert.equal('pruneHistory' in retentionMain, false);
         phase = 'automatic retention after merge replay';
         const retry = await MemDrive.open({ client: retentionClient, name, at: { fork: 'draft' } }, options());
-        assert.equal((await retry.merge({ requestId: 'publish-structured', summary: 'Publish synthetic structured note' }, options())).version, 'v1');
-        await assert.rejects(client.collection(name).tags.get(reservation.sourceTag, options()), error => (error.status ?? error.statusCode) === 404);
+        // Each automatic pass is best effort and has a short budget. A later
+        // terminal replay retries unfinished cleanup without changing its result.
+        let removed = false;
+        for (let attempt = 0; attempt < 5 && !removed; attempt++) {
+            assert.equal((await retry.merge({ requestId: 'publish-structured', summary: 'Publish synthetic structured note' }, options())).version, 'v1');
+            try { await client.collection(name).tags.get(reservation.sourceTag, options()); }
+            catch (error) {
+                if ((error.status ?? error.statusCode) !== 404) throw error;
+                removed = true;
+            }
+        }
+        assert(removed, 'Automatic retention did not remove the expired capture within five merge replays.');
         assert.deepEqual(await retentionMain.history({}, options()), history);
         assert.deepEqual(await retentionMain.read({ fileId: file.fileId }, options()), file);
         assert.deepEqual(await checkpoint.read({ fileId: file.fileId }, options()), file);

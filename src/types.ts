@@ -245,6 +245,7 @@ export interface ExternalEmbedding {
 type StoreOptions = ConnectionOptions & {
     labels?: Record<string, string> | undefined;
     metadataSchema?: MetadataSchema | undefined;
+    /** 1–31 days; also applies to automatic retention cleanup after terminal merges. */
     retentionInDays?: number | undefined;
 };
 
@@ -266,7 +267,7 @@ interface StoreDescription {
     name: string;
     labels: Record<string, string>;
     metadataSchema: MetadataSchema;
-    /** Native snapshot retention. Pinned refs and SDK journal records have separate lifetimes. */
+    /** Native retention and automatic merge cleanup window; explicit refs and history summaries do not expire. */
     retentionInDays?: number | undefined;
 }
 
