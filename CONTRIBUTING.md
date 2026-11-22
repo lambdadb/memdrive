@@ -33,8 +33,9 @@ from the public SDK. Ref creation returns a serializable store/view identity.
 Schemas describe JSON input while SDK validation enforces semantic constraints.
 Schema tests use Ajv only as a development dependency. Keep guide
 text independent of host authentication, product policy and provider adapters.
-The installed-package check exercises the tool workflow and authorization
-boundary as well as ESM, CommonJS, TypeScript and browser imports.
+The installed-package check exercises the tool workflow, authorization boundary
+and store/ref lifecycle, including partial deletion recovery, as well as ESM,
+CommonJS, TypeScript and browser imports.
 
 The LambdaDB dependency is pinned to an exact release. Update it deliberately with relevant API and regression checks. Tooling versions initially follow the native client's lockfile; updating tooling is separate from adopting a new database API.
 
@@ -50,6 +51,10 @@ missing settings fail rather than silently skipping. The publication workflow
 runs the live suite against the exact installed tarball. Set
 `MEMDRIVE_RUN_LIVE_MERGE_TESTS=1` to additionally run the opt-in public merge
 scenario, which owns and cleans up its content collection and merge journal.
+The default live smoke also exercises ref listing/deletion and public store
+destruction. The merge scenario verifies retained history after source deletion
+and public destruction of both owned collections. Partial deletion and recovery
+faults are covered by the isolated fixture suite.
 Document unperformed checks accurately.
 
 Set `MEMDRIVE_RUN_LIVE_EXTERNAL_VECTOR_TESTS=1` to also exercise external-vector

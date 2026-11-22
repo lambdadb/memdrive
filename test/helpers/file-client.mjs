@@ -1,6 +1,7 @@
 // Models the file SDK's native requests with immediate visibility.
 export function fileClient() {
     const collections = new Map();
+    let generation = 0;
     const calls = [];
     const fixture = { collections, calls };
     const fail = (statusCode, message) => { throw Object.assign(new Error(message), { statusCode }); };
@@ -14,7 +15,7 @@ export function fileClient() {
             if (collections.has(request.collectionName)) fail(409, 'Collection already exists');
             collections.set(request.collectionName, {
                 metadata: structuredClone({ ...request, defaultBranchName: 'main', projectName: 'fixture',
-                    createdAt: new Date(collections.size + 1) }),
+                    createdAt: new Date(++generation) }),
                 branches: new Map([['main', { docs: new Map() }]]), tags: new Map(),
             });
             return collectionResult(collections.get(request.collectionName));
@@ -32,7 +33,22 @@ export function fileClient() {
             })) });
             return {
                 collectionName: name,
-                async get() { return collectionResult(state()); },
+                async get() { return await fixture.getCollection?.(name) ?? collectionResult(state()); },
+                async update(request, options) {
+                    calls.push({ kind: 'collection-update', collection: name, request: structuredClone(request), retries: options?.retries });
+                    await fixture.beforeCollectionUpdate?.(name, request);
+                    Object.assign(state().metadata, structuredClone(request));
+                    await fixture.afterCollectionUpdate?.(name, request);
+                    return collectionResult(state());
+                },
+                async delete(options) {
+                    calls.push({ kind: 'collection-delete', collection: name, retries: options?.retries });
+                    await fixture.beforeCollectionDelete?.(name);
+                    state();
+                    collections.delete(name);
+                    await fixture.afterCollectionDelete?.(name);
+                    return { message: 'Deleted' };
+                },
                 branches: {
                     async create({ branchName, source }, options) {
                         calls.push({ kind: 'branch-create', request: { branchName, source }, retries: options?.retries });
@@ -45,10 +61,28 @@ export function fileClient() {
                         return { branch: { name: branchName } };
                     },
                     async list() {
-                        return { branches: [...state().branches.keys()].map(name => ({ name })) };
+                        return fixture.listBranches?.() ?? { branches: [...state().branches.keys()].map(name => ({ name })) };
+                    },
+                    async delete(branchName, options) {
+                        calls.push({ kind: 'branch-delete', name: branchName, retries: options?.retries });
+                        await fixture.beforeRefDelete?.('fork', branchName);
+                        if (branchName === 'main') fail(400, 'Cannot delete main');
+                        if (!state().branches.delete(branchName)) fail(404, 'Branch missing');
+                        await fixture.afterRefDelete?.('fork', branchName);
+                        return { message: 'Deleted' };
                     },
                 },
                 tags: {
+                    async list() {
+                        return fixture.listTags?.() ?? { tags: [...state().tags.keys()].map(name => ({ name })) };
+                    },
+                    async delete(tagName, options) {
+                        calls.push({ kind: 'tag-delete', name: tagName, retries: options?.retries });
+                        await fixture.beforeRefDelete?.('checkpoint', tagName);
+                        if (!state().tags.delete(tagName)) fail(404, 'Checkpoint missing');
+                        await fixture.afterRefDelete?.('checkpoint', tagName);
+                        return { message: 'Deleted' };
+                    },
                     async create({ tagName, source }, options) {
                         calls.push({ kind: 'tag-create', request: { tagName, source }, retries: options?.retries });
                         await fixture.beforeTagCreate?.(tagName, source);

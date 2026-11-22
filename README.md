@@ -154,6 +154,55 @@ Checkpoint and child fork creation from a working fork run in its local write qu
 
 Checkpoint search and exact reads use LambdaDB's tag read semantics. Listing retains the eventual preview behavior described below, including on a recently created checkpoint. For live validation of a prepared working view and retained state after source deletion, set `MEMDRIVE_RUN_LIVE_CHECKPOINT_TESTS=1` when running the live suite against a dedicated test project.
 
+## List and delete refs or destroy a store
+
+```ts
+const forks = await main.listForks();           // [{ name: 'research' }]
+const checkpoints = await main.listCheckpoints(); // [{ name: 'before-edit' }]
+await checkpoint.delete(); // Only this checkpoint.
+await work.delete();       // Only this working fork.
+await MemDrive.destroy({ client, name: 'workspace' }); // The entire store.
+```
+
+Both listing methods return all user refs in the store, sorted by name, from any
+view. They follow all native reference pages and exclude internal publication
+branches and tags. Results contain only `{ name }`; they are a live inventory,
+not a snapshot spanning concurrent ref changes.
+
+`delete()` is available only on fork and checkpoint handles. It preserves main,
+other refs and retained publication history. A successfully deleted handle
+rejects later operations with `REF_DELETED`. Repeating `delete()` on that handle
+is a no-op, even if a new ref reuses its name. Open or create a new handle to use
+the replacement. Main has no `delete()` method.
+
+`MemDrive.destroy({ client, name })` (also exported as `destroy`) deletes the
+content collection, all its refs and the owned publication journal. It verifies
+journal ownership before changing anything. Destruction marks the content
+collection as deleting, removes the journal, then removes the content collection.
+The marker uses the existing format tag, preserving labels and the native tag
+budget. Once marked, a fresh `open` fails with `STORE_DELETING`; destruction must
+finish. A missing store is treated as already destroyed. Old handles sharing the
+client reject operations with `STORE_DELETED`; create new handles after a
+successful destroy.
+
+The host must stop store operations across **all clients and processes**, fence
+outstanding requests, and hold exclusive ownership through deletion and name
+reuse. The SDK rejects deletion with `STORE_BUSY` while operations on the same
+client are active, blocks new operations during deletion, and rejects observed
+unfinished merges with `MERGE_BLOCKED`. Complete or recover those merges first.
+Unconfirmed writes or ref creation must also settle first. These local checks
+are not a distributed lock; discard handles held by other clients after deletion.
+
+Native deletion and marker updates disable automatic retries. After
+`REF_DELETION_UNCONFIRMED`, the affected handle and name stay fenced on that
+client. After the host has settled outstanding requests, retry `delete()` on the
+same handle before reusing the name. `STORE_DELETION_UNCONFIRMED` means the marker
+or cleanup may have succeeded. After settling requests, retry `MemDrive.destroy`
+with the same store name, using the original or a fresh client. The durable marker
+allows a fresh process to finish cleanup after a crash; the content collection
+remains the cleanup anchor until its journal is confirmed absent. Do not recreate
+the store until cleanup and outstanding requests have finished.
+
 ## Review working changes
 
 ```ts

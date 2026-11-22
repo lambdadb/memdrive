@@ -448,5 +448,12 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         });
     }
 
-    return { main: { read, pin }, merge, recover, status, history, initialize: ensureBootstrap };
+    async function assertIdle(signal?: AbortSignal) {
+        await refresh(signal);
+        const blocking = active?.reservation.requestId ?? unresolved?.requestId ?? unsettled?.requestId ?? executing;
+        if (blocking) throw mergeBlocked(blocking);
+        if (sourceMerges.size) throw new MemDriveError('STORE_BUSY', 'A merge capture is still in progress.');
+    }
+
+    return { main: { read, pin }, merge, recover, status, history, assertIdle, initialize: ensureBootstrap };
 }

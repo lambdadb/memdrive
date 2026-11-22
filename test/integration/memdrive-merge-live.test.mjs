@@ -244,6 +244,15 @@ test('live public merge publishes immutable views and resumes one interrupted re
         await (await freshFork('unrelated-edit')).merge(unrelatedRequest, options());
         await read(await freshMain(), '/unrelated.txt', '');
         await read(retained, '/unrelated.txt', null);
+
+        phase = 'Delete a source ref while retaining history, then destroy the store';
+        const historyBefore = await final.history({}, options());
+        await reopened.delete(options());
+        assert.deepEqual(await final.history({}, options()), historyBefore);
+        await MemDrive.destroy({ client: native(), name }, options());
+        for (const collection of created)
+            await assert.rejects(client.collection(collection).get(options()), error => statusOf(error) === 404);
+        t.diagnostic('Public destruction confirmed absence of the owned journal and content collection.');
     } catch (error) {
         failure = safeFailure(phase, error);
     } finally {
@@ -272,6 +281,7 @@ test('live public merge publishes immutable views and resumes one interrupted re
                 assert(absent, 'Collection cleanup was not confirmed.');
                 t.diagnostic(`Owned fixture cleanup confirmed GET 404 for ${collection}.`);
             } catch (error) {
+                if (statusOf(error) === 404) continue;
                 const cleanup = safeFailure('Fixture cleanup', error);
                 failure = failure ? new AggregateError([failure, cleanup]) : cleanup;
             }
