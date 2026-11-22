@@ -89,6 +89,8 @@ export async function evaluate(context, host, finalText) {
         checks.reviewedDiffBeforeMerge = reviewedDiff;
         if (id === 'unrelated') checks.isolationPreserved = !('/unrelated.md' in initial.working) && current['/unrelated.md'] === unrelated;
     } else if (id === 'conflict') {
+        observed.fork = await contents(context.drive);
+        checks.unpublishedExpectedContent = equal(observed.fork, { ...initial.working, '/faq.md': faq(42) });
         checks.conflictObserved = calls.some(e => e.name === 'merge' && e.result?.error?.code === 'MERGE_CONFLICT');
         checks.blockerReported = /conflict|concurrent|충돌/i.test(finalText) && /blocked|not published|unpublished|게시하지|게시되지/i.test(finalText);
         checks.noSuccessfulPublication = !successes.some(e => e.name === 'merge' && e.result.status === 'published');
@@ -104,6 +106,10 @@ export async function evaluate(context, host, finalText) {
         }
         if (id === 'past-version') checks.selectedExactVersion = successes.some(e => e.name === 'fork' && e.args.version === 'v1');
         else {
+            const created = successes.findIndex(e => e.name === 'fork' && e.args.name === 'trial' && e.result?.at?.name === 'trial');
+            const savedAt = successes.findIndex(e => e.name === 'checkpoint' && e.args.name === 'before-edit' && e.before.at.kind === 'fork' && e.before.at.name === 'trial');
+            const firstWrite = successes.findIndex(e => e.name === 'write' && e.before.at.kind === 'fork' && e.before.at.name === 'trial');
+            checks.checkpointOfDraftBeforeEditing = created >= 0 && savedAt > created && firstWrite > savedAt;
             const checkpoints = await main.listCheckpoints();
             checks.savedCheckpoint = checkpoints.some(ref => ref.name === 'before-edit');
             if (checks.savedCheckpoint) {

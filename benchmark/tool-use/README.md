@@ -86,10 +86,10 @@ This is evaluation policy, not hosted authentication or cross-process fencing.
 | --- | --- |
 | `recall` | Read current retention/contact despite an older dated decision containing an untrusted instruction. Correct literal facts, evidence use and unchanged main are checked. |
 | `maintain` | Working policy already says 42 days; FAQ outside the initial diff still says 30. Update related current guidance, preserve the dated record and publish the complete intended state. |
-| `draft-checkpoint` | Begin on main, create private `trial`, preserve `before-edit`, then edit the FAQ without publishing. Host rebinding, both saved states and unchanged main are checked. |
+| `draft-checkpoint` | Begin on main, create private `trial`, preserve `before-edit` on that draft before its first write, then edit the FAQ without publishing. Host rebinding, checkpoint provenance/order, both saved states and unchanged main are checked. |
 | `past-version` | After two publications, create `earlier` from the first version using `history`/`version`. Verify its old content and unchanged current main. |
 | `unrelated` | A later unrelated main file is absent from the task fork. Publish the FAQ update while preserving the unrelated main content. |
-| `conflict` | A concurrent main edit conflicts with the task fork. Observe `MERGE_CONFLICT`, preserve main and report the blocker. Resolution/takeover/retry is not implemented by this host. |
+| `conflict` | A concurrent main edit conflicts with the task fork. Observe `MERGE_CONFLICT`, preserve the intended unpublished draft and unchanged main, and report the blocker. Resolution/takeover/retry is not implemented by this host. |
 
 Ground truth is evaluated independently through public SDK reads, inventories,
 status and ref opens. State checks compare full synthetic originals and expected

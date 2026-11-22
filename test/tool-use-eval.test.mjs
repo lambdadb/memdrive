@@ -160,3 +160,41 @@ test('a convincing text answer cannot replace required SDK publication and instr
         assert.equal((await evaluate(context, host, result.finalText)).passed, false);
     });
 });
+
+test('conflict scoring rejects a destroyed draft even when main is unchanged and the blocker is reported', async () => {
+    await usingScenario('conflict', 'none', async (context, host) => {
+        await host.toolsCall('write', { op: 'delete', fileId: context.ids['/faq.md'] });
+        assert.equal((await host.toolsCall('merge', { requestId: 'wrong-edit', summary: 'Publish FAQ edit' })).error.code, 'MERGE_CONFLICT');
+        const scored = await evaluate(context, host, 'Concurrent conflict blocked publication; not published.');
+        assert.equal(scored.checks.conflictObserved, true);
+        assert.equal(scored.checks.mainUnchanged, true);
+        assert.equal(scored.checks.blockerReported, true);
+        assert.equal(scored.checks.unpublishedExpectedContent, false);
+        assert.equal(scored.passed, false);
+    });
+});
+
+test('checkpoint scoring requires draft provenance before its first mutation', async () => {
+    for (const timing of ['main-before-fork', 'main-after-edit', 'draft-after-edit'])
+        await usingScenario('draft-checkpoint', 'none', async (context, host) => {
+            if (timing === 'main-before-fork') await host.toolsCall('checkpoint', { name: 'before-edit' });
+            await host.toolsCall('fork', { name: 'trial' });
+            await host.toolsCall('read', { path: '/faq.md' });
+            // A same-content write still mutates the draft and must follow its before-edit checkpoint.
+            if (timing === 'draft-after-edit') {
+                await host.toolsCall('write', { op: 'update', fileId: context.ids['/faq.md'], content: context.initial.main['/faq.md'] });
+                await host.toolsCall('checkpoint', { name: 'before-edit' });
+            }
+            await host.toolsCall('write', { op: 'update', fileId: context.ids['/faq.md'], edits: [{ oldText: '30 days', newText: '42 days' }] });
+            if (timing === 'main-after-edit') {
+                const mainHost = createHost({ drive: context.main, client: context.client, writable: true, guide: 'none' });
+                await mainHost.toolsCall('checkpoint', { name: 'before-edit' });
+                host.events.push(...mainHost.events);
+            }
+            const scored = await evaluate(context, host, 'The private draft is ready.');
+            assert.equal(scored.checks.checkpointContent, true, timing);
+            assert.equal(scored.checks.forkContent, true, timing);
+            assert.equal(scored.checks.checkpointOfDraftBeforeEditing, false, timing);
+            assert.equal(scored.passed, false, timing);
+        });
+});
