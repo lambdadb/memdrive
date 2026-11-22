@@ -93,6 +93,14 @@ publication status, stable history pages, and visibility before merge
 bookkeeping finishes. The test verifies cleanup of its isolated collection
 and publication journal.
 
+The [model tool-use harness](benchmark/tool-use/README.md) consumes the shared
+SDK tool catalog in an in-process host with explicit allowlists and binding
+changes. Keep its scenarios, provider transport and scoring outside `src/` and
+the package archive. Its fixture/scripted tests run in ordinary CI without keys;
+real model calls require explicit model mode and `LLM_API_KEY`. Scripted or
+injected transports must never be reported as model performance, and fixture
+results do not establish live LambdaDB or MCP wire behavior.
+
 ## Versions and releases
 
 See [RELEASING.md](RELEASING.md). Main pushes publish dev builds when the committed version is tagged on origin; otherwise they verify the intended release against production. Authorized GitHub Releases publish RC or stable versions. A local build or package check is not release authorization.
