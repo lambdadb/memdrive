@@ -210,10 +210,13 @@ export type FileFilter =
     | { field: `metadata.${string}`; op: 'in'; value: (string | number | boolean)[] }
     | { field: `metadata.${string}`; op: 'exists'; value: boolean };
 
-export interface SearchExternalFilesRequest {
-    query: readonly number[];
+interface SearchOptions {
     limit?: number | undefined;
     filter?: FileFilter | undefined;
+}
+
+export interface SearchExternalFilesRequest extends SearchOptions {
+    query: readonly number[];
 }
 
 export interface SearchExternalFilesResult {
@@ -221,10 +224,9 @@ export interface SearchExternalFilesResult {
     reranked: false;
 }
 
-export interface SearchFilesRequest {
+export interface SearchFilesRequest extends SearchOptions {
     query: string;
     embeddingQuery?: string | undefined;
-    limit?: number | undefined;
     rerank?: boolean | {
         fields?: string[] | undefined;
         onFailure?: 'error' | 'returnOriginal' | undefined;

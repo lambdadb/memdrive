@@ -105,6 +105,19 @@ test('live file store writes, searches, lists and reopens a fresh fork with veri
         assert.equal(fused.reranked, false);
         assert.deepEqual(fused.hits, ranked.hits);
 
+        const topic = value => ({ field: 'metadata.topic', op: 'eq', value });
+        const distractor = await reopened.write({
+            op: 'create', path: '/unmatched.txt', content, metadata: { topic: 'unmatched' },
+        }, options());
+        const filtered = await reopened.search({ query: 'synthetic note', filter: topic('synthetic'), limit: 1 }, options());
+        assert.equal(filtered.reranked, true);
+        assert.deepEqual(filtered.hits, ranked.hits);
+        const unmatched = await reopened.search({
+            query: 'synthetic note', filter: topic('unmatched'), rerank: false,
+        }, options());
+        assert.deepEqual(unmatched.hits.map(hit => hit.fileId), [distractor.fileId]);
+        await reopened.write({ op: 'delete', fileId: distractor.fileId }, options());
+
         const native = client.collection(name);
         const branchRead = { ref: { kind: 'branch', name: 'fork-research' }, consistentRead: true };
         const chunkIds = async () => (await native.query({ ...branchRead, size: 10, fields: { include: ['id'] },
@@ -117,6 +130,16 @@ test('live file store writes, searches, lists and reopens a fresh fork with veri
         assert.equal(await reopened.read({ path }, options()), null);
         assert.deepEqual(await reopened.read({ path: moved.path }, options()), moved);
         assert.deepEqual(await chunkIds(), oldIds);
+        const renamedTopic = await reopened.write({
+            op: 'update', fileId: moved.fileId, metadata: { topic: 'updated' },
+        }, options());
+        assert.equal(renamedTopic.content, moved.content);
+        assert.deepEqual((await reopened.search({
+            query: 'synthetic note', filter: topic('updated'), rerank: false,
+        }, options())).hits.map(hit => hit.fileId), [moved.fileId]);
+        assert.deepEqual((await reopened.search({
+            query: 'synthetic note', filter: topic('synthetic'), rerank: false,
+        }, options())).hits, []);
         const changed = await reopened.write({ op: 'update', fileId: moved.fileId, metadata: {},
             edits: [{ oldText: 'Synthetic note', newText: 'Updated fixture' }] }, options());
         assert.equal(changed.content, content.replace('Synthetic note', 'Updated fixture'));
@@ -128,6 +151,14 @@ test('live file store writes, searches, lists and reopens a fresh fork with veri
         assert.notDeepEqual(newIds, oldIds);
         const changedResults = await reopened.search({ query: 'Updated fixture', rerank: false }, options());
         assert.deepEqual(changedResults.hits, [{ ...changed, range: { start: 0, end: changed.content.length } }]);
+        const absentTopic = { field: 'metadata.topic', op: 'exists', value: false };
+        assert.deepEqual((await reopened.search({
+            query: 'Updated fixture', filter: absentTopic, rerank: false,
+        }, options())).hits, changedResults.hits);
+        assert.deepEqual((await reopened.search({
+            query: 'Updated fixture', filter: topic('updated'), rerank: false,
+        }, options())).hits, []);
+        t.diagnostic('Managed search scoped candidates to matching chunk metadata after replacement and clear.');
         assert.deepEqual(await reopened.diff(options()), additions.map(change =>
             change.fileId === changed.fileId ? { ...change, path: changed.path } : change));
         assert.deepEqual(await reopened.write({ op: 'delete', fileId: changed.fileId }, options()), { fileId: changed.fileId });

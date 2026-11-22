@@ -1,5 +1,5 @@
 import type { LambdaDBClient } from '@functional-systems/lambdadb';
-import { create, open, type DriveFile, type CheckpointFileDrive, type FileChange, type DeleteFileResult, type SearchFilesResult, type ListFilesResult, type FileDrive, type MergeResult, type OpenFileStoreOptions } from '@functional-systems/memdrive';
+import { create, open, type DriveFile, type CheckpointFileDrive, type FileChange, type FileFilter, type DeleteFileResult, type SearchFilesResult, type ListFilesResult, type FileDrive, type MergeResult, type OpenFileStoreOptions } from '@functional-systems/memdrive';
 
 export async function fileConsumer(client: LambdaDBClient, options: OpenFileStoreOptions) {
     const main = await create({ client, name: 'workspace' });
@@ -21,7 +21,7 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     await reopened.list({ cursor: 'opaque', prefix: '/other/' });
     // @ts-expect-error Listing returns file metadata without original content.
     listed.files[0]?.content;
-    const ranked: SearchFilesResult = await reopened.search({ query: 'Task context', rerank: { onFailure: 'returnOriginal' } });
+    const ranked: SearchFilesResult = await reopened.search({ query: 'Task context', filter: topicFilter, rerank: { onFailure: 'returnOriginal' } });
     ranked.hits[0]?.range?.start;
     const changes: FileChange[] = await reopened.diff({ signal: new AbortController().signal });
     for (const change of changes) if (change.op === 'update' || change.op === 'delete') change.previousPath;
@@ -57,6 +57,8 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     return file;
 }
 
+const topicFilter: FileFilter = { field: 'metadata.topic', op: 'eq', value: 'local' };
+
 export async function externalFileConsumer(client: LambdaDBClient) {
     const embedding = { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'caller-model' } as const;
     const main = await create({ client, name: 'workspace', embedding });
@@ -67,7 +69,7 @@ export async function externalFileConsumer(client: LambdaDBClient) {
     const reference = await reopened.read({ fileId: file!.fileId });
     await reopened.write({ op: 'update', fileId: file!.fileId, content: vector, newPath: '/updated' });
     await reopened.merge({ requestId: 'publish-1', summary: 'Save the vector files' });
-    const hits = await main.search({ query: vector, filter: { field: 'metadata.topic', op: 'eq', value: 'local' } });
+    const hits = await main.search({ query: vector, filter: topicFilter });
     const results: false = hits.reranked;
     const saved = await reopened.checkpoint({ name: 'saved' });
     const pinned = await open({ client, name: 'workspace', mode: 'external', at: { checkpoint: 'saved' } });
