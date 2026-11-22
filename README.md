@@ -47,6 +47,30 @@ Use one writer per fork across runtimes and LambdaDB client instances. The SDK s
 
 
 
+## Find literal text in originals
+
+Use `findText` on managed stores to locate exact substrings in the original file text. It applies Unicode simple case folding and preserves the original spelling, punctuation, and whitespace in each hit. It matches overlapping occurrences and substrings that cross indexing chunk boundaries. Simple case folding does not normalize text or expand characters such as `ß` to `ss`. External-vector stores expose `findText` as `undefined`.
+
+```ts
+let page = await reopened.findText({
+    query: 'task context',
+    prefix: '/notes/',
+    filter: { field: 'metadata.topic', op: 'eq', value: 'planning' },
+    limit: 20,
+});
+for (;;) {
+    for (const hit of page.hits) console.log(hit.path, hit.range, hit.context.content);
+    if (!page.cursor) break;
+    page = await reopened.findText({ cursor: page.cursor });
+}
+```
+
+Each hit carries the file reference, the original matching text in `content`, and a half-open UTF-16 `range` for JavaScript's `slice`. Its `context` carries an excerpt and the excerpt's corresponding range. The excerpt includes up to 80 UTF-16 units of surrounding text on each side, extending by one unit if needed to avoid splitting a surrogate pair.
+
+Use a nonempty literal of up to 8192 UTF-8 bytes, including whitespace if needed. The optional prefix is a case-sensitive absolute path prefix. Metadata filters use the same `FileFilter` as `search`. The page limit is 1–100 hits and defaults to 20. The SDK scans original file records in file ID order, checking up to 16 originals per page, and emits each file's matches in offset order. A page can contain fewer hits than requested, including zero. Follow the cursor until it is absent. Cursors are scoped to the same handle, expire after five minutes, and may be evicted as newer cursors are created. Restart a search if the SDK returns `FIND_TEXT_CURSOR_UNAVAILABLE`.
+
+Main and checkpoint scans typically return `consistency: 'snapshot'` and keep reading the same published version across pages. Fork scans and scans of legacy main without a pinned published version return `consistency: 'live'`. Each fork page runs in the local writer queue, and the scan excludes file IDs above the initial upper bound. An edit or insertion ahead of the cursor can appear in later pages and a change behind it may be missed. A resumed file that changes or disappears invalidates the cursor.
+
 ## Filter search by metadata
 
 Pass `filter` to either text or external-vector search. The filter limits retrieval candidates before ranking. Text search applies it to chunks in both lexical and vector retrieval. Vector search applies it to file records.

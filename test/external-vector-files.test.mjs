@@ -44,6 +44,7 @@ test('external file reads and vector searches return references from the selecte
     assert.deepEqual(await saved.read({ path: file.path }), file);
 
     const pinned = await open({ at: { checkpoint: 'before-move' } });
+    for (const view of [main, work, saved, pinned]) assert.equal(view.findText, undefined);
     assert.deepEqual(await pinned.search({ query: vector(), filter: { and: [
         { field: 'metadata.topic', op: 'eq', value: metadata.topic },
         { field: 'metadata.ordinal', op: 'gte', value: 2 },

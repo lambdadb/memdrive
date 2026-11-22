@@ -8,6 +8,7 @@ import { branchRef, fetchOriginals, pathQuery, pinRef, readRef, viewRead, type H
 import { workingWriter, writeBatchLimit } from './writes.js';
 import { searchQuery, validateReranking, vectorSearchQuery } from './search.js';
 import { fileLister } from './list.js';
+import { fileTextFinder } from './find-text.js';
 import { createRef } from './refs.js';
 import { publicationIdentity, validateMergeRequest } from './publication-log.js';
 import { publication } from './publication.js';
@@ -165,7 +166,9 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
 
     function view(source: RefSource, enqueueRef?: <T>(operation: () => Promise<T>, signal?: AbortSignal) => Promise<T>) {
         return {
-            name, read: reader(source), search: searcher(source), list: fileLister(handle, name, source, metadataSchema), describe,
+            name, read: reader(source), search: searcher(source), list: fileLister(handle, name, source, metadataSchema),
+            findText: dimensions === undefined ? fileTextFinder(handle, name, source, metadataSchema, enqueueRef) : undefined,
+            describe,
             async fork(request: { name: string }, options?: RequestOptions) {
                 const { signal } = operationOptions(options);
                 checkAbort(signal);
