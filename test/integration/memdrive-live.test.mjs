@@ -44,6 +44,8 @@ test('live file store writes, searches, lists and reopens a fresh fork with veri
             { code: 'CHECKPOINT_NOT_FOUND', status: 404 });
         assert.deepEqual(await main.list({}, options()), { files: [], prefixes: [], consistency: 'eventual' });
         const fork = await main.fork({ name: 'research' }, options());
+        assert.deepEqual(await main.listForks(options()), [{ name: 'research' }]);
+        assert.deepEqual(await main.listCheckpoints(options()), []);
         const path = '/notes/한글 "draft":*?.md';
         const content = '# Synthetic note\r\n Trailing space \n';
         const [original, empty, nested] = await fork.write([
@@ -196,7 +198,7 @@ test('live file store writes, searches, lists and reopens a fresh fork with veri
             assert.equal(await directChild.read({ fileId: nested.fileId }, options()), null);
             const movedSource = await reopened.write({ op: 'update', fileId: sample.fileId, newPath: '/after-checkpoint.txt' }, options());
             assert.deepEqual(await checkpoint.read({ paths: [sample.path, movedSource.path] }, options()), [sample]);
-            await native.branches.delete('fork-research', options());
+            await reopened.delete(options());
             await assert.rejects(native.branches.get('fork-research', options()), error => statusOf(error) === 404);
             t.diagnostic('Working source deletion verified before reopening and forking the checkpoint.');
 
@@ -217,9 +219,19 @@ test('live file store writes, searches, lists and reopens a fresh fork with veri
             assert.deepEqual(rankedPin.hits, [{ ...sample, range: { start: 0, end: sample.content.length } }]);
             const copied = await pinned.checkpoint({ name: 'copied' }, options());
             assert.deepEqual(await copied.read({ fileId: sample.fileId }, options()), sample);
+            assert.deepEqual(await main.listCheckpoints(options()), [{ name: 'copied' }, { name: 'retained' }]);
+            await copied.delete(options());
+            await pinned.delete(options());
+            assert.deepEqual(await main.listCheckpoints(options()), []);
         } else {
             t.diagnostic('Checkpoint capture and fork validation are opt-in through MEMDRIVE_RUN_LIVE_CHECKPOINT_TESTS=1.');
+            await reopened.delete(options());
+            assert.deepEqual(await main.listForks(options()), []);
         }
+        await MemDrive.destroy({ client, name }, options());
+        await assert.rejects(main.status(options()), { code: 'STORE_DELETED' });
+        await assert.rejects(client.collection(name).get(options()), error => statusOf(error) === 404);
+        t.diagnostic('Public ref deletion and store destruction confirmed.');
     } catch (error) {
         collision = error?.code === 'STORE_EXISTS';
         failure = safeFailure('File store smoke', error);

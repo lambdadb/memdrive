@@ -109,8 +109,12 @@ type ViewFile<Mode extends EmbeddingMode> = Mode extends 'external' ? FileListEn
 type ViewSearch<Mode extends EmbeddingMode> = Mode extends 'external' ? SearchExternalFilesRequest : SearchFilesRequest;
 type ViewSearchResult<Mode extends EmbeddingMode> = Mode extends 'external' ? SearchExternalFilesResult : SearchFilesResult;
 
+export interface FileRefEntry { name: string }
+
 interface FileView<Mode extends EmbeddingMode> {
     readonly name: string;
+    listForks(options?: RequestOptions): Promise<FileRefEntry[]>;
+    listCheckpoints(options?: RequestOptions): Promise<FileRefEntry[]>;
     fork(request: { name: string }, options?: RequestOptions): Promise<WorkingFileDrive<Mode>>;
     checkpoint(request: { name: string }, options?: RequestOptions): Promise<CheckpointFileDrive<Mode>>;
     list(request?: ListFilesRequest, options?: RequestOptions): Promise<ListFilesResult>;
@@ -130,6 +134,7 @@ export interface MainFileDrive<Mode extends EmbeddingMode = 'managed'> extends F
 
 export interface CheckpointFileDrive<Mode extends EmbeddingMode = 'managed'> extends FileView<Mode> {
     readonly at: { readonly kind: 'checkpoint'; readonly name: string };
+    delete(options?: RequestOptions): Promise<void>;
 }
 
 export type FileChange =
@@ -183,6 +188,7 @@ export interface FileHistoryResult {
 
 export interface WorkingFileDrive<Mode extends EmbeddingMode = 'managed'> extends FileView<Mode> {
     readonly at: { readonly kind: 'fork'; readonly name: string };
+    delete(options?: RequestOptions): Promise<void>;
     merge(request: MergeRequest, options?: RequestOptions): Promise<MergeResult>;
     diff(options?: RequestOptions): Promise<FileChange[]>;
     write(request: FileMutation<Mode>, options?: RequestOptions): Promise<ViewFile<Mode>>;
