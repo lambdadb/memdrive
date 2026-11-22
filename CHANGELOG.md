@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Read bounded text ranges with exact line endings, Unicode-safe continuation and changed-original detection; expose the same contract through the shared read tool.
 - List user forks and checkpoints, delete selected refs with stale-handle protection, and destroy stores with owned-journal cleanup and durable deletion recovery.
 - Replace the memory SDK entry points with a file SDK for fresh stores, read-only main, and working forks.
 - Create files in batches and read exact originals by path or stable file ID. Search indexed chunks with hybrid retrieval, optional reranking and verified source ranges.

@@ -54,6 +54,12 @@ test('live file store writes, searches, lists and reopens a fresh fork with veri
             { op: 'create', path: '/notes/sub/also "draft":*?.txt', content: '' },
         ], options());
         const reopened = await MemDrive.open({ client: new LambdaDBClient(connection), name, at: { fork: 'research' } }, options());
+        const firstRange = await reopened.read({ fileId: original.fileId, maxChars: 5 }, options());
+        assert.equal(firstRange.content, content.slice(0, firstRange.range.end));
+        assert(firstRange.next);
+        const nextRange = await reopened.read(firstRange.next, options());
+        assert.equal(nextRange.content, content.slice(nextRange.range.start, nextRange.range.end));
+        assert.equal(nextRange.revision, firstRange.revision);
         const additions = [original, empty, nested].map(({ fileId, path }) => ({ op: 'create', fileId, path }))
             .sort((a, b) => a.fileId.localeCompare(b.fileId));
         assert.deepEqual(await reopened.diff(options()), additions);

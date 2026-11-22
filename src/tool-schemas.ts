@@ -41,6 +41,9 @@ export function fileToolSchemas(external: boolean) {
             { type: 'boolean' }, object({ fields: { ...array(string, 8), uniqueItems: true },
                 onFailure: { enum: ['error', 'returnOriginal'] } }),
         ] } }) };
+    const ranges = external ? {} : { startLine: { type: 'integer', minimum: 1 }, endLine: { type: 'integer', minimum: 1 },
+        maxChars: { type: 'integer', minimum: 2, maximum: 64000 }, offset: { type: 'integer', minimum: 0 },
+        revision: { type: 'string', pattern: '^[0-9a-f]{64}$' } };
     return {
         guide: object(),
         status: object(),
@@ -49,8 +52,10 @@ export function fileToolSchemas(external: boolean) {
         checkpoint: object({ name: { type: 'string', minLength: 3, maxLength: 41, pattern: '^[A-Za-z0-9_-]+$' } }, ['name']),
         history: continuation({ sinceVersion: { type: 'string', pattern: '^v(0|[1-9][0-9]*)$' }, limit: limit(100) }),
         list: continuation({ prefix: string, nameContains: string, delimiter: { const: '/' }, limit: limit(1000) }),
-        read: { ...object({ fileId, path, paths: { ...array(path, 100), uniqueItems: true } }),
-            oneOf: ['fileId', 'path', 'paths'].map(key => ({ required: [key] })) },
+        read: { ...object({ fileId, path, paths: { ...array(path, 100), uniqueItems: true }, ...ranges }),
+            oneOf: [object({ fileId, ...ranges }, ['fileId']), object({ path, ...ranges }, ['path']),
+                object({ paths: { ...array(path, 100), uniqueItems: true } }, ['paths'])],
+            ...(external ? {} : { dependencies: { offset: ['revision'] } }) },
         search: { ...object(searchProperties, ['query']), $defs: { filter } },
         findText: { ...continuation({ query: { type: 'string', minLength: 1 }, prefix: string,
             filter: { $ref: '#/$defs/filter' }, limit: limit(100) }, ['query']), $defs: { filter } },
