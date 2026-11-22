@@ -60,7 +60,8 @@ try {
     copyFileSync(join(root, 'test/file-tools.test.mjs'), join(temporary, 'test/file-tools.test.mjs'));
     copyFileSync(join(root, 'test/lifecycle.test.mjs'), join(temporary, 'test/lifecycle.test.mjs'));
     copyFileSync(join(root, 'test/read-range.test.mjs'), join(temporary, 'test/read-range.test.mjs'));
-    run(process.execPath, ['--test', 'test/memdrive-files.test.mjs', 'test/file-tools.test.mjs', 'test/lifecycle.test.mjs', 'test/read-range.test.mjs']);
+    copyFileSync(join(root, 'test/retention.test.mjs'), join(temporary, 'test/retention.test.mjs'));
+    run(process.execPath, ['--test', 'test/memdrive-files.test.mjs', 'test/file-tools.test.mjs', 'test/lifecycle.test.mjs', 'test/read-range.test.mjs', 'test/retention.test.mjs']);
     if (live) {
         cpSync(join(root, 'test/integration'), join(temporary, 'test/integration'), { recursive: true });
         const files = readdirSync(join(temporary, 'test/integration')).filter(file => file.endsWith('-live.test.mjs'));

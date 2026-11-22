@@ -152,6 +152,7 @@ interface FileView<Mode extends EmbeddingMode> {
 
 export interface MainFileDrive<Mode extends EmbeddingMode = 'managed'> extends FileView<Mode> {
     readonly at: { readonly kind: 'main' };
+    configure(request: { retentionInDays: number }, options?: RequestOptions): Promise<FileStoreDescription<Mode>>;
 }
 
 export interface CheckpointFileDrive<Mode extends EmbeddingMode = 'managed'> extends FileView<Mode> {
@@ -237,6 +238,7 @@ export interface ExternalEmbedding {
 type StoreOptions = ConnectionOptions & {
     labels?: Record<string, string> | undefined;
     metadataSchema?: MetadataSchema | undefined;
+    retentionInDays?: number | undefined;
 };
 
 export type CreateFileStoreOptions = StoreOptions & {
@@ -253,6 +255,8 @@ interface StoreDescription {
     name: string;
     labels: Record<string, string>;
     metadataSchema: MetadataSchema;
+    /** Native snapshot retention. Pinned refs and SDK journal records have separate lifetimes. */
+    retentionInDays?: number | undefined;
 }
 
 export type FileStoreDescription<Mode extends EmbeddingMode = 'managed'> = StoreDescription & (

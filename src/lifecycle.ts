@@ -42,7 +42,7 @@ export function lifecycle({ client, name }: ConnectionOptions) {
 /** Preserve overloaded public methods while tracking their complete promises. */
 export function guardView<T extends object>(view: T, run: (operation: () => Promise<unknown>) => Promise<unknown>): T {
     return Object.freeze(Object.fromEntries(Object.entries(view).map(([key, value]) => [key,
-        typeof value === 'function' && key !== 'delete'
+        typeof value === 'function' && key !== 'delete' && key !== 'configure'
             ? (...args: unknown[]) => run(() => Reflect.apply(value, view, args)) : value,
     ]))) as T;
 }
