@@ -192,6 +192,24 @@ Run main publication and recovery through one exclusive host-owned writer per st
 
 MemDrive keeps its initial view, request captures, and published versions in reserved refs and creates an internal collection on the first merge. Give the writer permission to provision that collection and readers permission to inspect its records. Retain the SDK-owned refs and journal together while the store is in use. Earlier file stores are initialized on the first operation that needs a frozen main view. Native tag availability also applies to named checkpoints on an empty or cold view.
 
+## Inspect publication status and history
+
+```ts
+const status = await work.status();
+const page = await work.history({ sinceVersion: 'v0', limit: 20 });
+if (page.cursor) {
+    const next = await work.history({ cursor: page.cursor });
+}
+```
+
+`status()` returns the selected view in `at` and the store's current published main version in `mainVersion`. Before the first publication, main is `v0`. An observed unfinished merge includes its `requestId` and `phase`. The `publication` phase keeps main on its previous published version. The `bookkeeping` phase means main already exposes the new version and the source baselines still need to be confirmed. The writer may still be running in either phase. Use the exclusive writer rules above for recovery.
+
+`history()` reports store-wide main publications from any main, fork, or checkpoint view in managed and external embedding modes. Entries are ordered by version, oldest first, and include the publication time, merge summary, and up to the first 100 affected file IDs in ID order. A deleted file still contributes its ID. `fileIdsTruncated` is true when a publication affected more than 100 files.
+
+The starting `sinceVersion` is exclusive and defaults to `v0`. Unchanged and conflicting requests create version gaps. A gap or future version returns `VERSION_NOT_FOUND`, and an invalid version format returns `INVALID_INPUT`. The page size defaults to 20 and accepts 1–100. The first page captures the latest publication as `throughVersion`. Pass only the cursor to continue through that same version while main advances. Cursors expire after five minutes or may be evicted sooner. They work across views of the same store opened through the same client instance. If a cursor is unavailable, start again with the last version you processed.
+
+These methods read the publication journal without initializing main, advancing a merge, or reading file bodies or vectors. A cold client may need to read the retained journal before returning the first result. If a required capture has been removed, `history()` returns `HISTORY_UNAVAILABLE` for that entry's version. Read the selected view to retrieve its current files.
+
 ## List files
 
 ```ts

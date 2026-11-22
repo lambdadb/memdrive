@@ -74,6 +74,9 @@ test('external vector publication replays the pinned vector and rebases later ed
     await reopened.write({ op: 'delete', fileId });
     assert.deepEqual(await reopened.diff(), [{ op: 'delete', fileId, previousPath: '/renamed' }]);
     const deleted = await reopened.merge(request('delete'));
+    assert.deepEqual(await reopened.status(), { at: { kind: 'fork', name: 'research' }, mainVersion: deleted.version });
+    assert.deepEqual((await reopened.history({ sinceVersion: 'v1' })).entries.map(entry => [entry.version, entry.fileIds]),
+        [['v2', [fileId]], [version, [fileId]], [deleted.version, [fileId]]]);
     assert.equal(state.tags.get(`md-main-${deleted.version}`).docs.size, 0);
     assert.equal(await main.read({ fileId }), null);
     assert.deepEqual(await reopened.diff(), []);

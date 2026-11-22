@@ -52,6 +52,11 @@ Set `MEMDRIVE_RUN_LIVE_FIND_TEXT_TESTS=1` to also verify literal matching,
 working and checkpoint cursors, and continued scans across multiple native
 query pages. The test creates one isolated collection and verifies its deletion.
 
+Set `MEMDRIVE_RUN_LIVE_STATUS_HISTORY_TESTS=1` to also verify read-only
+publication status, stable history pages, and visibility before merge
+bookkeeping finishes. The test verifies cleanup of its isolated collection
+and publication journal.
+
 ## Versions and releases
 
 See [RELEASING.md](RELEASING.md). Main pushes publish dev builds when the committed version is tagged on origin; otherwise they verify the intended release against production. Authorized GitHub Releases publish RC or stable versions. A local build or package check is not release authorization.

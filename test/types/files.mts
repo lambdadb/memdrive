@@ -1,4 +1,5 @@
 import type { LambdaDBClient } from '@functional-systems/lambdadb';
+import type { FileHistoryResult, FileStoreStatus } from '@functional-systems/memdrive';
 import { create, open, type DriveFile, type CheckpointFileDrive, type FileChange, type FileFilter, type FindTextResult, type DeleteFileResult, type SearchFilesResult, type ListFilesResult, type FileDrive, type EmbeddingMode, type MergeResult, type OpenFileStoreOptions } from '@functional-systems/memdrive';
 
 export async function fileConsumer(client: LambdaDBClient, options: OpenFileStoreOptions) {
@@ -56,6 +57,11 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     // @ts-expect-error Checkpoint handles cannot publish.
     await pinned.merge({ requestId: 'batch-1', summary: 'Save the research' });
     const selected: FileDrive = await open(options);
+    const state: FileStoreStatus = await selected.status();
+    const history: FileHistoryResult = await selected.history({ sinceVersion: state.mainVersion, limit: 1 });
+    if (history.cursor) await selected.history({ cursor: history.cursor });
+    // @ts-expect-error Continuation is scoped to the original history request.
+    await selected.history({ cursor: 'cursor', sinceVersion: 'v1' });
     if ('write' in selected) await selected.write({ op: 'create', path: '/another.md', content: '' });
     // @ts-expect-error Only a working fork has a write method.
     await main.write({ op: 'create', path: '/main.md', content: '' });
@@ -80,6 +86,8 @@ export async function externalFileConsumer(client: LambdaDBClient, options: Open
     const results: false = hits.reranked;
     const saved = await reopened.checkpoint({ name: 'saved' });
     const pinned = await open({ client, name: 'workspace', mode: 'external', at: { checkpoint: 'saved' } });
+    const state: FileStoreStatus = await pinned.status();
+    const history: FileHistoryResult = await work.history({ sinceVersion: state.mainVersion });
     await saved.search({ query: vector });
     await pinned.search({ query: vector });
     const modelIdentity: string = (await main.describe()).embedding.identity;
@@ -109,5 +117,5 @@ export async function externalFileConsumer(client: LambdaDBClient, options: Open
     await pinned.write({ op: 'delete', fileId: file!.fileId });
     // @ts-expect-error External stores do not configure text indexes.
     await create({ client, name: 'workspace', embedding, textSearch: { analyzers: ['standard'] } });
-    return { results, modelIdentity, reference };
+    return { results, modelIdentity, reference, history };
 }

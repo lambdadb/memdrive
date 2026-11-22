@@ -115,6 +115,8 @@ interface FileView<Mode extends EmbeddingMode> {
     checkpoint(request: { name: string }, options?: RequestOptions): Promise<CheckpointFileDrive<Mode>>;
     list(request?: ListFilesRequest, options?: RequestOptions): Promise<ListFilesResult>;
     describe(options?: RequestOptions): Promise<FileStoreDescription<Mode>>;
+    status(options?: RequestOptions): Promise<FileStoreStatus>;
+    history(request?: FileHistoryRequest, options?: RequestOptions): Promise<FileHistoryResult>;
     search(request: ViewSearch<Mode>, options?: RequestOptions): Promise<ViewSearchResult<Mode>>;
     readonly findText: Mode extends 'external' ? undefined
         : (request: FindTextRequest, options?: RequestOptions) => Promise<FindTextResult>;
@@ -144,6 +146,39 @@ export interface MergeResult {
     requestId: string;
     status: 'published' | 'unchanged';
     version: string;
+}
+
+export interface FileStoreStatus {
+    at: FileDrive['at'];
+    mainVersion: string;
+    /** An observed unfinished main merge. Its writer may still be running. */
+    merge?: { requestId: string; phase: 'publication' | 'bookkeeping' } | undefined;
+}
+
+/** List store-wide main publications after a version, or continue a previous page. */
+export type FileHistoryRequest = {
+    sinceVersion?: string | undefined;
+    limit?: number | undefined;
+    cursor?: never;
+} | {
+    cursor: string;
+    sinceVersion?: never;
+    limit?: never;
+};
+
+export interface FileHistoryEntry {
+    version: string;
+    publishedAt: string;
+    summary: string;
+    fileIds: string[];
+    fileIdsTruncated: boolean;
+}
+
+export interface FileHistoryResult {
+    entries: FileHistoryEntry[];
+    /** The latest published main version observed when the first page was requested. */
+    throughVersion: string;
+    cursor?: string | undefined;
 }
 
 export interface WorkingFileDrive<Mode extends EmbeddingMode = 'managed'> extends FileView<Mode> {
