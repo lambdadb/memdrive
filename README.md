@@ -542,6 +542,8 @@ Markdown/capacity/reranker policies, instruction delivery and telemetry remain
 host responsibilities. Tool availability and fetching the guide do not establish
 which instructions a model followed.
 
+Repository development includes a [model tool-use evaluation harness](https://github.com/lambdadb/memdrive/tree/main/benchmark/tool-use) for SDK-backed synthetic workflows and guide delivery. It is outside the published package and separate from LongMemEval/BEAM retrieval evaluation.
+
 ## List files
 
 ```ts
