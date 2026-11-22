@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
-import { create, open, destroy } from '@functional-systems/memdrive';
+import { create, open } from '@functional-systems/memdrive';
 import { fileClient } from './helpers/file-client.mjs';
 
 const day = 86_400_000;
@@ -18,7 +18,14 @@ const age = (fixture, days) => {
     }
     return journal.branches.get('main').docs;
 };
-const reopen = (fixture, mode = 'managed') => open({ client: { ...fixture.client }, name: 'pruning-store', mode });
+async function reopen(fixture, mode = 'managed') {
+    const client = { ...fixture.client };
+    const main = await open({ client, name: 'pruning-store', mode });
+    const draft = await open({ client, name: 'pruning-store', mode, at: { fork: 'draft' } });
+    return { main, draft, client };
+}
+const replay = draft => draft.merge({ requestId: 'first', summary: 'Create note' });
+const deletions = fixture => fixture.calls.filter(call => call.kind === 'tag-delete');
 
 async function setup(external = false) {
     const fixture = fileClient();
@@ -38,26 +45,17 @@ async function setup(external = false) {
     return { fixture, main, draft, saved, oldFork, original, records, content };
 }
 
-test('cleanup previews and batches only expired internal tags, preserving refs, history and replay', async () => {
-    const { fixture, draft, saved, oldFork, original } = await setup();
+test('terminal merge automatically expires internal tags while preserving refs, history, cursors and replay', async () => {
+    const { fixture, saved, oldFork, original } = await setup();
     const orphan = `merge-capture-${randomUUID()}`;
     await fixture.client.collection('pruning-store').tags.create({ tagName: orphan, source: { kind: 'branch', name: 'main' } });
-    const main = await reopen(fixture);
+    const { main, draft } = await reopen(fixture);
+    assert.equal('pruneHistory' in main, false);
     const before = await main.history();
-    const firstPage = await main.history({ limit: 1 });
-    const callStart = fixture.calls.length;
-    const preview = await main.pruneHistory();
-    assert.equal(preview.dryRun, true);
-    assert.equal(preview.retentionInDays, 1);
-    assert.equal(preview.tags.length, 5);
-    assert.deepEqual(preview.deleted, []);
-    assert(!fixture.calls.slice(callStart).some(call => ['upsert', 'tag-delete', 'branch-delete'].includes(call.kind)));
-    const batch = await main.pruneHistory({ dryRun: false, limit: 2 });
-    assert.equal(batch.deleted.length, 2);
-    assert.equal(batch.hasMore, true);
-    const rest = await main.pruneHistory({ dryRun: false });
-    assert.equal(rest.deleted.length, 3);
-    assert.equal(rest.hasMore, false);
+    const page = await main.history({ limit: 1 });
+    assert.equal(deletions(fixture).length, 0); // Open and reads do not clean.
+    assert.deepEqual(await replay(draft), { requestId: 'first', status: 'published', version: 'v1' });
+    assert.equal(deletions(fixture).length, 5);
     const state = fixture.collections.get('pruning-store');
     assert.deepEqual([...state.tags.keys()].sort(), ['checkpoint-saved', 'md-main-v3', orphan].sort());
     assert(state.branches.has('md-main-v0'));
@@ -65,151 +63,244 @@ test('cleanup previews and batches only expired internal tags, preserving refs, 
     assert.equal((await oldFork.read({ fileId: original.fileId })).content, 'Revision 1');
     assert.equal((await main.read({ fileId: original.fileId })).content, 'Revision 3');
     assert.deepEqual(await main.history(), before);
-    assert.deepEqual((await main.history({ cursor: firstPage.cursor })).entries, before.entries.slice(1, 2));
+    assert.deepEqual((await main.history({ cursor: page.cursor })).entries, before.entries.slice(1, 2));
     const fresh = await reopen(fixture);
-    assert.deepEqual(await fresh.history(), before);
-    const replayFork = await open({ client: { ...fixture.client }, name: 'pruning-store', at: { fork: 'draft' } });
-    const tagCount = state.tags.size;
-    assert.deepEqual(await replayFork.merge({ requestId: 'first', summary: 'Create note' }),
-        { requestId: 'first', status: 'published', version: 'v1' });
-    assert.equal(state.tags.size, tagCount);
-    await assert.rejects(draft.merge({ requestId: 'first', summary: 'Different input' }), { code: 'MERGE_REQUEST_CONFLICT' });
+    assert.deepEqual(await fresh.main.history(), before);
+    await replay(fresh.draft);
+    await assert.rejects(fresh.draft.merge({ requestId: 'first', summary: 'Different input' }), { code: 'MERGE_REQUEST_CONFLICT' });
     await oldFork.write({ op: 'update', fileId: original.fileId, content: 'Conflicting old fork' });
     await assert.rejects(oldFork.merge({ requestId: 'old-fork', summary: 'Try old baseline' }), { code: 'MERGE_CONFLICT' });
-    assert(fixture.calls.filter(call => call.kind === 'tag-delete').every(call => call.retries.strategy === 'none'));
+    assert(deletions(fixture).every(call => call.retries.strategy === 'none'));
 });
 
-test('a long-lived main version is retained until its successor is old enough and native retention is read afresh', async () => {
+test('new publication cleans old captures only after its own bookkeeping completes', async () => {
+    const { fixture, original, records } = await setup();
+    const { draft } = await reopen(fixture);
+    await draft.write({ op: 'update', fileId: original.fileId, content: 'Revision 4' });
+    fixture.beforeRefDelete = () => assert.equal(records.get('bookkeeping:4')?.kind, 'merge-bookkeeping-v1');
+    assert.equal((await draft.merge({ requestId: 'fourth', summary: 'New revision' })).version, 'v4');
+    assert.equal(deletions(fixture).length, 5);
+    assert(fixture.collections.get('pruning-store').tags.has('md-main-v3')); // Just superseded.
+});
+
+test('supersession timing and fresh native retention determine eligibility', async () => {
     const { fixture } = await setup();
     age(fixture, [20, 10, 0]);
-    const main = await reopen(fixture);
-    const preview = await main.pruneHistory();
-    assert(preview.tags.includes('md-main-v1'));
-    assert(!preview.tags.includes('md-main-v2'));
-    assert(!preview.tags.includes('md-main-v3'));
-    fixture.collections.get('pruning-store').metadata.snapshotRetentionInDays = 31;
-    assert.deepEqual((await main.pruneHistory()).tags, []);
-    assert.equal((await main.describe()).retentionInDays, 31);
+    const { main, draft } = await reopen(fixture);
+    await main.configure({ retentionInDays: 31 });
+    await replay(draft);
+    assert.equal(deletions(fixture).length, 0);
+    fixture.collections.get('pruning-store').metadata.snapshotRetentionInDays = 1;
+    await replay(draft);
+    const tags = fixture.collections.get('pruning-store').tags;
+    assert(!tags.has('md-main-v1'));
+    assert(tags.has('md-main-v2'));
+    assert(tags.has('md-main-v3'));
 });
 
-test('external stores retain bounded history without requiring vectors after cleanup', async () => {
+test('external stores retain history without loading vectors after cleanup', async () => {
     const { fixture, original, saved } = await setup(true);
-    const main = await reopen(fixture, 'external');
+    const { main, draft } = await reopen(fixture, 'external');
     const before = await main.history();
-    assert.equal((await main.pruneHistory({ dryRun: false })).deleted.length, 5);
-    assert.deepEqual(await (await reopen(fixture, 'external')).history(), before);
+    await replay(draft);
+    assert.equal(deletions(fixture).length, 5);
+    assert.deepEqual(await (await reopen(fixture, 'external')).main.history(), before);
     assert.equal((await saved.read({ fileId: original.fileId })).fileId, original.fileId);
 });
 
-test('completed conflict captures expire while conflict and unchanged request replay survive', async () => {
+test('conflict and unchanged outcomes trigger cleanup without changing replay semantics', async () => {
     const { fixture, draft, oldFork, original } = await setup();
     await oldFork.write({ op: 'update', fileId: original.fileId, content: 'Rejected revision' });
     await assert.rejects(oldFork.merge({ requestId: 'conflict', summary: 'Conflicting change' }), { code: 'MERGE_CONFLICT' });
     const unchanged = await draft.merge({ requestId: 'unchanged', summary: 'No changes' });
     age(fixture, [8, 3, 2, 2, 2]);
-    const main = await reopen(fixture);
-    assert.equal((await main.pruneHistory({ dryRun: false })).deleted.length, 6);
-    const freshClient = { ...fixture.client };
-    const freshOld = await open({ client: freshClient, name: 'pruning-store', at: { fork: 'alternate' } });
+    const fresh = await reopen(fixture);
+    const freshOld = await open({ client: fresh.client, name: 'pruning-store', at: { fork: 'alternate' } });
     await assert.rejects(freshOld.merge({ requestId: 'conflict', summary: 'Conflicting change' }), { code: 'MERGE_CONFLICT' });
-    const freshDraft = await open({ client: freshClient, name: 'pruning-store', at: { fork: 'draft' } });
-    assert.deepEqual(await freshDraft.merge({ requestId: 'unchanged', summary: 'No changes' }), unchanged);
+    assert.equal(deletions(fixture).length, 6);
+    assert.deepEqual(await fresh.draft.merge({ requestId: 'unchanged', summary: 'No changes' }), unchanged);
 });
 
-test('archived history preserves the original bounded file-ID list and truncation marker', async () => {
+test('bounded archives preserve 100 affected IDs and the truncation marker', async () => {
     const fixture = fileClient();
     const main = await create({ client: fixture.client, name: 'pruning-store', retentionInDays: 1 });
     const draft = await main.fork({ name: 'draft' });
     await draft.write(Array.from({ length: 100 }, (_, i) => ({ op: 'create', path: `/file-${i}`, content: '' })));
     await draft.write({ op: 'create', path: '/extra', content: '' });
-    await draft.merge({ requestId: 'many-files', summary: 'Create empty fixtures' });
+    await draft.merge({ requestId: 'first', summary: 'Create note' });
     age(fixture, [2]);
     const fresh = await reopen(fixture);
-    const before = await fresh.history();
+    const before = await fresh.main.history();
     assert.equal(before.entries[0].fileIds.length, 100);
     assert.equal(before.entries[0].fileIdsTruncated, true);
-    assert.equal((await fresh.pruneHistory({ dryRun: false })).deleted.length, 1);
-    assert.deepEqual(await (await reopen(fixture)).history(), before);
+    await replay(fresh.draft);
+    assert.equal(deletions(fixture).length, 1);
+    assert.deepEqual(await (await reopen(fixture)).main.history(), before);
 });
 
-test('unfinished bookkeeping prevents cleanup even when its publication is old', async () => {
+test('unfinished bookkeeping blocks cleanup until explicit recovery settles it', async () => {
     const { fixture, records } = await setup();
     records.delete('bookkeeping:3');
-    const main = await reopen(fixture);
-    await assert.rejects(main.pruneHistory({ dryRun: false }), { code: 'MERGE_BLOCKED' });
-    assert(!fixture.calls.some(call => call.kind === 'tag-delete'));
+    const { draft } = await reopen(fixture);
+    await replay(draft); // Old terminal request still replays, but cannot clean.
+    assert.equal(deletions(fixture).length, 0);
+    await open({ client: { ...fixture.client }, name: 'pruning-store', recover: true });
+    assert.equal(deletions(fixture).length, 5);
 });
 
-test('summaries must be confirmed before any deletion, and explicit retry settles an uncertain archive', async () => {
+test('unconfirmed archives retain all tags and retry automatically on a later merge', async () => {
     const { fixture } = await setup();
-    const main = await reopen(fixture);
+    const { main, draft } = await reopen(fixture);
     fixture.beforeUpsert = request => {
         if (request.docs.some(doc => doc.kind === 'merge-history-v1')) throw new Error('Lost archive response');
     };
-    await assert.rejects(main.pruneHistory({ dryRun: false }), { code: 'HISTORY_CLEANUP_UNCONFIRMED' });
-    assert(!fixture.calls.some(call => call.kind === 'tag-delete'));
-    await assert.rejects(main.configure({ retentionInDays: 2 }), { code: 'HISTORY_CLEANUP_UNCONFIRMED' });
-    await assert.rejects(main.pruneHistory(), { code: 'HISTORY_CLEANUP_UNCONFIRMED' });
+    assert.equal((await replay(draft)).status, 'published');
+    assert.equal(deletions(fixture).length, 0);
+    await main.configure({ retentionInDays: 2 });
     fixture.beforeUpsert = undefined;
-    assert.equal((await main.pruneHistory({ dryRun: false })).deleted.length, 5);
-    assert.equal((await main.configure({ retentionInDays: 2 })).retentionInDays, 2);
+    await replay(draft);
+    assert.equal(deletions(fixture).length, 5);
 });
 
-test('partial tag deletion is recoverable across clients without losing archived history', async () => {
+test('partial and unknown deletes preserve merge success and retry across clients', async () => {
     const { fixture } = await setup();
-    const client = { ...fixture.client };
-    const main = await open({ client, name: 'pruning-store' });
+    const { main, draft } = await reopen(fixture);
     const before = await main.history();
     let deletes = 0;
     fixture.afterRefDelete = () => { if (++deletes === 2) throw new Error('Lost delete response'); };
-    await assert.rejects(main.pruneHistory({ dryRun: false }), error => {
-        assert.equal(error.code, 'HISTORY_CLEANUP_UNCONFIRMED');
-        assert.equal(error.details.deleted.length, 1);
-        return true;
-    });
-    await assert.rejects(destroy({ client, name: 'pruning-store' }), { code: 'HISTORY_CLEANUP_UNCONFIRMED' });
+    assert.equal((await replay(draft)).status, 'published');
+    assert.equal(deletions(fixture).length, 2);
     fixture.afterRefDelete = undefined;
     const fresh = await reopen(fixture);
-    assert.deepEqual(await fresh.history(), before);
-    assert.equal((await fresh.pruneHistory({ dryRun: false })).deleted.length, 3);
-    assert.deepEqual(await fresh.history(), before);
-    assert.equal((await main.pruneHistory({ dryRun: false })).deleted.length, 0);
-    await main.configure({ retentionInDays: 2 });
+    assert.deepEqual(await fresh.main.history(), before);
+    await replay(fresh.draft);
+    assert.equal(deletions(fixture).length, 5);
+    assert.deepEqual(await fresh.main.history(), before);
 });
 
-test('cleanup validates inputs, missing native retention and replaced store generations without mutations', async () => {
-    const fixture = fileClient();
-    const main = await create({ client: fixture.client, name: 'pruning-store' });
-    for (const request of [{ limit: 0 }, { limit: 1001 }, { limit: '1' }, { dryRun: 'false' }, { force: true }])
-        await assert.rejects(main.pruneHistory(request), { code: 'INVALID_INPUT' });
-    await assert.rejects(main.pruneHistory({}, { signal: AbortSignal.abort() }), { code: 'ABORTED' });
-    await assert.rejects(main.pruneHistory({ dryRun: false }), { code: 'RETENTION_UNAVAILABLE' });
-    await main.configure({ retentionInDays: 7 });
-    assert.deepEqual((await main.pruneHistory()).tags, []);
-    fixture.collections.get('pruning-store').metadata.createdAt = new Date(9000);
-    await assert.rejects(main.pruneHistory({ dryRun: false }), { code: 'STORE_REPLACED' });
-    assert(!fixture.calls.some(call => call.kind === 'tag-delete'));
+test('missing retention, replaced generation and cancellation skip cleanup', async () => {
+    const { fixture } = await setup();
+    const { draft } = await reopen(fixture);
+    const metadata = fixture.collections.get('pruning-store').metadata;
+    delete metadata.snapshotRetentionInDays;
+    await replay(draft);
+    assert.equal(deletions(fixture).length, 0);
+    metadata.snapshotRetentionInDays = 1;
+    metadata.createdAt = new Date(9000);
+    await replay(draft);
+    assert.equal(deletions(fixture).length, 0);
+    await assert.rejects(draft.merge({ requestId: 'first', summary: 'Create note' }, { signal: AbortSignal.abort() }), { code: 'ABORTED' });
 });
 
-test('cleanup excludes concurrent operations and malformed archives cannot justify deletion', async () => {
-    const { fixture, records } = await setup();
-    const main = await reopen(fixture);
+test('in-flight reads defer cleanup until another merge without blocking either result', async () => {
+    const { fixture, original } = await setup();
+    const { main, draft } = await reopen(fixture);
     let release, enter;
     const entered = new Promise(resolve => { enter = resolve; });
-    fixture.beforeUpsert = async request => {
-        if (request.docs.some(doc => doc.kind === 'merge-history-v1')) {
+    fixture.beforeFetch = async request => {
+        if (request.ids.includes(`file:${original.fileId}`)) {
             enter();
             await new Promise(resolve => { release = resolve; });
         }
     };
-    const pruning = main.pruneHistory({ dryRun: false, limit: 1 });
+    const reading = main.read({ fileId: original.fileId });
     await entered;
-    await assert.rejects(main.read({ path: '/note' }), { code: 'STORE_BUSY' });
-    fixture.beforeUpsert = undefined;
+    await replay(draft);
+    assert.equal(deletions(fixture).length, 0);
+    fixture.beforeFetch = undefined;
     release();
-    await pruning;
+    assert.equal((await reading).content, 'Revision 3');
+    await replay(draft);
+    assert.equal(deletions(fixture).length, 5);
+});
+
+test('corrupt archives cannot justify deletion or replace a successful merge result', async () => {
+    const { fixture, records } = await setup();
+    const { draft } = await reopen(fixture);
+    let deletes = 0;
+    fixture.afterRefDelete = () => { if (++deletes === 1) throw new Error('Stop after one tag'); };
+    await replay(draft);
+    fixture.afterRefDelete = undefined;
     records.get('history:v1').sourceTag = `merge-capture-${randomUUID()}`;
-    const deleted = fixture.calls.filter(call => call.kind === 'tag-delete').length;
-    await assert.rejects(main.pruneHistory({ dryRun: false }), { code: 'INVALID_RESULT' });
-    assert.equal(fixture.calls.filter(call => call.kind === 'tag-delete').length, deleted);
+    await replay(draft);
+    assert.equal(deletions(fixture).length, 1);
+});
+
+test('cleanup is capped at 100 tags and the next merge continues the backlog', async () => {
+    const fixture = fileClient();
+    const main = await create({ client: fixture.client, name: 'pruning-store', retentionInDays: 1 });
+    const draft = await main.fork({ name: 'draft' });
+    const file = await draft.write({ op: 'create', path: '/note', content: '0' });
+    await draft.merge({ requestId: 'first', summary: 'Create note' });
+    for (let i = 1; i < 52; i++) {
+        await draft.write({ op: 'update', fileId: file.fileId, content: String(i) });
+        await draft.merge({ requestId: `revision-${i}`, summary: 'Update note' });
+    }
+    age(fixture, []);
+    const fresh = await reopen(fixture);
+    await replay(fresh.draft);
+    assert.equal(deletions(fixture).length, 100);
+    await replay(fresh.draft);
+    assert.equal(deletions(fixture).length, 103);
+});
+
+test('a history read racing cleanup uses the complete confirmed archive', async () => {
+    const fixture = fileClient();
+    const main = await create({ client: fixture.client, name: 'pruning-store', retentionInDays: 1 });
+    const draft = await main.fork({ name: 'draft' });
+    await draft.write([{ op: 'create', path: '/one', content: '' }, { op: 'create', path: '/two', content: '' }]);
+    await draft.merge({ requestId: 'first', summary: 'Create note' });
+    age(fixture, [2]);
+    const reader = await reopen(fixture);
+    const before = await reader.main.history();
+    const cleaner = await reopen(fixture);
+    fixture.diffPage = async request => {
+        if (!request.ref.name.startsWith('merge-capture-')) return;
+        fixture.diffPage = undefined;
+        const docs = fixture.collections.get('pruning-store').tags.get(request.ref.name).docs;
+        const one = [...docs.values()].find(doc => doc.kind === 'file');
+        await replay(cleaner.draft);
+        return { isDocsInline: true, total: 1, docs: [{ collection: 'pruning-store', doc: one }] };
+    };
+    assert.deepEqual(await reader.main.history(), before);
+    assert.equal(deletions(fixture).length, 1);
+});
+
+test('cleanup cancellation after publication preserves success and retries later', async () => {
+    const { fixture } = await setup();
+    const { draft } = await reopen(fixture);
+    const controller = new AbortController();
+    fixture.beforeUpsert = request => {
+        if (request.docs.some(doc => doc.kind === 'merge-history-v1')) controller.abort();
+    };
+    const result = await draft.merge({ requestId: 'first', summary: 'Create note' }, { signal: controller.signal });
+    assert.equal(result.status, 'published');
+    assert.equal(deletions(fixture).length, 0);
+    fixture.beforeUpsert = undefined;
+    await replay(draft);
+    assert.equal(deletions(fixture).length, 5);
+});
+
+test('cleanup has its own abort deadline without turning a terminal merge into failure', async () => {
+    const { fixture } = await setup();
+    let maintenanceSignal;
+    const client = { ...fixture.client, collection(name) {
+        const handle = fixture.client.collection(name);
+        return { ...handle, async get(options) {
+            maintenanceSignal = options?.signal;
+            return handle.get(options);
+        } };
+    } };
+    const draft = await open({ client, name: 'pruning-store', at: { fork: 'draft' } });
+    fixture.beforeUpsert = request => {
+        if (request.docs.some(doc => doc.kind === 'merge-history-v1')) return new Promise((_, reject) => {
+            maintenanceSignal.addEventListener('abort', () => reject(new Error('Cleanup deadline')), { once: true });
+        });
+    };
+    assert.equal((await replay(draft)).status, 'published');
+    assert.equal(maintenanceSignal.aborted, true);
+    assert.equal(deletions(fixture).length, 0);
+    fixture.beforeUpsert = undefined;
+    await replay(draft);
+    assert.equal(deletions(fixture).length, 5);
 });

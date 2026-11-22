@@ -160,25 +160,6 @@ interface FileView<Mode extends EmbeddingMode> {
 export interface MainFileDrive<Mode extends EmbeddingMode = 'managed'> extends FileView<Mode> {
     readonly at: { readonly kind: 'main' };
     configure(request: { retentionInDays: number }, options?: RequestOptions): Promise<FileStoreDescription<Mode>>;
-    pruneHistory(request?: HistoryPruneRequest, options?: RequestOptions): Promise<HistoryPruneResult>;
-}
-
-export interface HistoryPruneRequest {
-    /** Defaults to true. Hosts explicitly schedule deletion with false. */
-    dryRun?: boolean | undefined;
-    /** Maximum tags per call, 1–1000; defaults to 100. */
-    limit?: number | undefined;
-}
-
-export interface HistoryPruneResult {
-    retentionInDays: number;
-    cutoff: string;
-    dryRun: boolean;
-    /** Eligible internal tags observed for this batch. */
-    tags: string[];
-    /** Tags confirmed absent after deletion; empty for a dry run. */
-    deleted: string[];
-    hasMore: boolean;
 }
 
 export interface CheckpointFileDrive<Mode extends EmbeddingMode = 'managed'> extends FileView<Mode> {
@@ -264,6 +245,7 @@ export interface ExternalEmbedding {
 type StoreOptions = ConnectionOptions & {
     labels?: Record<string, string> | undefined;
     metadataSchema?: MetadataSchema | undefined;
+    /** 1–31 days; also applies to automatic retention cleanup after terminal merges. */
     retentionInDays?: number | undefined;
 };
 
@@ -285,7 +267,7 @@ interface StoreDescription {
     name: string;
     labels: Record<string, string>;
     metadataSchema: MetadataSchema;
-    /** Native snapshot retention. Pinned refs and SDK journal records have separate lifetimes. */
+    /** Native retention and automatic merge cleanup window; explicit refs and history summaries do not expire. */
     retentionInDays?: number | undefined;
 }
 

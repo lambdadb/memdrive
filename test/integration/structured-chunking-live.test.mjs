@@ -77,16 +77,26 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
         const retentionClient = new LambdaDBClient(connection);
         const retentionMain = await MemDrive.open({ client: retentionClient, name }, options());
         const history = await retentionMain.history({}, options());
-        const preview = await retentionMain.pruneHistory({}, options());
-        assert.equal(preview.tags.length, 1);
-        assert(preview.tags[0].startsWith('merge-capture-'));
-        phase = 'prune expired internal capture';
-        const pruned = await retentionMain.pruneHistory({ dryRun: false }, options());
-        assert.deepEqual(pruned.deleted, preview.tags);
+        const reservation = (await journal.docs.fetch({ ...ref, ids: ['reservation:1'] }, options())).docs[0].doc;
+        assert(reservation.sourceTag.startsWith('merge-capture-'));
+        assert.equal('pruneHistory' in retentionMain, false);
+        phase = 'automatic retention after merge replay';
+        const retry = await MemDrive.open({ client: retentionClient, name, at: { fork: 'draft' } }, options());
+        // Each automatic pass is best effort and has a short budget. A later
+        // terminal replay retries unfinished cleanup without changing its result.
+        let removed = false;
+        for (let attempt = 0; attempt < 5 && !removed; attempt++) {
+            assert.equal((await retry.merge({ requestId: 'publish-structured', summary: 'Publish synthetic structured note' }, options())).version, 'v1');
+            try { await client.collection(name).tags.get(reservation.sourceTag, options()); }
+            catch (error) {
+                if ((error.status ?? error.statusCode) !== 404) throw error;
+                removed = true;
+            }
+        }
+        assert(removed, 'Automatic retention did not remove the expired capture within five merge replays.');
         assert.deepEqual(await retentionMain.history({}, options()), history);
         assert.deepEqual(await retentionMain.read({ fileId: file.fileId }, options()), file);
         assert.deepEqual(await checkpoint.read({ fileId: file.fileId }, options()), file);
-        const retry = await MemDrive.open({ client: retentionClient, name, at: { fork: 'draft' } }, options());
         assert.equal((await retry.merge({ requestId: 'publish-structured', summary: 'Publish synthetic structured note' }, options())).version, 'v1');
     } catch (error) {
         collision = error?.code === 'STORE_EXISTS';

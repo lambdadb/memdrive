@@ -13,6 +13,7 @@ function coordinator() {
     let exclusive = false;
     let invalid = false;
     return {
+        soleOperation() { return active === 1 && !exclusive && !invalid; },
         invalidate() { invalid = true; },
         reset() { invalid = false; },
         async run<T>(operation: () => Promise<T>): Promise<T> {
@@ -42,7 +43,7 @@ export function lifecycle({ client, name }: ConnectionOptions) {
 /** Preserve overloaded public methods while tracking their complete promises. */
 export function guardView<T extends object>(view: T, run: (operation: () => Promise<unknown>) => Promise<unknown>): T {
     return Object.freeze(Object.fromEntries(Object.entries(view).map(([key, value]) => [key,
-        typeof value === 'function' && key !== 'delete' && key !== 'configure' && key !== 'pruneHistory'
+        typeof value === 'function' && key !== 'delete' && key !== 'configure'
             ? (...args: unknown[]) => run(() => Reflect.apply(value, view, args)) : value,
     ]))) as T;
 }
