@@ -20,12 +20,15 @@ Use `@functional-systems/memdrive` to create a text file store and save exact or
 ```ts
 import { MemDrive } from '@functional-systems/memdrive';
 
-const main = await MemDrive.create({ client, name: 'workspace' });
+const main = await MemDrive.create({
+    client, name: 'workspace', metadataSchema: { topic: { type: 'string' } },
+});
 const work = await main.fork({ name: 'research' });
 const file = await work.write({
     op: 'create',
     path: '/notes/context.md',
     content: '# Task context\r\n',
+    metadata: { topic: 'planning' },
 });
 
 const reopened = await MemDrive.open({ client, name: 'workspace', at: { fork: 'research' } });
@@ -43,6 +46,55 @@ Search enables native reranking by default. Use `rerank: false` for fused order 
 Use one writer per fork across runtimes and LambdaDB client instances. The SDK serializes writes to a fork within one client instance. It confirms the original and chunks with a consistent branch read before returning success. Batch writes can apply in parts. A file whose chunks require multiple requests becomes visible when its original is written after the earlier chunk requests are confirmed. If the request may have been accepted but the SDK cannot confirm it, the error code is `WRITE_UNCONFIRMED`. Its details identify the attempted files and any earlier confirmed files so the caller can inspect the fork. The handle blocks another create at that path until it observes an existing file there. This protection is local to the client instance. A replacement writer must confirm that the earlier request has settled before using that path.
 
 
+
+## Filter search by metadata
+
+Pass `filter` to either text or external-vector search. The filter limits retrieval candidates before ranking. Text search applies it to chunks in both lexical and vector retrieval. Vector search applies it to file records.
+
+```ts
+const { hits: planningHits } = await reopened.search({
+    query: 'Task context',
+    filter: { field: 'metadata.topic', op: 'eq', value: 'planning' },
+});
+```
+
+Search filters use declared scalar metadata fields with `eq`, `neq`, `in`, and `exists`. Numeric and datetime fields support `gt`, `gte`, `lt`, and `lte`. Combine conditions with nonempty `and` or `or` arrays. Datetimes use the same UTC ISO format with milliseconds as stored metadata. The metadata field must be declared in the store's `metadataSchema`. Use `{ field, op: 'exists', value: false }` to match an omitted field.
+
+## External-vector file stores
+
+Create an external-vector store when your application produces embeddings and keeps the original text in its own storage. The store records the model identity, and the application supplies compatible vectors for writes and searches. External stores support cosine similarity and 64–4096 dimensions. Supply dense arrays of finite numbers with at least one nonzero component at float32 precision.
+
+```ts
+const main = await MemDrive.create({
+    client,
+    name: 'local-notes',
+    embedding: { mode: 'external', dimensions: 768, similarity: 'cosine', identity: 'caller-model-v1' },
+    metadataSchema: { sourceId: { type: 'string' }, workspace: { type: 'string' } },
+});
+const work = await main.fork({ name: 'notes-draft' });
+const file = await work.write({
+    op: 'create',
+    path: '/notes/42',
+    content: noteVector,
+    metadata: { sourceId: '42', workspace: 'private' },
+});
+
+const reopened = await MemDrive.open({
+    client, name: 'local-notes', mode: 'external', at: { fork: 'notes-draft' },
+});
+const { hits } = await reopened.search({
+    query: questionVector,
+    filter: { field: 'metadata.workspace', op: 'eq', value: 'private' },
+    limit: 5,
+});
+// Resolve each hit's sourceId in the application's local store.
+```
+
+Pass `mode: 'external'` when reopening main, a fork, or a checkpoint from an external store. MemDrive checks the requested mode against the stored configuration. `describe()` returns the configured dimensions, similarity, and identity. External stores can carry up to three caller labels.
+
+Each file record stores one supplied vector. The mode has no text index, text payloads, chunks, managed inference, or reranking. Write, read, list, and search return file references with `fileId`, `path`, `modifiedAt`, and optional metadata. Search counts files toward its result limit and returns `reranked: false`. Use paths and metadata that are suitable to store in LambdaDB.
+
+Pass the replacement vector as `content` in `work.write({ op: 'update', fileId, content: replacementVector })`. A path or metadata update preserves the current vector. Vector files share the same fork, checkpoint, diff, merge, and deletion lifecycle as text files. A vector replacement alone counts as a file change.
 
 ## Edit files on a working fork
 
@@ -125,7 +177,7 @@ if (page.cursor) {
 }
 ```
 
-`prefix` matches the beginning of the full path. `nameContains` checks a case-sensitive literal substring of the filename, including its extension. Omit `delimiter` for recursive results. The `'/'` delimiter groups deeper matches into common prefixes. The limit counts files and prefixes together, defaults to 100, and accepts 1–1000. Results carry file IDs, paths, modification times, and any declared metadata. Use `read` to retrieve the exact original. This preview does not expose datastore or file versions or file sizes.
+`prefix` matches the beginning of the full path. `nameContains` checks a case-sensitive literal substring of the filename, including its extension. Omit `delimiter` for recursive results. The `'/'` delimiter groups deeper matches into common prefixes. The limit counts files and prefixes together, defaults to 100, and accepts 1–1000. Results carry file IDs, paths, modification times, and any declared metadata. For text files, use `read` to retrieve the exact original. This preview does not expose datastore or file versions or file sizes.
 
 List results report `consistency: 'eventual'`. The first call scans LambdaDB list pages and can omit recent writes or combine observations taken before and after a concurrent change. When the call succeeds, later pages reuse the collected metadata in path order, including when a cursor is retried. A continuation takes only `cursor` and belongs to the same drive handle. It expires after five minutes or when evicted from the handle's bounded cache. If the cursor is unavailable, start again without it. A continuation does not initiate a new database scan.
 

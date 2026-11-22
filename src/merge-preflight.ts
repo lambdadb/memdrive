@@ -1,6 +1,6 @@
 import { changedFiles, netChange } from './diff.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest } from './errors.js';
-import { decodeFile, fingerprintOf, originalId, resultDocs, validFileId } from './records.js';
+import { decodeStoredFile, fingerprintOf, originalId, resultDocs, validFileId } from './records.js';
 import { createRef } from './refs.js';
 import { fetchOriginals, pathQuery, viewRead, type Handle, type ViewRef } from './storage-reads.js';
 import type { MetadataSchema } from './types.js';
@@ -37,14 +37,14 @@ export function captureMergeSource(handle: Handle, source: BranchRef, tagName: s
     }, signal);
 }
 
-async function loadTargets(handle: Handle, name: string, source: TagRef, schema: MetadataSchema, signal?: AbortSignal) {
+async function loadTargets(handle: Handle, name: string, source: TagRef, schema: MetadataSchema, dimensions: number | undefined, signal?: AbortSignal) {
     const candidates: Candidate[] = [];
     for await (const candidate of changedFiles(handle, name, source, signal)) candidates.push(candidate);
 
     const targets = [];
     for (let start = 0; start < candidates.length; start += originalBatchSize) {
         const batch = candidates.slice(start, start + originalBatchSize);
-        const originals = await fetchOriginals(handle, name, source, batch.map(({ change }) => change.fileId), signal);
+        const originals = await fetchOriginals(handle, name, source, batch.map(({ change }) => change.fileId), signal, dimensions !== undefined);
         for (const candidate of batch) {
             const doc = originals.get(candidate.change.fileId);
             if (!doc || JSON.stringify(netChange(doc)) !== JSON.stringify(candidate))
@@ -52,7 +52,7 @@ async function loadTargets(handle: Handle, name: string, source: TagRef, schema:
             const { revision, generation } = doc;
             if ((revision !== undefined && !validFileId(revision)) || (generation !== undefined && !validFileId(generation)))
                 throw new MemDriveError('INVALID_RESULT', 'The pinned source original has invalid file tracking.');
-            const file = candidate.change.op === 'delete' ? undefined : decodeFile(doc, schema);
+            const file = candidate.change.op === 'delete' ? undefined : decodeStoredFile(doc, schema, dimensions);
             if (file && candidate.fingerprint !== undefined && await fingerprintOf(file) !== candidate.fingerprint)
                 throw new MemDriveError('INVALID_RESULT', 'The pinned source original disagrees with its fingerprint.');
             targets.push({ ...candidate, file, revision, generation });
@@ -67,12 +67,12 @@ async function loadTargets(handle: Handle, name: string, source: TagRef, schema:
  * confirmed source returned by the durable capture journal.
  */
 export async function prepareMerge(handle: Handle, name: string, capture: MergeSource, publishedMain: PublishedMain,
-    schema: MetadataSchema, signal?: AbortSignal) {
+    schema: MetadataSchema, signal?: AbortSignal, dimensions?: number) {
     if (capture[confirmedCapture] !== name || handle.collectionName !== name || publishedMain.kind !== 'tag' && publishedMain.name !== initialMainRef.name)
         throw new MemDriveError('INVALID_INPUT', 'Preparing a merge requires a confirmed source capture and the published main version.');
     const source: TagRef = { kind: 'tag', name: capture.name };
     const main: PublishedMain = { ...publishedMain };
-    const targets = await loadTargets(handle, name, source, schema, signal);
+    const targets = await loadTargets(handle, name, source, schema, dimensions, signal);
     const destinationClaims = new Map<string, string>();
     const byId = new Map(targets.map(target => [target.change.fileId, target]));
     for (const { file } of targets) {
@@ -86,10 +86,10 @@ export async function prepareMerge(handle: Handle, name: string, capture: MergeS
     const fileConflicts: string[] = [];
     for (let start = 0; start < targets.length; start += originalBatchSize) {
         const batch = targets.slice(start, start + originalBatchSize);
-        const originals = await fetchOriginals(handle, name, main, batch.map(({ change }) => change.fileId), signal);
+        const originals = await fetchOriginals(handle, name, main, batch.map(({ change }) => change.fileId), signal, dimensions !== undefined);
         for (const { baseline, change: { fileId } } of batch) {
             const doc = originals.get(fileId);
-            const file = doc ? decodeFile(doc, schema) : undefined;
+            const file = doc ? decodeStoredFile(doc, schema, dimensions) : undefined;
             if (file) {
                 if (mainPaths.has(file.path))
                     throw new MemDriveError('INVALID_RESULT', 'Published main returned multiple files for one path.');
@@ -141,5 +141,5 @@ export async function prepareMerge(handle: Handle, name: string, capture: MergeS
     if (fileConflicts.length || pathConflicts.length)
         throw new MemDriveError('MERGE_CONFLICT', 'Published main changed a targeted file or occupies a requested destination.',
             { details: { fileIds: fileConflicts, paths: pathConflicts } });
-    return { source, publishedMain: main, targets };
+    return { source, publishedMain: main, targets, dimensions };
 }

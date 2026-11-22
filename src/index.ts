@@ -1,12 +1,12 @@
-import type { CheckpointFileDrive, CheckpointSelection, ConnectionOptions, CreateFileStoreOptions, ForkSelection, DriveFile, FileDrive, FileSearchHit,
-    FileStoreDescription, MainFileDrive, MergeRequest, OpenFileStoreOptions, ReadFileRequest, RequestOptions, SearchFilesRequest,
+import type { CheckpointFileDrive, CheckpointSelection, ConnectionOptions, CreateExternalFileStoreOptions, CreateFileStoreOptions, EmbeddingMode, ForkSelection, FileDrive, FileListEntry, FileSearchHit,
+    FileStoreDescription, MainFileDrive, MergeRequest, OpenFileStoreOptions, ReadFileRequest, RequestOptions, SearchExternalFilesRequest, SearchFilesRequest,
     WorkingFileDrive } from './types.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
 import { keysOnly, parseStore, storeConfiguration } from './config.js';
-import { decodeFile, resultDocs, validFileId, validPath } from './records.js';
+import { decodeFile, decodeFileEntry, resultDocs, validFileId, validPath } from './records.js';
 import { branchRef, fetchOriginals, pathQuery, pinRef, readRef, viewRead, type Handle, type RefSource } from './storage-reads.js';
 import { workingWriter, writeBatchLimit } from './writes.js';
-import { searchQuery, validateReranking } from './search.js';
+import { searchQuery, validateReranking, vectorSearchQuery } from './search.js';
 import { fileLister } from './list.js';
 import { createRef } from './refs.js';
 import { publicationIdentity, validateMergeRequest } from './publication-log.js';
@@ -41,20 +41,22 @@ async function remote<T>(operation: () => Promise<T>, message: string, signal?: 
 }
 
 type Store = ReturnType<typeof store>;
-function store(client: Client, handle: Handle, description: FileStoreDescription, identity: Awaited<ReturnType<typeof publicationIdentity>>) {
-    const { name, metadataSchema } = description;
-    const forks = new Map<string, WorkingFileDrive>();
-    const checkpoints = new Map<string, CheckpointFileDrive>();
+function store(client: Client, handle: Handle, description: FileStoreDescription<EmbeddingMode>, identity: Awaited<ReturnType<typeof publicationIdentity>>) {
+    const { name, metadataSchema, embedding } = description;
+    const dimensions = embedding.mode === 'external' ? embedding.dimensions : undefined;
+    const decodeRead = dimensions === undefined ? decodeFile : decodeFileEntry;
+    const forks = new Map<string, WorkingFileDrive<EmbeddingMode>>();
+    const checkpoints = new Map<string, CheckpointFileDrive<EmbeddingMode>>();
     const pendingRefs = new Set<string>();
     const writers = new Map<string, ReturnType<typeof workingWriter>>();
     function writerFor(branch: string) {
         const existing = writers.get(branch);
         if (existing) return existing;
-        const writer = workingWriter(handle, name, branch, metadataSchema);
+        const writer = workingWriter(handle, name, branch, metadataSchema, dimensions);
         writers.set(branch, writer);
         return writer;
     }
-    const publishing = publication(client, handle, identity, metadataSchema, writerFor);
+    const publishing = publication(client, handle, identity, metadataSchema, writerFor, dimensions);
 
     async function describe(options?: RequestOptions) {
         const { signal } = operationOptions(options);
@@ -63,8 +65,8 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
     }
 
     function reader(source: RefSource) {
-        function read(request: ReadFileRequest, options?: RequestOptions): Promise<DriveFile | null>;
-        function read(request: { paths: string[] }, options?: RequestOptions): Promise<DriveFile[]>;
+        function read(request: ReadFileRequest, options?: RequestOptions): Promise<FileListEntry | null>;
+        function read(request: { paths: string[] }, options?: RequestOptions): Promise<FileListEntry[]>;
         async function read(request: ReadFileRequest | { paths: string[] }, options?: RequestOptions) {
             const { signal } = operationOptions(options);
             checkAbort(signal);
@@ -75,7 +77,7 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
                 requireInput(validFileId(fileId), 'Provide a fileId returned by MemDrive.');
                 return readRef(source, async ref => {
                     const doc = (await fetchOriginals(handle, name, ref, [fileId], signal)).get(fileId);
-                    return doc?.kind === 'file' ? decodeFile(doc, metadataSchema) : null;
+                    return doc?.kind === 'file' ? decodeRead(doc, metadataSchema) : null;
                 }, signal);
             }
             const multi = 'paths' in request;
@@ -87,9 +89,9 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
                 const response = await remote(() => handle.query({ size: paths.length * 2, ...viewRead(ref), query: pathQuery(paths) },
                     nativeOptions(signal)), 'Could not read files by path.', signal);
                 checkAbort(signal);
-                const expected = new Set(paths), files = new Map<string, DriveFile>();
+                const expected = new Set(paths), files = new Map<string, FileListEntry>();
                 for (const doc of resultDocs(response, name, paths.length)) {
-                    const file = decodeFile(doc, metadataSchema);
+                    const file = decodeRead(doc, metadataSchema);
                     if (!expected.has(file.path) || files.has(file.path))
                         throw new MemDriveError('INVALID_RESULT', 'Read returned unexpected or duplicate paths.');
                     files.set(file.path, file);
@@ -101,9 +103,28 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
     }
 
     function searcher(source: RefSource) {
-        return async (request: SearchFilesRequest, options?: RequestOptions) => {
+        return async (request: SearchFilesRequest | SearchExternalFilesRequest, options?: RequestOptions) => {
             const { signal } = operationOptions(options);
             checkAbort(signal);
+            if (dimensions !== undefined) {
+                const body = vectorSearchQuery(request, metadataSchema, dimensions);
+                return readRef(source, async ref => {
+                    const response = await remote(() => handle.query({ ...body, ...viewRead(ref),
+                        fields: { include: ['id', 'kind', 'fileId', 'path', 'modifiedAt', 'metadata'] } },
+                    nativeOptions(signal)), 'File search failed.', signal);
+                    checkAbort(signal);
+                    const docs = resultDocs(response, name, body.size!);
+                    const seen = new Set<string>();
+                    const hits = docs.map(doc => {
+                        const file = decodeFileEntry(doc, metadataSchema);
+                        if (seen.has(file.fileId))
+                            throw new MemDriveError('INVALID_RESULT', 'Search returned a duplicate file.');
+                        seen.add(file.fileId);
+                        return file;
+                    });
+                    return { hits, reranked: false as const };
+                }, signal);
+            }
             const body = searchQuery(request, metadataSchema);
             return readRef(source, async ref => {
                 const response = await remote(() => handle.query({ ...body, ...viewRead(ref),
@@ -180,13 +201,13 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         };
     }
 
-    function working(fork: string): WorkingFileDrive {
+    function working(fork: string): WorkingFileDrive<EmbeddingMode> {
         const existing = forks.get(fork);
         if (existing) return existing;
         const branch = forkPrefix + fork;
         const writer = writerFor(branch);
         const { enqueueRef, write, diff } = writer;
-        const drive: WorkingFileDrive = Object.freeze({
+        const drive: WorkingFileDrive<EmbeddingMode> = Object.freeze({
             ...view(branchRef(branch), enqueueRef), at: Object.freeze({ kind: 'fork' as const, name: fork }), write, diff,
             merge(request: MergeRequest, options?: RequestOptions) {
                 const { signal } = operationOptions(options);
@@ -200,10 +221,10 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         return drive;
     }
 
-    function pinned(checkpoint: string): CheckpointFileDrive {
+    function pinned(checkpoint: string): CheckpointFileDrive<EmbeddingMode> {
         const existing = checkpoints.get(checkpoint);
         if (existing) return existing;
-        const drive: CheckpointFileDrive = Object.freeze({
+        const drive: CheckpointFileDrive<EmbeddingMode> = Object.freeze({
             ...view({ kind: 'tag', name: checkpointPrefix + checkpoint }),
             at: Object.freeze({ kind: 'checkpoint' as const, name: checkpoint }),
         });
@@ -211,12 +232,13 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         return drive;
     }
 
-    const mainView: MainFileDrive = Object.freeze({
+    const mainView: MainFileDrive<EmbeddingMode> = Object.freeze({
         ...view(publishing.main), at: Object.freeze({ kind: 'main' as const }),
     });
 
     return {
         main: mainView,
+        mode: embedding.mode,
         recover: publishing.recover,
         initialize: publishing.initialize,
         async openFork(fork: string, signal?: AbortSignal) {
@@ -254,10 +276,13 @@ function storesFor(client: Client) {
     return stores;
 }
 
-export async function create(options: CreateFileStoreOptions, requestOptions?: RequestOptions): Promise<MainFileDrive> {
+export function create(options: CreateFileStoreOptions, requestOptions?: RequestOptions): Promise<MainFileDrive>;
+export function create(options: CreateExternalFileStoreOptions, requestOptions?: RequestOptions): Promise<MainFileDrive<'external'>>;
+export function create(options: CreateFileStoreOptions | CreateExternalFileStoreOptions, requestOptions?: RequestOptions): Promise<MainFileDrive<EmbeddingMode>>;
+export async function create(options: CreateFileStoreOptions | CreateExternalFileStoreOptions, requestOptions?: RequestOptions) {
     const { signal } = operationOptions(requestOptions);
     checkAbort(signal);
-    validateConnection(options, ['client', 'name', 'labels', 'textSearch', 'metadataSchema']);
+    validateConnection(options, ['client', 'name', 'labels', 'textSearch', 'metadataSchema', 'embedding']);
     const { client, name } = options;
     requireInput(typeof client.createCollection === 'function', 'Client must support collection creation.');
     const { indexConfigs, tags, description } = storeConfiguration(options);
@@ -273,15 +298,25 @@ export async function create(options: CreateFileStoreOptions, requestOptions?: R
     return created.main;
 }
 
-export function open(options: ConnectionOptions & { at?: undefined; recover?: boolean | undefined }, requestOptions?: RequestOptions): Promise<MainFileDrive>;
-export function open(options: ConnectionOptions & { at: ForkSelection }, requestOptions?: RequestOptions): Promise<WorkingFileDrive>;
-export function open(options: ConnectionOptions & { at: CheckpointSelection }, requestOptions?: RequestOptions): Promise<CheckpointFileDrive>;
+type AtMain = { at?: undefined; recover?: boolean | undefined };
+type AtFork = { at: ForkSelection; recover?: never };
+type AtCheckpoint = { at: CheckpointSelection; recover?: never };
+
+export function open(options: OpenFileStoreOptions & AtMain, requestOptions?: RequestOptions): Promise<MainFileDrive>;
+export function open(options: OpenFileStoreOptions & AtFork, requestOptions?: RequestOptions): Promise<WorkingFileDrive>;
+export function open(options: OpenFileStoreOptions & AtCheckpoint, requestOptions?: RequestOptions): Promise<CheckpointFileDrive>;
+export function open(options: OpenFileStoreOptions<'external'> & AtMain, requestOptions?: RequestOptions): Promise<MainFileDrive<'external'>>;
+export function open(options: OpenFileStoreOptions<'external'> & AtFork, requestOptions?: RequestOptions): Promise<WorkingFileDrive<'external'>>;
+export function open(options: OpenFileStoreOptions<'external'> & AtCheckpoint, requestOptions?: RequestOptions): Promise<CheckpointFileDrive<'external'>>;
 export function open(options: OpenFileStoreOptions, requestOptions?: RequestOptions): Promise<FileDrive>;
-export async function open(options: OpenFileStoreOptions, requestOptions?: RequestOptions): Promise<FileDrive> {
+export function open(options: OpenFileStoreOptions<'external'>, requestOptions?: RequestOptions): Promise<FileDrive<'external'>>;
+export function open(options: OpenFileStoreOptions<EmbeddingMode>, requestOptions?: RequestOptions): Promise<FileDrive<EmbeddingMode>>;
+export async function open(options: OpenFileStoreOptions<EmbeddingMode>, requestOptions?: RequestOptions) {
     const { signal } = operationOptions(requestOptions);
     checkAbort(signal);
-    validateConnection(options, ['client', 'name', 'at', 'recover']);
-    const { client, name, at, recover } = options;
+    validateConnection(options, ['client', 'name', 'at', 'recover', 'mode']);
+    const { client, name, at, recover, mode = 'managed' } = options;
+    requireInput(mode === 'managed' || mode === 'external', 'Select managed or external embedding mode.');
     requireInput(recover === undefined || at === undefined && typeof recover === 'boolean',
         'Recovery can be requested when opening main.');
     let fork: string | undefined;
@@ -309,6 +344,8 @@ export async function open(options: OpenFileStoreOptions, requestOptions?: Reque
         selected = stores.get(name) ?? store(client, handle, description, identity);
         stores.set(name, selected);
     }
+    if (mode !== selected.mode)
+        throw new MemDriveError('INCOMPATIBLE_STORE', `The file store uses ${selected.mode} embedding mode.`);
     if (fork !== undefined) return selected.openFork(fork, signal);
     if (checkpoint !== undefined) return selected.openCheckpoint(checkpoint, signal);
     if (recover) await selected.recover(signal);

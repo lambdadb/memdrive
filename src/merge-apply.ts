@@ -1,7 +1,7 @@
 import { managedEmbedding } from './config.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, requireInput } from './errors.js';
 import type { prepareMerge } from './merge-preflight.js';
-import { bytes, contentHash, decodeFile, fileOriginal, fileRecords, fingerprintOf, originalId, resultDocs, validFileId } from './records.js';
+import { bytes, contentHash, decodeStoredFile, fileOriginal, fileRecords, fingerprintOf, originalId, resultDocs, validFileId } from './records.js';
 import { branchRef, fetchOriginals, pathQuery, viewRead, type Handle, type ViewRef } from './storage-reads.js';
 import type { MetadataSchema } from './types.js';
 import { listChunkIds, writeBatches, type workingWriter } from './writes.js';
@@ -46,8 +46,13 @@ async function publishedRecords(handle: Handle, name: string, prepared: Prepared
     version: string, revision: string, signal?: AbortSignal) {
     const { file } = target;
     if (!file) return { docs: [], chunkIds: [] };
-    const tracking = { revision, generation: revision, fingerprint: '', version };
+    const tracking = { revision, ...('content' in file ? { generation: revision } : {}), fingerprint: '', version };
     const { changed: _changed, baseline: _baseline, fingerprint: _fingerprint, ...original } = fileOriginal(file, tracking);
+    if ('embedding' in file) {
+        const wireBytes = bytes(original) + 1;
+        requireInput(wireBytes - 1 <= 5 * 1024 * 1024, 'A merge record exceeds the native 5 MiB document limit.');
+        return { docs: [{ doc: original, inputBytes: 0, wireBytes }], chunkIds: [] };
+    }
     const { fileId, path, fileName, ancestorPaths, modifiedAt, metadata } = original;
     const prior = target.baseline
         ? (await fetchOriginals(handle, name, prepared.publishedMain, [fileId], signal)).get(fileId)
@@ -118,6 +123,11 @@ export async function applyMerge(handle: Handle, name: string, prepared: Prepare
 function matchesFields(doc: NativeDoc, expected: NativeDoc) {
     return Object.entries(expected).every(([key, value]) => {
         const actual = doc[key];
+        if (key === 'embedding' && expected.kind === 'file') {
+            // Native JSON can represent a float32 using fewer decimal digits.
+            return Array.isArray(actual) && Array.isArray(value) && actual.length === value.length
+                && actual.every((component, index) => typeof component === 'number' && Math.fround(component) === value[index]);
+        }
         if ((key === 'metadata' || key === 'baseline') && actual && value && typeof actual === 'object' && typeof value === 'object')
             return JSON.stringify(Object.entries(actual).sort()) === JSON.stringify(Object.entries(value).sort());
         return JSON.stringify(actual) === JSON.stringify(value);
@@ -129,7 +139,9 @@ function requireRecords(found: NativeDoc[], expected: NativeDoc[]) {
     for (const doc of found) {
         const record = byId.get(doc.id);
         if (!record || !matchesFields(doc, record) || doc.changed !== undefined || doc.baseline !== undefined
-            || doc.fingerprint !== undefined || (record.metadata === undefined && doc.metadata !== undefined))
+            || doc.fingerprint !== undefined || (record.embedding !== undefined && record.kind === 'file'
+                && (doc.body !== undefined || doc.content !== undefined))
+            || (record.metadata === undefined && doc.metadata !== undefined))
             throw new MemDriveError('INVALID_RESULT', 'The published candidate contains an unexpected file or chunk.');
         byId.delete(doc.id);
     }
@@ -189,7 +201,8 @@ export async function advanceMergeSource(handle: Handle, name: string, prepared:
         for (const target of prepared.targets) {
             const { fileId } = target.change;
             const id = originalId(fileId);
-            const readCurrent = async () => (await fetchOriginals(handle, name, branchRef(branch), [fileId], signal)).get(fileId);
+            const readCurrent = async () => (await fetchOriginals(handle, name, branchRef(branch), [fileId], signal,
+                prepared.dimensions !== undefined)).get(fileId);
             const current = await readCurrent();
             async function confirm(expected?: NativeDoc) {
                 try {
@@ -215,7 +228,7 @@ export async function advanceMergeSource(handle: Handle, name: string, prepared:
                 throw new MemDriveError('INVALID_RESULT', 'The working original has invalid revision data.');
             let next;
             if (current?.kind === 'file') {
-                const file = decodeFile(current, schema);
+                const file = decodeStoredFile(current, schema, prepared.dimensions);
                 const generation = current.generation;
                 if (generation !== undefined && !validFileId(generation))
                     throw new MemDriveError('INVALID_RESULT', 'The working original has invalid generation data.');

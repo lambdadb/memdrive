@@ -78,6 +78,11 @@ export function fileClient() {
                         };
                         return native;
                     }
+                    if (request.query.knn) {
+                        const candidates = source.filter(doc => doc.kind === 'file');
+                        const docs = fixture.rank?.(candidates, request) ?? candidates;
+                        return response(docs.slice(0, request.size), request.fields);
+                    }
                     const direct = request.query.queryString;
                     if (direct?.defaultField === 'id' && direct.skipSyntax)
                         return response(source.filter(doc => doc.id === direct.query).slice(0, request.size), request.fields);

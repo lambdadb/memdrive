@@ -180,6 +180,32 @@ test('ranked hybrid search verifies UTF-16 ranges and omits orphan chunks', asyn
     assert.equal(lookup.consistentRead, true);
     assert.equal(lookup.ref.name, 'fork-research');
 
+    const filter = { and: [
+        { field: 'metadata.topic', op: 'eq', value: 'fixture' },
+        { field: 'metadata.topic', op: 'exists', value: true },
+    ] };
+    await fork.search({ query: 'notes', filter });
+    const filtered = fixture.calls.findLast(call => call.kind === 'query' && call.request.query.bayesian).request;
+    const [knn, lexical] = filtered.query.bayesian;
+    assert.deepEqual(knn.knn.filter, { bool: [
+        { queryString: { query: '"chunk"', defaultField: 'kind' }, occur: 'filter' },
+        { bool: [
+            { queryString: { query: '"fixture"', defaultField: 'metadata.topic' }, occur: 'filter' },
+            { queryString: { query: '[* TO *]', defaultField: 'metadata.topic' }, occur: 'filter' },
+        ], occur: 'filter' },
+    ] });
+    assert.deepEqual(lexical.bool, [
+        ...knn.knn.filter.bool,
+        { queryString: { query: 'notes', defaultField: 'content', skipSyntax: true }, occur: 'must' },
+    ]);
+    assert.equal(filtered.rerank.candidateSize, lookup.rerank.candidateSize);
+    const calls = fixture.calls.length;
+    for (const invalid of [null, { field: 'metadata.notDeclared', op: 'exists', value: false },
+        { field: 'metadata.topic', op: 'eq', value: null }]) {
+        await assert.rejects(fork.search({ query: 'notes', filter: invalid }), { code: 'INVALID_INPUT' });
+    }
+    assert.equal(fixture.calls.length, calls);
+
     const branch = fixture.collections.get('workspace').branches.get('fork-research');
     const firstChunk = [...branch.docs.values()].find(doc => doc.kind === 'chunk' && doc.start === 0);
     firstChunk.end++;

@@ -14,10 +14,10 @@ export const readRef = <T>(source: RefSource, operation: (ref: ViewRef) => Promi
     'read' in source ? source.read(operation, signal) : operation(source);
 export const branchRef = (name: string) => ({ kind: 'branch' as const, name });
 
-export function viewRead(ref: ViewRef) {
+export function viewRead(ref: ViewRef, includeVectors = false) {
     return ref.kind === 'branch'
-        ? { ref, consistentRead: true as const, includeVectors: false }
-        : { ref, consistentRead: false as const, includeVectors: false };
+        ? { ref, consistentRead: true as const, includeVectors }
+        : { ref, consistentRead: false as const, includeVectors };
 }
 export const branchRead = (branch: string) => viewRead(branchRef(branch));
 
@@ -38,11 +38,11 @@ export const afterId = (id: string | undefined) => id === undefined ? [] : [
     { queryString: { query: `{${id} TO *}`, defaultField: 'id' }, occur: 'filter' },
 ];
 
-export async function fetchOriginals(handle: Handle, name: string, ref: ViewRef, fileIds: string[], signal?: AbortSignal) {
+export async function fetchOriginals(handle: Handle, name: string, ref: ViewRef, fileIds: string[], signal?: AbortSignal, includeVectors = false) {
     if (!fileIds.length) return new Map<string, Record<string, unknown>>();
     let response;
     try {
-        response = await nativeRequest(() => handle.docs.fetch({ ids: fileIds.map(originalId), ...viewRead(ref) }, nativeOptions(signal)), signal);
+        response = await nativeRequest(() => handle.docs.fetch({ ids: fileIds.map(originalId), ...viewRead(ref, includeVectors) }, nativeOptions(signal)), signal);
     } catch (cause) {
         throw databaseError(cause, 'Could not read file originals.');
     }

@@ -1,8 +1,8 @@
 import type { LambdaDBClient } from '@functional-systems/lambdadb';
-import { create, open, type DriveFile, type CheckpointFileDrive, type FileChange, type DeleteFileResult, type SearchFilesResult, type ListFilesResult, type FileDrive, type MergeResult, type OpenFileStoreOptions } from '@functional-systems/memdrive';
+import { create, open, type DriveFile, type CheckpointFileDrive, type FileChange, type FileFilter, type DeleteFileResult, type SearchFilesResult, type ListFilesResult, type FileDrive, type MergeResult, type OpenFileStoreOptions } from '@functional-systems/memdrive';
 
 export async function fileConsumer(client: LambdaDBClient, options: OpenFileStoreOptions) {
-    const main = await create({ client, name: 'workspace' });
+    const main = await create({ client, name: 'workspace', metadataSchema: { topic: { type: 'string' } } });
     const fork = await main.fork({ name: 'research' });
     const created: DriveFile = await fork.write({ op: 'create', path: '/notes/context.md', content: '' });
     const reopened = await open({ client, name: 'workspace', at: { fork: 'research' } });
@@ -21,7 +21,7 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     await reopened.list({ cursor: 'opaque', prefix: '/other/' });
     // @ts-expect-error Listing returns file metadata without original content.
     listed.files[0]?.content;
-    const ranked: SearchFilesResult = await reopened.search({ query: 'Task context', rerank: { onFailure: 'returnOriginal' } });
+    const ranked: SearchFilesResult = await reopened.search({ query: 'Task context', filter: topicFilter, rerank: { onFailure: 'returnOriginal' } });
     ranked.hits[0]?.range?.start;
     const changes: FileChange[] = await reopened.diff({ signal: new AbortController().signal });
     for (const change of changes) if (change.op === 'update' || change.op === 'delete') change.previousPath;
@@ -55,4 +55,47 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     // @ts-expect-error Path and ID selectors are mutually exclusive.
     await selected.read({ fileId: created.fileId, path: created.path });
     return file;
+}
+
+const topicFilter: FileFilter = { field: 'metadata.topic', op: 'eq', value: 'local' };
+
+export async function externalFileConsumer(client: LambdaDBClient) {
+    const embedding = { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'caller-model' } as const;
+    const main = await create({ client, name: 'workspace', embedding, metadataSchema: { topic: { type: 'string' } } });
+    const work = await main.fork({ name: 'semantic' });
+    const vector: readonly number[] = Array(64).fill(0.25);
+    const [file] = await work.write([{ op: 'create', path: '/note', content: vector }]);
+    const reopened = await open({ client, name: 'workspace', mode: 'external', at: { fork: 'semantic' } });
+    const reference = await reopened.read({ fileId: file!.fileId });
+    await reopened.write({ op: 'update', fileId: file!.fileId, content: vector, newPath: '/updated' });
+    await reopened.merge({ requestId: 'publish-1', summary: 'Save the vector files' });
+    const hits = await main.search({ query: vector, filter: topicFilter });
+    const results: false = hits.reranked;
+    const saved = await reopened.checkpoint({ name: 'saved' });
+    const pinned = await open({ client, name: 'workspace', mode: 'external', at: { checkpoint: 'saved' } });
+    await saved.search({ query: vector });
+    await pinned.search({ query: vector });
+    const modelIdentity: string = (await main.describe()).embedding.identity;
+
+    // @ts-expect-error External reads omit text.
+    reference?.content;
+    // @ts-expect-error External search hits omit stored vectors.
+    hits.hits[0]?.embedding;
+    // @ts-expect-error External file creates require a caller-provided embedding.
+    await work.write({ op: 'create', path: '/text', content: 'text' });
+    // @ts-expect-error External search accepts vectors only.
+    await main.search({ query: 'text' });
+    // @ts-expect-error External writes accept vectors through content.
+    await work.write({ op: 'create', path: '/old-shape', embedding: vector });
+    // @ts-expect-error External updates accept vectors through content.
+    await work.write({ op: 'update', fileId: file!.fileId, embedding: vector });
+    // @ts-expect-error External searches accept vectors through query.
+    await main.search({ queryVector: vector });
+    // @ts-expect-error External search cannot request a text reranker.
+    await main.search({ query: vector, rerank: true });
+    // @ts-expect-error Checkpoints do not mutate content.
+    await pinned.write({ op: 'delete', fileId: file!.fileId });
+    // @ts-expect-error External stores do not configure text indexes.
+    await create({ client, name: 'workspace', embedding, textSearch: { analyzers: ['standard'] } });
+    return { results, modelIdentity, reference };
 }
