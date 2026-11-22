@@ -22,6 +22,7 @@ const fileIndexes = {
 } as const;
 const indexTypes = { string: 'keyword', number: 'double', boolean: 'boolean', datetime: 'datetime' } as const;
 const supportedAnalyzers: ReadonlySet<unknown> = new Set(Object.values(Analyzer));
+export const validRetention = (days: unknown): days is number => typeof days === 'number' && Number.isInteger(days) && days >= 1 && days <= 31;
 
 export const validDate = (value: unknown): value is string => typeof value === 'string'
     && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
@@ -91,6 +92,7 @@ export function metadataValues(value: unknown, schema: MetadataSchema): Metadata
 
 export function storeConfiguration(options: CreateFileStoreOptions | CreateExternalFileStoreOptions) {
     const { name } = options;
+    requireInput(options.retentionInDays === undefined || validRetention(options.retentionInDays), 'retentionInDays must be 1–31.');
     const metadataSchema = schemaEntries(options.metadataSchema);
     const external = options.embedding?.mode === 'external';
     const labels = labelEntries(options.labels, external ? 3 : 4);
@@ -117,6 +119,7 @@ export function storeConfiguration(options: CreateFileStoreOptions | CreateExter
     }
     if (Object.keys(metadataSchema).length) indexConfigs.metadata = { type: 'object', objectIndexConfigs:
         Object.fromEntries(Object.entries(metadataSchema).map(([key, value]) => [key, { ...value, type: indexTypes[value.type] }])) };
+    if (options.retentionInDays !== undefined) description.retentionInDays = options.retentionInDays;
     return { indexConfigs, tags, description };
 }
 
@@ -126,6 +129,8 @@ export function parseStore(collection: unknown, name: string): FileStoreDescript
             && isObject(collection.tags) && collection.tags[formatTag] === format && isObject(collection.indexConfigs),
         'Collection format or main branch is incompatible.');
         const { tags, indexConfigs } = collection;
+        requireInput(collection.snapshotRetentionInDays === undefined || validRetention(collection.snapshotRetentionInDays), 'Invalid native snapshot retention.');
+        const retention = collection.snapshotRetentionInDays === undefined ? {} : { retentionInDays: collection.snapshotRetentionInDays as number };
         const external = Object.hasOwn(tags, embeddingTag);
         const labels = labelEntries(Object.fromEntries(Object.entries(tags).filter(([key]) => key !== formatTag && key !== embeddingTag)),
             external ? 3 : 4);
@@ -146,7 +151,7 @@ export function parseStore(collection: unknown, name: string): FileStoreDescript
             requireInput(isObject(embedding) && embedding.type === 'vector' && embedding.managedEmbedding !== true
                 && embedding.embedding === undefined && content === undefined && body === undefined,
             'External file embedding index is incompatible.');
-            return { name, labels, metadataSchema, embedding: externalEmbedding({ mode: 'external',
+            return { name, labels, metadataSchema, ...retention, embedding: externalEmbedding({ mode: 'external',
                 dimensions: embedding.dimensions, similarity: embedding.similarity, identity: tags[embeddingTag] }) };
         }
         requireInput(isObject(embedding) && embedding.type === 'vector' && embedding.managedEmbedding !== false && isObject(embedding.embedding)
@@ -157,7 +162,7 @@ export function parseStore(collection: unknown, name: string): FileStoreDescript
         const analyzers = textAnalyzers({ analyzers: content.analyzers ?? ['standard'] });
         requireInput(JSON.stringify(analyzers) === JSON.stringify(textAnalyzers({ analyzers: body.analyzers ?? ['standard'] })),
             'Original and chunk analyzers must match.');
-        return { name, labels, metadataSchema, textSearch: { analyzers }, embedding: { ...managedEmbedding } };
+        return { name, labels, metadataSchema, ...retention, textSearch: { analyzers }, embedding: { ...managedEmbedding } };
     } catch (cause) {
         throw new MemDriveError('INCOMPATIBLE_STORE', 'The collection is not a compatible MemDrive file store.', { cause });
     }

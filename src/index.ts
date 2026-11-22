@@ -2,7 +2,7 @@ import type { CheckpointFileDrive, CheckpointSelection, ConnectionOptions, Creat
     FileHistoryRequest, FileStoreDescription, MainFileDrive, MergeRequest, OpenFileStoreOptions, ReadFileRequest, RequestOptions, SearchExternalFilesRequest, SearchFilesRequest,
     WorkingFileDrive } from './types.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
-import { formatTag, keysOnly, parseStore, storeConfiguration } from './config.js';
+import { formatTag, keysOnly, parseStore, storeConfiguration, validRetention } from './config.js';
 import { decodeFile, decodeFileEntry, resultDocs, validFileId, validPath } from './records.js';
 import { branchRef, fetchOriginals, pathQuery, pinRef, readRef, viewRead, type Handle, type RefSource } from './storage-reads.js';
 import { workingWriter, writeBatchLimit } from './writes.js';
@@ -51,6 +51,7 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
     const { name, metadataSchema, embedding } = description;
     const gate = lifecycle({ client, name });
     let invalid = false;
+    let pendingRetention: number | undefined;
     const refStates = new Map<string, { deleted: boolean; uncertain: boolean }>();
     function assertLive() {
         if (invalid) throw new MemDriveError('STORE_DELETED', 'This store handle has been invalidated by destruction.');
@@ -83,6 +84,7 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
     const publishing = publication(client, handle, identity, metadataSchema, writerFor, dimensions);
 
     async function assertDeleteSafe(signal?: AbortSignal, retry?: { uncertain: boolean }) {
+        if (pendingRetention !== undefined) throw new MemDriveError('CONFIGURATION_UNCONFIRMED', 'Settle the pending retention configuration before deleting resources.');
         if (pendingRefs.size) throw new MemDriveError('REF_CREATION_UNCONFIRMED', 'Resolve unconfirmed reference creation before deleting.');
         if ([...refStates.values()].some(state => state !== retry && state.uncertain))
             throw new MemDriveError('REF_DELETION_UNCONFIRMED', 'Settle unconfirmed reference deletion before deleting other resources.');
@@ -350,7 +352,48 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         return drive;
     }
 
-    const mainView: MainFileDrive<EmbeddingMode> = guarded(view(publishing.main, { kind: 'main' }));
+    const mainView: MainFileDrive<EmbeddingMode> = guarded({ ...view(publishing.main, { kind: 'main' }),
+        async configure(request: { retentionInDays: number }, options?: RequestOptions) {
+            const { signal } = operationOptions(options);
+            checkAbort(signal);
+            requireInput(keysOnly(request, ['retentionInDays']) && validRetention(request.retentionInDays), 'Configure requires retentionInDays from 1–31.');
+            const days = request.retentionInDays;
+            return gate.exclusive(async () => {
+                assertLive();
+                if (pendingRetention !== undefined && pendingRetention !== days)
+                    throw new MemDriveError('CONFIGURATION_UNCONFIRMED', 'Fence outstanding requests and retry the same retention value first.');
+                const inspect = async () => {
+                    const response = await remote(() => handle.get(nativeOptions(signal)), 'Could not inspect retention configuration.', signal);
+                    const found = parseStore(response.collection, name);
+                    if ((await publicationIdentity(name, response.collection)).driveId !== identity.driveId) {
+                        invalid = true;
+                        throw new MemDriveError('STORE_REPLACED', 'This handle belongs to a previous store generation.');
+                    }
+                    return found;
+                };
+                let found = await inspect();
+                if (found.retentionInDays !== days) {
+                    pendingRetention = days;
+                    try {
+                        await nativeRequest(() => handle.update({ snapshotRetentionInDays: days }, mutationOptions(signal)), signal);
+                    } catch (cause) {
+                        const error = databaseError(cause, 'Could not configure snapshot retention.');
+                        if ([400, 401, 403, 404, 409, 422, 429].includes(error.status ?? 0)) { pendingRetention = undefined; throw error; }
+                        throw new MemDriveError('CONFIGURATION_UNCONFIRMED', 'Retention configuration may have succeeded. Fence outstanding requests before retrying the same value.', { cause });
+                    }
+                    try {
+                        found = await inspect();
+                        if (found.retentionInDays !== days) throw new MemDriveError('INVALID_RESULT', 'The configured retention was not observed.');
+                    } catch (cause) {
+                        throw new MemDriveError('CONFIGURATION_UNCONFIRMED', 'Could not confirm retention configuration. Fence outstanding requests before retrying the same value.', { cause });
+                    }
+                }
+                pendingRetention = undefined;
+                description.retentionInDays = days;
+                return structuredClone(description);
+            });
+        },
+    });
 
     return {
         main: mainView,
@@ -402,15 +445,17 @@ export function create(options: CreateFileStoreOptions | CreateExternalFileStore
 export async function create(options: CreateFileStoreOptions | CreateExternalFileStoreOptions, requestOptions?: RequestOptions) {
     const { signal } = operationOptions(requestOptions);
     checkAbort(signal);
-    validateConnection(options, ['client', 'name', 'labels', 'textSearch', 'metadataSchema', 'embedding']);
+    validateConnection(options, ['client', 'name', 'labels', 'textSearch', 'metadataSchema', 'embedding', 'retentionInDays']);
     const { client, name } = options;
     return lifecycle(options).run(async () => {
         storesFor(client).get(name)?.assertLive();
         requireInput(typeof client.createCollection === 'function', 'Client must support collection creation.');
         const { indexConfigs, tags, description } = storeConfiguration(options);
-        const response = await remote(() => client.createCollection({ collectionName: name, indexConfigs, tags },
+        const response = await remote(() => client.createCollection({ collectionName: name, indexConfigs, tags,
+            ...(options.retentionInDays === undefined ? {} : { snapshotRetentionInDays: options.retentionInDays }) },
             nativeOptions(signal)), 'Could not create the file store.', signal, { 409: 'STORE_EXISTS' });
         checkAbort(signal);
+        if (validRetention(response.collection?.snapshotRetentionInDays)) description.retentionInDays = response.collection.snapshotRetentionInDays;
         const stores = storesFor(client);
         const identity = await publicationIdentity(name, response.collection);
         checkAbort(signal);

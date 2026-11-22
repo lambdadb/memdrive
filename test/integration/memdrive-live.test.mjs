@@ -40,6 +40,8 @@ test('live file store writes, searches, lists and reopens a fresh fork with veri
         const main = await MemDrive.create({ client, name, metadataSchema: { topic: { type: 'string' } } }, options());
         assert.equal('write' in main, false);
         assert.equal('diff' in main, false);
+        assert.equal((await main.configure({ retentionInDays: 7 }, options())).retentionInDays, 7);
+        assert.equal((await client.collection(name).get(options())).collection.snapshotRetentionInDays, 7);
         await assert.rejects(MemDrive.open({ client, name, at: { checkpoint: 'never-created' } }, options()),
             { code: 'CHECKPOINT_NOT_FOUND', status: 404 });
         assert.deepEqual(await main.list({}, options()), { files: [], prefixes: [], consistency: 'eventual' });

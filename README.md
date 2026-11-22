@@ -47,6 +47,31 @@ Use one writer per fork across runtimes and LambdaDB client instances. The SDK s
 
 
 
+## Configure native snapshot retention
+
+```ts
+const main = await MemDrive.create({ client, name: 'workspace', retentionInDays: 7 });
+await main.configure({ retentionInDays: 14 });
+console.log((await main.describe()).retentionInDays);
+```
+
+`retentionInDays` accepts integers from 1 through 31 and maps to LambdaDB's
+`snapshotRetentionInDays`. Omitting it on creation uses the native default.
+The description reports the last observed setting when native metadata supplies
+it. `configure` is available on main in both embedding modes. It verifies the
+store generation and confirms the setting with a read; repeated confirmed values
+do not send an update. Other clients should reopen to observe configuration
+changes. Coordinate configuration through the same exclusive host ownership
+used for lifecycle operations.
+
+Configuration updates disable automatic retries. `CONFIGURATION_UNCONFIRMED`
+blocks a different retention value and resource deletion on that client. After
+the host fences outstanding requests, retry the same value to reconcile it.
+This setting does not delete named checkpoints, unpin SDK publication tags, or
+expire merge request IDs and journal records. Those require a separate SDK
+history cleanup policy; lowering native snapshot retention alone does not
+establish content erasure.
+
 ## Read a bounded text range
 
 ```ts
