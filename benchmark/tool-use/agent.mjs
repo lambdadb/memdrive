@@ -32,7 +32,7 @@ export async function runAgent({ host, scenario, ask, model = 'gpt-6.1-sol', gui
             const tools = definitions.map(tool => ({ type: 'function', name: tool.name, description: tool.description,
                 parameters: tool.inputSchema, strict: false }));
             offered.push({ round, binding, definitions });
-            const request = { model, reasoning: { effort: 'low' }, store: false, parallel_tool_calls: false,
+            const request = { model, reasoning: { effort: 'low' }, store: false, include: ['reasoning.encrypted_content'], parallel_tool_calls: false,
                 max_output_tokens: budget.outputTokens, tools,
                 input: [...input, { role: 'developer', content: 'Current host binding: ' + JSON.stringify(binding) }] };
             const reservation = encoder.encode(JSON.stringify(request), [], []).length + budget.outputTokens;
@@ -44,6 +44,7 @@ export async function runAgent({ host, scenario, ask, model = 'gpt-6.1-sol', gui
             assert.equal(response.model, model, 'Model identity mismatch');
             assert.equal(response.status, 'completed', 'Incomplete model response');
             assert(Array.isArray(response.output), 'Invalid model output');
+            assert(response.output.every(item => item && ['reasoning', 'function_call', 'message'].includes(item.type)), 'Unsupported model output');
             for (const key of ['input_tokens', 'output_tokens']) assert(Number.isSafeInteger(response.usage?.[key]) && response.usage[key] >= 0, 'Missing usage');
             usage.inputTokens += response.usage.input_tokens;
             usage.outputTokens += response.usage.output_tokens;

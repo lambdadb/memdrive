@@ -67,6 +67,8 @@ test('model continuation preserves reasoning items and message phases and delive
         let round = 0;
         const opaque = { type: 'reasoning', id: 'reason', encrypted_content: 'opaque-test', summary: [] };
         const ask = async request => {
+            assert.equal(request.store, false);
+            assert.deepEqual(request.include, ['reasoning.encrypted_content']);
             if (round++ === 0) return response(request.model, [opaque,
                 { type: 'message', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: 'Checking.' }] },
                 { ...call('read', {}), arguments: '{broken' }]);
@@ -91,6 +93,7 @@ test('duplicate IDs, request budgets and incomplete model responses stop without
         await assert.rejects(runAgent({ host, scenario: context.scenario, guide: 'none', ask, budget: { ...limits, totalTokens: 1 } }), /budget/);
         assert.equal(requests, 0);
         await assert.rejects(runAgent({ host, scenario: context.scenario, guide: 'none', ask: async r => ({ ...final(r.model), status: 'incomplete' }) }), /Incomplete/);
+        await assert.rejects(runAgent({ host, scenario: context.scenario, guide: 'none', ask: async r => response(r.model, [{ type: 'web_search_call' }]) }), /Unsupported/);
         await assert.rejects(runAgent({ host, scenario: context.scenario, guide: 'none', ask, budget: { ...limits, toolCalls: 0 } }), /budget/);
     });
 });
