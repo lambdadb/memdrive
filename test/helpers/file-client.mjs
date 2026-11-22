@@ -109,6 +109,24 @@ export function fileClient() {
                         if (request.sort?.[0]?.id === 'asc') selected.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
                         return response(selected.slice(0, request.size), request.fields);
                     }
+                    if (request.size === 1 && request.sort?.[0]?.id && request.fields?.include?.includes('modifiedAt')) {
+                        const override = await fixture.findTextQuery?.(request, options);
+                        if (override !== undefined) return override;
+                        function matches(doc, { bool, queryString }) {
+                            if (bool) return bool[0].occur === 'should'
+                                ? bool.some(clause => matches(doc, clause)) : bool.every(clause => matches(doc, clause));
+                            const { query, defaultField, skipSyntax } = queryString;
+                            if (defaultField === 'kind') return doc.kind === JSON.parse(query);
+                            if (defaultField === 'id') return skipSyntax ? doc.id === query : doc.id > /^\{(.+) TO \*\}$/.exec(query)[1];
+                            if (defaultField === 'ancestorPaths') return doc.ancestorPaths?.includes(JSON.parse(query));
+                            if (defaultField.startsWith('metadata.')) return doc.metadata?.[defaultField.slice(9)] === JSON.parse(query);
+                            throw new Error('Unexpected literal scan filter');
+                        }
+                        const direction = request.sort[0].id === 'asc' ? 1 : -1;
+                        const docs = source.filter(doc => request.query.bool.every(clause => matches(doc, clause)))
+                            .sort((a, b) => a.id < b.id ? -direction : a.id > b.id ? direction : 0);
+                        return response(docs.slice(0, request.size), request.fields);
+                    }
                     if (request.sort?.[0]?.id === 'asc') {
                         const docs = source.filter(doc => request.query.bool.every(({ queryString }) => {
                             const { query, defaultField } = queryString;

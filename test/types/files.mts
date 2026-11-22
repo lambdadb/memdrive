@@ -1,5 +1,5 @@
 import type { LambdaDBClient } from '@functional-systems/lambdadb';
-import { create, open, type DriveFile, type CheckpointFileDrive, type FileChange, type FileFilter, type DeleteFileResult, type SearchFilesResult, type ListFilesResult, type FileDrive, type MergeResult, type OpenFileStoreOptions } from '@functional-systems/memdrive';
+import { create, open, type DriveFile, type CheckpointFileDrive, type FileChange, type FileFilter, type FindTextResult, type DeleteFileResult, type SearchFilesResult, type ListFilesResult, type FileDrive, type EmbeddingMode, type MergeResult, type OpenFileStoreOptions } from '@functional-systems/memdrive';
 
 export async function fileConsumer(client: LambdaDBClient, options: OpenFileStoreOptions) {
     const main = await create({ client, name: 'workspace', metadataSchema: { topic: { type: 'string' } } });
@@ -23,6 +23,11 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     listed.files[0]?.content;
     const ranked: SearchFilesResult = await reopened.search({ query: 'Task context', filter: topicFilter, rerank: { onFailure: 'returnOriginal' } });
     ranked.hits[0]?.range?.start;
+    const exact: FindTextResult = await reopened.findText({ query: 'Task context', prefix: '/notes/', filter: topicFilter });
+    exact.hits[0]?.context.range.start;
+    if (exact.cursor) await reopened.findText({ cursor: exact.cursor });
+    // @ts-expect-error A continuation inherits its original options.
+    await reopened.findText({ cursor: 'opaque', filter: topicFilter });
     const changes: FileChange[] = await reopened.diff({ signal: new AbortController().signal });
     for (const change of changes) if (change.op === 'update' || change.op === 'delete') change.previousPath;
     // @ts-expect-error Diff is available only on working forks.
@@ -38,6 +43,8 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     const checkpoint: CheckpointFileDrive = await reopened.checkpoint({ name: 'saved' });
     const pinned: CheckpointFileDrive = await open({ client, name: 'workspace', at: { checkpoint: 'saved' } });
     await pinned.read({ fileId: created.fileId });
+    await pinned.findText({ query: 'saved' });
+    await main.findText({ query: 'saved' });
     await checkpoint.fork({ name: 'from-saved' });
     await reopened.fork({ name: 'nested' });
     // @ts-expect-error Choose exactly one named view.
@@ -59,7 +66,7 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
 
 const topicFilter: FileFilter = { field: 'metadata.topic', op: 'eq', value: 'local' };
 
-export async function externalFileConsumer(client: LambdaDBClient) {
+export async function externalFileConsumer(client: LambdaDBClient, options: OpenFileStoreOptions<EmbeddingMode>) {
     const embedding = { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'caller-model' } as const;
     const main = await create({ client, name: 'workspace', embedding, metadataSchema: { topic: { type: 'string' } } });
     const work = await main.fork({ name: 'semantic' });
@@ -76,6 +83,11 @@ export async function externalFileConsumer(client: LambdaDBClient) {
     await saved.search({ query: vector });
     await pinned.search({ query: vector });
     const modelIdentity: string = (await main.describe()).embedding.identity;
+
+    const mixed = await open(options);
+    if (mixed.findText) await mixed.findText({ query: 'saved' });
+    // @ts-expect-error Literal matching is available only for managed text stores.
+    await main.findText({ query: 'text' });
 
     // @ts-expect-error External reads omit text.
     reference?.content;

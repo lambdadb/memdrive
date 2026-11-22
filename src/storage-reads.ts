@@ -33,6 +33,16 @@ export function pathQuery(paths: string[], { literal = false } = {}) {
     ] };
 }
 
+export function ancestorFilter(ancestor: string) {
+    // Scope to the closest complete ancestor that can be quoted without
+    // escaping embedded quotes. Callers check the full prefix literally.
+    const quote = ancestor.indexOf('"');
+    const nativeAncestor = quote === -1 ? ancestor : ancestor.slice(0, ancestor.lastIndexOf('/', quote) + 1);
+    return nativeAncestor.length <= 1 ? [] : [{
+        queryString: { query: JSON.stringify(nativeAncestor), defaultField: 'ancestorPaths' }, occur: 'filter',
+    }];
+}
+
 // Use only IDs already validated against the SDK's generated ASCII format.
 export const afterId = (id: string | undefined) => id === undefined ? [] : [
     { queryString: { query: `{${id} TO *}`, defaultField: 'id' }, occur: 'filter' },

@@ -116,6 +116,8 @@ interface FileView<Mode extends EmbeddingMode> {
     list(request?: ListFilesRequest, options?: RequestOptions): Promise<ListFilesResult>;
     describe(options?: RequestOptions): Promise<FileStoreDescription<Mode>>;
     search(request: ViewSearch<Mode>, options?: RequestOptions): Promise<ViewSearchResult<Mode>>;
+    readonly findText: Mode extends 'external' ? undefined
+        : (request: FindTextRequest, options?: RequestOptions) => Promise<FindTextResult>;
     read(request: ReadFileRequest, options?: RequestOptions): Promise<ViewFile<Mode> | null>;
     read(request: { paths: string[] }, options?: RequestOptions): Promise<ViewFile<Mode>[]>;
 }
@@ -240,4 +242,33 @@ export interface FileSearchHit extends DriveFile {
 export interface SearchFilesResult {
     hits: FileSearchHit[];
     reranked: boolean;
+}
+
+
+export type FindTextRequest = {
+    query: string;
+    prefix?: string | undefined;
+    filter?: FileFilter | undefined;
+    limit?: number | undefined;
+    cursor?: never;
+} | {
+    cursor: string;
+    query?: never;
+    prefix?: never;
+    filter?: never;
+    limit?: never;
+};
+
+export interface FileTextHit extends DriveFile {
+    /** Verified half-open UTF-16 offsets into the file's original text. */
+    range: { start: number; end: number };
+    /** An original text excerpt containing the match, with its own UTF-16 offsets. */
+    context: { content: string; range: { start: number; end: number } };
+}
+
+export interface FindTextResult {
+    hits: FileTextHit[];
+    consistency: 'snapshot' | 'live';
+    /** Continue with this cursor even when the current page has no hits. */
+    cursor?: string | undefined;
 }

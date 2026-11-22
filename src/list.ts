@@ -1,7 +1,7 @@
 import { keysOnly } from './config.js';
 import { checkAbort, databaseError, MemDriveError, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
 import { bytes, decodeFileEntry, resultDocs, validPath } from './records.js';
-import { afterId, readRef, viewRead, type RefSource } from './storage-reads.js';
+import { afterId, ancestorFilter, readRef, viewRead, type RefSource } from './storage-reads.js';
 import type { ConnectionOptions, FileListEntry, ListFilesRequest, ListFilesResult, MetadataSchema, RequestOptions } from './types.js';
 
 type Handle = ReturnType<ConnectionOptions['client']['collection']>;
@@ -27,6 +27,10 @@ const legalText = (value: unknown): value is string => typeof value === 'string'
     && !/[\p{Cc}\p{Surrogate}]/u.test(value) && encoder.encode(value).length <= 4096;
 const exceeded = () => new MemDriveError('LIST_SCAN_LIMIT', 'Listing exceeded the preview scan budget. Narrow the directory prefix and start again.');
 const cursorUnavailable = () => new MemDriveError('LIST_CURSOR_UNAVAILABLE', 'Listing cursor is unavailable on this handle. Start again without a cursor.');
+
+export const validPathPrefix = (value: unknown): value is string =>
+    legalText(value) && (value === '' || value.startsWith('/')) && !value.includes('\\');
+export const prefixAncestor = (prefix: string) => prefix.slice(0, prefix.lastIndexOf('/') + 1);
 
 export function fileLister(handle: Handle, name: string, source: RefSource, schema: MetadataSchema) {
     const scans = new Map<string, Scan>();
@@ -64,21 +68,15 @@ export function fileLister(handle: Handle, name: string, source: RefSource, sche
         }
 
         const { prefix = '', nameContains = '', delimiter, limit = 100 } = request;
-        requireInput(legalText(prefix) && (prefix === '' || prefix.startsWith('/')) && !prefix.includes('\\'),
+        requireInput(validPathPrefix(prefix),
             'List prefix must be an absolute path prefix of at most 4096 UTF-8 bytes.');
         requireInput(legalText(nameContains), 'List filename substring must be text of at most 4096 UTF-8 bytes.');
         requireInput(delimiter === undefined || delimiter === '/', 'List delimiter must be "/".');
         requireInput(Number.isSafeInteger(limit) && limit >= 1 && limit <= 1000, 'List limit must be 1–1000.');
-        const ancestor = prefix.slice(0, prefix.lastIndexOf('/') + 1);
+        const ancestor = prefixAncestor(prefix);
         requireInput(ancestor.length <= 1 || validPath(ancestor.slice(0, -1)), 'List prefix contains an invalid directory component.');
         const clauses = [{ queryString: { query: '"file"', defaultField: 'kind' }, occur: 'filter' }];
-        // Scope to the closest complete ancestor that can be quoted without
-        // escaping embedded quotes. The path check below retains the full prefix.
-        const quote = ancestor.indexOf('"');
-        const nativeAncestor = quote === -1 ? ancestor : ancestor.slice(0, ancestor.lastIndexOf('/', quote) + 1);
-        if (nativeAncestor.length > 1) clauses.push({
-            queryString: { query: JSON.stringify(nativeAncestor), defaultField: 'ancestorPaths' }, occur: 'filter',
-        });
+        clauses.push(...ancestorFilter(ancestor));
         // Keep parser-sensitive text out of the native regex. The literal
         // comparison below applies to all inputs.
         if (/^[A-Za-z0-9 ]{1,128}$/.test(nameContains)) clauses.push({
