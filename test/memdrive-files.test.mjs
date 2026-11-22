@@ -37,7 +37,11 @@ test('file stores round-trip exact text and empty originals by path and stable I
     const writes = calls.filter(call => call.kind === 'upsert');
     assert.deepEqual(writes.map(call => call.request.branch), ['fork-research', 'fork-research', 'fork-alternate']);
     const [chunk, original] = writes[0].request.docs;
-    assert.deepEqual(original, {
+    const { revision, fingerprint, chunking, ...storedOriginal } = original;
+    assert.equal(typeof revision, 'string');
+    assert.match(fingerprint, /^[0-9a-f]{64}$/);
+    assert.deepEqual(chunking, { strategy: 'boundary', version: '1' });
+    assert.deepEqual(storedOriginal, {
         id: `file:${file.fileId}`, kind: 'file', fileId: file.fileId, path, body: content, modifiedAt: file.modifiedAt,
         fileName: '한글 "draft":*?.md', ancestorPaths: ['/', '/notes/'], changed: true,
     });
@@ -147,7 +151,7 @@ test('batched writes and reads share requests, propagate metadata, and validate 
     assert.deepEqual(description.labels, labels);
     assert.deepEqual(description.metadataSchema, metadataSchema);
     assert.deepEqual(description.textSearch, { analyzers: ['english'] });
-    assert.deepEqual(fixture.collections.get('workspace').metadata.indexConfigs.embedding.embedding.sourceField, 'content');
+    assert.deepEqual(fixture.collections.get('workspace').metadata.indexConfigs.embedding.embedding.sourceField, 'embeddingText');
     assert.deepEqual(await reopened.read({ paths: ['/second', '/missing', '/first'] }), [second, first]);
 
     await assert.rejects(reopened.write([request('/untouched'), request('/first')]), { code: 'PATH_EXISTS' });

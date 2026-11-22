@@ -36,7 +36,7 @@ try {
     assert.equal(installed.name, pkg.name, 'Installed package name differs');
     assert.equal(installed.version, pkg.version, 'Installed package version differs');
     assert.equal(installed.memdriveSourceCommit, pkg.memdriveSourceCommit, 'Installed source commit differs');
-    assert.deepEqual(Object.keys(installed.exports).sort(), ['.', './package.json']);
+    assert.deepEqual(Object.keys(installed.exports).sort(), ['.', './docling', './package.json']);
     assert.deepEqual(Object.keys(installed.dependencies), ['@functional-systems/lambdadb']);
     const assertion = `for (const key of ['create', 'open', 'destroy', 'MemDriveError', 'createFileTools', 'fileToolError']) {
         if (typeof sdk[key] !== 'function') throw new Error('Missing export: ' + key);
@@ -45,6 +45,11 @@ try {
     if (!sdk.fileToolGuide.version || !sdk.fileToolGuide.content) throw new Error('Missing file-tool guide');`;
     run(process.execPath, ['--input-type=module', '-e', `import * as sdk from ${JSON.stringify(pkg.name)}; ${assertion}`]);
     run(process.execPath, ['--input-type=commonjs', '-e', `const sdk = require(${JSON.stringify(pkg.name)}); ${assertion}`]);
+    run(process.execPath, ['--input-type=module', '-e', `
+        import { createDoclingChunker } from '${pkg.name}/docling';
+        try { await createDoclingChunker({ tokenizer: '/missing-tokenizer.json' }); throw new Error('Unexpected backend'); }
+        catch (error) { if (error.code !== 'CHUNKER_UNAVAILABLE') throw error; }
+    `]);
     for (const file of readdirSync(join(root, 'test/types')).filter(file => /\.(?:mts|cts|ts)$/.test(file)))
         copyFileSync(join(root, 'test/types', file), join(temporary, file));
     copyFileSync(join(root, 'test/types/tsconfig.json'), join(temporary, 'tsconfig.json'));
@@ -62,6 +67,13 @@ try {
     copyFileSync(join(root, 'test/read-range.test.mjs'), join(temporary, 'test/read-range.test.mjs'));
     copyFileSync(join(root, 'test/retention.test.mjs'), join(temporary, 'test/retention.test.mjs'));
     run(process.execPath, ['--test', 'test/memdrive-files.test.mjs', 'test/file-tools.test.mjs', 'test/lifecycle.test.mjs', 'test/read-range.test.mjs', 'test/retention.test.mjs']);
+    // Core consumers above work without the optional native package. Test its
+    // separate entry point only after explicitly installing the pinned backend.
+    run('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund', '--save-exact', 'docling.rs@2.85.0']);
+    mkdirSync(join(temporary, 'test/fixtures'), { recursive: true });
+    copyFileSync(join(root, 'test/fixtures/docling-tokenizer.json'), join(temporary, 'test/fixtures/docling-tokenizer.json'));
+    copyFileSync(join(root, 'test/structured-chunking.test.mjs'), join(temporary, 'test/structured-chunking.test.mjs'));
+    run(process.execPath, ['--test', 'test/structured-chunking.test.mjs']);
     if (live) {
         cpSync(join(root, 'test/integration'), join(temporary, 'test/integration'), { recursive: true });
         const files = readdirSync(join(temporary, 'test/integration')).filter(file => file.endsWith('-live.test.mjs'));

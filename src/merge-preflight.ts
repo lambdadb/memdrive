@@ -1,4 +1,5 @@
 import { changedFiles, netChange } from './diff.js';
+import { resolvedChunking } from './text-chunks.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest } from './errors.js';
 import { decodeStoredFile, fingerprintOf, originalId, resultDocs, validFileId } from './records.js';
 import { createRef } from './refs.js';
@@ -55,7 +56,7 @@ async function loadTargets(handle: Handle, name: string, source: TagRef, schema:
             const file = candidate.change.op === 'delete' ? undefined : decodeStoredFile(doc, schema, dimensions);
             if (file && candidate.fingerprint !== undefined && await fingerprintOf(file) !== candidate.fingerprint)
                 throw new MemDriveError('INVALID_RESULT', 'The pinned source original disagrees with its fingerprint.');
-            targets.push({ ...candidate, file, revision, generation });
+            targets.push({ ...candidate, file, revision, generation, chunking: resolvedChunking(doc.chunking) });
         }
     }
     return targets;

@@ -47,7 +47,8 @@ async function publishedRecords(handle: Handle, name: string, prepared: Prepared
     const { file } = target;
     if (!file) return { docs: [], chunkIds: [] };
     const tracking = { revision, ...('content' in file ? { generation: revision } : {}), fingerprint: '', version };
-    const { changed: _changed, baseline: _baseline, fingerprint: _fingerprint, ...original } = fileOriginal(file, tracking);
+    const { changed: _changed, baseline: _baseline, fingerprint: _fingerprint, ...baseOriginal } = fileOriginal(file, tracking);
+    const original = { ...baseOriginal, ...(target.chunking === undefined ? {} : { chunking: target.chunking }) };
     if ('embedding' in file) {
         const wireBytes = bytes(original) + 1;
         requireInput(wireBytes - 1 <= 5 * 1024 * 1024, 'A merge record exceeds the native 5 MiB document limit.');
@@ -59,36 +60,42 @@ async function publishedRecords(handle: Handle, name: string, prepared: Prepared
         : undefined;
     if (target.baseline && !prior)
         throw new MemDriveError('INVALID_RESULT', 'The retained main tag is missing the merge baseline.');
-    if (prior?.body !== file.content) {
+    if (target.chunking === undefined && prior?.body !== file.content) {
         const result = await fileRecords(file, tracking);
         const docs = result.docs.map(record => record.doc.kind === 'file' ? { ...record, doc: original } : record);
         return { docs, chunkIds: docs.filter(({ doc }) => doc.kind === 'chunk').map(({ doc }) => doc.id) };
     }
 
-    // Copy vectors from the immutable baseline when only path or metadata
-    // changes. Full replacement removes obsolete metadata keys and avoids
-    // relying on the chunker's current segmentation or re-embedding the text.
-    const generation = prior.generation;
+    // Configured chunking copies the captured representation and vectors.
+    // Legacy same-body changes copy the baseline. Neither path invokes a parser
+    // during publication/recovery or depends on its current segmentation.
+    const copyRef = target.chunking === undefined ? prepared.publishedMain : prepared.source;
+    const generation = target.chunking === undefined ? prior?.generation : target.generation;
     if (generation !== undefined && !validFileId(generation))
         throw new MemDriveError('INVALID_RESULT', 'The retained main original has invalid generation data.');
-    const oldIds = await listChunkIds(handle, name, prepared.publishedMain, fileId, { generation }, signal);
+    const oldIds = await listChunkIds(handle, name, copyRef, fileId, { generation }, signal);
     if (!oldIds.length && file.content.trim())
         throw new MemDriveError('INVALID_RESULT', 'The retained main original has no visible chunks.');
     const chunks = [];
     for (let offset = 0; offset < oldIds.length; offset += 16) {
         const ids = oldIds.slice(offset, offset + 16);
         const expected = new Set(ids);
-        for (const old of await fetchRecordBatch(handle, name, prepared.publishedMain, ids, true, signal)) {
-            const { id, kind, content, start, end, embedding } = old;
+        for (const old of await fetchRecordBatch(handle, name, copyRef, ids, true, signal)) {
+            const { id, kind, content, start, end, embedding, embeddingText } = old;
             if (typeof id !== 'string' || !expected.delete(id) || kind !== 'chunk' || old.fileId !== fileId
                 || typeof content !== 'string' || !content.trim()
-                || typeof start !== 'number' || typeof end !== 'number' || !Number.isInteger(start) || !Number.isInteger(end)
-                || start < 0 || end <= start || end > file.content.length || file.content.slice(start, end) !== content
+                || (start !== undefined || end !== undefined) && (typeof start !== 'number' || typeof end !== 'number'
+                    || !Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start
+                    || end > file.content.length || file.content.slice(start, end) !== content)
+                || target.chunking !== undefined && (typeof embeddingText !== 'string' || !embeddingText.trim() || old.path !== file.path
+                    || old.revision !== target.revision)
+                || target.chunking === undefined && (start === undefined || end === undefined)
                 || !Array.isArray(embedding) || embedding.length !== managedEmbedding.dimensions || embedding.some(value => !Number.isFinite(value)))
                 throw new MemDriveError('INVALID_RESULT', 'The retained main tag returned an invalid chunk or managed vector.');
             const root = generation === undefined ? id : id.slice(0, -(generation.length + 1));
             const doc = { id: `${root}:${revision}`, kind: 'chunk' as const, fileId, path, fileName, ancestorPaths,
-                modifiedAt, revision, ...(metadata === undefined ? {} : { metadata }), content, start, end, embedding };
+                modifiedAt, revision, ...(metadata === undefined ? {} : { metadata }), content, ...(start === undefined ? {} : { start, end }), embedding,
+                ...(embeddingText === undefined ? {} : { embeddingText }) };
             chunks.push({ doc, inputBytes: 0, wireBytes: bytes(doc) + 1 });
         }
         if (expected.size) throw new MemDriveError('INVALID_RESULT', 'The retained main tag omitted a baseline chunk.');
@@ -232,8 +239,8 @@ export async function advanceMergeSource(handle: Handle, name: string, prepared:
                 const generation = current.generation;
                 if (generation !== undefined && !validFileId(generation))
                     throw new MemDriveError('INVALID_RESULT', 'The working original has invalid generation data.');
-                next = fileOriginal(file, { revision: latestRevision, generation, baseline, version: baseline?.version,
-                    fingerprint: await fingerprintOf(file) });
+                next = { ...fileOriginal(file, { revision: latestRevision, generation, baseline, version: baseline?.version,
+                    fingerprint: await fingerprintOf(file) }), ...(current.chunking === undefined ? {} : { chunking: current.chunking }) };
             } else {
                 next = { id, fileId, kind: 'tombstone', path: current?.path ?? target.file!.path,
                     modifiedAt: current?.modifiedAt ?? target.file!.modifiedAt, revision: latestRevision, changed: true, baseline };

@@ -1,3 +1,4 @@
+import { resolvedChunking, type TextChunker } from './text-chunks.js';
 import { keysOnly, metadataValues, vectorValues } from './config.js';
 import { MemDriveError, requireInput } from './errors.js';
 import { validFileId, validPath, validText, baselineOf, decodeStoredFile, fileOriginal, fileRecords, fingerprintOf, metadataKey, originalId, type StoredFile } from './records.js';
@@ -60,7 +61,7 @@ function replaceExact(source: string, edits: TextEdit[]): string {
 }
 
 export async function planEdit(request: EditRequest, doc: Record<string, unknown> | undefined,
-    schema: MetadataSchema, dimensions?: number) {
+    schema: MetadataSchema, dimensions?: number, chunker?: TextChunker, options?: { signal?: AbortSignal | undefined }) {
     const { fileId } = request;
     const current = doc?.kind === 'file' ? decodeStoredFile(doc, schema, dimensions) : undefined;
     const version = typeof doc?.version === 'string' && doc.version ? doc.version : undefined;
@@ -98,9 +99,10 @@ export async function planEdit(request: EditRequest, doc: Record<string, unknown
     const generation = replace ? revision : generationValue;
     const modifiedAt = !replace && path === current.path ? current.modifiedAt : new Date().toISOString();
     const file = { ...fields, modifiedAt, content };
-    const tracking = { revision, generation, baseline, fingerprint: await fingerprintOf(file), version };
+    const tracking = { revision, generation, baseline, fingerprint: await fingerprintOf(file), version,
+        ...(doc?.chunking === undefined ? {} : { chunking: resolvedChunking(doc.chunking) }) };
     const base = { op: 'update' as const, file, generation };
     return replace
-        ? { ...base, moveOnly: false as const, records: await fileRecords(file, tracking) }
+        ? { ...base, moveOnly: false as const, records: await fileRecords(file, tracking, chunker, options) }
         : { ...base, moveOnly: true as const, original: fileOriginal(file, tracking) };
 }
