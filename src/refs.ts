@@ -1,10 +1,21 @@
-import { checkAbort, databaseError, MemDriveError, nativeRequest } from './errors.js';
+import { validDate } from './config.js';
+import { checkAbort, databaseError, MemDriveError, nativeRequest, requireInput } from './errors.js';
 
 type CreatedRef = { kind: 'fork' | 'checkpoint' | 'merge source'; name: string };
 
 const rejected = new Set([400, 401, 403, 404, 409, 422, 429]);
 
-export async function createRef<T>(pending: Set<string>, ref: CreatedRef, signal: AbortSignal | undefined, submit: () => Promise<T>, valid: (result: T) => boolean) {
+export function validateRefTime(asOf: unknown, checkpoint: boolean): asserts asOf is string | undefined {
+    requireInput(asOf === undefined || !checkpoint && validDate(asOf) && Date.parse(asOf) <= Date.now(),
+        'asOf requires a nonfuture UTC ISO timestamp with milliseconds on main or a working fork.');
+}
+
+export function historicalViewUnavailable(asOf: string, cause?: unknown) {
+    return new MemDriveError('HISTORICAL_VIEW_UNAVAILABLE', 'The requested historical view is unavailable or no longer retained.',
+        { cause, details: { asOf } });
+}
+
+export async function createRef<T>(pending: Set<string>, ref: CreatedRef, signal: AbortSignal | undefined, submit: () => Promise<T>, valid: (result: T) => boolean, asOf?: string) {
     const { kind, name } = ref;
     const key = `${kind}:${name}`;
     checkAbort(signal);
@@ -22,6 +33,11 @@ export async function createRef<T>(pending: Set<string>, ref: CreatedRef, signal
         const error = databaseError(cause, `Could not create the ${kind}.`);
         if (!rejected.has(error.status ?? 0)) throw unconfirmed(cause);
         pending.delete(key);
+        if (asOf !== undefined && (error.status === 400 || error.status === 404)) {
+            const unavailable = historicalViewUnavailable(asOf, cause);
+            unavailable.status = error.status;
+            throw unavailable;
+        }
         if (error.status === 409) error.code = kind === 'fork' ? 'BRANCH_CONFLICT'
             : kind === 'checkpoint' ? 'CHECKPOINT_CONFLICT' : 'MERGE_SOURCE_CONFLICT';
         throw error;

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add optional `asOf` to fork and checkpoint creation: main selects a completed publication, working forks select a retained native committed snapshot, and missing history fails without falling back. Include matching tool schemas and guide version 3.
+
 - Automatically enforce configured retention after terminal merges and completed recovery, preserving explicit forks/checkpoints, current main, bounded history summaries and request replay. Cleanup is bounded and best effort; remove the prerelease-only public pruning API.
 - Configure native snapshot retention at creation or through main, with generation checks, confirmed updates and fencing of unconfirmed configuration changes.
 - Add persisted per-file chunking strategies and an optional local Docling Hybrid adapter, preserving exact originals, contextualized embeddings, verified ranges and parser-free publication recovery.

@@ -143,8 +143,8 @@ interface FileView<Mode extends EmbeddingMode> {
     readonly name: string;
     listForks(options?: RequestOptions): Promise<FileRefEntry[]>;
     listCheckpoints(options?: RequestOptions): Promise<FileRefEntry[]>;
-    fork(request: { name: string }, options?: RequestOptions): Promise<WorkingFileDrive<Mode>>;
-    checkpoint(request: { name: string }, options?: RequestOptions): Promise<CheckpointFileDrive<Mode>>;
+    fork(request: CreateFileRefRequest, options?: RequestOptions): Promise<WorkingFileDrive<Mode>>;
+    checkpoint(request: CreateFileRefRequest, options?: RequestOptions): Promise<CheckpointFileDrive<Mode>>;
     list(request?: ListFilesRequest, options?: RequestOptions): Promise<ListFilesResult>;
     describe(options?: RequestOptions): Promise<FileStoreDescription<Mode>>;
     status(options?: RequestOptions): Promise<FileStoreStatus>;
@@ -155,6 +155,13 @@ interface FileView<Mode extends EmbeddingMode> {
     read(request: Mode extends 'external' ? never : ReadFileRangeRequest, options?: RequestOptions): Promise<FileReadPage | null>;
     read(request: ReadFileRequest, options?: RequestOptions): Promise<ViewFile<Mode> | null>;
     read(request: { paths: string[] }, options?: RequestOptions): Promise<ViewFile<Mode>[]>;
+}
+
+/** Create a named ref from the bound view, optionally at a retained past time. */
+export interface CreateFileRefRequest {
+    name: string;
+    /** UTC ISO timestamp (YYYY-MM-DDTHH:mm:ss.sssZ). Not supported on checkpoint views. */
+    asOf?: string | undefined;
 }
 
 export interface MainFileDrive<Mode extends EmbeddingMode = 'managed'> extends FileView<Mode> {
