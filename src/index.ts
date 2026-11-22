@@ -10,6 +10,8 @@ import { searchQuery, validateReranking, vectorSearchQuery } from './search.js';
 import { fileLister } from './list.js';
 import { fileTextFinder } from './find-text.js';
 import { createRef } from './refs.js';
+import { rangeKeys, readRange, validateReadRange } from './read-range.js';
+import type { DriveFile, FileReadPage, ReadFileRangeRequest } from './types.js';
 import { deletingFormat, deleteReference, destroyStore, guardView, lifecycle } from './lifecycle.js';
 import { publicationIdentity, validateMergeRequest } from './publication-log.js';
 import { publication } from './publication.js';
@@ -142,20 +144,34 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         return structuredClone(description);
     }
 
-    function reader(source: RefSource) {
+    function reader(source: RefSource, at: FileDrive['at']) {
+        function read(request: ReadFileRangeRequest, options?: RequestOptions): Promise<FileReadPage | null>;
         function read(request: ReadFileRequest, options?: RequestOptions): Promise<FileListEntry | null>;
         function read(request: { paths: string[] }, options?: RequestOptions): Promise<FileListEntry[]>;
-        async function read(request: ReadFileRequest | { paths: string[] }, options?: RequestOptions) {
+        async function read(request: ReadFileRequest | ReadFileRangeRequest | { paths: string[] }, options?: RequestOptions) {
             const { signal } = operationOptions(options);
             checkAbort(signal);
-            requireInput(keysOnly(request, ['fileId', 'path', 'paths']) && Object.keys(request).length === 1,
-                'Read requires exactly one of fileId, path or paths.');
+            requireInput(keysOnly(request, ['fileId', 'path', 'paths', ...rangeKeys])
+                && ['fileId', 'path', 'paths'].filter(key => Object.hasOwn(request, key)).length === 1,
+            'Read requires exactly one of fileId, path or paths.');
+            const ranged = rangeKeys.some(key => Object.hasOwn(request, key));
+            if (ranged) {
+                requireInput(dimensions === undefined && !('paths' in request), 'Ranged reads require one text file.');
+                validateReadRange(request as ReadFileRangeRequest);
+            }
+            const decode = async (doc: Record<string, unknown>) => {
+                const file = decodeRead(doc, metadataSchema);
+                const result = ranged ? await readRange(file as DriveFile, request as ReadFileRangeRequest, at,
+                    typeof doc.version === 'string' ? doc.version : undefined) : file;
+                checkAbort(signal);
+                return result;
+            };
             if ('fileId' in request) {
                 const fileId = request.fileId;
                 requireInput(validFileId(fileId), 'Provide a fileId returned by MemDrive.');
                 return readRef(source, async ref => {
                     const doc = (await fetchOriginals(handle, name, ref, [fileId], signal)).get(fileId);
-                    return doc?.kind === 'file' ? decodeRead(doc, metadataSchema) : null;
+                    return doc?.kind === 'file' ? decode(doc) : null;
                 }, signal);
             }
             const multi = 'paths' in request;
@@ -169,7 +185,7 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
                 checkAbort(signal);
                 const expected = new Set(paths), files = new Map<string, FileListEntry>();
                 for (const doc of resultDocs(response, name, paths.length)) {
-                    const file = decodeRead(doc, metadataSchema);
+                    const file = await decode(doc);
                     if (!expected.has(file.path) || files.has(file.path))
                         throw new MemDriveError('INVALID_RESULT', 'Read returned unexpected or duplicate paths.');
                     files.set(file.path, file);
@@ -246,7 +262,7 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         Object.freeze(at);
         return {
             at,
-            name, read: reader(source), search: searcher(source), list: fileLister(handle, name, source, metadataSchema),
+            name, read: reader(source, at), search: searcher(source), list: fileLister(handle, name, source, metadataSchema),
             findText: dimensions === undefined ? fileTextFinder(handle, name, source, metadataSchema, enqueueRef) : undefined,
             describe,
             listForks: (options?: RequestOptions) => listRefs('fork', options),

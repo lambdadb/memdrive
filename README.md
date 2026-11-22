@@ -47,6 +47,40 @@ Use one writer per fork across runtimes and LambdaDB client instances. The SDK s
 
 
 
+## Read a bounded text range
+
+```ts
+let page = await work.read({ path: '/notes/plan.md', startLine: 10, endLine: 30, maxChars: 4000 });
+while (page) {
+    console.log(page.content, page.range, page.totalLines);
+    if (!page.next) break;
+    page = await work.read(page.next);
+}
+```
+
+Line numbers are one-based and inclusive. CRLF, LF and lone CR each end one line;
+a trailing line ending starts an empty final line, and an empty file has one line.
+The original text and line endings are preserved. An omitted end selects through
+EOF; an end beyond EOF is clamped, while a start beyond EOF is invalid.
+
+Adding `startLine`, `endLine` or `maxChars` selects a range response with the file
+identity, bounded `content`, `at`, `totalLines`, `revision` and `range`. The range
+contains inclusive line numbers and half-open UTF-16 `start`/`end` offsets into
+the original. `version`, when present, identifies the main publication last
+assigned to that original; it does not claim unpublished fork edits are published.
+`maxChars` bounds content to 2–64000 UTF-16 code units (default 16000 for range
+requests). Pages never split a surrogate pair or CRLF and can continue within a
+long line. The bound applies to content, not serialized metadata or JSON overhead.
+
+Pass the returned `next` request unchanged to continue on the same view. It binds
+the file ID, bounds, offset and fingerprint of the original path, content and
+metadata. A changed original returns `READ_VERSION_CHANGED`; restart without
+offset/revision. This detects changes rather than retaining a working snapshot.
+Missing files return `null`. External-vector files and `paths` batches do not
+support ranges. Requests without range fields still return full originals with
+the existing shape. Range reads fetch the full original from LambdaDB, so they
+bound application/model output rather than database transfer size.
+
 ## Find literal text in originals
 
 Use `findText` on managed stores to locate exact substrings in the original file text. It applies Unicode simple case folding and preserves the original spelling, punctuation, and whitespace in each hit. It matches overlapping occurrences and substrings that cross indexing chunk boundaries. Simple case folding does not normalize text or expand characters such as `ß` to `ss`. External-vector stores expose `findText` as `undefined`.

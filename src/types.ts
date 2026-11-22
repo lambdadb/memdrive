@@ -54,6 +54,27 @@ export interface ListFilesResult {
 }
 
 export type ReadFileRequest = { fileId: string; path?: never } | { path: string; fileId?: never };
+export interface ReadFileRangeOptions {
+    startLine?: number | undefined;
+    endLine?: number | undefined;
+    maxChars?: number | undefined;
+    offset?: number | undefined;
+    revision?: string | undefined;
+}
+export type ReadFileRangeRequest = ReadFileRequest & ReadFileRangeOptions & (
+    { startLine: number } | { endLine: number } | { maxChars: number } | { offset: number; revision: string } | { revision: string }
+);
+export interface FileReadPage extends DriveFile {
+    at: FileDrive['at'];
+    /** Fingerprint of the original path, content and metadata, checked on continuation. */
+    revision: string;
+    /** Main publication last assigned to this original, when present. */
+    version?: string | undefined;
+    totalLines: number;
+    /** One-based inclusive line numbers and half-open UTF-16 offsets in the original. */
+    range: { startLine: number; endLine: number; start: number; end: number };
+    next?: ReadFileRangeRequest | undefined;
+}
 export interface CreateFileRequest {
     op: 'create';
     path: string;
@@ -124,6 +145,7 @@ interface FileView<Mode extends EmbeddingMode> {
     search(request: ViewSearch<Mode>, options?: RequestOptions): Promise<ViewSearchResult<Mode>>;
     readonly findText: Mode extends 'external' ? undefined
         : (request: FindTextRequest, options?: RequestOptions) => Promise<FindTextResult>;
+    read(request: Mode extends 'external' ? never : ReadFileRangeRequest, options?: RequestOptions): Promise<FileReadPage | null>;
     read(request: ReadFileRequest, options?: RequestOptions): Promise<ViewFile<Mode> | null>;
     read(request: { paths: string[] }, options?: RequestOptions): Promise<ViewFile<Mode>[]>;
 }
