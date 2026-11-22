@@ -17,7 +17,7 @@ test('external vector publication replays the pinned vector and rebases later ed
         metadataSchema: { label: { type: 'string' } },
         embedding: { mode: 'external', dimensions, similarity: 'cosine', identity: 'fixture' } });
     const work = await main.fork({ name: 'research' });
-    const { fileId } = await work.write({ op: 'create', path: '/notes', embedding: originalVector, metadata: { label: 'old' } });
+    const { fileId } = await work.write({ op: 'create', path: '/notes', content: originalVector, metadata: { label: 'old' } });
     const id = `file:${fileId}`;
     const state = fixture.collections.get(name);
 
@@ -34,7 +34,7 @@ test('external vector publication replays the pinned vector and rebases later ed
 
     await work.merge(request('first'));
     const stale = await main.fork({ name: 'stale' });
-    await work.write({ op: 'update', fileId, embedding: capturedVector });
+    await work.write({ op: 'update', fileId, content: capturedVector });
     assert.deepEqual(await work.diff(), [{ op: 'update', fileId, path: '/notes' }]);
 
     fixture.beforeUpsert = ({ branch, docs }) => {
@@ -42,7 +42,7 @@ test('external vector publication replays the pinned vector and rebases later ed
             throw Object.assign(new Error('Rejected before dispatch'), { statusCode: 400 });
     };
     await assert.rejects(work.merge(request('replace')), { code: 'MERGE_RESUMABLE' });
-    await work.write({ op: 'update', fileId, embedding: laterVector });
+    await work.write({ op: 'update', fileId, content: laterVector });
     assert.deepEqual(published('v1').embedding, originalVector.map(Math.fround));
 
     fixture.beforeUpsert = undefined;
@@ -52,9 +52,9 @@ test('external vector publication replays the pinned vector and rebases later ed
     assert.deepEqual(await reopened.diff(), [{ op: 'update', fileId, path: '/notes' }]);
 
     // Reverting only the vector clears the net change against the new baseline.
-    await reopened.write({ op: 'update', fileId, embedding: capturedVector });
+    await reopened.write({ op: 'update', fileId, content: capturedVector });
     assert.deepEqual(await reopened.diff(), []);
-    await stale.write({ op: 'update', fileId, embedding: laterVector });
+    await stale.write({ op: 'update', fileId, content: laterVector });
     await assert.rejects(stale.merge(request('stale')), { code: 'MERGE_CONFLICT',
         details: { fileIds: [fileId], paths: [], requestId: 'stale' } });
 

@@ -22,7 +22,7 @@ test('external file reads and vector searches return references from the selecte
 
     const work = await main.fork({ name: 'vector-draft' });
     const metadata = { topic: 'owner "one" *', ordinal: 4 };
-    const file = await work.write({ op: 'create', path: '/local/note', embedding: vector(), metadata });
+    const file = await work.write({ op: 'create', path: '/local/note', content: vector(), metadata });
     assert.deepEqual(file, { fileId: file.fileId, path: '/local/note', modifiedAt: file.modifiedAt, metadata });
     const writes = calls.filter(({ kind }) => kind === 'upsert');
     assert.equal(writes.length, 1);
@@ -44,7 +44,7 @@ test('external file reads and vector searches return references from the selecte
     assert.deepEqual(await saved.read({ path: file.path }), file);
 
     const pinned = await open({ at: { checkpoint: 'before-move' } });
-    assert.deepEqual(await pinned.search({ queryVector: vector(), filter: { and: [
+    assert.deepEqual(await pinned.search({ query: vector(), filter: { and: [
         { field: 'metadata.topic', op: 'eq', value: metadata.topic },
         { field: 'metadata.ordinal', op: 'gte', value: 2 },
         { field: 'metadata.ordinal', op: 'lt', value: 5 },
@@ -78,21 +78,24 @@ test('external inputs and incompatible modes fail before dispatch', async () => 
     assert.equal(collections.size, 0);
     const main = await MemDrive.create({ client, name, embedding });
     const work = await main.fork({ name: 'vector-draft' });
-    const file = await work.write({ op: 'create', path: '/file', embedding: vector() });
+    const file = await work.write({ op: 'create', path: '/file', content: vector() });
     const remoteCalls = calls.length;
     const badVectors = [[1], Array(64).fill(0), vector(1e-80), vector(1e80), vector(Infinity), vector(NaN), [1, ...Array(62).fill(0), '2']];
     const sparse = vector();
     delete sparse[1];
     for (const invalid of [...badVectors, sparse]) {
-        await assert.rejects(work.write({ op: 'create', path: '/bad', embedding: invalid }), { code: 'INVALID_INPUT' });
-        await assert.rejects(work.write({ op: 'update', fileId: file.fileId, embedding: invalid }), { code: 'INVALID_INPUT' });
-        await assert.rejects(work.search({ queryVector: invalid }), { code: 'INVALID_INPUT' });
+        await assert.rejects(work.write({ op: 'create', path: '/bad', content: invalid }), { code: 'INVALID_INPUT' });
+        await assert.rejects(work.write({ op: 'update', fileId: file.fileId, content: invalid }), { code: 'INVALID_INPUT' });
+        await assert.rejects(work.search({ query: invalid }), { code: 'INVALID_INPUT' });
     }
+    await assert.rejects(work.write({ op: 'create', path: '/bad', embedding: vector() }), { code: 'INVALID_INPUT' });
+    await assert.rejects(work.write({ op: 'update', fileId: file.fileId, embedding: vector() }), { code: 'INVALID_INPUT' });
+    await assert.rejects(work.search({ queryVector: vector() }), { code: 'INVALID_INPUT' });
     await assert.rejects(work.write({ op: 'create', path: '/bad', content: 'text' }), { code: 'INVALID_INPUT' });
     await assert.rejects(work.write({ op: 'update', fileId: file.fileId, edits: [] }), { code: 'INVALID_INPUT' });
     await assert.rejects(work.search({ query: 'text' }), { code: 'INVALID_INPUT' });
-    await assert.rejects(work.search({ queryVector: vector(), rerank: false }), { code: 'INVALID_INPUT' });
-    await assert.rejects(work.search({ queryVector: vector(), filter: { field: 'metadata.undeclared', op: 'eq', value: 5 } }),
+    await assert.rejects(work.search({ query: vector(), rerank: false }), { code: 'INVALID_INPUT' });
+    await assert.rejects(work.search({ query: vector(), filter: { field: 'metadata.undeclared', op: 'eq', value: 5 } }),
         { code: 'INVALID_INPUT' });
     assert.equal(calls.length, remoteCalls);
 

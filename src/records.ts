@@ -68,9 +68,8 @@ export function decodeStoredFile(doc: Record<string, unknown>, schema: MetadataS
 }
 
 export async function createRecords(request: CreateFileRequest | CreateExternalFileRequest, schema: MetadataSchema, dimensions?: number) {
-    const field = dimensions === undefined ? 'content' : 'embedding';
-    requireInput(keysOnly(request, ['op', 'path', field, 'metadata']) && request.op === 'create',
-        dimensions === undefined ? 'Create requires a path and original text.' : 'Create requires a path and external embedding.');
+    requireInput(keysOnly(request, ['op', 'path', 'content', 'metadata']) && request.op === 'create',
+        dimensions === undefined ? 'Create requires a path and original text.' : 'Create requires a path and vector content.');
     const { path } = request;
     requirePath(path);
     let payload: { content: string } | { embedding: number[] };
@@ -78,7 +77,7 @@ export async function createRecords(request: CreateFileRequest | CreateExternalF
         requireInput(validText(request.content), 'File content must be UTF-8 text.');
         payload = { content: request.content };
     } else {
-        payload = { embedding: vectorValues(request.embedding, dimensions) };
+        payload = { embedding: vectorValues(request.content, dimensions) };
     }
     const metadata = metadataValues(request.metadata, schema);
     const file: StoredFile = { fileId: globalThis.crypto.randomUUID(), path, modifiedAt: new Date().toISOString(), ...payload,

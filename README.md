@@ -59,7 +59,7 @@ const work = await main.fork({ name: 'notes-draft' });
 const file = await work.write({
     op: 'create',
     path: '/notes/42',
-    embedding: noteVector,
+    content: noteVector,
     metadata: { sourceId: '42', workspace: 'private' },
 });
 
@@ -67,7 +67,7 @@ const reopened = await MemDrive.open({
     client, name: 'local-notes', mode: 'external', at: { fork: 'notes-draft' },
 });
 const { hits } = await reopened.search({
-    queryVector: questionVector,
+    query: questionVector,
     filter: { field: 'metadata.workspace', op: 'eq', value: 'private' },
     limit: 5,
 });
@@ -80,7 +80,7 @@ Each file record stores one supplied vector. The mode has no text index, text pa
 
 Search filters use declared scalar metadata fields with `eq`, `neq`, `in`, and `exists`. Numeric and datetime fields support `gt`, `gte`, `lt`, and `lte`. Combine conditions with nonempty `and` or `or` arrays. Datetimes use the same UTC ISO format with milliseconds as stored metadata.
 
-Pass `embedding` to replace a vector in `work.write({ op: 'update', fileId, embedding })`. A path or metadata update preserves the current vector. Vector files share the same fork, checkpoint, diff, merge, and deletion lifecycle as text files. A vector replacement alone counts as a file change.
+Pass the replacement vector as `content` in `work.write({ op: 'update', fileId, content: replacementVector })`. A path or metadata update preserves the current vector. Vector files share the same fork, checkpoint, diff, merge, and deletion lifecycle as text files. A vector replacement alone counts as a file change.
 
 ## Edit files on a working fork
 

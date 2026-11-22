@@ -89,9 +89,8 @@ export type WriteFileResult = DriveFile | DeleteFileResult;
 export interface CreateExternalFileRequest {
     op: 'create';
     path: string;
-    embedding: readonly number[];
+    content: readonly number[];
     metadata?: Metadata | undefined;
-    content?: never;
 }
 
 export interface UpdateExternalFileRequest {
@@ -99,8 +98,7 @@ export interface UpdateExternalFileRequest {
     fileId: string;
     newPath?: string | undefined;
     metadata?: Metadata | undefined;
-    embedding?: readonly number[] | undefined;
-    content?: never;
+    content?: readonly number[] | undefined;
     edits?: never;
 }
 
@@ -213,7 +211,7 @@ export type FileFilter =
     | { field: `metadata.${string}`; op: 'exists'; value: boolean };
 
 export interface SearchExternalFilesRequest {
-    queryVector: readonly number[];
+    query: readonly number[];
     limit?: number | undefined;
     filter?: FileFilter | undefined;
 }

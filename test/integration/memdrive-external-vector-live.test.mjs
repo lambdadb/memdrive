@@ -119,7 +119,7 @@ test('live external vectors preserve private application text and frozen vector 
         }));
     }
     async function nearest(view, expected, { probe = query, limit = expected.length, filter } = {}) {
-        const { hits, reranked } = await view.search({ queryVector: probe, limit, ...(filter ? { filter } : {}) }, options());
+        const { hits, reranked } = await view.search({ query: probe, limit, ...(filter ? { filter } : {}) }, options());
         assert.equal(reranked, false);
         assert.deepEqual(hits.map(hit => hit.fileId), expected);
         for (const hit of hits) {
@@ -143,9 +143,9 @@ test('live external vectors preserve private application text and frozen vector 
         assert(!Object.hasOwn(collection.indexConfigs, 'content') && !Object.hasOwn(collection.indexConfigs, 'body'));
         const work = await main.fork({ name: 'source-vector' }, options());
         const [a, b, c] = await work.write([
-            { op: 'create', path: '/opaque/a', embedding: input, metadata: { topic: 'initial', rank: 12 } },
-            { op: 'create', path: '/opaque/b', embedding: orthogonal, metadata: { topic, rank: 1 } },
-            { op: 'create', path: '/opaque/c', embedding: opposite, metadata: { topic: 'owner "synth" X 한글', rank: 12 } },
+            { op: 'create', path: '/opaque/a', content: input, metadata: { topic: 'initial', rank: 12 } },
+            { op: 'create', path: '/opaque/b', content: orthogonal, metadata: { topic, rank: 1 } },
+            { op: 'create', path: '/opaque/c', content: opposite, metadata: { topic: 'owner "synth" X 한글', rank: 12 } },
         ], options());
         const ids = [a.fileId, b.fileId, c.fileId];
         for (const [index, fileId] of ids.entries()) localTexts.set(fileId, privateNotes[index]);
@@ -197,10 +197,10 @@ test('live external vectors preserve private application text and frozen vector 
         const checkpointName = 'initial-vector-view';
         await published.checkpoint({ name: checkpointName }, options());
         const stale = await published.fork({ name: 'stale-vector-draft' }, options());
-        await stale.write({ op: 'update', fileId: a.fileId, embedding: vector(0, 1, 1) }, options());
+        await stale.write({ op: 'update', fileId: a.fileId, content: vector(0, 1, 1) }, options());
 
         phase = 'Publish a captured vector while preserving a later working edit';
-        await work.write({ op: 'update', fileId: a.fileId, embedding: capturedVector }, options());
+        await work.write({ op: 'update', fileId: a.fileId, content: capturedVector }, options());
         assert.deepEqual(await work.diff(options()), [{ op: 'update', fileId: a.fileId, path: '/moved/a' }]);
         gate = { id: originalId(a.fileId), entered: deferred(), release: deferred(), reached: false };
         const publication = merge(work, 'Publish the captured vector without later changes');
@@ -208,7 +208,7 @@ test('live external vectors preserve private application text and frozen vector 
         let second, interruption;
         try {
             await Promise.race([gate.entered.promise, unexpected]);
-            await work.write({ op: 'update', fileId: a.fileId, embedding: laterVector }, options());
+            await work.write({ op: 'update', fileId: a.fileId, content: laterVector }, options());
         } catch (error) {
             interruption = error;
         } finally {

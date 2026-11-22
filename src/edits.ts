@@ -6,8 +6,9 @@ import type { DeleteFileRequest, MetadataSchema, TextEdit, UpdateExternalFileReq
 type EditRequest = UpdateFileRequest | UpdateExternalFileRequest | DeleteFileRequest;
 
 export function editRequest(request: unknown, schema: MetadataSchema, dimensions?: number): EditRequest {
-    const fields = dimensions === undefined ? ['content', 'edits'] : ['embedding'];
-    requireInput(keysOnly(request, ['op', 'fileId', 'newPath', 'metadata', ...fields]) && validFileId(request.fileId),
+    const fields = dimensions === undefined ? ['op', 'fileId', 'newPath', 'metadata', 'content', 'edits']
+        : ['op', 'fileId', 'newPath', 'metadata', 'content'];
+    requireInput(keysOnly(request, fields) && validFileId(request.fileId),
         'Update and delete require a fileId returned by MemDrive.');
     if (request.op === 'delete') {
         requireInput(Object.keys(request).length === 2, 'Delete accepts only a fileId.');
@@ -17,11 +18,11 @@ export function editRequest(request: unknown, schema: MetadataSchema, dimensions
     const base = { op: 'update' as const, fileId: request.fileId,
         ...(request.newPath === undefined ? {} : { newPath: request.newPath }) };
     if (dimensions !== undefined) {
-        requireInput([request.newPath, request.embedding, request.metadata].some(value => value !== undefined),
-            'Update requires a path, metadata or a replacement embedding.');
+        requireInput([request.newPath, request.content, request.metadata].some(value => value !== undefined),
+            'Update requires a path, metadata or replacement vector content.');
         const metadata = metadataValues(request.metadata, schema);
         return { ...base, ...(request.metadata === undefined ? {} : { metadata: metadata ?? {} }),
-            ...(request.embedding === undefined ? {} : { embedding: vectorValues(request.embedding, dimensions) }) };
+            ...(request.content === undefined ? {} : { content: vectorValues(request.content, dimensions) }) };
     }
     requireInput((request.content === undefined || validText(request.content))
         && !(request.edits !== undefined && request.content !== undefined)
@@ -81,14 +82,15 @@ export async function planEdit(request: EditRequest, doc: Record<string, unknown
     const fields = { fileId, path, modifiedAt: current.modifiedAt, ...(metadata === undefined ? {} : { metadata }) };
     const revision = globalThis.crypto.randomUUID();
     if ('embedding' in current) {
-        const embedding = 'embedding' in request && request.embedding !== undefined ? [...request.embedding] : current.embedding;
+        const embedding = request.content !== undefined && typeof request.content !== 'string' ? [...request.content] : current.embedding;
         const file: StoredFile = { ...fields, embedding };
         const fingerprint = await fingerprintOf(file);
         if (fingerprint !== await fingerprintOf(current)) file.modifiedAt = new Date().toISOString();
         const records = await fileRecords(file, { revision, baseline, fingerprint, version });
         return { op: 'update' as const, file: records.file, generation: undefined, moveOnly: false as const, records };
     }
-    const content = request.edits ? replaceExact(current.content, request.edits) : request.content ?? current.content;
+    const content = request.edits ? replaceExact(current.content, request.edits)
+        : typeof request.content === 'string' ? request.content : current.content;
     const generationValue = doc?.generation;
     if (generationValue !== undefined && !validFileId(generationValue))
         throw new MemDriveError('INVALID_RESULT', 'Read returned invalid file generation data.');
