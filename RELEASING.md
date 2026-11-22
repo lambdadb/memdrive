@@ -111,7 +111,7 @@ publication. Source, archive or unexpected `latest` changes fail immediately.
 Reruns validate an existing version and report when its channel has advanced,
 without moving the tag.
 
-The live suite creates one isolated collection and forks main. It writes two
+The basic live scenario creates an isolated collection and forks main. It writes two
 short synthetic originals, verifies reads by path and file ID through a reopened
 fork, and checks main isolation and duplicate path rejection. It exercises managed
 embeddings and searches with and without native reranking. Requests have
@@ -119,6 +119,11 @@ embeddings and searches with and without native reranking. Requests have
 or failed cleanup fail the run. Record the pinned LambdaDB client version and
 test environment. Unit tests, installed-package checks, live integration and
 registry verification establish different facts.
+
+The default suite also creates a separate structured-text store using local
+Docling Hybrid and a synthetic tokenizer. It verifies exact originals, rendered
+search previews, checkpoints and publication without a parser on the reopened
+reader, then destroys the content store and its publication journal.
 
 ## GitHub and npm configuration
 

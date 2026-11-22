@@ -24,10 +24,9 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
     const chunker = await createDoclingChunker({
         tokenizer: new URL('../fixtures/docling-tokenizer.json', import.meta.url).pathname, maxTokens: 32,
     });
-    let owned = false;
+    let collision = false;
     try {
         const main = await MemDrive.create({ client, name, chunker }, options());
-        owned = true;
         const fork = await main.fork({ name: 'draft' }, options());
         const file = await fork.write({ op: 'create', path: '/note.md', content: '# Heading\n\nHello world.' }, options());
         const checkpoint = await fork.checkpoint({ name: 'saved' }, options());
@@ -42,10 +41,13 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
         const after = await reopened.search({ query: 'Hello world', rerank: false }, options());
         assert.deepEqual(after.hits, before.hits);
     } catch (error) {
+        collision = error?.code === 'STORE_EXISTS';
         const detail = error instanceof assert.AssertionError ? ` ${error.message}` : '';
         throw new Error(`Structured live smoke failed (${error?.code ?? error?.name ?? 'Error'}).${detail}`);
     } finally {
-        if (owned) {
+        // Creation can fail after the native collection exists. Clean the
+        // unique test name in that case too, but never touch a name collision.
+        if (!collision) {
             try { await MemDrive.destroy({ client, name }, options()); }
             catch (error) { throw new Error(`Structured live cleanup failed (${error?.code ?? error?.name ?? 'Error'}).`); }
             await assert.rejects(client.collection(name).get(options()), error => (error.status ?? error.statusCode) === 404);

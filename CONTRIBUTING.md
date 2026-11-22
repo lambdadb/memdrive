@@ -55,7 +55,8 @@ Add focused tests for distinct correctness risks. Public API changes need type-c
 A passing local suite establishes unit and package behavior only. `npm run test:live`
 requires Node.js 24 and `LAMBDADB_BASE_URL`, `LAMBDADB_PROJECT_NAME` and
 `LAMBDADB_PROJECT_API_KEY` in the environment or a local `.env.local`. It creates
-and deletes one isolated test collection. Use a dedicated test project;
+and deletes isolated test collections, including the structured-text store and
+its publication journal. Use a dedicated test project;
 missing settings fail rather than silently skipping. The publication workflow
 runs the live suite against the exact installed tarball. Set
 `MEMDRIVE_RUN_LIVE_MERGE_TESTS=1` to additionally run the opt-in public merge
