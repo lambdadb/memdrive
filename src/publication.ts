@@ -1,10 +1,10 @@
-import { keysOnly } from './config.js';
+import { keysOnly, parseStore, validRetention } from './config.js';
 import { historyRetention, type RetainedPublication } from './history-retention.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, requireInput } from './errors.js';
 import { mergeCaptureJournal } from './merge-journal.js';
 import { applyMerge, advanceMergeSource, verifyMerge } from './merge-apply.js';
 import { confirmedMergeSource, initialMainRef, prepareMerge } from './merge-preflight.js';
-import { appliedId, bookkeepingId, completionId, parseOutcome, parseReservation, publicationLog, reservationId, returnOutcome,
+import { appliedId, bookkeepingId, completionId, parseOutcome, parseReservation, publicationIdentity, publicationLog, reservationId, returnOutcome,
     tagFor, versionFor, type BoundRequest, type Outcome, type PublicationRecord, type Reservation } from './publication-log.js';
 import { awaitMergeTag, refBackoff } from './refs.js';
 import { branchRef, type Handle, type ViewRef } from './storage-reads.js';
@@ -28,7 +28,7 @@ function mergeBlocked(requestId: string, cause?: unknown) {
 }
 
 export function publication(client: ConnectionOptions['client'], content: Handle, { name, driveId }: { name: string; driveId: string },
-    schema: MetadataSchema, writerFor: (branch: string) => Writer, dimensions?: number) {
+    schema: MetadataSchema, writerFor: (branch: string) => Writer, dimensions: number | undefined, canMaintain: () => boolean) {
     const internal = client.collection(name);
     const journal = publicationLog(content, internal, driveId);
     const capture = mergeCaptureJournal(content, internal, { name, driveId }, { captureEmpty: true });
@@ -361,13 +361,17 @@ export function publication(client: ConnectionOptions['client'], content: Handle
 
         const result = enqueue(async () => {
             executing = requestId;
+            let completed = false;
             try {
                 checkAbort(signal);
                 await refresh(signal);
                 const existing = requests.get(requestId);
                 if (existing) {
                     checkBinding(existing, request);
-                    if (existing.outcome && existing !== active) return returnOutcome(existing.outcome, requestId);
+                    if (existing.outcome && existing !== active) {
+                        completed = true;
+                        return returnOutcome(existing.outcome, requestId);
+                    }
                 }
                 if (active && active.reservation.requestId !== requestId) throw mergeBlocked(active.reservation.requestId);
                 if (unresolved && unresolved.requestId !== requestId) throw mergeBlocked(unresolved.requestId);
@@ -396,9 +400,11 @@ export function publication(client: ConnectionOptions['client'], content: Handle
                     entry = requests.get(requestId);
                 }
                 if (!entry) throw new MemDriveError('INVALID_RESULT', 'The merge reservation was not observed.');
-                return await finish(entry, signal);
+                try { return await finish(entry, signal); }
+                finally { completed = Boolean(entry.outcome && entry !== active); }
             } finally {
                 executing = undefined;
+                if (completed) await maintainHistory(signal);
             }
         });
         const settled = result.then(() => undefined, () => undefined);
@@ -419,26 +425,43 @@ export function publication(client: ConnectionOptions['client'], content: Handle
                 await settleRecord(signal);
                 if (active) await finish(active, signal);
             } catch (cause) {
-                if (cause instanceof MemDriveError && cause.code === 'MERGE_CONFLICT') return;
-                throw cause;
+                if (!(cause instanceof MemDriveError) || cause.code !== 'MERGE_CONFLICT') throw cause;
+            } finally {
+                await maintainHistory(signal);
             }
         });
     }
 
-    async function assertIdle(signal?: AbortSignal, allowCleanupRetry = false) {
-        if (!allowCleanupRetry) retained.assertSettled();
+    async function assertIdle(signal?: AbortSignal) {
         await refresh(signal);
         const blocking = active?.reservation.requestId ?? unresolved?.requestId ?? unsettled?.requestId ?? executing;
         if (blocking) throw mergeBlocked(blocking);
         if (sourceMerges.size) throw new MemDriveError('STORE_BUSY', 'A merge capture is still in progress.');
     }
 
-    async function pruneHistory(configuration: { retentionInDays: number; dryRun: boolean; limit: number }, signal?: AbortSignal) {
-        await assertIdle(signal, true);
-        const completed = [...requests.values()].flatMap(({ reservation, outcome }) => outcome ? [{ reservation, outcome }] : []);
-        return retained.prune(publications, completed, configuration, signal);
+    async function maintainHistory(signal?: AbortSignal) {
+        if (signal?.aborted || active || unresolved || unsettled || !canMaintain()) return;
+        const controller = new AbortController();
+        const abort = () => controller.abort();
+        signal?.addEventListener('abort', abort, { once: true });
+        const timer = setTimeout(abort, 5_000);
+        try {
+            // Retention can change through another client. Never guess a value
+            // or clean a replacement store generation with this client's journal.
+            const response = await nativeRequest(() => content.get(nativeOptions(controller.signal)), controller.signal);
+            const found = parseStore(response.collection, content.collectionName);
+            if (!validRetention(found.retentionInDays)
+                || (await publicationIdentity(content.collectionName, response.collection)).driveId !== driveId) return;
+            const completed = [...requests.values()].flatMap(({ reservation, outcome }) => outcome ? [{ reservation, outcome }] : []);
+            await retained.prune(publications, completed, found.retentionInDays, controller.signal);
+        } catch {
+            // Maintenance must not change a durable terminal merge result.
+            // Archives and tag deletions are idempotent; later merges retry.
+        } finally {
+            clearTimeout(timer);
+            signal?.removeEventListener('abort', abort);
+        }
     }
 
-    return { main: { read, pin }, merge, recover, status, history, assertIdle, pruneHistory,
-        assertCleanupSettled: retained.assertSettled, initialize: ensureBootstrap };
+    return { main: { read, pin }, merge, recover, status, history, assertIdle, initialize: ensureBootstrap };
 }

@@ -10,7 +10,7 @@ import { searchQuery, validateReranking, vectorSearchQuery } from './search.js';
 import { fileLister } from './list.js';
 import { fileTextFinder } from './find-text.js';
 import { textChunker } from './text-chunks.js';
-import type { DoclingChunker, HistoryPruneRequest } from './types.js';
+import type { DoclingChunker } from './types.js';
 import { createRef } from './refs.js';
 import { rangeKeys, readRange, validateReadRange } from './read-range.js';
 import type { DriveFile, FileReadPage, ReadFileRangeRequest } from './types.js';
@@ -85,14 +85,16 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         writers.set(branch, writer);
         return writer;
     }
-    const publishing = publication(client, handle, identity, metadataSchema, writerFor, dimensions);
+    const publishing = publication(client, handle, identity, metadataSchema, writerFor, dimensions,
+        () => gate.soleOperation() && !invalid && pendingRetention === undefined && pendingRefs.size === 0
+            && ![...refStates.values()].some(state => state.uncertain));
 
-    async function assertDeleteSafe(signal?: AbortSignal, retry?: { uncertain: boolean }, allowCleanupRetry = false) {
+    async function assertDeleteSafe(signal?: AbortSignal, retry?: { uncertain: boolean }) {
         if (pendingRetention !== undefined) throw new MemDriveError('CONFIGURATION_UNCONFIRMED', 'Settle the pending retention configuration before deleting resources.');
         if (pendingRefs.size) throw new MemDriveError('REF_CREATION_UNCONFIRMED', 'Resolve unconfirmed reference creation before deleting.');
         if ([...refStates.values()].some(state => state !== retry && state.uncertain))
             throw new MemDriveError('REF_DELETION_UNCONFIRMED', 'Settle unconfirmed reference deletion before deleting other resources.');
-        await publishing.assertIdle(signal, allowCleanupRetry);
+        await publishing.assertIdle(signal);
         for (const writer of writers.values()) await writer.enqueueRef(async () => undefined, signal);
     }
 
@@ -357,28 +359,6 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
     }
 
     const mainView: MainFileDrive<EmbeddingMode> = guarded({ ...view(publishing.main, { kind: 'main' }),
-        async pruneHistory(request: HistoryPruneRequest = {}, options?: RequestOptions) {
-            const { signal } = operationOptions(options);
-            checkAbort(signal);
-            requireInput(keysOnly(request, ['dryRun', 'limit']), 'Prune history accepts dryRun and limit.');
-            const { dryRun = true, limit = 100 } = request;
-            requireInput(typeof dryRun === 'boolean' && typeof limit === 'number' && Number.isSafeInteger(limit) && limit >= 1 && limit <= 1000,
-                'Prune history requires a boolean dryRun and a limit from 1–1000.');
-            return gate.exclusive(async () => {
-                assertLive();
-                await assertDeleteSafe(signal, undefined, true);
-                const response = await remote(() => handle.get(nativeOptions(signal)), 'Could not inspect retention configuration.', signal);
-                const found = parseStore(response.collection, name);
-                if ((await publicationIdentity(name, response.collection)).driveId !== identity.driveId) {
-                    invalid = true;
-                    throw new MemDriveError('STORE_REPLACED', 'This handle belongs to a previous store generation.');
-                }
-                if (!validRetention(found.retentionInDays))
-                    throw new MemDriveError('RETENTION_UNAVAILABLE', 'Native retention is unavailable. Configure retention before pruning history.');
-                description.retentionInDays = found.retentionInDays;
-                return publishing.pruneHistory({ retentionInDays: found.retentionInDays, dryRun, limit }, signal);
-            });
-        },
         async configure(request: { retentionInDays: number }, options?: RequestOptions) {
             const { signal } = operationOptions(options);
             checkAbort(signal);
@@ -386,7 +366,6 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
             const days = request.retentionInDays;
             return gate.exclusive(async () => {
                 assertLive();
-                publishing.assertCleanupSettled();
                 if (pendingRetention !== undefined && pendingRetention !== days)
                     throw new MemDriveError('CONFIGURATION_UNCONFIRMED', 'Fence outstanding requests and retry the same retention value first.');
                 const inspect = async () => {

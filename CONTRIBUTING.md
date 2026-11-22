@@ -36,7 +36,7 @@ chunks and vectors during publication and recovery.
 The default live suite additionally checks Docling writes, checkpoint reads and
 publication against the real backend, then destroys its isolated store and journal.
 It also ages timestamps in that isolated synthetic journal to exercise internal
-capture pruning, retained history, checkpoint reads and merge replay. It does
+automatic capture cleanup after merge replay, retained history and checkpoint reads. It does
 not wait a real retention period or measure physical GC.
 
 The shared file-tool catalog also lives at the package root. Preserve the bound
@@ -50,7 +50,8 @@ and store/ref lifecycle, including partial deletion recovery, as well as ESM,
 CommonJS, TypeScript and browser imports.
 The installed core package also runs history-retention regressions covering
 protected refs, supersession timing, bounded archives, terminal outcomes and
-uncertain or partial cleanup. Public type checks restrict pruning to main.
+uncertain or partial cleanup, cancellation and read concurrency. Public type checks
+verify that retention needs no separate cleanup API.
 
 The LambdaDB dependency is pinned to an exact release. Update it deliberately with relevant API and regression checks. Tooling versions initially follow the native client's lockfile; updating tooling is separate from adopting a new database API.
 

@@ -130,9 +130,9 @@ readiness check. Failure output names the stage and HTTP status without request
 headers or bodies.
 
 That isolated structured scenario also configures one-day retention and ages
-only its synthetic reservation/completion timestamps. It prunes the completed
-merge capture, verifies retained history, main and checkpoint reads, and replays
-the completed merge. This tests the native cleanup path without waiting a real
+only its synthetic reservation/completion timestamps. Replaying the completed
+merge automatically releases its expired capture; the test verifies tag absence,
+retained history, main and checkpoint reads, and another successful replay. This tests the native cleanup path without waiting a real
 day. Superseded-main selection and failure recovery have fixture coverage;
 neither check measures physical GC after tag removal.
 

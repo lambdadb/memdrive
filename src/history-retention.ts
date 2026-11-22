@@ -4,7 +4,7 @@ import { deleteReference } from './lifecycle.js';
 import { validFileId } from './records.js';
 import { tagFor, type HistoryArchive, type Outcome, type Reservation, type publicationLog } from './publication-log.js';
 import type { Handle } from './storage-reads.js';
-import type { FileHistoryEntry, HistoryPruneResult } from './types.js';
+import type { FileHistoryEntry } from './types.js';
 
 export type RetainedPublication = Pick<FileHistoryEntry, 'version' | 'publishedAt' | 'summary'> & { sourceTag: string };
 export type CompletedRequest = { reservation: Reservation; outcome: Outcome & { completedAt: string } };
@@ -14,13 +14,7 @@ const day = 86_400_000;
 /** Preserve bounded public history before releasing its source snapshot. */
 export function historyRetention(content: Handle, journal: ReturnType<typeof publicationLog>, driveId: string,
     hasTag: (name: string, signal?: AbortSignal) => Promise<boolean>) {
-    let unconfirmed = false;
     const archiveId = (version: string) => `history:${version}`;
-
-    function assertSettled() {
-        if (unconfirmed) throw new MemDriveError('HISTORY_CLEANUP_UNCONFIRMED',
-            'Fence outstanding cleanup requests and retry pruneHistory with dryRun: false before configuring retention or deleting resources.');
-    }
 
     async function archived(publication: RetainedPublication, signal?: AbortSignal): Promise<FileHistoryEntry | undefined> {
         const doc = await journal.read(archiveId(publication.version), signal);
@@ -63,7 +57,9 @@ export function historyRetention(content: Handle, journal: ReturnType<typeof pub
             if (!await hasTag(sourceTag, signal)) throw unavailable();
             throw new MemDriveError('INVALID_RESULT', 'A published merge capture contained no changed files.');
         }
-        return { version, publishedAt, summary, fileIds, fileIdsTruncated };
+        // A different client may have archived/deleted the capture during a
+        // paged scan. Prefer its complete archive even if the last page was empty.
+        return await archived(publication, signal) ?? { version, publishedAt, summary, fileIds, fileIdsTruncated };
     }
 
     async function archive(publication: RetainedPublication, signal?: AbortSignal) {
@@ -74,8 +70,7 @@ export function historyRetention(content: Handle, journal: ReturnType<typeof pub
     }
 
     async function prune(publications: readonly RetainedPublication[], requests: readonly CompletedRequest[],
-        { retentionInDays, dryRun, limit }: { retentionInDays: number; dryRun: boolean; limit: number }, signal?: AbortSignal): Promise<HistoryPruneResult> {
-        if (dryRun) assertSettled();
+        retentionInDays: number, signal?: AbortSignal): Promise<void> {
         const cutoff = new Date(Date.now() - retentionInDays * day).toISOString();
         const candidates: { tag: string; expiresFrom: string; publication?: RetainedPublication | undefined }[] = [];
         for (let i = 0; i + 1 < publications.length; i++) {
@@ -92,6 +87,7 @@ export function historyRetention(content: Handle, journal: ReturnType<typeof pub
                 candidates.push({ tag: reservation.sourceTag, expiresFrom: outcome.completedAt, publication });
             }
         }
+        if (!candidates.length) return;
         let response;
         try { response = await nativeRequest(() => content.tags.list(nativeOptions(signal)), signal); }
         catch (cause) { throw databaseError(cause, 'Could not inspect internal history tags.'); }
@@ -109,37 +105,23 @@ export function historyRetention(content: Handle, journal: ReturnType<typeof pub
         }
         const eligible = candidates.filter(candidate => names.has(candidate.tag))
             .sort((a, b) => a.expiresFrom.localeCompare(b.expiresFrom) || a.tag.localeCompare(b.tag));
-        const selected = eligible.slice(0, limit);
-        const result: HistoryPruneResult = { retentionInDays, cutoff, dryRun, tags: selected.map(candidate => candidate.tag),
-            deleted: [], hasMore: eligible.length > selected.length };
-        if (dryRun) return result;
-        try {
-            // Confirm every selected publication summary before any deletion.
-            const saved = new Set<string>();
-            for (const { publication } of selected) {
-                if (publication && !saved.has(publication.version)) {
-                    await archive(publication, signal);
-                    saved.add(publication.version);
-                }
+        const selected = eligible.slice(0, 100);
+        // Confirm every selected publication summary before any deletion.
+        const saved = new Set<string>();
+        for (const { publication } of selected) {
+            if (publication && !saved.has(publication.version)) {
+                await archive(publication, signal);
+                saved.add(publication.version);
             }
-            for (const { tag } of selected) {
-                await deleteReference(() => content.tags.delete(tag, mutationOptions(signal)), async () => {
-                    if (await hasTag(tag, signal)) throw new MemDriveError('INVALID_RESULT', 'History tag deletion was not confirmed.');
-                }, () => { unconfirmed = true; }, signal);
-                result.deleted.push(tag);
-            }
-        } catch (cause) {
-            if (cause instanceof MemDriveError && cause.code === 'MERGE_JOURNAL_UNCONFIRMED') unconfirmed = true;
-            const error = databaseError(cause, 'Could not prune internal history tags.');
-            const failure = new MemDriveError(unconfirmed ? 'HISTORY_CLEANUP_UNCONFIRMED' : error.code,
-                unconfirmed ? 'History cleanup is unconfirmed. Fence outstanding requests before retrying pruneHistory with dryRun: false.' : error.message,
-                { cause, details: { deleted: [...result.deleted] } });
-            if (error.status !== undefined) failure.status = error.status;
-            throw failure;
         }
-        unconfirmed = false;
-        return result;
+        for (const { tag } of selected) {
+            // Names belong to immutable completed requests and are never reused
+            // within a store generation. Retrying an unknown deletion is safe.
+            await deleteReference(() => content.tags.delete(tag, mutationOptions(signal)), async () => {
+                if (await hasTag(tag, signal)) throw new MemDriveError('INVALID_RESULT', 'History tag deletion was not confirmed.');
+            }, () => {}, signal);
+        }
     }
 
-    return { entry, prune, assertSettled };
+    return { entry, prune };
 }
