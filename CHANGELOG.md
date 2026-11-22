@@ -5,6 +5,7 @@
 - Replace the memory SDK entry points with a file SDK for fresh stores, read-only main, and working forks.
 - Create files in batches and read exact originals by path or stable file ID. Search indexed chunks with hybrid retrieval, optional reranking and verified source ranges.
 - Find case-insensitive literal occurrences in original file text with verified UTF-16 ranges, excerpts, metadata filters and resumable pages.
+- Read the published main version, unfinished merge phase and paginated main publication history from any file view.
 - Run LongMemEval against the public file SDK. The file-based corpus and run formats bind each evidence span to its original file and keep prior benchmark results on their original protocol.
 
 ## 0.1.0

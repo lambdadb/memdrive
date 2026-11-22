@@ -1,4 +1,6 @@
-import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest } from './errors.js';
+import { keysOnly } from './config.js';
+import { changedFiles } from './diff.js';
+import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, requireInput } from './errors.js';
 import { mergeCaptureJournal } from './merge-journal.js';
 import { applyMerge, advanceMergeSource, verifyMerge } from './merge-apply.js';
 import { confirmedMergeSource, initialMainRef, prepareMerge } from './merge-preflight.js';
@@ -6,11 +8,17 @@ import { appliedId, bookkeepingId, completionId, parseOutcome, parseReservation,
     tagFor, versionFor, type BoundRequest, type Outcome, type PublicationRecord, type Reservation } from './publication-log.js';
 import { awaitMergeTag, refBackoff } from './refs.js';
 import { branchRef, type Handle, type ViewRef } from './storage-reads.js';
-import type { ConnectionOptions, MetadataSchema } from './types.js';
+import type { ConnectionOptions, FileHistoryEntry, FileHistoryRequest, FileHistoryResult, FileStoreStatus, MetadataSchema } from './types.js';
 import type { workingWriter } from './writes.js';
 
 type Writer = ReturnType<typeof workingWriter>;
 type Entry = { slot: bigint; reservation: Reservation; outcome?: Outcome };
+type Publication = Pick<FileHistoryEntry, 'version' | 'publishedAt' | 'summary'> & { sourceTag: string };
+type HistoryPage = { start: number; end: number; limit: number; throughVersion: string };
+
+const historyCursorLifetime = 5 * 60 * 1000;
+const historyCursorLimit = 64;
+const historyFileLimit = 100;
 
 function tagRef(name: string) {
     return { kind: 'tag' as const, name };
@@ -28,6 +36,9 @@ export function publication(client: ConnectionOptions['client'], content: Handle
     const capture = mergeCaptureJournal(content, internal, { name, driveId }, { captureEmpty: true });
     const initialVersion = 'v0';
     const requests = new Map<string, Entry>();
+    const publications: Publication[] = [];
+    const positions = new Map([[initialVersion, 0]]);
+    const cursors = new Map<string, HistoryPage & { expiresAt: number }>();
     let published = initialVersion;
     let slot = 1n;
     let active: Entry | undefined;
@@ -45,10 +56,10 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         try {
             const result = await nativeRequest(() => content.tags.get(name, nativeOptions(signal)), signal);
             if (result?.tag?.name !== name)
-                throw new MemDriveError('INVALID_RESULT', 'Tag lookup did not return the requested main version.');
+                throw new MemDriveError('INVALID_RESULT', 'Tag lookup did not return the requested tag.');
             return true;
         } catch (cause) {
-            const error = databaseError(cause, 'Could not inspect a main version tag.');
+            const error = databaseError(cause, 'Could not inspect the requested tag.');
             if (error.status === 404) return false;
             throw error;
         }
@@ -135,8 +146,15 @@ export function publication(client: ConnectionOptions['client'], content: Handle
                 if (!active.outcome) {
                     const record = await journal.read(completionId(slot), signal);
                     if (!record) return;
-                    active.outcome = parseOutcome(record, active.reservation);
-                    if (active.outcome.status === 'published') published = active.outcome.version;
+                    const outcome = parseOutcome(record, active.reservation);
+                    active.outcome = outcome;
+                    if (outcome.status === 'published') {
+                        const { sourceTag, summary } = active.reservation;
+                        // parseOutcome requires the retained capture for a publication.
+                        published = outcome.version;
+                        publications.push({ version: published, publishedAt: outcome.completedAt, summary, sourceTag: sourceTag! });
+                        positions.set(published, publications.length);
+                    }
                 }
                 if (active.outcome.status === 'published') {
                     const record = await journal.read(bookkeepingId(slot), signal);
@@ -153,6 +171,80 @@ export function publication(client: ConnectionOptions['client'], content: Handle
     }
 
     const refFor = (version: string) => version === initialVersion ? initialMainRef : tagRef(tagFor(version));
+
+    async function status(at: FileStoreStatus['at'], signal?: AbortSignal): Promise<FileStoreStatus> {
+        await refresh(signal);
+        checkAbort(signal);
+        const result: FileStoreStatus = { at, mainVersion: published };
+        const requestId = active?.reservation.requestId ?? unresolved?.requestId;
+        if (requestId !== undefined)
+            result.merge = { requestId, phase: active?.outcome?.status === 'published' ? 'bookkeeping' : 'publication' };
+        return result;
+    }
+
+    async function history(request: FileHistoryRequest, signal?: AbortSignal): Promise<FileHistoryResult> {
+        requireInput(keysOnly(request, ['sinceVersion', 'limit', 'cursor']), 'Invalid history options.');
+        const now = Date.now();
+        for (const [id, page] of cursors) if (page.expiresAt <= now) cursors.delete(id);
+        let page: HistoryPage;
+        if ('cursor' in request) {
+            requireInput(Object.keys(request).length === 1 && typeof request.cursor === 'string',
+                'Pass only cursor when continuing history.');
+            const found = cursors.get(request.cursor);
+            if (!found) throw new MemDriveError('HISTORY_CURSOR_UNAVAILABLE', 'History cursor is unavailable on this store handle. Start again without a cursor.');
+            page = found;
+        } else {
+            const { sinceVersion = initialVersion, limit = 20 } = request;
+            requireInput(typeof sinceVersion === 'string' && sinceVersion.length <= 52 - 'md-main-'.length
+                && /^v(?:0|[1-9][0-9]*)$/.test(sinceVersion),
+                'Provide a canonical version such as v0 or v1.');
+            requireInput(Number.isSafeInteger(limit) && limit >= 1 && limit <= 100, 'History limit must be 1–100.');
+            await refresh(signal);
+            checkAbort(signal);
+            const start = positions.get(sinceVersion);
+            if (start === undefined)
+                throw new MemDriveError('VERSION_NOT_FOUND', 'The requested version was not observed as a published main version.',
+                    { details: { version: sinceVersion } });
+            page = { start, end: publications.length, limit, throughVersion: published };
+        }
+
+        const { start, end, limit, throughVersion } = page;
+        const stop = Math.min(start + limit, end);
+        const entries: FileHistoryEntry[] = [];
+        for (const { version, publishedAt, summary, sourceTag } of publications.slice(start, stop)) {
+            const unavailable = () => new MemDriveError('HISTORY_UNAVAILABLE',
+                'The retained merge capture is missing. Reread the current drive if you need current file state.', { details: { version } });
+            const fileIds: string[] = [];
+            let fileIdsTruncated = false;
+            try {
+                for await (const { change } of changedFiles(content, content.collectionName, tagRef(sourceTag), signal)) {
+                    if (fileIds.length === historyFileLimit) {
+                        fileIdsTruncated = true;
+                        break;
+                    }
+                    fileIds.push(change.fileId);
+                }
+            } catch (cause) {
+                if (cause instanceof MemDriveError && cause.status === 404 && !await hasTag(sourceTag, signal))
+                    throw unavailable();
+                throw cause;
+            }
+            if (!fileIds.length) {
+                if (!await hasTag(sourceTag, signal)) throw unavailable();
+                throw new MemDriveError('INVALID_RESULT', 'A published merge capture contained no changed files.');
+            }
+            entries.push({ version, publishedAt, summary, fileIds, fileIdsTruncated });
+        }
+        checkAbort(signal);
+        const result: FileHistoryResult = { entries, throughVersion };
+        if (stop < end) {
+            const cursor = globalThis.crypto.randomUUID();
+            if (cursors.size >= historyCursorLimit) cursors.delete(cursors.keys().next().value!);
+            cursors.set(cursor, { start: stop, end, limit, throughVersion, expiresAt: Date.now() + historyCursorLifetime });
+            result.cursor = cursor;
+        }
+        return result;
+    }
 
     async function pin(signal?: AbortSignal) {
         await refresh(signal);
@@ -356,5 +448,5 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         });
     }
 
-    return { main: { read, pin }, merge, recover, initialize: ensureBootstrap };
+    return { main: { read, pin }, merge, recover, status, history, initialize: ensureBootstrap };
 }

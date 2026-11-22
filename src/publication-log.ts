@@ -43,14 +43,14 @@ export function parseReservation(doc: Record<string, unknown>, slot: bigint, pri
         branch: sourceBranch, sourceTag, startedAt, priorVersion, version };
 }
 
-export function parseOutcome(doc: Record<string, unknown>, reservation: Reservation): Outcome {
+export function parseOutcome(doc: Record<string, unknown>, reservation: Reservation): Outcome & { completedAt: string } {
     if (doc.kind !== 'merge-result-v1' || !validDate(doc.completedAt)) throw invalid();
     if (doc.status === 'published' && doc.version === reservation.version && reservation.sourceTag !== null
         || doc.status === 'unchanged' && doc.version === reservation.priorVersion)
-        return { status: doc.status, version: doc.version as string };
+        return { status: doc.status, version: doc.version as string, completedAt: doc.completedAt };
     if (doc.status === 'conflict' && Array.isArray(doc.fileIds) && doc.fileIds.every(validFileId)
         && Array.isArray(doc.paths) && doc.paths.every(validPath) && doc.fileIds.length + doc.paths.length > 0)
-        return { status: 'conflict', fileIds: doc.fileIds as string[], paths: doc.paths as string[] };
+        return { status: 'conflict', fileIds: doc.fileIds as string[], paths: doc.paths as string[], completedAt: doc.completedAt };
     throw invalid();
 }
 

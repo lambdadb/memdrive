@@ -76,6 +76,11 @@ test('a partial physical merge preserves all public main views and replays froze
     await assert.rejects(work.merge(request('second')), { code: 'MERGE_RESUMABLE' });
     assert(failed, 'A native original already changed before the injected failure.');
     const observer = await MemDrive.open(withClient(fixture));
+    const beforeStatus = fixture.calls.length;
+    assert.deepEqual(await observer.status(),
+        { at: { kind: 'main' }, mainVersion: 'v1', merge: { requestId: 'second', phase: 'publication' } });
+    assert.equal((await observer.history()).throughVersion, 'v1');
+    assert(fixture.calls.slice(beforeStatus).every(({ kind }) => ['fetch', 'query'].includes(kind)));
     assert.deepEqual(await observer.read({ paths: ['/one', '/two'] }), [one, two]);
     assert.deepEqual((await observer.list()).files.map(({ path }) => path), ['/one', '/two']);
     assert.deepEqual((await observer.search({ query: 'draft', rerank: false })).hits.map(({ content }) => content).sort(), ['/one', '/two']);
@@ -166,6 +171,8 @@ test('a read-only legacy store safely rechecks main if an upgrade and publicatio
     const legacy = fixture.collections.get(name);
     legacy.branches.delete('md-main-v0');
     const observer = await MemDrive.open(withClient(fixture));
+    assert.deepEqual(await observer.status(), { at: { kind: 'main' }, mainVersion: 'v0' });
+    assert.deepEqual(await observer.history(), { entries: [], throughVersion: 'v0' });
     assert.deepEqual(await observer.list(), { files: [], prefixes: [], consistency: 'eventual' });
     assert(!legacy.branches.has('md-main-v0'));
 
@@ -192,6 +199,89 @@ test('a read-only legacy store safely rechecks main if an upgrade and publicatio
     await fork.merge(request('legacy'));
     release.resolve();
     assert.deepEqual(await read, saved);
+});
+
+test('main history uses retained captures, omits version gaps, and pins pagination across views', async t => {
+    const { fixture, main } = await setup();
+    const work = await main.fork({ name: 'history' });
+    const first = await work.write(file('/first'));
+    await work.merge(request('first'));
+    const old = await main.checkpoint({ name: 'original' });
+    await work.merge(request('unchanged'));
+    const second = await work.write(file('/second'));
+    await work.write({ op: 'delete', fileId: first.fileId });
+    await work.merge(request('third'));
+    const beforeReads = fixture.calls.length;
+    const page = await old.history({ limit: 1, sinceVersion: 'v0' });
+    assert(page.cursor);
+    assert.equal(page.throughVersion, 'v3');
+    const [entry] = page.entries;
+    assert.equal(new Date(entry.publishedAt).toISOString(), entry.publishedAt);
+    assert.deepEqual(entry, { version: 'v1', publishedAt: entry.publishedAt, summary: 'Publish first',
+        fileIds: [first.fileId], fileIdsTruncated: false });
+    assert.deepEqual(await old.status(), { at: { kind: 'checkpoint', name: 'original' }, mainVersion: 'v3' });
+    assert.deepEqual(await work.status(), { at: { kind: 'fork', name: 'history' }, mainVersion: 'v3' });
+    assert(fixture.calls.slice(beforeReads).every(({ kind, request }) => kind === 'fetch' && !request.includeVectors
+        || kind === 'query' && !request.includeVectors && !request.fields.include.includes('body')));
+
+    await work.write(file('/fourth'));
+    await work.merge(request('fourth'));
+    const tail = await work.history({ cursor: page.cursor });
+    assert.equal(tail.throughVersion, 'v3');
+    assert.equal(tail.cursor, undefined);
+    assert.deepEqual(tail.entries.map(item => [item.version, item.fileIds]), [['v3', [first.fileId, second.fileId].sort()]]);
+    assert.deepEqual(await work.history({ cursor: page.cursor }), tail);
+    const reopened = await MemDrive.open(withClient(fixture));
+    assert.deepEqual((await reopened.history({ limit: 1 })).entries, page.entries);
+    assert.deepEqual((await reopened.history({ sinceVersion: 'v1' })).entries.map(({ version }) => version), ['v3', 'v4']);
+    assert.deepEqual(await reopened.history({ sinceVersion: 'v4' }), { throughVersion: 'v4', entries: [] });
+    await assert.rejects(reopened.history({ cursor: page.cursor }), { code: 'HISTORY_CURSOR_UNAVAILABLE' });
+    for (const sinceVersion of ['v2', 'v5'])
+        await assert.rejects(reopened.history({ sinceVersion }), { code: 'VERSION_NOT_FOUND', details: { version: sinceVersion } });
+    await assert.rejects(reopened.history({ sinceVersion: 'v01' }), { code: 'INVALID_INPUT' });
+    await assert.rejects(reopened.history({ limit: 0 }), { code: 'INVALID_INPUT' });
+    await assert.rejects(reopened.history({ cursor: page.cursor, limit: 1 }), { code: 'INVALID_INPUT' });
+    await assert.rejects(reopened.history({}, { signal: AbortSignal.abort() }), { code: 'ABORTED' });
+
+    const afterExpiry = Date.now() + 5 * 60 * 1000;
+    const clock = t.mock.method(Date, 'now', () => afterExpiry);
+    try {
+        await assert.rejects(work.history({ cursor: page.cursor }), { code: 'HISTORY_CURSOR_UNAVAILABLE' });
+    } finally {
+        clock.mock.restore();
+    }
+
+    const tags = fixture.collections.get(name).tags;
+    tags.delete([...tags.keys()].find(tag => tag.startsWith('merge-capture-')));
+    await assert.rejects(reopened.history(), { code: 'HISTORY_UNAVAILABLE', details: { version: 'v1' } });
+});
+
+test('history caps affected IDs and reads a published completion while bookkeeping is running', async () => {
+    const { fixture, main } = await setup();
+    const work = await main.fork({ name: 'big-merge' });
+    const files = await work.write(Array.from({ length: 100 }, (_, i) => file(`/entry-${i}`, '')));
+    files.push(await work.write(file('/last', '')));
+    const started = gate(), release = gate();
+    fixture.beforeUpsert = async ({ docs }) => {
+        if (docs[0].kind === 'merge-bookkeeping-v1') {
+            started.resolve();
+            await release.promise;
+        }
+    };
+    const merged = work.merge(request('many'));
+    await Promise.race([started.promise, merged]);
+    try {
+        const reader = await MemDrive.open(withClient(fixture));
+        assert.deepEqual(await reader.status(),
+            { at: { kind: 'main' }, mainVersion: 'v1', merge: { requestId: 'many', phase: 'bookkeeping' } });
+        const page = await reader.history();
+        assert.deepEqual(page.entries[0].fileIds, files.map(({ fileId }) => fileId).sort().slice(0, 100));
+        assert.equal(page.entries[0].fileIdsTruncated, true);
+    } finally {
+        release.resolve();
+        await merged;
+    }
+    assert.deepEqual(await main.status(), { at: { kind: 'main' }, mainVersion: 'v1' });
 });
 
 test('known cold tag rejections retry inside the public call while preserving the captured working state', async () => {

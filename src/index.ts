@@ -1,5 +1,5 @@
 import type { CheckpointFileDrive, CheckpointSelection, ConnectionOptions, CreateExternalFileStoreOptions, CreateFileStoreOptions, EmbeddingMode, ForkSelection, FileDrive, FileListEntry, FileSearchHit,
-    FileStoreDescription, MainFileDrive, MergeRequest, OpenFileStoreOptions, ReadFileRequest, RequestOptions, SearchExternalFilesRequest, SearchFilesRequest,
+    FileHistoryRequest, FileStoreDescription, MainFileDrive, MergeRequest, OpenFileStoreOptions, ReadFileRequest, RequestOptions, SearchExternalFilesRequest, SearchFilesRequest,
     WorkingFileDrive } from './types.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
 import { keysOnly, parseStore, storeConfiguration } from './config.js';
@@ -164,11 +164,24 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         };
     }
 
-    function view(source: RefSource, enqueueRef?: <T>(operation: () => Promise<T>, signal?: AbortSignal) => Promise<T>) {
+    function view<Selection extends FileDrive['at']>(source: RefSource, at: Selection,
+        enqueueRef?: <T>(operation: () => Promise<T>, signal?: AbortSignal) => Promise<T>) {
+        Object.freeze(at);
         return {
+            at,
             name, read: reader(source), search: searcher(source), list: fileLister(handle, name, source, metadataSchema),
             findText: dimensions === undefined ? fileTextFinder(handle, name, source, metadataSchema, enqueueRef) : undefined,
             describe,
+            async status(options?: RequestOptions) {
+                const { signal } = operationOptions(options);
+                checkAbort(signal);
+                return publishing.status(at, signal);
+            },
+            async history(request: FileHistoryRequest = {}, options?: RequestOptions) {
+                const { signal } = operationOptions(options);
+                checkAbort(signal);
+                return publishing.history(request, signal);
+            },
             async fork(request: { name: string }, options?: RequestOptions) {
                 const { signal } = operationOptions(options);
                 checkAbort(signal);
@@ -211,7 +224,7 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         const writer = writerFor(branch);
         const { enqueueRef, write, diff } = writer;
         const drive: WorkingFileDrive<EmbeddingMode> = Object.freeze({
-            ...view(branchRef(branch), enqueueRef), at: Object.freeze({ kind: 'fork' as const, name: fork }), write, diff,
+            ...view(branchRef(branch), { kind: 'fork', name: fork }, enqueueRef), write, diff,
             merge(request: MergeRequest, options?: RequestOptions) {
                 const { signal } = operationOptions(options);
                 checkAbort(signal);
@@ -227,17 +240,13 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
     function pinned(checkpoint: string): CheckpointFileDrive<EmbeddingMode> {
         const existing = checkpoints.get(checkpoint);
         if (existing) return existing;
-        const drive: CheckpointFileDrive<EmbeddingMode> = Object.freeze({
-            ...view({ kind: 'tag', name: checkpointPrefix + checkpoint }),
-            at: Object.freeze({ kind: 'checkpoint' as const, name: checkpoint }),
-        });
+        const drive: CheckpointFileDrive<EmbeddingMode> = Object.freeze(
+            view({ kind: 'tag', name: checkpointPrefix + checkpoint }, { kind: 'checkpoint', name: checkpoint }));
         checkpoints.set(checkpoint, drive);
         return drive;
     }
 
-    const mainView: MainFileDrive<EmbeddingMode> = Object.freeze({
-        ...view(publishing.main), at: Object.freeze({ kind: 'main' as const }),
-    });
+    const mainView: MainFileDrive<EmbeddingMode> = Object.freeze(view(publishing.main, { kind: 'main' }));
 
     return {
         main: mainView,
