@@ -1,6 +1,6 @@
 /** Shared text for the guide tool and host-provided resources. No drive reads are needed. */
 export const fileToolGuide = Object.freeze({
-    version: '2',
+    version: '3',
     content: `# Using MemDrive file tools
 
 The host binds these tools to one authorized drive and view. Tool arguments cannot switch that binding. Use only tools the host offers. If fork is enabled, create a working fork when needed; the host must authorize and bind its tools to that returned view before you can edit it. Authentication, permissions, save policy and coordination belong to the host.
@@ -19,7 +19,7 @@ findText reports snapshot or live consistency. Published main and checkpoints us
 
 ## Create refs
 
-When enabled by the host, fork({ name }) creates a working fork and checkpoint({ name }) creates a read-only checkpoint from the currently bound view. Both return { name: storeName, at: { kind, name: refName } }, not an SDK handle. A checkpoint of a working fork includes its unpublished edits. Creating either ref does not publish those edits or change the current tool binding. The host chooses whether to expose each tool and whether to bind a returned view. Fork names use 3–47 letters, digits, underscores or hyphens and cannot be main; checkpoint names use 3–41 of the same characters. On REF_CREATION_UNCONFIRMED, pause source mutations and have the host open the named ref to inspect it; do not blindly retry.
+When enabled by the host, fork({ name, asOf? }) creates a working fork and checkpoint({ name, asOf? }) creates a read-only checkpoint from the currently bound view. Both return { name: storeName, at: { kind, name: refName } }, not an SDK handle. Without asOf, a checkpoint of a working fork includes its unpublished edits. Optional asOf is a nonfuture UTC ISO timestamp with milliseconds (YYYY-MM-DDTHH:mm:ss.sssZ). On main it selects the last completed publication at or before that time; publishedAt in history entries can identify that boundary, but summaries may outlive the retained content. On a working fork it selects the native committed snapshot at or before that time, which may precede recent writes. Checkpoint views are already fixed and reject asOf. HISTORICAL_VIEW_UNAVAILABLE means no retained source is available; never silently substitute current state or another timestamp. Creating either ref does not publish those edits or change the current tool binding. The host chooses whether to expose each tool and whether to bind a returned view. Fork names use 3–47 letters, digits, underscores or hyphens and cannot be main; checkpoint names use 3–41 of the same characters. On REF_CREATION_UNCONFIRMED, pause source mutations and have the host open the named ref to inspect it; do not blindly retry.
 
 ## Edit and publish
 

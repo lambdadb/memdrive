@@ -17,8 +17,8 @@ test('advertised tool schemas accept SDK inputs and reject ambiguous selectors, 
         const content = external ? [1, ...Array(63).fill(0)] : 'Original';
         const valid = [
             ['guide', {}], ['status', {}], ['diff', {}], ['history', {}],
-            ['fork', { name: 'new-fork' }], ['fork', { name: 'x'.repeat(47) }],
-            ['checkpoint', { name: 'main' }], ['checkpoint', { name: 'x'.repeat(41) }],
+            ['fork', { name: 'new-fork' }], ['fork', { name: 'past', asOf: '2026-01-01T00:00:00.000Z' }], ['fork', { name: 'x'.repeat(47) }],
+            ['checkpoint', { name: 'main' }], ['checkpoint', { name: 'past', asOf: '2026-01-01T00:00:00.000Z' }], ['checkpoint', { name: 'x'.repeat(41) }],
             ['history', { sinceVersion: 'v0', limit: 1 }], ['history', { cursor: 'opaque' }],
             ['list', { prefix: '/notes/', nameContains: 'plan', delimiter: '/', limit: 1000 }], ['list', { cursor: 'opaque' }],
             ['read', { path: '/plan' }], ['read', { fileId: 'returned-id' }], ['read', { paths: ['/one', '/two'] }],
@@ -73,5 +73,17 @@ test('advertised tool schemas accept SDK inputs and reject ambiguous selectors, 
             assert.equal(validators[definition.name]({ at: { fork: 'other' } }), false);
             assert.equal(validators[definition.name]({ drive: 'other' }), false);
         }
+    }
+});
+
+test('fixed checkpoint tool schemas reject asOf while keeping ordinary ref creation', async () => {
+    const fixture = fileClient();
+    const main = await MemDrive.create({ client: fixture.client, name: 'schema-checkpoint' });
+    const saved = await main.checkpoint({ name: 'saved' });
+    const ajv = new Ajv({ strict: true });
+    for (const tool of createFileTools({ drive: saved, tools: ['fork', 'checkpoint'] }).definitions) {
+        const validate = ajv.compile(tool.inputSchema);
+        assert(validate({ name: 'copy' }));
+        assert.equal(validate({ name: 'copy', asOf: '2026-01-01T00:00:00.000Z' }), false);
     }
 });

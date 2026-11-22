@@ -54,6 +54,25 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
         const after = await reopened.search({ query: 'Hello world', rerank: false }, options());
         assert.deepEqual(after.hits, before.hits);
 
+        phase = 'capture committed working time';
+        const firstPublication = (await main.history({}, options())).entries[0].publishedAt;
+        const branchHead = (await client.collection(name).branches.get('fork-draft', options())).branch.headSnapshot;
+        assert(branchHead?.snapshotCommittedAt instanceof Date);
+        const workingTime = branchHead.snapshotCommittedAt.toISOString();
+        const workingPast = await fork.checkpoint({ name: 'working-past', asOf: workingTime }, options());
+        assert.deepEqual(await workingPast.read({ fileId: file.fileId }, options()), file);
+        phase = 'publish a later revision';
+        const updated = await fork.write({ op: 'update', fileId: file.fileId, content: '# Heading\n\nGoodbye world.' }, options());
+        await fork.merge({ requestId: 'publish-later', summary: 'Publish later synthetic revision' },
+            { signal: AbortSignal.timeout(270_000) });
+        phase = 'create historical refs after later publication';
+        const mainPast = await main.fork({ name: 'main-past', asOf: firstPublication }, options());
+        const savedPast = await main.checkpoint({ name: 'main-past', asOf: firstPublication }, options());
+        const forkPast = await fork.fork({ name: 'fork-past', asOf: workingTime }, options());
+        for (const past of [mainPast, savedPast, forkPast])
+            assert.deepEqual(await past.read({ fileId: file.fileId }, options()), file);
+        assert.deepEqual(await main.read({ fileId: file.fileId }, options()), updated);
+
         phase = 'prepare aged retention fixture';
         await main.configure({ retentionInDays: 1 }, options());
         const { collection } = await client.collection(name).get(options());
@@ -95,7 +114,8 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
         }
         assert(removed, 'Automatic retention did not remove the expired capture within five merge replays.');
         assert.deepEqual(await retentionMain.history({}, options()), history);
-        assert.deepEqual(await retentionMain.read({ fileId: file.fileId }, options()), file);
+        assert.deepEqual(await retentionMain.read({ fileId: file.fileId }, options()), updated);
+        assert.deepEqual(await savedPast.read({ fileId: file.fileId }, options()), file);
         assert.deepEqual(await checkpoint.read({ fileId: file.fileId }, options()), file);
         assert.equal((await retry.merge({ requestId: 'publish-structured', summary: 'Publish synthetic structured note' }, options())).version, 'v1');
     } catch (error) {
