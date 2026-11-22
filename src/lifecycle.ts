@@ -23,7 +23,7 @@ function coordinator() {
             finally { active--; }
         },
         async exclusive<T>(operation: () => Promise<T>): Promise<T> {
-            if (exclusive || active) throw new MemDriveError('STORE_BUSY', 'Wait for active store operations to finish before deleting.');
+            if (exclusive || active) throw new MemDriveError('STORE_BUSY', 'Wait for active store operations to finish before maintenance.');
             exclusive = true;
             try { return await operation(); }
             finally { exclusive = false; }
@@ -42,7 +42,7 @@ export function lifecycle({ client, name }: ConnectionOptions) {
 /** Preserve overloaded public methods while tracking their complete promises. */
 export function guardView<T extends object>(view: T, run: (operation: () => Promise<unknown>) => Promise<unknown>): T {
     return Object.freeze(Object.fromEntries(Object.entries(view).map(([key, value]) => [key,
-        typeof value === 'function' && key !== 'delete' && key !== 'configure'
+        typeof value === 'function' && key !== 'delete' && key !== 'configure' && key !== 'pruneHistory'
             ? (...args: unknown[]) => run(() => Reflect.apply(value, view, args)) : value,
     ]))) as T;
 }

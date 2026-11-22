@@ -14,7 +14,9 @@ export type Outcome = { status: 'published' | 'unchanged'; version: string }
 export type Completion = RecordBase & Outcome & { kind: 'merge-result-v1'; completedAt: string };
 export type Applied = RecordBase & { kind: 'merge-applied-v1' };
 export type Bookkeeping = RecordBase & { kind: 'merge-bookkeeping-v1' };
-export type PublicationRecord = Reservation | Completion | Applied | Bookkeeping;
+export type HistoryArchive = RecordBase & { kind: 'merge-history-v1'; version: string; publishedAt: string; summary: string;
+    sourceTag: string; fileIds: string[]; fileIdsTruncated: boolean };
+export type PublicationRecord = Reservation | Completion | Applied | Bookkeeping | HistoryArchive;
 
 export const versionFor = (slot: bigint) => `v${slot}`;
 export const tagFor = (version: string) => `md-main-${version}`;

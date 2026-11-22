@@ -129,6 +129,13 @@ immediate checkpoint creation after a first write remains a separate backend
 readiness check. Failure output names the stage and HTTP status without request
 headers or bodies.
 
+That isolated structured scenario also configures one-day retention and ages
+only its synthetic reservation/completion timestamps. It prunes the completed
+merge capture, verifies retained history, main and checkpoint reads, and replays
+the completed merge. This tests the native cleanup path without waiting a real
+day. Superseded-main selection and failure recovery have fixture coverage;
+neither check measures physical GC after tag removal.
+
 ## GitHub and npm configuration
 
 Set these repository variables; missing values never fall back across environments:

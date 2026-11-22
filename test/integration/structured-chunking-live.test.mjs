@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { LambdaDBClient } from '@functional-systems/lambdadb';
 import { MemDrive } from '@functional-systems/memdrive';
@@ -53,6 +53,41 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
         phase = 'search published chunks';
         const after = await reopened.search({ query: 'Hello world', rerank: false }, options());
         assert.deepEqual(after.hits, before.hits);
+
+        phase = 'prepare aged retention fixture';
+        await main.configure({ retentionInDays: 1 }, options());
+        const { collection } = await client.collection(name).get(options());
+        const driveId = createHash('sha256').update(JSON.stringify([name, collection.projectName, collection.createdAt.toISOString()])).digest('hex');
+        const journal = client.collection(`md-journal-${driveId.slice(0, 40)}`);
+        const metadata = (await journal.get(options())).collection;
+        assert.equal(metadata.tags['memdrive.owner'], driveId);
+        assert.equal(metadata.tags['memdrive.format'], 'merge-publication-v1');
+        const ref = { ref: { kind: 'branch', name: 'main' }, consistentRead: true };
+        const completion = (await journal.docs.fetch({ ...ref, ids: ['completion:1'] }, options())).docs[0].doc;
+        assert.equal(completion.driveId, driveId);
+        assert.equal(completion.status, 'published');
+        assert.equal(completion.version, 'v1');
+        // Age only timestamps in this owned synthetic fixture. This validates
+        // the real cleanup path without pretending a day elapsed in real time.
+        const aged = Date.now() - 2 * 86_400_000;
+        await journal.docs.update({ branch: 'main', docs: [
+            { id: 'reservation:1', startedAt: new Date(aged - 1000).toISOString() },
+            { id: 'completion:1', completedAt: new Date(aged).toISOString() },
+        ] }, options());
+        const retentionClient = new LambdaDBClient(connection);
+        const retentionMain = await MemDrive.open({ client: retentionClient, name }, options());
+        const history = await retentionMain.history({}, options());
+        const preview = await retentionMain.pruneHistory({}, options());
+        assert.equal(preview.tags.length, 1);
+        assert(preview.tags[0].startsWith('merge-capture-'));
+        phase = 'prune expired internal capture';
+        const pruned = await retentionMain.pruneHistory({ dryRun: false }, options());
+        assert.deepEqual(pruned.deleted, preview.tags);
+        assert.deepEqual(await retentionMain.history({}, options()), history);
+        assert.deepEqual(await retentionMain.read({ fileId: file.fileId }, options()), file);
+        assert.deepEqual(await checkpoint.read({ fileId: file.fileId }, options()), file);
+        const retry = await MemDrive.open({ client: retentionClient, name, at: { fork: 'draft' } }, options());
+        assert.equal((await retry.merge({ requestId: 'publish-structured', summary: 'Publish synthetic structured note' }, options())).version, 'v1');
     } catch (error) {
         collision = error?.code === 'STORE_EXISTS';
         const detail = error instanceof assert.AssertionError ? ` ${error.message}` : '';

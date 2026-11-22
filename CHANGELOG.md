@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Prune expired internal publication and merge-capture tags using native retention, preserving user refs, current main, bounded history summaries and completed-request replay.
 - Configure native snapshot retention at creation or through main, with generation checks, confirmed updates and fencing of unconfirmed configuration changes.
 - Add persisted per-file chunking strategies and an optional local Docling Hybrid adapter, preserving exact originals, contextualized embeddings, verified ranges and parser-free publication recovery.
 - Read bounded text ranges with exact line endings, Unicode-safe continuation and changed-original detection; expose the same contract through the shared read tool.

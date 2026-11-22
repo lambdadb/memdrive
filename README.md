@@ -67,10 +67,60 @@ used for lifecycle operations.
 Configuration updates disable automatic retries. `CONFIGURATION_UNCONFIRMED`
 blocks a different retention value and resource deletion on that client. After
 the host fences outstanding requests, retry the same value to reconcile it.
-This setting does not delete named checkpoints, unpin SDK publication tags, or
-expire merge request IDs and journal records. Those require a separate SDK
-history cleanup policy; lowering native snapshot retention alone does not
-establish content erasure.
+This setting alone does not unpin retained refs or expire journal records.
+Use `main.pruneHistory` to release expired internal tags under the same setting.
+User forks and named checkpoints never expire automatically.
+
+## Prune internal history tags
+
+```ts
+const preview = await main.pruneHistory(); // dryRun: true, limit: 100
+console.log(preview.tags, preview.retentionInDays);
+let batch;
+do {
+    batch = await main.pruneHistory({ dryRun: false, limit: 100 });
+} while (batch.hasMore);
+```
+
+This maintenance API is available on main in both embedding modes. The host
+schedules it; opening a store, configuring retention and merging do not start
+cleanup. Each call verifies the store generation and reads its current native
+`retentionInDays`. Missing native retention returns `RETENTION_UNAVAILABLE`.
+
+- A superseded main tag becomes eligible after the retention period measured
+  from the next publication, preserving the state at the start of the window.
+- A merge-source capture becomes eligible after the period measured from its
+  terminal outcome. Unfinished publication or source bookkeeping blocks cleanup.
+- The current main tag, initial view, user forks and named checkpoints stay.
+  Only tags proven to belong to completed SDK requests are candidates; unknown
+  tags and unreserved captures stay. Fork baselines remain in their own records.
+- Before deleting any selected tag, the SDK confirms the affected publications'
+  bounded history summaries in the journal, including up to 100 affected IDs
+  and the truncation flag. These archives contain no file bodies or vectors.
+  Request identities, terminal results and summaries retain their existing
+  indefinite lifetime, so history pagination and completed-request replay work.
+
+Upgrade all history readers to a version supporting these archives before the
+first cleanup. Older readers require the captures. The result contains the
+observed retention, ISO cutoff, selected `tags`, confirmed `deleted` tags and
+`hasMore`. `limit` accepts 1–1000 and bounds selected tags, not the journal or tag
+catalog scans. Dry runs perform no mutations; they are previews, not reservations.
+
+Coordinate maintenance exclusively across clients: drain reads, working writes,
+publication and recovery, and fence former owners and outstanding requests.
+The SDK's local gate only protects operations through the same client. Keep the
+host clock accurate because publication times and cutoff use it. The current
+retention range exceeds SDK cursor lifetimes; named refs remain available.
+
+Deletion disables automatic retries and confirms absence. On partial failure,
+`error.details.deleted` lists confirmed deletions. `HISTORY_CLEANUP_UNCONFIRMED`
+blocks configuration, resource deletion and dry-run cleanup on that client.
+After fencing outstanding requests, retry `pruneHistory({ dryRun: false })` to
+reconcile. Fresh clients still require the same host coordination.
+
+LambdaDB handles snapshot GC after refs are removed. Other refs may retain the
+same content. Neither pruning tags nor lowering retention establishes immediate
+physical erasure.
 
 ## Structured text chunking
 
@@ -363,7 +413,7 @@ Main reads, searches, lists, forks, and checkpoints select one published version
 
 Run main publication and recovery through one exclusive host-owned writer per store across runtimes and client instances. Continue to enforce one writer per working fork, including its post-merge bookkeeping. Once the previous owner and its in-flight mutations have settled, the replacement owner can call `MemDrive.open({ client, name: 'workspace', recover: true })`. A normal `open` never resumes the merge. A paused merge continues to serve the previous published version until publication, and recovery continues from the retained request. Recovery does not automatically roll back the writable branch.
 
-MemDrive keeps its initial view, request captures, and published versions in reserved refs and creates an internal collection on the first merge. Give the writer permission to provision that collection and readers permission to inspect its records. Retain the SDK-owned refs and journal together while the store is in use. Earlier file stores are initialized on the first operation that needs a frozen main view. Native tag availability also applies to named checkpoints on an empty or cold view.
+MemDrive keeps its initial view, request captures, and published versions in reserved refs and creates an internal collection on the first merge. Give the writer permission to provision that collection and readers permission to inspect its records. Keep the journal while the store is in use and use `pruneHistory` to release expired internal tags safely. Earlier file stores are initialized on the first operation that needs a frozen main view. Native tag availability also applies to named checkpoints on an empty or cold view.
 
 ## Inspect publication status and history
 
@@ -381,7 +431,7 @@ if (page.cursor) {
 
 The starting `sinceVersion` is exclusive and defaults to `v0`. Unchanged and conflicting requests create version gaps. A gap or future version returns `VERSION_NOT_FOUND`, and an invalid version format returns `INVALID_INPUT`. The page size defaults to 20 and accepts 1–100. The first page captures the latest publication as `throughVersion`. Pass only the cursor to continue through that same version while main advances. Cursors expire after five minutes or may be evicted sooner. They work across views of the same store opened through the same client instance. If a cursor is unavailable, start again with the last version you processed.
 
-These methods read the publication journal without initializing main, advancing a merge, or reading file bodies or vectors. A cold client may need to read the retained journal before returning the first result. If a required capture has been removed, `history()` returns `HISTORY_UNAVAILABLE` for that entry's version. Read the selected view to retrieve its current files.
+These methods read the publication journal without initializing main, advancing a merge, or reading file bodies or vectors. A cold client may need to read the retained journal before returning the first result. History uses the bounded archive saved by `pruneHistory`, or reads affected IDs from the retained capture before archival. If both are missing, `history()` returns `HISTORY_UNAVAILABLE` for that entry's version. Read the selected view to retrieve its current files.
 
 ## Bind shared file tools
 
