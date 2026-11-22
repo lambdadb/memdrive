@@ -122,8 +122,12 @@ registry verification establish different facts.
 
 The default suite also creates a separate structured-text store using local
 Docling Hybrid and a synthetic tokenizer. It verifies exact originals, rendered
-search previews, checkpoints and publication without a parser on the reopened
-reader, then destroys the content store and its publication journal.
+search previews, publication and a checkpoint of the confirmed published tag
+without a parser on the reopened reader, then destroys the content store and its
+publication journal. Publication gets its full cold-snapshot wait budget;
+immediate checkpoint creation after a first write remains a separate backend
+readiness check. Failure output names the stage and HTTP status without request
+headers or bodies.
 
 ## GitHub and npm configuration
 
