@@ -11,12 +11,14 @@ test('advertised tool schemas accept SDK inputs and reject ambiguous selectors, 
         const main = await MemDrive.create({ client: fixture.client, name: 'schema-fixture',
             ...(external ? { embedding: { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'fixture-v1' } } : {}) });
         const work = await main.fork({ name: 'draft' });
-        const names = ['guide', 'status', 'history', 'list', 'read', 'search', 'diff', 'write', 'merge', ...(external ? [] : ['findText'])];
+        const names = ['guide', 'status', 'history', 'list', 'read', 'search', 'fork', 'checkpoint', 'diff', 'write', 'merge', ...(external ? [] : ['findText'])];
         const { definitions } = createFileTools({ drive: work, tools: names });
         const validators = Object.fromEntries(definitions.map(tool => [tool.name, ajv.compile(tool.inputSchema)]));
         const content = external ? [1, ...Array(63).fill(0)] : 'Original';
         const valid = [
             ['guide', {}], ['status', {}], ['diff', {}], ['history', {}],
+            ['fork', { name: 'new-fork' }], ['fork', { name: 'x'.repeat(47) }],
+            ['checkpoint', { name: 'main' }], ['checkpoint', { name: 'x'.repeat(41) }],
             ['history', { sinceVersion: 'v0', limit: 1 }], ['history', { cursor: 'opaque' }],
             ['list', { prefix: '/notes/', nameContains: 'plan', delimiter: '/', limit: 1000 }], ['list', { cursor: 'opaque' }],
             ['read', { path: '/plan' }], ['read', { fileId: 'returned-id' }], ['read', { paths: ['/one', '/two'] }],
@@ -40,6 +42,9 @@ test('advertised tool schemas accept SDK inputs and reject ambiguous selectors, 
         for (const [name, input] of valid)
             assert(validators[name](input), `${external ? 'vector' : 'text'} ${name}: ${JSON.stringify(validators[name].errors)}`);
         const invalid = [
+            ['fork', {}], ['fork', { name: 'main' }], ['fork', { name: 'xy' }],
+            ['fork', { name: 'x'.repeat(48) }], ['checkpoint', { name: 'x'.repeat(42) }],
+            ['checkpoint', { name: 'invalid/path' }], ['checkpoint', { name: 'valid', at: { fork: 'other' } }],
             ['status', { recover: true }], ['read', { path: '/one', fileId: 'id' }], ['read', {}],
             ['read', { paths: [] }], ['read', { paths: ['/one', '/one'] }],
             ['history', { cursor: 'opaque', limit: 1 }], ['list', { cursor: 'opaque', prefix: '/' }],

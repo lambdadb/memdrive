@@ -44,6 +44,9 @@ export function fileToolSchemas(external: boolean) {
     return {
         guide: object(),
         status: object(),
+        fork: object({ name: { type: 'string', minLength: 3, maxLength: 47,
+            pattern: '^[A-Za-z0-9_-]+$', not: { const: 'main' } } }, ['name']),
+        checkpoint: object({ name: { type: 'string', minLength: 3, maxLength: 41, pattern: '^[A-Za-z0-9_-]+$' } }, ['name']),
         history: continuation({ sinceVersion: { type: 'string', pattern: '^v(0|[1-9][0-9]*)$' }, limit: limit(100) }),
         list: continuation({ prefix: string, nameContains: string, delimiter: { const: '/' }, limit: limit(1000) }),
         read: { ...object({ fileId, path, paths: { ...array(path, 100), uniqueItems: true } }),

@@ -3,7 +3,7 @@ export const fileToolGuide = Object.freeze({
     version: '1',
     content: `# Using MemDrive file tools
 
-The host binds these tools to one authorized drive and view. Tool arguments cannot switch that binding. Use only tools the host offers; ask the host to select a working fork when changes are needed. Authentication, permissions, save policy and coordination belong to the host.
+The host binds these tools to one authorized drive and view. Tool arguments cannot switch that binding. Use only tools the host offers. If fork is enabled, create a working fork when needed; the host must authorize and bind its tools to that returned view before you can edit it. Authentication, permissions, save policy and coordination belong to the host.
 
 ## Orient and retrieve
 
@@ -16,6 +16,10 @@ For an inventory, call list without a delimiter and follow every cursor. list de
 Continue list, findText and history with only the returned cursor. An empty findText page may still have a cursor. These cursors expire after five minutes and can be evicted; they are not durable bookmarks. list and findText require the same view handle. history cursors can cross views of the same store on the same client instance. For history, retain the last processed version and restart with sinceVersion when a cursor becomes unavailable. History pages keep throughVersion fixed while main advances. sinceVersion is exclusive, defaults to v0, and must identify an observed publication; gaps are not valid starting versions. Pages default to 20 entries and permit 1–100, with up to 100 affected file IDs per entry and an explicit truncation flag. HISTORY_UNAVAILABLE means required retained capture data is missing; reread current originals when current state is needed.
 
 findText reports snapshot or live consistency. Published main and checkpoints use a pinned snapshot. Working-fork traversal is live: edits behind the cursor may be missed, and a changed file being resumed requires restarting. Do not claim a complete snapshot from a live traversal.
+
+## Create refs
+
+When enabled by the host, fork({ name }) creates a working fork and checkpoint({ name }) creates a read-only checkpoint from the currently bound view. Both return { name: storeName, at: { kind, name: refName } }, not an SDK handle. A checkpoint of a working fork includes its unpublished edits. Creating either ref does not publish those edits or change the current tool binding. The host chooses whether to expose each tool and whether to bind a returned view. Fork names use 3–47 letters, digits, underscores or hyphens and cannot be main; checkpoint names use 3–41 of the same characters. On REF_CREATION_UNCONFIRMED, pause source mutations and have the host open the named ref to inspect it; do not blindly retry.
 
 ## Edit and publish
 

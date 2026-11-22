@@ -15,7 +15,7 @@ import { publication } from './publication.js';
 export type * from './types.js';
 export { MemDriveError } from './errors.js';
 export { createFileTools, fileToolError, fileToolGuide } from './tools.js';
-export type { FileToolDefinition, FileToolErrorResult, FileToolName, FileTools } from './tools.js';
+export type { FileToolDefinition, FileToolErrorResult, FileToolName, FileToolRefResult, FileTools } from './tools.js';
 
 type Client = ConnectionOptions['client'];
 

@@ -221,7 +221,7 @@ import { createFileTools, fileToolError, fileToolGuide } from '@functional-syste
 
 const tools = createFileTools({
     drive: work,
-    tools: ['guide', 'status', 'history', 'list', 'read', 'search', 'findText', 'diff', 'write', 'merge'],
+    tools: ['guide', 'status', 'history', 'list', 'read', 'search', 'findText', 'fork', 'checkpoint', 'diff', 'write', 'merge'],
 });
 
 // Register definitions with the host's model or MCP transport.
@@ -246,15 +246,16 @@ try {
 ```
 
 Available names are `guide`, `status`, `history`, `list`, `read`, `search`,
-`findText`, `diff`, `write` and `merge`. `diff`, `write` and `merge` require a working
-fork; `findText` requires text mode. Selecting an unavailable tool fails at binding
+`findText`, `fork`, `checkpoint`, `diff`, `write` and `merge`. `diff`, `write` and
+`merge` require a working fork; `findText` requires text mode. Selecting an unavailable tool fails at binding
 with `TOOL_UNAVAILABLE`. External-vector bindings advertise vector inputs for
 `search` and `write` and return the SDK's file references. No embeddings or local
 content hydration are supplied by the tool layer.
 
-`execute(name, input, options?)` returns the underlying SDK result unchanged and
-rejects with SDK errors. In particular, `status` and `history` keep their SDK
-names, arguments and results. Zero-argument tools accept `{}`. `write` accepts a
+`execute(name, input, options?)` returns the underlying SDK result unchanged for
+file and publication operations and rejects with SDK errors. In particular,
+`status` and `history` keep their SDK names, arguments and results.
+Zero-argument tools accept `{}`. `write` accepts a
 single SDK operation object, or `{ operations: [...] }` for the SDK's array form;
 the result is respectively one file/deletion result or an array. A batch is not a
 transaction. `guide` returns the exported versioned text without provisioning or
@@ -262,20 +263,44 @@ reading drive files. `fileToolError` preserves SDK error codes, messages, status
 and details, excludes causes and stacks, and masks unexpected errors. It does not
 retry calls or authorize recovery.
 
+`fork` and `checkpoint` accept the SDK's `{ name }` argument on main, working forks
+and checkpoints in both embedding modes. They create a ref from the bound view
+and return a serializable `FileToolRefResult`, `{ name: storeName, at: { kind,
+name: refName } }`, instead of an SDK handle. Neither operation publishes edits
+or changes the tool binding. For example:
+
+```ts
+const created = await tools.execute('fork', { name: 'research-copy' });
+// { name: 'workspace', at: { kind: 'fork', name: 'research-copy' } }
+const saved = await tools.execute('checkpoint', { name: 'before-edit' });
+// Both refs come from work; tools is still bound to work.
+```
+
+The host can authorize and open the returned ref using `MemDrive.open`, then
+create another tool binding with its own allowlist. Ref creation is marked
+`readOnly: false`. Duplicate names and uncertain creation retain the SDK's
+`BRANCH_CONFLICT`, `CHECKPOINT_CONFLICT` and `REF_CREATION_UNCONFIRMED` errors.
+
+The `guide` tool is optional, just like the other tools. Its name is the catalog's
+implementation choice for delivering the read-only usage guide. Hosts can omit
+it and use the exported `fileToolGuide` as an MCP resource or other instruction
+channel instead; no guide tool call is required by the executor.
+
 For a read-only connection, select only the needed query tools, for example
 `['guide', 'status', 'history', 'list', 'read', 'search']`. The executor copies the
 allowlist and rejects every other name with `TOOL_NOT_ALLOWED`, even if the
 underlying handle supports writes. Definitions are deeply frozen. Input Schemas
 describe JSON structure; the public SDK validates semantic constraints such as
 UTF-8 limits, paths, declared metadata and embedding dimensions. The `readOnly`
-flag classifies content operations, not backend credentials: inherited SDK
+flag classifies content and ref mutations, not backend credentials: inherited SDK
 snapshot initialization can still require provisioning a retained ref on an
 older uninitialized store. `guide`, `status` and `history` do not initialize it.
 
 The host must authenticate and authorize every invocation, bind the permitted
 drive/ref and establish the exclusive writer rules for merge. Arguments cannot
-select another drive or ref. Fork/checkpoint creation, opening another view,
-recovery and store lifecycle are host operations and are absent from this catalog.
+select another drive or ref. The host chooses whether to enable fork/checkpoint
+creation. Opening and binding another view, recovery and store lifecycle remain
+host operations outside this catalog.
 Keep the SDK client and view handles alive for cursor continuations; creating a
 new client for each request loses those cursors. Transport formatting, hosted
 Markdown/capacity/reranker policies, instruction delivery and telemetry remain

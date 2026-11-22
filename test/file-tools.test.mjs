@@ -3,7 +3,7 @@ import test from 'node:test';
 import { MemDrive, MemDriveError, createFileTools, fileToolError, fileToolGuide } from '@functional-systems/memdrive';
 import { fileClient } from './helpers/file-client.mjs';
 
-const all = ['guide', 'status', 'history', 'list', 'read', 'search', 'findText', 'diff', 'write', 'merge'];
+const all = ['guide', 'status', 'history', 'list', 'read', 'search', 'findText', 'fork', 'checkpoint', 'diff', 'write', 'merge'];
 const publication = requestId => ({ requestId, summary: `Publish ${requestId}` });
 async function setup(options = {}) {
     const fixture = fileClient();
@@ -112,4 +112,68 @@ test('external-vector tools use vector schemas and preserve reference results wi
     assert.deepEqual(await readOnly.execute('history', {}), await main.history());
     assert.deepEqual(await readOnly.execute('read', { path: '/vector' }), file);
     assert.throws(() => createFileTools({ drive: checkpoint, tools: ['write'] }), { code: 'TOOL_UNAVAILABLE' });
+});
+
+test('ref tools create reopenable views from main, forks and checkpoints without switching or publishing', async () => {
+    for (const mode of ['managed', 'external']) {
+        const external = mode === 'external';
+        const options = external ? { embedding: { mode, dimensions: 64, similarity: 'cosine', identity: 'fixture-v1' } } : {};
+        const { fixture, main, work } = await setup(options);
+        const content = external ? [1, ...Array(63).fill(0)] : 'Published original.';
+        const file = await work.write({ op: 'create', path: '/original', content });
+        await work.merge(publication('first'));
+        await work.write({ op: 'update', fileId: file.fileId, newPath: '/unpublished' });
+        const saved = await work.checkpoint({ name: 'source-checkpoint' });
+        const copies = [];
+        for (const source of [main, work, saved]) {
+            const tools = createFileTools({ drive: source, tools: ['fork', 'checkpoint', 'status'] });
+            const before = await source.status();
+            const expectedFile = await source.read({ fileId: file.fileId });
+            for (const kind of ['fork', 'checkpoint']) {
+                const name = `from-${source.at.kind}`;
+                const created = await tools.execute(kind, { name });
+                assert.deepEqual(created, { name: main.name, at: { kind, name } });
+                assert.deepEqual(JSON.parse(JSON.stringify(created)), created);
+                assert.equal(tools.definitions.find(tool => tool.name === kind).readOnly, false);
+                const reopened = await MemDrive.open({ client: fixture.client, name: created.name,
+                    ...(external ? { mode } : {}), at: { [created.at.kind]: created.at.name } });
+                assert.deepEqual(await reopened.read({ fileId: file.fileId }), expectedFile);
+                copies.push({ reopened, expectedFile });
+                assert.deepEqual(await tools.execute('status', {}), before);
+                await assert.rejects(tools.execute('write', { op: 'delete', fileId: file.fileId }), { code: 'TOOL_NOT_ALLOWED' });
+            }
+        }
+        await work.write({ op: 'update', fileId: file.fileId, newPath: '/later' });
+        for (const { reopened, expectedFile } of copies)
+            assert.deepEqual(await reopened.read({ fileId: file.fileId }), expectedFile);
+        assert.equal((await main.status()).mainVersion, 'v1');
+        assert.equal((await main.read({ fileId: file.fileId })).path, '/original');
+    }
+});
+
+test('ref tools enforce independent permissions, validate locally and preserve conflict and uncertain-outcome errors', async () => {
+    const { fixture, work } = await setup();
+    const forkOnly = createFileTools({ drive: work, tools: ['fork'] });
+    const checkpointOnly = createFileTools({ drive: work, tools: ['checkpoint'] });
+    const before = fixture.calls.length;
+    await assert.rejects(forkOnly.execute('checkpoint', { name: 'saved' }), { code: 'TOOL_NOT_ALLOWED' });
+    await assert.rejects(checkpointOnly.execute('fork', { name: 'draft' }), { code: 'TOOL_NOT_ALLOWED' });
+    for (const [tools, kind, max] of [[forkOnly, 'fork', 47], [checkpointOnly, 'checkpoint', 41]]) {
+        for (const input of [{}, { name: 'ab' }, { name: 'x'.repeat(max + 1) }, { name: 'bad/path' },
+            { name: 'valid', at: { fork: 'other' } }, { name: 'valid', store: 'other' }])
+            await assert.rejects(tools.execute(kind, input), { code: 'INVALID_INPUT' });
+        await assert.rejects(tools.execute(kind, { name: 'valid' }, { signal: AbortSignal.abort() }), { code: 'ABORTED' });
+    }
+    await assert.rejects(forkOnly.execute('fork', { name: 'main' }), { code: 'INVALID_INPUT' });
+    assert.equal(fixture.calls.length, before);
+    await forkOnly.execute('fork', { name: 'copy' });
+    await checkpointOnly.execute('checkpoint', { name: 'saved' });
+    await assert.rejects(forkOnly.execute('fork', { name: 'copy' }), { code: 'BRANCH_CONFLICT' });
+    await assert.rejects(checkpointOnly.execute('checkpoint', { name: 'saved' }), { code: 'CHECKPOINT_CONFLICT' });
+    fixture.afterTagCreate = tag => { if (tag.name === 'checkpoint-uncertain') throw new Error('Lost response'); };
+    await assert.rejects(checkpointOnly.execute('checkpoint', { name: 'uncertain' }),
+        { code: 'REF_CREATION_UNCONFIRMED', details: { checkpoint: 'uncertain' } });
+    const afterUncertain = fixture.calls.length;
+    await assert.rejects(checkpointOnly.execute('checkpoint', { name: 'uncertain' }), { code: 'REF_CREATION_UNCONFIRMED' });
+    assert.equal(fixture.calls.length, afterUncertain);
 });
