@@ -38,10 +38,11 @@ try {
     assert.equal(installed.memdriveSourceCommit, pkg.memdriveSourceCommit, 'Installed source commit differs');
     assert.deepEqual(Object.keys(installed.exports).sort(), ['.', './package.json']);
     assert.deepEqual(Object.keys(installed.dependencies), ['@functional-systems/lambdadb']);
-    const assertion = `for (const key of ['create', 'open', 'MemDriveError']) {
+    const assertion = `for (const key of ['create', 'open', 'MemDriveError', 'createFileTools', 'fileToolError']) {
         if (typeof sdk[key] !== 'function') throw new Error('Missing export: ' + key);
     }
-    if (sdk.MemDrive.create !== sdk.create || sdk.MemDrive.open !== sdk.open) throw new Error('Missing static factory');`;
+    if (sdk.MemDrive.create !== sdk.create || sdk.MemDrive.open !== sdk.open) throw new Error('Missing static factory');
+    if (!sdk.fileToolGuide.version || !sdk.fileToolGuide.content) throw new Error('Missing file-tool guide');`;
     run(process.execPath, ['--input-type=module', '-e', `import * as sdk from ${JSON.stringify(pkg.name)}; ${assertion}`]);
     run(process.execPath, ['--input-type=commonjs', '-e', `const sdk = require(${JSON.stringify(pkg.name)}); ${assertion}`]);
     for (const file of readdirSync(join(root, 'test/types')).filter(file => /\.(?:mts|cts|ts)$/.test(file)))
@@ -49,14 +50,15 @@ try {
     copyFileSync(join(root, 'test/types/tsconfig.json'), join(temporary, 'tsconfig.json'));
     run(process.execPath, [resolve(root, 'node_modules/typescript/bin/tsc'), '-p', join(temporary, 'tsconfig.json')]);
     await build({
-        stdin: { contents: `export { create, open, MemDrive } from ${JSON.stringify(pkg.name)};`,
+        stdin: { contents: `export { create, open, MemDrive, createFileTools, fileToolError, fileToolGuide } from ${JSON.stringify(pkg.name)};`,
             resolveDir: temporary, sourcefile: 'consumer.js' },
         bundle: true, platform: 'browser', format: 'esm', target: 'es2022', write: false,
     });
     mkdirSync(join(temporary, 'test/helpers'), { recursive: true });
     copyFileSync(join(root, 'test/helpers/file-client.mjs'), join(temporary, 'test/helpers/file-client.mjs'));
     copyFileSync(join(root, 'test/memdrive-files.test.mjs'), join(temporary, 'test/memdrive-files.test.mjs'));
-    run(process.execPath, ['--test', 'test/memdrive-files.test.mjs']);
+    copyFileSync(join(root, 'test/file-tools.test.mjs'), join(temporary, 'test/file-tools.test.mjs'));
+    run(process.execPath, ['--test', 'test/memdrive-files.test.mjs', 'test/file-tools.test.mjs']);
     if (live) {
         cpSync(join(root, 'test/integration'), join(temporary, 'test/integration'), { recursive: true });
         const files = readdirSync(join(temporary, 'test/integration')).filter(file => file.endsWith('-live.test.mjs'));

@@ -210,6 +210,78 @@ The starting `sinceVersion` is exclusive and defaults to `v0`. Unchanged and con
 
 These methods read the publication journal without initializing main, advancing a merge, or reading file bodies or vectors. A cold client may need to read the retained journal before returning the first result. If a required capture has been removed, `history()` returns `HISTORY_UNAVAILABLE` for that entry's version. Read the selected view to retrieve its current files.
 
+## Bind shared file tools
+
+MCP hosts and applications can share the same names, JSON Schemas and descriptions
+without importing a model-provider adapter. Bind an already authorized SDK handle
+and explicitly select the permitted tools:
+
+```ts
+import { createFileTools, fileToolError, fileToolGuide } from '@functional-systems/memdrive';
+
+const tools = createFileTools({
+    drive: work,
+    tools: ['guide', 'status', 'history', 'list', 'read', 'search', 'findText', 'diff', 'write', 'merge'],
+});
+
+// Register definitions with the host's model or MCP transport.
+const definitions = tools.definitions;
+const state = await tools.execute('status', {});
+const guide = await tools.execute('guide', {}); // { version, content }, no storage calls
+
+// A host can expose precisely the same text as a resource.
+const guideResource = fileToolGuide;
+
+const controller = new AbortController();
+try {
+    await tools.execute('write', {
+        op: 'update', fileId: file.fileId,
+        edits: [{ oldText: 'Earlier decision', newText: 'Current decision and reason' }],
+    }, { signal: controller.signal });
+} catch (error) {
+    // { ok: false, error: { code, message, status?, details? } }
+    const toolFailure = fileToolError(error);
+    // Encode toolFailure using the host's transport and error indicator.
+}
+```
+
+Available names are `guide`, `status`, `history`, `list`, `read`, `search`,
+`findText`, `diff`, `write` and `merge`. `diff`, `write` and `merge` require a working
+fork; `findText` requires text mode. Selecting an unavailable tool fails at binding
+with `TOOL_UNAVAILABLE`. External-vector bindings advertise vector inputs for
+`search` and `write` and return the SDK's file references. No embeddings or local
+content hydration are supplied by the tool layer.
+
+`execute(name, input, options?)` returns the underlying SDK result unchanged and
+rejects with SDK errors. In particular, `status` and `history` keep their SDK
+names, arguments and results. Zero-argument tools accept `{}`. `write` accepts a
+single SDK operation object, or `{ operations: [...] }` for the SDK's array form;
+the result is respectively one file/deletion result or an array. A batch is not a
+transaction. `guide` returns the exported versioned text without provisioning or
+reading drive files. `fileToolError` preserves SDK error codes, messages, status
+and details, excludes causes and stacks, and masks unexpected errors. It does not
+retry calls or authorize recovery.
+
+For a read-only connection, select only the needed query tools, for example
+`['guide', 'status', 'history', 'list', 'read', 'search']`. The executor copies the
+allowlist and rejects every other name with `TOOL_NOT_ALLOWED`, even if the
+underlying handle supports writes. Definitions are deeply frozen. Input Schemas
+describe JSON structure; the public SDK validates semantic constraints such as
+UTF-8 limits, paths, declared metadata and embedding dimensions. The `readOnly`
+flag classifies content operations, not backend credentials: inherited SDK
+snapshot initialization can still require provisioning a retained ref on an
+older uninitialized store. `guide`, `status` and `history` do not initialize it.
+
+The host must authenticate and authorize every invocation, bind the permitted
+drive/ref and establish the exclusive writer rules for merge. Arguments cannot
+select another drive or ref. Fork/checkpoint creation, opening another view,
+recovery and store lifecycle are host operations and are absent from this catalog.
+Keep the SDK client and view handles alive for cursor continuations; creating a
+new client for each request loses those cursors. Transport formatting, hosted
+Markdown/capacity/reranker policies, instruction delivery and telemetry remain
+host responsibilities. Tool availability and fetching the guide do not establish
+which instructions a model followed.
+
 ## List files
 
 ```ts

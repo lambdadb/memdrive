@@ -27,6 +27,14 @@ npm run check:package
 
 The package root and its `package.json` subpath are the public entry points. Use the public package name in examples and consumer checks. Keep application-specific conventions, model adapters and answer generation outside the SDK.
 
+The shared file-tool catalog also lives at the package root. Preserve the bound
+view and explicit allowlist when adding tools. Successful results come from the
+public SDK; schemas describe JSON input while SDK validation enforces semantic
+constraints. Schema tests use Ajv only as a development dependency. Keep guide
+text independent of host authentication, product policy and provider adapters.
+The installed-package check exercises the tool workflow and authorization
+boundary as well as ESM, CommonJS, TypeScript and browser imports.
+
 The LambdaDB dependency is pinned to an exact release. Update it deliberately with relevant API and regression checks. Tooling versions initially follow the native client's lockfile; updating tooling is separate from adopting a new database API.
 
 ## Validation and evidence
