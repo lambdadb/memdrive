@@ -2,7 +2,7 @@ import type { LambdaDBClient } from '@functional-systems/lambdadb';
 import { create, open, type DriveFile, type CheckpointFileDrive, type FileChange, type FileFilter, type DeleteFileResult, type SearchFilesResult, type ListFilesResult, type FileDrive, type MergeResult, type OpenFileStoreOptions } from '@functional-systems/memdrive';
 
 export async function fileConsumer(client: LambdaDBClient, options: OpenFileStoreOptions) {
-    const main = await create({ client, name: 'workspace' });
+    const main = await create({ client, name: 'workspace', metadataSchema: { topic: { type: 'string' } } });
     const fork = await main.fork({ name: 'research' });
     const created: DriveFile = await fork.write({ op: 'create', path: '/notes/context.md', content: '' });
     const reopened = await open({ client, name: 'workspace', at: { fork: 'research' } });
@@ -61,7 +61,7 @@ const topicFilter: FileFilter = { field: 'metadata.topic', op: 'eq', value: 'loc
 
 export async function externalFileConsumer(client: LambdaDBClient) {
     const embedding = { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'caller-model' } as const;
-    const main = await create({ client, name: 'workspace', embedding });
+    const main = await create({ client, name: 'workspace', embedding, metadataSchema: { topic: { type: 'string' } } });
     const work = await main.fork({ name: 'semantic' });
     const vector: readonly number[] = Array(64).fill(0.25);
     const [file] = await work.write([{ op: 'create', path: '/note', content: vector }]);

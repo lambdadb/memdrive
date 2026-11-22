@@ -20,12 +20,15 @@ Use `@functional-systems/memdrive` to create a text file store and save exact or
 ```ts
 import { MemDrive } from '@functional-systems/memdrive';
 
-const main = await MemDrive.create({ client, name: 'workspace' });
+const main = await MemDrive.create({
+    client, name: 'workspace', metadataSchema: { topic: { type: 'string' } },
+});
 const work = await main.fork({ name: 'research' });
 const file = await work.write({
     op: 'create',
     path: '/notes/context.md',
     content: '# Task context\r\n',
+    metadata: { topic: 'planning' },
 });
 
 const reopened = await MemDrive.open({ client, name: 'workspace', at: { fork: 'research' } });
@@ -49,8 +52,8 @@ Use one writer per fork across runtimes and LambdaDB client instances. The SDK s
 Pass `filter` to either text or external-vector search. The filter limits retrieval candidates before ranking. Text search applies it to chunks in both lexical and vector retrieval. Vector search applies it to file records.
 
 ```ts
-const { hits } = await reopened.search({
-    query: 'Project notes',
+const { hits: planningHits } = await reopened.search({
+    query: 'Task context',
     filter: { field: 'metadata.topic', op: 'eq', value: 'planning' },
 });
 ```
