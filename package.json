@@ -21,7 +21,8 @@
   "tshy": {
     "exports": {
       ".": "./src/index.ts",
-      "./package.json": "./package.json"
+      "./package.json": "./package.json",
+      "./docling": "./src/docling.ts"
     }
   },
   "scripts": {
@@ -41,7 +42,9 @@
   },
   "devDependencies": {
     "@eslint/js": "9.32.0",
+    "@types/node": "24.10.0",
     "ajv": "8.20.0",
+    "docling.rs": "2.85.0",
     "esbuild": "0.28.2",
     "eslint": "9.32.0",
     "globals": "15.15.0",
@@ -62,7 +65,17 @@
         "default": "./dist/commonjs/index.js"
       }
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./docling": {
+      "import": {
+        "types": "./dist/esm/docling.d.ts",
+        "default": "./dist/esm/docling.js"
+      },
+      "require": {
+        "types": "./dist/commonjs/docling.d.ts",
+        "default": "./dist/commonjs/docling.js"
+      }
+    }
   },
   "author": "Functional Systems, Inc.",
   "homepage": "https://github.com/lambdadb/memdrive#readme",
@@ -75,5 +88,13 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "peerDependencies": {
+    "docling.rs": "2.85.0"
+  },
+  "peerDependenciesMeta": {
+    "docling.rs": {
+      "optional": true
+    }
   }
 }

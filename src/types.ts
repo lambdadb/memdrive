@@ -9,6 +9,13 @@ export interface RequestOptions {
     signal?: AbortSignal | undefined;
 }
 
+export interface ChunkingOptions { strategy: 'auto' | 'boundary' | 'none' | 'docling' }
+/** Runtime-local optional backend; native modules are never imported by the browser entry point. */
+export interface DoclingChunker {
+    readonly id: string;
+    chunk(file: { path: string; content: string; format: string }, options?: RequestOptions): Promise<Array<{ text: string; contextualized: string }>>;
+}
+
 export type ForkSelection = { fork: string; checkpoint?: never };
 export type CheckpointSelection = { checkpoint: string; fork?: never };
 
@@ -17,7 +24,7 @@ export type EmbeddingMode = 'managed' | 'external';
 export type OpenFileStoreOptions<Mode extends EmbeddingMode = 'managed'> = ConnectionOptions & ModeOption<Mode> & (
     { at?: undefined; recover?: boolean | undefined }
     | { at: ForkSelection | CheckpointSelection; recover?: never }
-);
+) & { chunker?: DoclingChunker | undefined };
 
 type ModeOption<Mode extends EmbeddingMode> = Mode extends 'external' ? { mode: 'external' } : { mode?: 'managed' | undefined };
 
@@ -244,11 +251,15 @@ type StoreOptions = ConnectionOptions & {
 export type CreateFileStoreOptions = StoreOptions & {
     embedding?: { mode: 'managed' } | undefined;
     textSearch?: { analyzers: string[] } | undefined;
+    chunking?: ChunkingOptions | undefined;
+    chunker?: DoclingChunker | undefined;
 };
 
 export type CreateExternalFileStoreOptions = StoreOptions & {
     embedding: ExternalEmbedding;
     textSearch?: never;
+    chunking?: never;
+    chunker?: never;
 };
 
 interface StoreDescription {
@@ -261,6 +272,7 @@ interface StoreDescription {
 
 export type FileStoreDescription<Mode extends EmbeddingMode = 'managed'> = StoreDescription & (
     Mode extends 'external' ? { embedding: ExternalEmbedding; textSearch?: never } : {
+        chunking?: ChunkingOptions | undefined;
         textSearch: { analyzers: string[] };
         embedding: {
             mode: 'managed';

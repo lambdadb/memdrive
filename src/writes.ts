@@ -1,3 +1,4 @@
+import type { TextChunker } from './text-chunks.js';
 import { editRequest, planEdit } from './edits.js';
 import { diffFiles } from './diff.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
@@ -116,7 +117,7 @@ export async function listChunkIds(handle: Handle, name: string, ref: ViewRef, f
     throw new MemDriveError('CHUNK_SCAN_LIMIT', 'Current chunk lookup exceeded the supported number of pages.');
 }
 
-export function workingWriter(handle: Handle, name: string, branch: string, schema: MetadataSchema, dimensions?: number) {
+export function workingWriter(handle: Handle, name: string, branch: string, schema: MetadataSchema, dimensions?: number, chunker?: TextChunker) {
     let queue = Promise.resolve();
     let userBarrier: Promise<void> | undefined;
 
@@ -180,7 +181,7 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
         const operations = multi ? [...request] : [request];
         requireInput(operations.length >= 1 && operations.length <= writeBatchLimit, 'Submit 1–100 file operations.');
         const prepared = Promise.all(operations.map(async operation => operation?.op === 'create'
-            ? { op: 'create' as const, records: await createRecords(operation, schema, dimensions) }
+            ? { op: 'create' as const, records: await createRecords(operation, schema, dimensions, chunker, { signal }) }
             : editRequest(operation, schema, dimensions)));
         void prepared.catch(() => {});
         return enqueueUser(() => enqueue(async () => {
@@ -208,7 +209,7 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
 
             const originals = await fetchOriginals(handle, name, branchRef(branch), targetIds, signal, dimensions !== undefined);
             const plans: Plan[] = await Promise.all(inputs.map(input =>
-                input.op === 'create' ? input : planEdit(input, originals.get(input.fileId), schema, dimensions)));
+                input.op === 'create' ? input : planEdit(input, originals.get(input.fileId), schema, dimensions, chunker, { signal })));
             const destinations = new Map<string, string>();
             for (const plan of plans) {
                 if (plan.op === 'delete') continue;

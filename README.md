@@ -39,7 +39,7 @@ const { hits, reranked } = await reopened.search({ query: 'Task context', limit:
 
 `read` returns the original file or `null` when absent. Content can be empty and the SDK preserves whitespace and line endings. Paths are case-sensitive, absolute and slash-separated. Pass an array of up to 100 operations to write files in batches. Pass up to 100 distinct paths in `read({ paths })` to read existing files in request order. An existing path in the same fork rejects creation with `PATH_EXISTS`. Main exposes the published file view and supplies the starting point for creating a fork. Working edits are scoped to that fork. A store can declare scalar metadata fields with `metadataSchema` and carry collection labels. File writes attach optional `metadata` and record the modification time.
 
-Search ranks file chunks with Bayesian lexical and vector retrieval. The store defaults to LambdaDB's `standard` analyzer and OpenAI's managed `text-embedding-3-small` embeddings. Set `textSearch.analyzers` when creating a store to select other supported analyzers. Text is currently split at paragraph, sentence or whitespace boundaries using an 800-code-point cap. Each hit carries the stable file ID, path, metadata and a chunk preview. When the chunk's location is verified against the exact original, the hit also includes a UTF-16 `range` that can be passed to JavaScript's `slice`.
+Search ranks file chunks with Bayesian lexical and vector retrieval. The store defaults to LambdaDB's `standard` analyzer and OpenAI's managed `text-embedding-3-small` embeddings. Set `textSearch.analyzers` when creating a store to select other supported analyzers. The default boundary splitter uses paragraph, sentence or whitespace boundaries with an 800-code-point cap; an optional local Docling adapter supports structured text as described below. Each hit carries the stable file ID, path, metadata and a chunk preview. When the chunk's location is verified against the exact original, the hit also includes a UTF-16 `range` that can be passed to JavaScript's `slice`.
 
 Search enables native reranking by default. Use `rerank: false` for fused order or `rerank: { onFailure: 'returnOriginal' }` to allow native provider fallback. The result's `reranked` flag reports whether reranking was applied. An optional `embeddingQuery` supplies separate semantic context while preserving `query` for lexical matching.
 
@@ -71,6 +71,71 @@ This setting does not delete named checkpoints, unpin SDK publication tags, or
 expire merge request IDs and journal records. Those require a separate SDK
 history cleanup policy; lowering native snapshot retention alone does not
 establish content erasure.
+
+## Structured text chunking
+
+New managed stores persist `chunking: { strategy: 'auto' }` by default. Explicit
+strategies are `boundary` (the 800-code-point splitter), `none` (one nonblank
+chunk), and `docling` (requires the local adapter and a supported format).
+External-vector stores do not accept chunking settings or adapters.
+
+For structured text in Node.js, install the optional pinned adapter dependency
+and provide a local Hugging Face `tokenizer.json` suitable for your embedding
+model. The SDK does not download a tokenizer or invoke an LLM for chunking.
+
+```sh
+npm install docling.rs@2.85.0
+```
+
+```ts
+import { createDoclingChunker } from '@functional-systems/memdrive/docling';
+
+const chunker = await createDoclingChunker({
+    tokenizer: './tokenizer.json', maxTokens: 256, mergePeers: true,
+});
+const main = await MemDrive.create({
+    client, name: 'structured-workspace', chunking: { strategy: 'auto' }, chunker,
+});
+const work = await main.fork({ name: 'draft' });
+await work.write({ op: 'create', path: '/notes/context.md', content: '# Context\n\nExact original text.' });
+// Supply the same adapter when reopening for structured writes.
+await MemDrive.open({ client, name: 'structured-workspace', at: { fork: 'draft' }, chunker });
+```
+
+`auto` uses Docling Hybrid for recognized Markdown, HTML, CSV, AsciiDoc, LaTeX
+and XML paths when an adapter is supplied. HTML/XML signatures also identify
+otherwise unnamed formats. Plain text and ambiguous inputs such as JSON and
+YAML use boundary splitting. Without an adapter, `auto` uses boundary splitting.
+An explicitly requested `docling` store cannot be created or written without
+an adapter (`CHUNKER_UNAVAILABLE`); unsupported formats return
+`UNSUPPORTED_FORMAT`. Parser failures are surfaced, not silently retried through
+a different splitter. `maxTokens` accepts 16–8192 and defaults to 256;
+`mergePeers` defaults to true.
+
+The exact original input string, whitespace and line endings
+remain unchanged. Chunk previews contain rendered body text, while managed
+embeddings use Docling's contextualized text, including structural context.
+A chunk has a source range only if its text occurs exactly once in the original.
+Rendered tables and repeated passages can therefore have no range. Markdown YAML
+front matter remains searchable as exact source chunks; heading-only documents
+fall back to exact source chunks if Docling emits no body. This is text-file
+chunking, not a binary PDF or image ingestion API.
+
+Each original records the resolved strategy and adapter identity, including
+tokenizer hash and options. Moving, publishing and recovering files reuse the
+captured chunks and vectors without rerunning the parser. Replacing content or
+updating metadata runs the configured splitter again. Reads, checkpoints and
+publication recovery can reopen without a local adapter. A changed tokenizer
+file requires explicitly creating a new adapter.
+An already cached store keeps its adapter binding. Use a separate LambdaDB
+client instance when opening that store with a different adapter; otherwise
+`CHUNKER_MISMATCH` prevents changing active writers implicitly.
+
+Stores created before chunking configuration was introduced keep their existing
+boundary layout and embedding source. They remain readable and writable; opening
+them does not migrate or reindex them. Create a fresh store to adopt configured
+chunking. The package root remains browser-compatible without `docling.rs`;
+the `/docling` subpath is Node-only.
 
 ## Read a bounded text range
 

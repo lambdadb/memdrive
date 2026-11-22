@@ -9,6 +9,8 @@ import { workingWriter, writeBatchLimit } from './writes.js';
 import { searchQuery, validateReranking, vectorSearchQuery } from './search.js';
 import { fileLister } from './list.js';
 import { fileTextFinder } from './find-text.js';
+import { textChunker } from './text-chunks.js';
+import type { DoclingChunker } from './types.js';
 import { createRef } from './refs.js';
 import { rangeKeys, readRange, validateReadRange } from './read-range.js';
 import type { DriveFile, FileReadPage, ReadFileRangeRequest } from './types.js';
@@ -47,7 +49,7 @@ async function remote<T>(operation: () => Promise<T>, message: string, signal?: 
 }
 
 type Store = ReturnType<typeof store>;
-function store(client: Client, handle: Handle, description: FileStoreDescription<EmbeddingMode>, identity: Awaited<ReturnType<typeof publicationIdentity>>) {
+function store(client: Client, handle: Handle, description: FileStoreDescription<EmbeddingMode>, identity: Awaited<ReturnType<typeof publicationIdentity>>, backend?: DoclingChunker) {
     const { name, metadataSchema, embedding } = description;
     const gate = lifecycle({ client, name });
     let invalid = false;
@@ -69,6 +71,8 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         }));
     }
     const dimensions = embedding.mode === 'external' ? embedding.dimensions : undefined;
+    const chunker = 'chunking' in description && description.chunking ? textChunker(description.chunking, backend) : undefined;
+    if (!chunker && backend) throw new MemDriveError('INCOMPATIBLE_STORE', 'This store does not support configured structured chunking.');
     const decodeRead = dimensions === undefined ? decodeFile : decodeFileEntry;
     const forks = new Map<string, WorkingFileDrive<EmbeddingMode>>();
     const checkpoints = new Map<string, CheckpointFileDrive<EmbeddingMode>>();
@@ -77,7 +81,7 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
     function writerFor(branch: string) {
         const existing = writers.get(branch);
         if (existing) return existing;
-        const writer = workingWriter(handle, name, branch, metadataSchema, dimensions);
+        const writer = workingWriter(handle, name, branch, metadataSchema, dimensions, chunker);
         writers.set(branch, writer);
         return writer;
     }
@@ -397,7 +401,7 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
 
     return {
         main: mainView,
-        identity, assertLive, assertDeleteSafe,
+        identity, assertLive, assertDeleteSafe, backendId: backend?.id,
         invalidate() { invalid = true; },
         mode: embedding.mode,
         recover: publishing.recover,
@@ -445,21 +449,22 @@ export function create(options: CreateFileStoreOptions | CreateExternalFileStore
 export async function create(options: CreateFileStoreOptions | CreateExternalFileStoreOptions, requestOptions?: RequestOptions) {
     const { signal } = operationOptions(requestOptions);
     checkAbort(signal);
-    validateConnection(options, ['client', 'name', 'labels', 'textSearch', 'metadataSchema', 'embedding', 'retentionInDays']);
+    validateConnection(options, ['client', 'name', 'labels', 'textSearch', 'metadataSchema', 'embedding', 'chunking', 'chunker', 'retentionInDays']);
     const { client, name } = options;
     return lifecycle(options).run(async () => {
         storesFor(client).get(name)?.assertLive();
         requireInput(typeof client.createCollection === 'function', 'Client must support collection creation.');
-        const { indexConfigs, tags, description } = storeConfiguration(options);
-        const response = await remote(() => client.createCollection({ collectionName: name, indexConfigs, tags,
-            ...(options.retentionInDays === undefined ? {} : { snapshotRetentionInDays: options.retentionInDays }) },
+        const { indexConfigs, tags, description, collectionDescription } = storeConfiguration(options);
+        if ('chunking' in description && description.chunking) textChunker(description.chunking, options.chunker, true);
+        const response = await remote(() => client.createCollection({ collectionName: name, indexConfigs, tags, ...(options.retentionInDays === undefined ? {} : { snapshotRetentionInDays: options.retentionInDays }),
+            ...(collectionDescription === undefined ? {} : { description: collectionDescription }) },
             nativeOptions(signal)), 'Could not create the file store.', signal, { 409: 'STORE_EXISTS' });
         checkAbort(signal);
         if (validRetention(response.collection?.snapshotRetentionInDays)) description.retentionInDays = response.collection.snapshotRetentionInDays;
         const stores = storesFor(client);
         const identity = await publicationIdentity(name, response.collection);
         checkAbort(signal);
-        const created = stores.get(name) ?? store(client, client.collection(name), description, identity);
+        const created = stores.get(name) ?? store(client, client.collection(name), description, identity, options.chunker);
         stores.set(name, created);
         await created.initialize(signal);
         return created.main;
@@ -482,7 +487,7 @@ export function open(options: OpenFileStoreOptions<EmbeddingMode>, requestOption
 export async function open(options: OpenFileStoreOptions<EmbeddingMode>, requestOptions?: RequestOptions) {
     const { signal } = operationOptions(requestOptions);
     checkAbort(signal);
-    validateConnection(options, ['client', 'name', 'at', 'recover', 'mode']);
+    validateConnection(options, ['client', 'name', 'at', 'recover', 'mode', 'chunker']);
     const { client, name, at, recover, mode = 'managed' } = options;
     requireInput(mode === 'managed' || mode === 'external', 'Select managed or external embedding mode.');
     requireInput(recover === undefined || at === undefined && typeof recover === 'boolean',
@@ -512,10 +517,12 @@ export async function open(options: OpenFileStoreOptions<EmbeddingMode>, request
             const description = parseStore(response?.collection, name);
             const identity = await publicationIdentity(name, response.collection);
             checkAbort(signal);
-            selected = stores.get(name) ?? store(client, handle, description, identity);
+            selected = stores.get(name) ?? store(client, handle, description, identity, options.chunker);
             stores.set(name, selected);
         }
         selected.assertLive();
+        if (options.chunker && selected.backendId !== options.chunker.id)
+            throw new MemDriveError('CHUNKER_MISMATCH', 'The cached store is bound to another chunker. Use a separate client instance.');
         if (mode !== selected.mode)
             throw new MemDriveError('INCOMPATIBLE_STORE', `The file store uses ${selected.mode} embedding mode.`);
         if (fork !== undefined) return selected.openFork(fork, signal);

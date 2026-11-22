@@ -1,6 +1,7 @@
 import { MemDriveError, requireInput } from './errors.js';
 import { isObject, keysOnly, metadataValues, validDate, vectorValues } from './config.js';
 import { chunkSpans } from './chunking.js';
+import type { TextChunker, ResolvedChunking } from './text-chunks.js';
 import type { CreateExternalFileRequest, CreateFileRequest, DriveFile, FileListEntry, MetadataSchema } from './types.js';
 
 const encoder = new TextEncoder();
@@ -67,7 +68,7 @@ export function decodeStoredFile(doc: Record<string, unknown>, schema: MetadataS
     }
 }
 
-export async function createRecords(request: CreateFileRequest | CreateExternalFileRequest, schema: MetadataSchema, dimensions?: number) {
+export async function createRecords(request: CreateFileRequest | CreateExternalFileRequest, schema: MetadataSchema, dimensions?: number, chunker?: TextChunker, options?: { signal?: AbortSignal | undefined }) {
     requireInput(keysOnly(request, ['op', 'path', 'content', 'metadata']) && request.op === 'create',
         dimensions === undefined ? 'Create requires a path and original text.' : 'Create requires a path and vector content.');
     const { path } = request;
@@ -84,7 +85,7 @@ export async function createRecords(request: CreateFileRequest | CreateExternalF
         ...(metadata === undefined ? {} : { metadata }) };
     if ('embedding' in file)
         return fileRecords(file, { revision: globalThis.crypto.randomUUID(), fingerprint: await fingerprintOf(file) });
-    return fileRecords(file);
+    return fileRecords(file, undefined, chunker, options);
 }
 
 export type FileBaseline = { version: string; path: string; fingerprint: string };
@@ -102,6 +103,7 @@ export const fingerprintOf = (file: StoredFile) =>
     contentHash(JSON.stringify([file.path, metadataKey(file.metadata), 'embedding' in file ? file.embedding : file.content]));
 
 type FileTracking = {
+    chunking?: ResolvedChunking | undefined;
     revision: string;
     generation?: string | undefined;
     baseline?: FileBaseline | undefined;
@@ -127,9 +129,11 @@ export function fileOriginal(file: StoredFile, tracking?: FileTracking) {
         changed: !tracking?.baseline || tracking.fingerprint !== tracking.baseline.fingerprint, ...tracking };
 }
 
-export async function fileRecords(file: StoredFile, tracking?: FileTracking) {
+export async function fileRecords(file: StoredFile, tracking?: FileTracking, chunker?: TextChunker, options?: { signal?: AbortSignal | undefined }) {
     const { fileId } = file;
-    const original = fileOriginal(file, tracking);
+    requireInput(bytes(fileOriginal(file, tracking)) <= 5 * 1024 * 1024, 'The file original exceeds the native 5 MiB document limit.');
+    const rendered = 'content' in file && chunker ? await chunker(file, options) : undefined;
+    const original = fileOriginal(file, rendered ? { revision: globalThis.crypto.randomUUID(), fingerprint: await fingerprintOf(file), ...tracking, chunking: rendered.resolved } : tracking);
     const { path, fileName, ancestorPaths, modifiedAt, metadata, revision } = original;
     const generation = tracking?.generation;
     const shared = { fileId, path, fileName, ancestorPaths, modifiedAt,
@@ -141,20 +145,21 @@ export async function fileRecords(file: StoredFile, tracking?: FileTracking) {
         const { embedding: _embedding, ...reference } = file;
         return { file: reference, docs: [originalRecord] };
     }
-    const spans = chunkSpans(file.content).filter(span => span.text.trim());
+    const spans = rendered?.chunks ?? chunkSpans(file.content).filter(span => span.text.trim()).map(span => ({ ...span, contextualized: span.text }));
     const occurrences = new Map<string, number>();
-    const hashes = await Promise.all(spans.map(span => contentHash(span.text)));
-    const chunks = spans.map(({ text, start, end }, index) => {
+    const hashes = await Promise.all(spans.map(span => contentHash(rendered ? JSON.stringify([span.text, span.contextualized]) : span.text)));
+    const chunks = spans.map(({ text, contextualized, start, end }, index) => {
         const hash = hashes[index]!;
         const occurrence = occurrences.get(hash) ?? 0;
         occurrences.set(hash, occurrence + 1);
         // Legacy and new creates keep their established IDs. Each replacement
         // gets a new suffix so delayed cleanup cannot delete a later generation.
         const suffix = generation === undefined ? '' : `:${generation}`;
-        return { id: `chunk:${fileId}:${hash}:${occurrence}${suffix}`, kind: 'chunk' as const, ...shared, content: text, start, end };
+        return { id: `chunk:${fileId}:${hash}:${occurrence}${suffix}`, kind: 'chunk' as const, ...shared, content: text, ...(rendered ? { embeddingText: contextualized } : {}),
+            ...(start === undefined || end === undefined ? {} : { start, end }) };
     });
     // Large files stage their chunks before making the original visible.
-    const chunkRecords = chunks.map(doc => ({ doc, inputBytes: encoder.encode(doc.content).length, wireBytes: bytes(doc) + 1 }));
+    const chunkRecords = chunks.map(doc => ({ doc, inputBytes: encoder.encode(doc.embeddingText ?? doc.content).length, wireBytes: bytes(doc) + 1 }));
     requireInput(chunkRecords.every(record => record.wireBytes - 1 <= 5 * 1024 * 1024), 'A chunk exceeds the native 5 MiB document limit.');
     const docs = [...chunkRecords, originalRecord];
     return { file, docs };
