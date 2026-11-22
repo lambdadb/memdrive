@@ -308,35 +308,36 @@ Checkpoint and child fork creation from a working fork run in its local write qu
 
 Checkpoint search and exact reads use LambdaDB's tag read semantics. Listing retains the eventual preview behavior described below, including on a recently created checkpoint. For live validation of a prepared working view and retained state after source deletion, set `MEMDRIVE_RUN_LIVE_CHECKPOINT_TESTS=1` when running the live suite against a dedicated test project.
 
-## Create a ref from a past time
+## Create a ref from a published version
 
 ```ts
 const { entries } = await main.history();
-const asOf = entries[0].publishedAt;
-const past = await main.fork({ name: 'past-work', asOf });
-const savedPast = await main.checkpoint({ name: 'past-save', asOf });
+const version = entries[0].version; // For example, 'v1'.
+const past = await main.fork({ name: 'past-work', version });
+const savedPast = await main.checkpoint({ name: 'past-save', version });
 ```
 
-Both methods accept optional `asOf`, a nonfuture UTC ISO timestamp with
-milliseconds (`YYYY-MM-DDTHH:mm:ss.sssZ`). On main, it selects the last completed
-publication at or before that time, including the initial empty view only from
-its retained initialization time. An unfinished merge never becomes visible
-through historical main. Equal timestamps select the later publication.
-On a working fork, `asOf` selects LambdaDB's latest retained committed snapshot
-at or before that time; recent writes may not yet belong to a committed snapshot.
-A checkpoint is already fixed and rejects `asOf`. Omit it to copy that checkpoint.
+On main, both methods accept optional `version` to select that exact completed
+publication. Omit it for current main. `v0` selects the retained initial view;
+older stores without that pin cannot reconstruct it. An unfinished merge's
+version cannot be selected even if its target tag already exists.
 
-An absent or expired historical source fails with `HISTORICAL_VIEW_UNAVAILABLE`;
-the SDK does not substitute current state or an older available publication.
-History summaries may outlive their content, so a `publishedAt` entry does not
-guarantee the corresponding source is still retained. Older stores without a
-retained initial pin cannot reconstruct that earlier state. Creation still has
-the name-conflict and uncertain-outcome behavior described above.
+An unknown, unpublished or expired version fails with
+`HISTORICAL_VIEW_UNAVAILABLE`, with the requested `version` in error details.
+The SDK does not substitute another version. History summaries may outlive their
+content, so a history entry does not guarantee that version is still retained.
+Creation retains the name-conflict and uncertain-outcome behavior described above.
 
-Once created, these explicit forks and checkpoints do not automatically expire.
-A historical fork preserves its old merge baseline, so publishing edits from it
-can conflict with later changes on main. This creates a new ref; it does not
-roll back main or change the original view.
+Working forks and checkpoints accept only `{ name }` and copy their bound state.
+To preserve a working intermediate state, explicitly create a checkpoint, then
+open or fork that checkpoint when needed. `asOf` is no longer accepted on any
+view; MemDrive does not expose native snapshot time selection. `publishedAt`
+remains descriptive history metadata, not a ref selector.
+
+Once created, explicit forks and checkpoints do not automatically expire.
+A fork from an old main version preserves its merge baseline, so publishing edits
+from it can conflict with later main changes. Ref creation does not roll back
+main or change the original view.
 
 ## List and delete refs or destroy a store
 
@@ -496,9 +497,9 @@ reading drive files. `fileToolError` preserves SDK error codes, messages, status
 and details, excludes causes and stacks, and masks unexpected errors. It does not
 retry calls or authorize recovery.
 
-`fork` and `checkpoint` accept the SDK's `{ name, asOf? }` argument on main and
-working forks in both embedding modes. Checkpoint bindings accept only `{ name }`
-and omit `asOf` from their schemas. They create a ref from the bound view
+`fork` and `checkpoint` accept the SDK's `{ name, version? }` argument on main in
+both embedding modes. Working-fork and checkpoint bindings accept only `{ name }`
+and omit `version` from their schemas. No binding exposes `asOf`. They create a ref from the bound view
 and return a serializable `FileToolRefResult`, `{ name: storeName, at: { kind,
 name: refName } }`, instead of an SDK handle. Neither operation publishes edits
 or changes the tool binding. For example:

@@ -24,10 +24,9 @@ const metadata = { type: 'object', additionalProperties: scalar };
 const fileId = { type: 'string', description: 'A stable fileId returned by MemDrive.' };
 const path = { type: 'string', description: 'An absolute file path within the bound drive.' };
 
-export function fileToolSchemas(external: boolean, historicalRefs: boolean) {
-    const refTime = historicalRefs ? { asOf: { type: 'string',
-        pattern: '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$',
-        description: 'Nonfuture UTC time. Main selects the last completed publication at or before it; a fork selects a native committed snapshot.' } } : {};
+export function fileToolSchemas(external: boolean, main: boolean) {
+    const refVersion = main ? { version: { type: 'string', pattern: '^v(0|[1-9][0-9]*)$',
+        description: 'Exact retained main publication, such as v3, or the retained initial v0. Omit for current main.' } } : {};
     const content = external ? array({ type: 'number' }) : string;
     const create = object({ op: { const: 'create' }, path, content, metadata }, ['op', 'path', 'content']);
     const updateProperties = { op: { const: 'update' }, fileId, newPath: path, content, metadata,
@@ -51,8 +50,8 @@ export function fileToolSchemas(external: boolean, historicalRefs: boolean) {
         guide: object(),
         status: object(),
         fork: object({ name: { type: 'string', minLength: 3, maxLength: 47,
-            pattern: '^[A-Za-z0-9_-]+$', not: { const: 'main' } }, ...refTime }, ['name']),
-        checkpoint: object({ name: { type: 'string', minLength: 3, maxLength: 41, pattern: '^[A-Za-z0-9_-]+$' }, ...refTime }, ['name']),
+            pattern: '^[A-Za-z0-9_-]+$', not: { const: 'main' } }, ...refVersion }, ['name']),
+        checkpoint: object({ name: { type: 'string', minLength: 3, maxLength: 41, pattern: '^[A-Za-z0-9_-]+$' }, ...refVersion }, ['name']),
         history: continuation({ sinceVersion: { type: 'string', pattern: '^v(0|[1-9][0-9]*)$' }, limit: limit(100) }),
         list: continuation({ prefix: string, nameContains: string, delimiter: { const: '/' }, limit: limit(1000) }),
         read: { ...object({ fileId, path, paths: { ...array(path, 100), uniqueItems: true }, ...ranges }),

@@ -35,7 +35,8 @@ exact originals, avoid invented ranges for rendered text, and reuse captured
 chunks and vectors during publication and recovery.
 The default live suite additionally checks Docling writes, checkpoint reads and
 publication against the real backend. It publishes a later revision, then creates
-main and working-fork historical refs and verifies their earlier originals before
+main refs by exact publication version and forks an explicit saved checkpoint,
+verifying their earlier originals before
 destroying its isolated store and journal.
 It also ages timestamps in that isolated synthetic journal to exercise internal
 automatic capture cleanup after merge replay, retained history and checkpoint reads. It does
@@ -54,7 +55,7 @@ The installed core package also runs history-retention regressions covering
 protected refs, supersession timing, bounded archives, terminal outcomes and
 uncertain or partial cleanup, cancellation and read concurrency. Public type checks
 verify that retention needs no separate cleanup API. Historical-ref regressions
-cover publication boundaries, unavailable snapshots, preserved merge baselines,
+cover exact publication versions, unpublished or expired versions, preserved merge baselines,
 external vectors, uncertain creation and bound tool schemas.
 
 The LambdaDB dependency is pinned to an exact release. Update it deliberately with relevant API and regression checks. Tooling versions initially follow the native client's lockfile; updating tooling is separate from adopting a new database API.

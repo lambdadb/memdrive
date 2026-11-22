@@ -230,32 +230,19 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         return refFor(published);
     }
 
-    async function pinAt(asOf: string, signal?: AbortSignal): Promise<ViewRef> {
+    async function pinVersion(version: string, signal?: AbortSignal): Promise<ViewRef> {
         await refresh(signal);
-        // Resolve only completed publications. Native main may contain writes
-        // from an unfinished merge and must never be used for historical main.
-        for (let i = publications.length - 1; i >= 0; i--) {
-            const publication = publications[i]!;
-            if (publication.publishedAt > asOf) continue;
-            const ref = tagRef(tagFor(publication.version));
-            if (!await hasTag(ref.name, signal)) throw historicalViewUnavailable(asOf);
-            return ref;
+        // Only completed publication versions are selectable, even if an
+        // unfinished merge has already created its target tag.
+        if (!positions.has(version)) throw historicalViewUnavailable(version);
+        if (version === initialVersion) {
+            // Never synthesize a historical v0 from a legacy store's current main.
+            if (!await hasInitial(signal)) throw historicalViewUnavailable(version);
+            return initialMainRef;
         }
-        // Do not create a present-day v0 and pretend it represents an earlier
-        // time on a legacy store. Its known lifetime starts at the retained pin.
-        let response;
-        try { response = await nativeRequest(() => content.branches.get(initialMainRef.name, nativeOptions(signal)), signal); }
-        catch (cause) {
-            const error = databaseError(cause, 'Could not inspect the initial main version.');
-            if (error.status === 404) throw historicalViewUnavailable(asOf, cause);
-            throw error;
-        }
-        const initial = response?.branch;
-        checkAbort(signal);
-        if (initial?.name !== initialMainRef.name || !(initial.createdAt instanceof Date) || !Number.isFinite(initial.createdAt.getTime()))
-            throw new MemDriveError('INVALID_RESULT', 'The initial main version has invalid creation metadata.');
-        if (initial.createdAt.getTime() > Date.parse(asOf)) throw historicalViewUnavailable(asOf);
-        return initialMainRef;
+        const ref = tagRef(tagFor(version));
+        if (!await hasTag(ref.name, signal)) throw historicalViewUnavailable(version);
+        return ref;
     }
 
     async function read<T>(operation: (ref: ViewRef) => Promise<T>, signal?: AbortSignal) {
@@ -491,5 +478,5 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         }
     }
 
-    return { main: { read, pin }, pinAt, merge, recover, status, history, assertIdle, initialize: ensureBootstrap };
+    return { main: { read, pin }, pinVersion, merge, recover, status, history, assertIdle, initialize: ensureBootstrap };
 }
