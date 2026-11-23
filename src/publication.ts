@@ -1,16 +1,16 @@
 import { keysOnly, parseStore } from './config.js';
-import { historyRetention, publicationOf, type RetainedPublication } from './history-retention.js';
+import { historyRetention, publicationOf } from './history-retention.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, requireInput } from './errors.js';
 import { mergeCaptureJournal } from './merge-journal.js';
 import { applyMerge, advanceMergeSource, verifyMerge } from './merge-apply.js';
 import { confirmedMergeSource, initialMainRef, prepareMerge } from './merge-preflight.js';
 import { appliedId, bookkeepingId, canonicalVersion, completionId, parseOutcome, parseRequestIndex, parseReservation, publicationIdentity, publicationLog,
-    requestIndexId, reservationId, returnOutcome, slotOf, tagFor, versionFor, type BoundRequest, type Outcome, type PublicationRecord, type RequestIndex,
-    type Reservation, type SlotState } from './publication-log.js';
+    publishedFileLimit, requestIndexId, reservationId, returnOutcome, slotOf, tagFor, versionFor, type BoundRequest, type Outcome, type PublicationRecord,
+    type RequestIndex, type Reservation, type SlotState } from './publication-log.js';
 import { awaitMergeTag, historicalViewUnavailable, refBackoff } from './refs.js';
 import { branchRef, type Handle, type ViewRef } from './storage-reads.js';
 import { decodeToken, encodeToken, storeTag } from './cursor-tokens.js';
-import type { ConnectionOptions, FileHistoryRequest, FileHistoryResult, FileStoreStatus, MetadataSchema } from './types.js';
+import type { ConnectionOptions, FileHistoryEntry, FileHistoryRequest, FileHistoryResult, FileStoreStatus, MetadataSchema } from './types.js';
 import type { workingWriter } from './writes.js';
 
 type Writer = ReturnType<typeof workingWriter>;
@@ -46,7 +46,7 @@ export function publication(client: ConnectionOptions['client'], content: Handle
     const journal = publicationLog(content, internal, driveId);
     const capture = mergeCaptureJournal(content, internal, { name, driveId }, { captureEmpty: true });
     const initialVersion = 'v0';
-    const retained = historyRetention(content, journal, driveId, hasTag);
+    const retained = historyRetention(content, journal, hasTag);
     const cursorStore = storeTag(driveId);
     let published = initialVersion;
     // The first slot not yet observed as settled. Every lower slot has a
@@ -348,14 +348,15 @@ export function publication(client: ConnectionOptions['client'], content: Handle
 
         // Read slots after `since` in batches until the page fills or reaches
         // the fixed end. The first batch also proves that the exclusive start
-        // and a cursor's end are publications of this store.
-        const publications: RetainedPublication[] = [];
+        // and a cursor's end are publications of this store. A publication's
+        // slot records are its whole entry; nothing else is read.
+        const entries: FileHistoryEntry[] = [];
         const size = BigInt(Math.min(400, Math.max(2 * limit, 32)));
         // Current main is a publication by definition; v0 always exists.
         const checkFirst = first !== 0n && since !== main;
         const checkLast = continued && last !== 0n && throughVersion !== main;
         for (let next = checkFirst ? first : first + 1n, checked = !checkFirst && !checkLast;
-            !checked || (publications.length < limit && next <= last);) {
+            !checked || (entries.length < limit && next <= last);) {
             const to = next + size <= last ? next + size - 1n : last;
             const states = await journal.readSlots(next, to, signal, !checked && checkLast && last > to ? [last] : []);
             checkAbort(signal);
@@ -363,18 +364,16 @@ export function publication(client: ConnectionOptions['client'], content: Handle
                 if ((checkFirst && !publicationAt(states, first)) || (checkLast && !publicationAt(states, last))) throw unknown();
                 checked = true;
             }
-            for (let at = next > first ? next : first + 1n; at <= to && publications.length < limit; at++) {
+            for (let at = next > first ? next : first + 1n; at <= to && entries.length < limit; at++) {
                 const publication = publicationAt(states, at);
-                if (publication) publications.push(publication);
+                if (publication) entries.push(publication);
             }
             next = to + 1n;
         }
 
-        const entries = await retained.entries(publications, signal);
-        checkAbort(signal);
         const result: FileHistoryResult = { entries, throughVersion };
         // The fixed end is itself a publication, so a full page that stops before it has a successor.
-        const final = publications.at(-1)?.version;
+        const final = entries.at(-1)?.version;
         if (final !== undefined && final !== throughVersion)
             result.next = { cursor: encodeToken(historyToken, { d: await cursorStore, s: final, t: throughVersion, l: limit }) };
         return result;
@@ -486,7 +485,12 @@ export function publication(client: ConnectionOptions['client'], content: Handle
                             await refBackoff(250 * 2 ** attempt, signal);
                         }
                     }
-                    outcome = { status: 'published', version };
+                    // The affected files are the plan's targets: the capture's net
+                    // changes in ascending ID order. A resumed merge rebuilds the same
+                    // plan from the same capture, so it records the same IDs.
+                    outcome = { status: 'published', version,
+                        fileIds: plan.targets.slice(0, publishedFileLimit).map(({ change }) => change.fileId),
+                        fileIdsTruncated: plan.targets.length > publishedFileLimit };
                 }
                 await append(requestId, { id: completionId(slot), driveId, kind: 'merge-result-v1', completedAt: new Date().toISOString(), ...outcome }, signal);
             }
@@ -665,7 +669,7 @@ export function publication(client: ConnectionOptions['client'], content: Handle
             await retained.prune(slot, found.retentionInDays, controller.signal);
         } catch {
             // Maintenance must not change a durable terminal merge result.
-            // Archives and tag deletions are idempotent; later merges retry.
+            // Tag deletions are idempotent; later merges retry.
         } finally {
             clearTimeout(timer);
             signal?.removeEventListener('abort', abort);

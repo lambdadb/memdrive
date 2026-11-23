@@ -230,7 +230,7 @@ test('a reader of a store whose creation left v0 unpinned safely rechecks main i
     assert.deepEqual(await read, saved);
 });
 
-test('main history uses retained captures, omits version gaps, and pins pagination across views', async t => {
+test('main history reports each publication\'s affected files, omits version gaps, and pins pagination across views', async t => {
     const { fixture, main } = await setup();
     const work = await fork(main, { name: 'history' });
     const first = await work.write(file('/first'));
@@ -290,9 +290,14 @@ test('main history uses retained captures, omits version gaps, and pins paginati
         clock.mock.restore();
     }
 
+    // History is recorded at publication and does not depend on a merge capture.
+    const complete = await reopened.history();
     const tags = fixture.collections.get(name).tags;
-    tags.delete([...tags.keys()].find(tag => tag.startsWith('merge-capture-')));
-    await assert.rejects(reopened.history(), { code: 'HISTORY_UNAVAILABLE', details: { version: 'v1' } });
+    const captures = [...tags.keys()].filter(tag => tag.startsWith('merge-capture-'));
+    assert.equal(captures.length, 3);
+    for (const tag of captures) tags.delete(tag);
+    assert.deepEqual(await reopened.history(), complete);
+    assert.deepEqual(await (await MemDrive.open(withClient(fixture))).history(), complete);
 });
 
 test('history caps affected IDs and reads a published completion while bookkeeping is running', async () => {

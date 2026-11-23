@@ -122,11 +122,10 @@ publication; a merge capture ages from its terminal outcome. The current main,
 initial view, fork baselines and unfinished recovery remain protected.
 
 Cleanup is best effort: each pass selects at most 100 expired refs and has a
-five-second abort budget within the caller's deadline. It confirms retained
-summaries before removing any selected ref. Passes work through merges in order
-from a watermark stored in the journal, which advances only past merges whose
-internal refs are confirmed released, so any client resumes where the last pass
-stopped. A pass stops at the first merge whose outcome is still inside the
+five-second abort budget within the caller's deadline. Passes work through
+merges in order from a watermark stored in the journal, which advances only past
+merges whose internal refs are confirmed released, so any client resumes where
+the last pass stopped. A pass stops at the first merge whose outcome is still inside the
 window; later merges wait for it. Failure, cancellation, unavailable
 retention configuration or a busy local client defers work to a later merge without
 changing its durable result. There is no cleanup API, background timer or
@@ -142,8 +141,9 @@ version beyond the window. List cursors expire within five minutes, well before 
 findText and history cursors become unavailable once their pinned version is released.
 
 Internally, only refs proven to belong to completed SDK requests are removed.
-Bounded history archives retain the summary and up to 100 affected IDs, with no
-bodies or vectors. LambdaDB handles snapshot GC after refs are removed, and
+A publication's journal records keep its summary and up to 100 affected IDs,
+with no bodies or vectors, so history does not depend on a released ref.
+LambdaDB handles snapshot GC after refs are removed, and
 other refs may still retain the same content. Tag removal does not establish
 immediate physical erasure.
 
@@ -498,7 +498,7 @@ if (page.next) {
 
 The starting `sinceVersion` is exclusive and defaults to `v0`. Unchanged and conflicting requests create version gaps. A gap or future version returns `VERSION_NOT_FOUND`, and an invalid version format returns `INVALID_INPUT`. The page size defaults to 20 and accepts 1–100. The first page captures the latest publication as `throughVersion`. Pass the returned `next` (`{ cursor }`) unchanged to continue through that same version while main advances. The cursor is a self-contained opaque token: it holds no SDK memory, does not expire by time and continues on any client of the same store. It becomes unavailable (`HISTORY_CURSOR_UNAVAILABLE`) when it is malformed, belongs to another or replaced store, or names versions this store did not publish. If a cursor is unavailable, start again with the last version you processed.
 
-These methods read the publication journal without initializing main, advancing a merge, or reading file bodies or vectors. The SDK reads journal records on demand and keeps no per-merge state in memory: a cold client locates the latest merge with a few batched reads, a number that grows logarithmically with the number of merges, and each history page, version selection and request replay reads only the records it needs. History uses the bounded archive saved by automatic retention cleanup, or reads affected IDs from the retained capture before archival. If both are missing, `history()` returns `HISTORY_UNAVAILABLE` for that entry's version. Read the selected view to retrieve its current files.
+These methods read the publication journal without initializing main, advancing a merge, or reading file bodies or vectors. The SDK reads journal records on demand and keeps no per-merge state in memory: a cold client locates the latest merge with a few batched reads, a number that grows logarithmically with the number of merges, and each history page, version selection and request replay reads only the records it needs. A merge records its affected file IDs in the journal when it publishes, so a history page reads only its publications' journal records and stays complete after retention cleanup releases their merge captures. Read the selected view to retrieve its current files.
 
 ## Shared file tools
 
