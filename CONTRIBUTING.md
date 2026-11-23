@@ -61,13 +61,22 @@ and store/ref lifecycle, including partial deletion recovery, as well as ESM,
 CommonJS, TypeScript and browser imports.
 The installed core package also runs history-retention regressions covering
 protected refs, supersession timing, bounded archives, terminal outcomes and
-uncertain or partial cleanup, cancellation and read concurrency, and the SDK window
-kept separate from one-day native retention. Public type checks
+uncertain or partial cleanup, the stored cleanup watermark, cancellation and read
+concurrency, and the SDK window kept separate from one-day native retention. Public type checks
 verify that retention needs no separate cleanup API. Historical-ref regressions
 cover exact publication versions, unpublished or expired versions, preserved merge baselines,
 external vectors, uncertain creation and source-dependent version schemas.
 
 The LambdaDB dependency is pinned to an exact release. Update it deliberately with relevant API and regression checks. Tooling versions initially follow the native client's lockfile; updating tooling is separate from adopting a new database API.
+
+The publication journal is read on demand by document ID, with batched
+fetches of at most 1,000 IDs, and never through an index query. Keep per-store
+memory independent of the number of merges: journal regressions assert a hard
+bound on cold-client fetches and that later reads return to the journal. Every
+journal record except the retention watermark is written once: confirm a
+reservation before its request index, and the index before any terminal record. Stores
+are registered weakly and pinned only while they hold state a new object would
+lose; the release regressions enable `gc` inside their own test file.
 
 ## Validation and evidence
 

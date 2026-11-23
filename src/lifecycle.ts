@@ -4,39 +4,84 @@ import { publicationIdentity } from './publication-log.js';
 import type { Handle } from './storage-reads.js';
 import type { ConnectionOptions } from './types.js';
 
-const coordinators = new WeakMap<ConnectionOptions['client'], Map<string, ReturnType<typeof coordinator>>>();
 export const deletingFormat = 'files-deleting-v0';
 const rejected = new Set([400, 401, 403, 404, 409, 422, 429]);
 
-function coordinator() {
-    let active = 0;
-    let exclusive = false;
-    let invalid = false;
+/**
+ * Name-keyed objects that live only as long as something else needs them.
+ * An entry is held weakly, so it is collected once the application drops it;
+ * `hold` keeps it strongly while it carries state that must not be lost. The
+ * same name returns the same object for as long as that object is alive.
+ */
+export function weakRegistry<T extends object>() {
+    const entries = new Map<string, WeakRef<T>>();
+    const held = new Map<string, T>();
+    const collected = new FinalizationRegistry<string>(name => {
+        if (entries.get(name)?.deref() === undefined) entries.delete(name);
+    });
     return {
-        soleOperation() { return active === 1 && !exclusive && !invalid; },
-        invalidate() { invalid = true; },
-        reset() { invalid = false; },
-        async run<T>(operation: () => Promise<T>): Promise<T> {
-            if (exclusive) throw new MemDriveError('STORE_BUSY', 'A lifecycle operation is in progress.');
-            if (invalid) throw new MemDriveError('STORE_DELETED', 'Store destruction is incomplete or unconfirmed. Resume with MemDrive.destroy.');
-            active++;
-            try { return await operation(); }
-            finally { active--; }
+        get: (name: string) => entries.get(name)?.deref(),
+        set(name: string, value: T) {
+            if (entries.get(name)?.deref() === value) return;
+            held.delete(name);
+            entries.set(name, new WeakRef(value));
+            collected.register(value, name);
         },
-        async exclusive<T>(operation: () => Promise<T>): Promise<T> {
-            if (exclusive || active) throw new MemDriveError('STORE_BUSY', 'Wait for active store operations to finish before maintenance.');
-            exclusive = true;
-            try { return await operation(); }
-            finally { exclusive = false; }
+        delete(name: string) {
+            entries.delete(name);
+            held.delete(name);
+        },
+        /** Pin or release the current entry of `name`. A replaced or removed object is ignored. */
+        hold(name: string, value: object, keep: boolean) {
+            if (entries.get(name)?.deref() !== value) return;
+            if (keep) held.set(name, value as T);
+            else held.delete(name);
         },
     };
 }
 
+type Coordinator = ReturnType<typeof coordinator>;
+const coordinators = new WeakMap<ConnectionOptions['client'], ReturnType<typeof weakRegistry<Coordinator>>>();
+
+function coordinator(retain: (gate: object, keep: boolean) => void) {
+    let active = 0;
+    let exclusive = false;
+    let invalid = false;
+    // A running operation or an unfinished destruction must outlive every
+    // reference the application holds; an idle coordinator may be collected.
+    const update = () => retain(gate, active > 0 || exclusive || invalid);
+    const gate = {
+        soleOperation() { return active === 1 && !exclusive && !invalid; },
+        invalidate() { invalid = true; update(); },
+        reset() { invalid = false; update(); },
+        async run<T>(operation: () => Promise<T>): Promise<T> {
+            if (exclusive) throw new MemDriveError('STORE_BUSY', 'A lifecycle operation is in progress.');
+            if (invalid) throw new MemDriveError('STORE_DELETED', 'Store destruction is incomplete or unconfirmed. Resume with MemDrive.destroy.');
+            active++;
+            update();
+            try { return await operation(); }
+            finally { active--; update(); }
+        },
+        async exclusive<T>(operation: () => Promise<T>): Promise<T> {
+            if (exclusive || active) throw new MemDriveError('STORE_BUSY', 'Wait for active store operations to finish before maintenance.');
+            exclusive = true;
+            update();
+            try { return await operation(); }
+            finally { exclusive = false; update(); }
+        },
+    };
+    return gate;
+}
+
 export function lifecycle({ client, name }: ConnectionOptions) {
     let stores = coordinators.get(client);
-    if (!stores) { stores = new Map(); coordinators.set(client, stores); }
+    if (!stores) { stores = weakRegistry(); coordinators.set(client, stores); }
     let gate = stores.get(name);
-    if (!gate) { gate = coordinator(); stores.set(name, gate); }
+    if (!gate) {
+        const registry = stores;
+        gate = coordinator((value, keep) => registry.hold(name, value, keep));
+        stores.set(name, gate);
+    }
     return gate;
 }
 
