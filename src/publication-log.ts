@@ -4,7 +4,7 @@ import { contentHash, resultDocs, validFileId, validPath, validText } from './re
 import { branchRead, type Handle } from './storage-reads.js';
 import type { MergeRequest, MergeResult } from './types.js';
 
-export type BoundRequest = MergeRequest & { branch: string };
+export type BoundRequest = Omit<MergeRequest, 'at'> & { branch: string };
 type RecordBase = { id: string; driveId: string };
 export type Reservation = RecordBase & BoundRequest & {
     kind: 'merge-reservation-v1'; sourceTag: string | null; startedAt: string; priorVersion: string; version: string;
@@ -29,7 +29,7 @@ const requestId = (value: unknown): value is string => validText(value) && value
 const summary = (value: unknown): value is string => validText(value) && value.trim().length > 0 && value.length <= 1024;
 const branch = (value: unknown): value is string => typeof value === 'string' && /^fork-[A-Za-z0-9_-]{3,47}$/.test(value);
 
-export function validateMergeRequest(request: unknown): asserts request is MergeRequest {
+export function validateMergeRequest(request: unknown): asserts request is Omit<MergeRequest, 'at'> {
     requireInput(keysOnly(request, ['requestId', 'summary']) && requestId(request.requestId) && summary(request.summary),
         'Provide a merge request ID and a nonempty summary.');
 }

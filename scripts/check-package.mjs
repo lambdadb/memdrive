@@ -42,8 +42,11 @@ try {
         if (typeof sdk[key] !== 'function') throw new Error('Missing export: ' + key);
     }
     if (sdk.MemDrive.create !== sdk.create || sdk.MemDrive.open !== sdk.open || sdk.MemDrive.destroy !== sdk.destroy) throw new Error('Missing static factory');
-    const catalog = sdk.getFileToolDefinitions({ embeddingMode: 'managed', tools: ['fork', 'write'] });
-    if (!Object.isFrozen(catalog) || !catalog[0].inputSchema.properties.version || catalog[1].name !== 'write') throw new Error('Invalid fixed tool catalog');
+    if (Object.keys(sdk.MemDrive).sort().join() !== 'create,destroy,open') throw new Error('Unexpected static factory members');
+    const catalog = sdk.getFileToolDefinitions({ embeddingMode: 'managed', tools: ['fork', 'write', 'listForks', 'deleteFork'] });
+    if (!Object.isFrozen(catalog) || !catalog[0].inputSchema.properties.version || !catalog[0].inputSchema.properties.at
+        || catalog[1].name !== 'write' || !catalog[1].inputSchema.required.includes('at') || !catalog[1].inputSchema.$defs.forkAt
+        || catalog[2].name !== 'listForks' || catalog[3].readOnly !== false) throw new Error('Invalid fixed tool catalog');
     if (!sdk.fileToolGuide.version || !sdk.fileToolGuide.content || !sdk.fileToolGuideTopics.editing.content) throw new Error('Missing file-tool guide');
     for (const { topic } of sdk.fileToolGuide.topics) {
         if (sdk.fileToolGuideTopics[topic].version !== sdk.fileToolGuide.version) throw new Error('Mismatched guide version');

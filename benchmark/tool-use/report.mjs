@@ -5,19 +5,22 @@ import { agentFailureCodes } from './agent.mjs';
 import { summarize } from './run.mjs';
 
 const toolNames = ['guide', 'status', 'history', 'list', 'read', 'search', 'findText',
-    'fork', 'checkpoint', 'diff', 'write', 'merge'];
+    'fork', 'checkpoint', 'listForks', 'listCheckpoints', 'deleteFork', 'deleteCheckpoint', 'diff', 'write', 'merge'];
+// BINDING_CHANGED and REF_DELETED identify errors in protocol-v1 run directories.
 const toolErrorCodes = [
-    'ABORTED', 'BINDING_CHANGED', 'BRANCH_CONFLICT', 'BRANCH_NOT_FOUND', 'CHECKPOINT_CONFLICT', 'DATABASE_ERROR',
-    'EDIT_CONFLICT', 'FILE_NOT_FOUND',
+    'ABORTED', 'BINDING_CHANGED', 'BRANCH_CONFLICT', 'BRANCH_NOT_FOUND', 'CHECKPOINT_CONFLICT', 'CHECKPOINT_NOT_FOUND',
+    'CURSOR_VIEW_MISMATCH', 'DATABASE_ERROR', 'EDIT_CONFLICT', 'FILE_NOT_FOUND',
     'FIND_TEXT_CURSOR_UNAVAILABLE', 'HISTORICAL_VIEW_UNAVAILABLE', 'HISTORY_CURSOR_UNAVAILABLE', 'HISTORY_UNAVAILABLE',
     'INVALID_INPUT', 'INVALID_JSON', 'INVALID_RESULT', 'LIST_CURSOR_UNAVAILABLE', 'LIST_SCAN_LIMIT', 'MERGE_BLOCKED',
     'MERGE_CONFLICT', 'MERGE_REQUEST_CONFLICT', 'PATH_EXISTS', 'READ_VERSION_CHANGED', 'REF_CREATION_UNCONFIRMED',
-    'REF_DELETED', 'TOOL_EXECUTION_FAILED', 'TOOL_NOT_ALLOWED', 'TOOL_UNAVAILABLE', 'VERSION_NOT_FOUND', 'WRITE_UNCONFIRMED',
+    'REF_DELETED', 'REF_DELETION_UNCONFIRMED', 'TARGET_NOT_AUTHORIZED', 'TOOL_EXECUTION_FAILED', 'TOOL_NOT_ALLOWED', 'TOOL_UNAVAILABLE',
+    'VERSION_NOT_FOUND', 'WRITE_UNCONFIRMED',
 ];
 const known = (value, choices) => choices.includes(value) ? value : undefined;
 const count = value => Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 const toolName = name => known(name, toolNames) ?? 'unknown';
-const binding = value => value && { kind: known(value.at?.kind, ['main', 'fork', 'checkpoint']), generation: count(value.generation) };
+// Only the view kind is exported; view names are task data.
+const viewKind = args => args && typeof args === 'object' ? known(args.at?.kind, ['main', 'fork', 'checkpoint']) : undefined;
 
 async function readJSON(file) {
     try { return JSON.parse(await readFile(file, 'utf8')); }
@@ -42,9 +45,8 @@ function requestDiagnostic({ round, status, response, error }, model) {
 
 function toolEvent(event) {
     if (event.kind === 'resource_read') return { kind: 'resource_read', actor: 'host' };
-    if (event.kind === 'binding_changed') return { kind: 'binding_changed', binding: binding(event.binding) };
     if (event.kind !== 'tool') return undefined;
-    return { kind: 'tool', name: toolName(event.name), binding: binding(event.before),
+    return { kind: 'tool', name: toolName(event.name), at: viewKind(event.args),
         outcome: event.result?.error ? 'error' : 'ok',
         errorCode: event.result?.error && (known(event.result.error.code, toolErrorCodes) ?? 'OTHER_TOOL_ERROR'),
         truncated: event.delivery?.truncated === true,
@@ -65,7 +67,7 @@ function caseDiagnostic(entry, result, receipts, model) {
                 resourceReadsByHost: count(behavior.resourceReadsByHost), exactEdits: count(behavior.exactEdits),
                 readBeforeWrite: behavior.readBeforeWrite, reviewedDiff: behavior.reviewedDiff } },
         events: (result?.events ?? []).map(toolEvent).filter(Boolean),
-        offered: offered.map(round => ({ round: count(round.round), binding: binding(round.binding),
+        offered: offered.map(round => ({ round: count(round.round),
             tools: (round.definitions ?? []).map(tool => toolName(tool.name)) })),
         requests: receipts.map(receipt => requestDiagnostic(receipt, model)),
     };

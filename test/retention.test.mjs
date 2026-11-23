@@ -3,7 +3,7 @@ import test from 'node:test';
 import { create, open, destroy } from '@functional-systems/memdrive';
 import { fileClient } from './helpers/file-client.mjs';
 
-test('native snapshot retention is configurable on create and main in both embedding modes', async () => {
+test('native snapshot retention is configurable on create and the store in both embedding modes', async () => {
     for (const external of [false, true]) {
         const { client, collections, calls } = fileClient();
         const connection = { client, name: 'retention-store' };
@@ -11,10 +11,9 @@ test('native snapshot retention is configurable on create and main in both embed
             ...(external ? { embedding: { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'fixture' } } : {}) });
         assert.equal(collections.get(connection.name).metadata.snapshotRetentionInDays, 7);
         assert.equal((await main.describe()).retentionInDays, 7);
-        const fork = await main.fork({ name: 'draft' });
-        assert.equal('configure' in fork, false);
+        await main.fork({ name: 'draft' });
         assert.equal((await main.configure({ retentionInDays: 31 })).retentionInDays, 31);
-        assert.equal((await fork.describe()).retentionInDays, 31);
+        assert.equal((await main.describe()).retentionInDays, 31);
         const reopened = await open({ ...connection, client: { ...client }, ...(external ? { mode: 'external' } : {}) });
         assert.equal((await reopened.describe()).retentionInDays, 31);
         const updates = calls.filter(call => call.kind === 'collection-update');
@@ -57,13 +56,13 @@ test('unknown configuration outcomes fence conflicting changes and resource dele
 test('configuration excludes active work and refuses a replaced store generation', async () => {
     const fixture = fileClient();
     const main = await create({ client: fixture.client, name: 'retention-store' });
-    const fork = await main.fork({ name: 'draft' });
+    const { at } = await main.fork({ name: 'draft' });
     let release, enter;
     const entered = new Promise(resolve => { enter = resolve; });
     fixture.beforeCollectionUpdate = async () => { enter(); await new Promise(resolve => { release = resolve; }); };
     const configuring = main.configure({ retentionInDays: 7 });
     await entered;
-    await assert.rejects(fork.write({ op: 'create', path: '/file', content: '' }), { code: 'STORE_BUSY' });
+    await assert.rejects(main.write({ at, op: 'create', path: '/file', content: '' }), { code: 'STORE_BUSY' });
     release();
     await configuring;
     fixture.collections.get('retention-store').metadata.createdAt = new Date(9000);

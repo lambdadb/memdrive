@@ -1,4 +1,4 @@
-import { MemDrive, createFileTools, fileToolError, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
+import { createFileTools, fileToolError, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
 
 export const guideURI = 'memdrive://docs/file-tools';
 const guideResources = [
@@ -6,21 +6,22 @@ const guideResources = [
     ...Object.entries(fileToolGuideTopics).map(([topic, document]) =>
         ({ uri: `memdrive://docs/${topic}`, name: document.title, document })),
 ];
-const reads = ['status', 'history', 'list', 'read', 'search', 'findText'];
-const writes = ['fork', 'checkpoint', 'diff', 'write', 'merge'];
+const reads = ['status', 'history', 'list', 'read', 'search', 'findText', 'listForks', 'listCheckpoints'];
+const writes = ['fork', 'checkpoint', 'deleteFork', 'deleteCheckpoint', 'diff', 'write', 'merge'];
+const viewKey = at => at === undefined || at?.kind === 'main' ? 'main' : `${at?.kind}:${at?.name}`;
 
 // A protocol-shaped, in-process host. It is not an MCP server or wire implementation.
-export function createHost({ drive, client, writable, guide, rebindFork = false }) {
-    let bound = drive, generation = 0;
+// It connects one authorized drive with a fixed allowlist. The model selects
+// views with `at`; the host accepts main, the task's starting view and views
+// returned by this conversation's successful fork or checkpoint calls.
+export function createHost({ drive, writable, guide, start = { kind: 'main' } }) {
     const events = [];
-    const catalog = () => createFileTools({ drive: bound, tools: [
-        ...(guide === 'tool' ? ['guide'] : []), ...reads,
-        ...(writable ? writes.filter(name => !['diff', 'write', 'merge'].includes(name) || bound.at.kind === 'fork') : []),
-    ] });
+    const tools = createFileTools({ drive, tools: [...(guide === 'tool' ? ['guide'] : []), ...reads, ...(writable ? writes : [])] });
+    const authorized = new Set(['main', viewKey(start)]);
     return {
         events,
-        get binding() { return { name: bound.name, at: bound.at, generation }; },
-        toolsList() { return { tools: structuredClone(catalog().definitions) }; },
+        start: structuredClone(start),
+        toolsList() { return { tools: structuredClone(tools.definitions) }; },
         resourcesList() { return { resources: guide === 'resource'
             ? guideResources.map(({ uri, name }) => ({ uri, name, mimeType: 'text/markdown' })) : [] }; },
         resourcesRead(uri) {
@@ -30,27 +31,18 @@ export function createHost({ drive, client, writable, guide, rebindFork = false 
             events.push({ kind: 'resource_read', actor: 'host', uri, version: document.version });
             return { contents: [{ uri, mimeType: 'text/markdown', text: document.content }], version: document.version };
         },
-        async toolsCall(name, args, { signal, expectedGeneration = generation } = {}) {
-            const before = this.binding;
-            if (expectedGeneration !== generation) {
-                const result = { ok: false, error: { code: 'BINDING_CHANGED', message: 'The host changed the binding. Use the newly offered tools on the next turn.' } };
-                events.push({ kind: 'tool', name, args, before, result });
-                return result;
-            }
+        async toolsCall(name, args, { signal } = {}) {
             let result;
-            try {
-                result = await catalog().execute(name, args, { signal });
-            } catch (error) { result = fileToolError(error); }
-            // The scenario authorizes only a newly created fork in this store.
-            // Never take a store/ref selector directly from model arguments.
-            let handoff;
-            if (name === 'fork' && rebindFork && before.at.kind === 'main' && result?.at?.kind === 'fork' && result.name === bound.name) {
-                bound = await MemDrive.open({ client, name: bound.name, at: { fork: result.at.name } }, { signal });
-                generation++;
-                handoff = { kind: 'binding_changed', binding: this.binding };
-                events.push({ kind: 'host_handoff', ...handoff });
+            // Evaluation policy, not hosted authentication. The SDK validates at.
+            if (args?.at !== undefined && !authorized.has(viewKey(args.at)))
+                result = { ok: false, error: { code: 'TARGET_NOT_AUTHORIZED', message: 'The host has not authorized this view for the task.' } };
+            else {
+                try {
+                    result = await tools.execute(name, args, { signal });
+                    if ((name === 'fork' || name === 'checkpoint') && result?.at) authorized.add(viewKey(result.at));
+                } catch (error) { result = fileToolError(error); }
             }
-            events.push({ kind: 'tool', name, args: structuredClone(args), before, result: structuredClone(result), ...(handoff ? { handoff } : {}) });
+            events.push({ kind: 'tool', name, args: structuredClone(args), result: structuredClone(result) });
             return result;
         },
     };

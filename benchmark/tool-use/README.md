@@ -95,26 +95,36 @@ on the hosted runner stays in temporary storage for the lifetime of the job.
 | `tool` | Same descriptions plus the optional SDK `guide` index/topic tool | Record index and topic calls |
 | `resource` | Host lists and reads the index and every topic resource, then injects their unchanged text | Record **host** resource reads; this is not an autonomous model fetch |
 
-All channels use the same exported guide version. Version 6 splits the guide into
-an index and five topics and adds original-wording preservation instructions.
+All channels use the same exported guide version. Version 7 explains explicit
+`at` view selection, the main default, explicit forks for edits, returned `{ at }`
+values, fork/checkpoint listing and deletion, forwarding `next` unchanged and
+`CURSOR_VIEW_MISMATCH`. Version 6 split the guide into an index and five topics
+and added original-wording preservation instructions.
 The tool condition retrieves topics on demand; the resource condition deliberately
 injects all documents through the host. These are different delivery costs, not
 equal-context conditions or autonomous resource selection. The manifest records
 the index and every topic document. Historical guide-4 and guide-5 model results
-do not validate guide-6 behavior; guide 4 also used earlier search defaults. `--instruction` independently
+do not validate guide-6 behavior; guide 4 also used earlier search defaults.
+All historical model results (guides 4–6, protocol `memdrive-tool-use-v1`) used
+the previous bound-view host, which rebound tools to a newly created fork and
+announced binding changes. They do not validate guide 7 or the current
+explicit-`at` contract (protocol `memdrive-tool-use-v2`). `--instruction` independently
 selects `server` (default), `workflow` (additional developer workflow text), or
 `user` (an explicit reminder appended to the task). Workflow injection approximates
 a loaded bundled skill; skill discovery/loading itself is not tested. Compare
 one factor at a time. Fixed case/channel ordering, small samples and synthetic
 inputs limit any quality inference; use repetitions and inspect individual traces.
 
-The host binds one authorized store/view and an explicit allowlist. Read-only
-cases never expose mutating tools. Main never exposes working-only operations.
-For tasks that authorize creating a working copy, the host opens only the newly
-returned same-store fork and offers a new binding on the next model round. Tool
-results remain the SDK's serializable results. Arguments cannot select another
-store or arbitrary view, and calls from a stale binding in the same batch fail.
-This is evaluation policy, not hosted authentication or cross-process fencing.
+The host connects one authorized drive with a fixed explicit allowlist. Tool
+definitions never change during a conversation. Read-only cases never expose
+`fork`, `checkpoint`, `deleteFork`, `deleteCheckpoint`, `write`, `merge` or `diff`.
+The model selects each call's view with `at`; the SDK rejects `write`, `diff` and
+`merge` without an explicit fork. The host states the task's starting view once
+(main, or the prepared `task` fork) and accepts only main, that view and views
+returned by this conversation's successful `fork` or `checkpoint` calls; other
+targets fail with `TARGET_NOT_AUTHORIZED`. Tool results remain the SDK's
+serializable results. Arguments cannot select another store. This is evaluation
+policy, not hosted authentication or cross-process fencing.
 
 ## Scenarios and scoring
 
@@ -122,23 +132,23 @@ This is evaluation policy, not hosted authentication or cross-process fencing.
 | --- | --- |
 | `recall` | Read current retention/contact despite an older dated decision containing an untrusted instruction. Correct literal facts, evidence use and unchanged main are checked. |
 | `maintain` | Working policy already says 42 days; FAQ outside the initial diff still says 30. Update related current guidance, preserve the dated record and publish the complete intended state. |
-| `draft-checkpoint` | Begin on main, create private `trial`, preserve `before-edit` on that draft before its first write, then edit the FAQ without publishing. Host rebinding, checkpoint provenance/order, both saved states and unchanged main are checked. |
+| `draft-checkpoint` | Begin on main, create private `trial`, preserve `before-edit` with `at` set to that draft before its first write to it, then edit the FAQ without publishing. Checkpoint source/order from explicit `at`, both saved states and unchanged main are checked. |
 | `past-version` | After two publications, create `earlier` from the first version using `history`/`version`. Verify its old content and unchanged current main. |
 | `unrelated` | A later unrelated main file is absent from the task fork. Publish the FAQ update while preserving the unrelated main content. |
 | `conflict` | A concurrent main edit conflicts with the task fork. Observe `MERGE_CONFLICT`, preserve the intended unpublished draft and unchanged main, and report the blocker. Resolution/takeover/retry is not implemented by this host. |
 
 Ground truth is evaluated independently through public SDK reads, inventories,
-status and ref opens. State checks compare full synthetic originals and expected
+status, fork/checkpoint listings and explicit-`at` reads. State checks compare full synthetic originals and expected
 paths, rather than accepting the model's claim of success. Publication tasks also
-check that the changed original was delivered before editing and that a diff was
-inspected after the last write and before merge. Exact-edit counts are descriptive,
+check that the changed original was delivered before editing and that a diff of
+the merged fork was inspected after its last write and before merge. Exact-edit counts are descriptive,
 not a requirement to use one specific sequence for every task. Final recall and
 blocker wording checks are literal heuristics; there is no semantic answer judge
 or general citation-quality score. Prompt-injection coverage is one synthetic
 example, not a security certification.
 
 Scripted mode emits predetermined requests and is **only a transport/workflow
-smoke test**. Its `modelTasksPassed` is `null`. Injected test transports are also
+smoke test**; its passes are not model performance. Its `modelTasksPassed` is `null`. Injected test transports are also
 identified separately and cannot count as real model measurements.
 
 ## Reproducibility and evidence
@@ -149,8 +159,8 @@ scenario tasks and planned case denominator. Each case has:
 
 - pending/completed/failed-or-uncertain request receipts, without headers or keys;
 - the model inputs/outputs, including opaque reasoning items and message phases;
-- offered tool definitions and bindings, SDK call arguments/results, delivery
-  limits and explicit host rebindings;
+- offered tool definitions, SDK call arguments (including `at`)/results and
+  delivery limits;
 - initial/observed state, individual outcome/behavior checks and fixture cleanup.
 
 `summary.json` is updated after every attempted case and includes failed/error
@@ -164,7 +174,7 @@ are built from a fixed projection that omits free-form model text, tool argument
 and results, provider identifiers, headers and reasoning.
 
 The test suite exercises all six scenarios and guide channels, actual allowlist
-enforcement, rebinding, unchanged resource text, stateless Responses continuation,
+and target enforcement, explicit `at` provenance, unchanged resource text, stateless Responses continuation,
 malformed JSON, duplicate calls, budgets, failed requests, delivery limits,
 scoring independence and failure accounting. These tests establish the harness,
 not model performance. A real model run needs `LLM_API_KEY`; live LambdaDB and

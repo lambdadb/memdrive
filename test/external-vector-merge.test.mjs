@@ -16,7 +16,14 @@ test('external vector publication replays the pinned vector and rebases later ed
     const main = await MemDrive.create({ client: fixture.client, name,
         metadataSchema: { label: { type: 'string' } },
         embedding: { mode: 'external', dimensions, similarity: 'cosine', identity: 'fixture' } });
-    const work = await main.fork({ name: 'research' });
+    const { at } = await main.fork({ name: 'research' });
+    const bind = drive => ({
+        write: request => drive.write({ at, ...request }),
+        diff: () => drive.diff({ at }),
+        merge: request => drive.merge({ at, ...request }),
+        status: () => drive.status({ at }),
+    });
+    const work = bind(main);
     const { fileId } = await work.write({ op: 'create', path: '/notes', content: originalVector, metadata: { label: 'old' } });
     const id = `file:${fileId}`;
     const state = fixture.collections.get(name);
@@ -33,7 +40,7 @@ test('external vector publication replays the pinned vector and rebases later ed
     };
 
     await work.merge(request('first'));
-    const stale = await main.fork({ name: 'stale' });
+    const { at: staleAt } = await main.fork({ name: 'stale' });
     await work.write({ op: 'update', fileId, content: capturedVector });
     assert.deepEqual(await work.diff(), [{ op: 'update', fileId, path: '/notes' }]);
 
@@ -46,7 +53,8 @@ test('external vector publication replays the pinned vector and rebases later ed
     assert.deepEqual(published('v1').embedding, originalVector.map(Math.fround));
 
     fixture.beforeUpsert = undefined;
-    const reopened = await MemDrive.open({ client: { ...fixture.client }, name, mode: 'external', at: { fork: 'research' } });
+    const fresh = await MemDrive.open({ client: { ...fixture.client }, name, mode: 'external' });
+    const reopened = bind(fresh);
     await reopened.merge(request('replace'));
     assert.deepEqual(published('v2').embedding.map(Math.fround), capturedVector.map(Math.fround));
     assert.deepEqual(await reopened.diff(), [{ op: 'update', fileId, path: '/notes' }]);
@@ -54,8 +62,8 @@ test('external vector publication replays the pinned vector and rebases later ed
     // Reverting only the vector clears the net change against the new baseline.
     await reopened.write({ op: 'update', fileId, content: capturedVector });
     assert.deepEqual(await reopened.diff(), []);
-    await stale.write({ op: 'update', fileId, content: laterVector });
-    await assert.rejects(stale.merge(request('stale')), { code: 'MERGE_CONFLICT',
+    await main.write({ at: staleAt, op: 'update', fileId, content: laterVector });
+    await assert.rejects(main.merge({ at: staleAt, ...request('stale') }), { code: 'MERGE_CONFLICT',
         details: { fileIds: [fileId], paths: [], requestId: 'stale' } });
 
     await reopened.write({ op: 'update', fileId, newPath: '/renamed', metadata: {} });
@@ -75,7 +83,7 @@ test('external vector publication replays the pinned vector and rebases later ed
     assert.deepEqual(await reopened.diff(), [{ op: 'delete', fileId, previousPath: '/renamed' }]);
     const deleted = await reopened.merge(request('delete'));
     assert.deepEqual(await reopened.status(), { at: { kind: 'fork', name: 'research' }, mainVersion: deleted.version });
-    assert.deepEqual((await reopened.history({ sinceVersion: 'v1' })).entries.map(entry => [entry.version, entry.fileIds]),
+    assert.deepEqual((await fresh.history({ sinceVersion: 'v1' })).entries.map(entry => [entry.version, entry.fileIds]),
         [['v2', [fileId]], [version, [fileId]], [deleted.version, [fileId]]]);
     assert.equal(state.tags.get(`md-main-${deleted.version}`).docs.size, 0);
     assert.equal(await main.read({ fileId }), null);

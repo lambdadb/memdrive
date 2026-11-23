@@ -104,8 +104,9 @@ test('live external vectors preserve private application text and frozen vector 
     }
 
     const native = client(), handle = native.collection(name);
-    const open = at => MemDrive.open({ client: client(), name, mode: 'external', ...(at ? { at } : {}) }, options());
-    const merge = (work, summary) => work.merge({ requestId: randomUUID(), summary }, options());
+    // A view is one drive object plus an explicit at; omitted at selects main.
+    const open = async at => ({ drive: await MemDrive.open({ client: client(), name, mode: 'external' }, options()), at });
+    const merge = (work, summary) => work.drive.merge({ at: work.at, requestId: randomUUID(), summary }, options());
     const toTag = result => tag(`md-main-${result.version}`);
     async function records(ref, ids) {
         const response = await handle.docs.fetch({ ref, ids: ids.map(originalId), includeVectors: true,
@@ -119,7 +120,7 @@ test('live external vectors preserve private application text and frozen vector 
         }));
     }
     async function nearest(view, expected, { probe = query, limit = expected.length, filter } = {}) {
-        const { hits, reranked } = await view.search({ query: probe, limit, ...(filter ? { filter } : {}) }, options());
+        const { hits, reranked } = await view.drive.search({ at: view.at, query: probe, limit, ...(filter ? { filter } : {}) }, options());
         assert.equal(reranked, false);
         assert.deepEqual(hits.map(hit => hit.fileId), expected);
         for (const hit of hits) {
@@ -133,7 +134,7 @@ test('live external vectors preserve private application text and frozen vector 
         const main = await MemDrive.create({ client: native, name, embedding: model, labels: { 'eval.owner': owner },
             metadataSchema: { topic: { type: 'string' }, rank: { type: 'number' } } }, options());
         assert.deepEqual((await main.describe(options())).embedding, model);
-        assert.deepEqual((await (await open()).list({}, options())).files, []);
+        assert.deepEqual((await (await open()).drive.list({}, options())).files, []);
 
         const { collection } = await handle.get(options());
         assert.equal(collection.indexConfigs.embedding.type, 'vector');
@@ -141,12 +142,13 @@ test('live external vectors preserve private application text and frozen vector 
         assert.equal(collection.indexConfigs.embedding.similarity, 'cosine');
         assert(!collection.indexConfigs.embedding.managedEmbedding && !collection.indexConfigs.embedding.embedding);
         assert(!Object.hasOwn(collection.indexConfigs, 'content') && !Object.hasOwn(collection.indexConfigs, 'body'));
-        const work = await main.fork({ name: 'source-vector' }, options());
-        const [a, b, c] = await work.write([
+        const work = { drive: main, at: (await main.fork({ name: 'source-vector' }, options())).at };
+        assert.deepEqual(work.at, { kind: 'fork', name: 'source-vector' });
+        const [a, b, c] = await main.write({ at: work.at, operations: [
             { op: 'create', path: '/opaque/a', content: input, metadata: { topic: 'initial', rank: 12 } },
             { op: 'create', path: '/opaque/b', content: orthogonal, metadata: { topic, rank: 1 } },
             { op: 'create', path: '/opaque/c', content: opposite, metadata: { topic: 'owner "synth" X 한글', rank: 12 } },
-        ], options());
+        ] }, options());
         const ids = [a.fileId, b.fileId, c.fileId];
         for (const [index, fileId] of ids.entries()) localTexts.set(fileId, privateNotes[index]);
         const sent = observed.vectors.find(({ branch, id }) => branch === sourceRef.name && id === originalId(a.fileId));
@@ -162,17 +164,17 @@ test('live external vectors preserve private application text and frozen vector 
         assert.equal(scan.docs.length, ids.length);
         assert(scan.docs.every(hit => hit.doc.kind === 'file'));
         assert.deepEqual(scan.docs.map(hit => hit.doc.fileId).sort(), [...ids].sort());
-        const fresh = await open({ fork: 'source-vector' });
+        const fresh = await open({ kind: 'fork', name: 'source-vector' });
         const results = await nearest(fresh, [a.fileId, b.fileId], { probe: input });
         assert.deepEqual(results.map(hit => localTexts.get(hit.fileId)), [localTexts.get(a.fileId), localTexts.get(b.fileId)]);
         assert(observed.queries.some(probe => JSON.stringify(probe) === JSON.stringify(canonical)),
             'Query must preserve the same Float32 coordinates on the wire.');
-        const read = await fresh.read({ fileId: a.fileId }, options());
+        const read = await fresh.drive.read({ at: fresh.at, fileId: a.fileId }, options());
         noPayloadText(read);
         assert(!Object.hasOwn(read, 'embedding'), 'A public read exposed the stored vector.');
 
         phase = 'Move and update metadata without changing the vector';
-        await work.write({ op: 'update', fileId: a.fileId, newPath: '/moved/a', metadata: { topic, rank: 12 } }, options());
+        await main.write({ at: work.at, op: 'update', fileId: a.fileId, newPath: '/moved/a', metadata: { topic, rank: 12 } }, options());
         assert.deepEqual((await records(sourceRef, [a.fileId])).get(a.fileId), nativeVectors.get(a.fileId));
         await nearest(fresh, [a.fileId, b.fileId]);
         const [filtered] = await nearest(fresh, [a.fileId], { limit: 3, filter: { and: [
@@ -188,27 +190,27 @@ test('live external vectors preserve private application text and frozen vector 
         assert.equal(first.status, 'published');
         const published = await open();
         await nearest(published, [a.fileId, b.fileId]);
-        const listed = (await published.list({}, options())).files;
+        const listed = (await published.drive.list({}, options())).files;
         assert.deepEqual(listed.map(file => file.fileId).sort(), [...ids].sort());
         for (const file of listed) {
             noPayloadText(file);
             assert(!Object.hasOwn(file, 'embedding'), 'A public list exposed the stored vector.');
         }
         const checkpointName = 'initial-vector-view';
-        await published.checkpoint({ name: checkpointName }, options());
-        const stale = await published.fork({ name: 'stale-vector-draft' }, options());
-        await stale.write({ op: 'update', fileId: a.fileId, content: vector(0, 1, 1) }, options());
+        await published.drive.checkpoint({ name: checkpointName }, options());
+        const stale = { drive: published.drive, at: (await published.drive.fork({ name: 'stale-vector-draft' }, options())).at };
+        await stale.drive.write({ at: stale.at, op: 'update', fileId: a.fileId, content: vector(0, 1, 1) }, options());
 
         phase = 'Publish a captured vector while preserving a later working edit';
-        await work.write({ op: 'update', fileId: a.fileId, content: capturedVector }, options());
-        assert.deepEqual(await work.diff(options()), [{ op: 'update', fileId: a.fileId, path: '/moved/a' }]);
+        await main.write({ at: work.at, op: 'update', fileId: a.fileId, content: capturedVector }, options());
+        assert.deepEqual(await main.diff({ at: work.at }, options()), [{ op: 'update', fileId: a.fileId, path: '/moved/a' }]);
         gate = { id: originalId(a.fileId), entered: deferred(), release: deferred(), reached: false };
         const publication = merge(work, 'Publish the captured vector without later changes');
         const unexpected = publication.then(() => { throw new Error('Publication skipped its expected original mutation.'); });
         let second, interruption;
         try {
             await Promise.race([gate.entered.promise, unexpected]);
-            await work.write({ op: 'update', fileId: a.fileId, content: laterVector }, options());
+            await main.write({ at: work.at, op: 'update', fileId: a.fileId, content: laterVector }, options());
         } catch (error) {
             interruption = error;
         } finally {
@@ -222,23 +224,31 @@ test('live external vectors preserve private application text and frozen vector 
         await nearest(current, [a.fileId], { probe: capturedVector });
         assert.deepEqual((await records(toTag(second), [a.fileId])).get(a.fileId).map(Math.fround), capturedVector);
         assert.deepEqual((await records(sourceRef, [a.fileId])).get(a.fileId).map(Math.fround), laterVector);
-        assert.deepEqual(await (await open({ fork: 'source-vector' })).diff(options()), [{ op: 'update', fileId: a.fileId, path: '/moved/a' }]);
-        const checkpoint = await open({ checkpoint: checkpointName });
+        assert.deepEqual(await (await open()).drive.diff({ at: work.at }, options()), [{ op: 'update', fileId: a.fileId, path: '/moved/a' }]);
+        const checkpoint = await open({ kind: 'checkpoint', name: checkpointName });
         await nearest(checkpoint, [a.fileId, b.fileId]);
         assert.deepEqual((await records(toTag(first), [a.fileId])).get(a.fileId).map(Math.fround), canonical);
         await assert.rejects(merge(stale, 'Reject an overlapping vector-only stale draft'), { code: 'MERGE_CONFLICT' });
         t.diagnostic('Published and checkpoint vectors were frozen; the vector-only working edit remained in diff and a stale vector conflicted.');
 
         phase = 'Delete a vector file and preserve its checkpoint';
-        const remove = await current.fork({ name: 'delete-vector' }, options());
-        await remove.write({ op: 'delete', fileId: b.fileId }, options());
-        assert.deepEqual(await remove.diff(options()), [{ op: 'delete', fileId: b.fileId, previousPath: b.path }]);
+        const remove = { drive: current.drive, at: (await current.drive.fork({ name: 'delete-vector' }, options())).at };
+        await remove.drive.write({ at: remove.at, op: 'delete', fileId: b.fileId }, options());
+        assert.deepEqual(await remove.drive.diff({ at: remove.at }, options()), [{ op: 'delete', fileId: b.fileId, previousPath: b.path }]);
         const third = await merge(remove, 'Delete one synthetic vector file');
         assert.equal(third.status, 'published');
-        assert.equal(await (await open()).read({ fileId: b.fileId }, options()), null);
+        assert.equal(await (await open()).drive.read({ fileId: b.fileId }, options()), null);
         assert.equal((await records(toTag(third), [b.fileId])).size, 0);
-        assert.equal((await checkpoint.read({ fileId: b.fileId }, options())).path, b.path);
+        assert.equal((await checkpoint.drive.read({ at: checkpoint.at, fileId: b.fileId }, options())).path, b.path);
         await nearest(await open(), [a.fileId], { probe: capturedVector });
+        // merge publishes only; each published source fork remains until deleted explicitly.
+        assert.deepEqual(await main.listForks({}, options()), { forks: [
+            { at: remove.at }, { at: work.at }, { at: stale.at },
+        ] });
+        assert.deepEqual(await remove.drive.deleteFork({ at: remove.at }, options()), { at: remove.at });
+        assert.deepEqual(await main.deleteCheckpoint({ at: checkpoint.at }, options()), { at: checkpoint.at });
+        assert.deepEqual(await main.listForks({}, options()), { forks: [{ at: work.at }, { at: stale.at }] });
+        assert.deepEqual(await main.listCheckpoints({}, options()), { checkpoints: [] });
     } catch (error) {
         failure = safeFailure(phase, error);
     } finally {

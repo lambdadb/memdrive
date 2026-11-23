@@ -12,6 +12,7 @@ import { answerRequest, estimate, frozenConversation, hash, metadataSchema, pack
 
 const protocol = 'beam-original-file-sdk-v1';
 const fork = 'corpus';
+const at = { kind: 'fork', name: fork };
 const textSearch = { analyzers: ['english'] };
 const embedding = { mode: 'managed', provider: 'openai', model: 'text-embedding-3-small', dimensions: 1536, similarity: 'cosine' };
 const validName = name => typeof name === 'string' && /^[A-Za-z0-9_-]{3,52}$/.test(name);
@@ -55,7 +56,7 @@ async function checkSources(drive, prepared, fileIds) {
     const sources = sourceMap(prepared.files, fileIds);
     let offset = 0;
     for (const batch of fileBatches(prepared.files)) {
-        const files = await drive.read({ paths: batch.map(file => file.path) });
+        const files = await drive.read({ at, paths: batch.map(file => file.path) });
         assert.deepEqual(files.map(({ fileId, path, content, metadata }) => ({ fileId, path, content, metadata })),
             batch.map((file, i) => ({ fileId: fileIds[offset + i], ...file })), 'Stored original differs from frozen BEAM input');
         offset += batch.length;
@@ -64,7 +65,7 @@ async function checkSources(drive, prepared, fileIds) {
 }
 
 async function openCorpus(client, ledger) {
-    const drive = await MemDrive.open({ client, name: ledger.name, at: { fork } });
+    const drive = await MemDrive.open({ client, name: ledger.name });
     const descriptor = await drive.describe();
     assert.equal(descriptor.name, ledger.name);
     assert.deepEqual(descriptor.labels, labels(ledger.owner, ledger.fingerprint), 'BEAM corpus owner or source differs');
@@ -83,14 +84,14 @@ async function ingest(client, file, ledger) {
     await writeFile(file, json(ledger), privateFile);
     const main = await MemDrive.create({ client, name: ledger.name, metadataSchema, textSearch,
         labels: labels(ledger.owner, ledger.fingerprint) });
-    const drive = await main.fork({ name: fork });
+    await main.fork({ name: fork });
     const fileIds = [];
     for (const batch of fileBatches(prepared.files)) {
-        const created = await drive.write(batch.map(file => ({ op: 'create', ...file })));
+        const created = await main.write({ at, operations: batch.map(file => ({ op: 'create', ...file })) });
         assert.deepEqual(created.map(file => file.path), batch.map(file => file.path), 'File write order differs');
         fileIds.push(...created.map(file => file.fileId));
     }
-    await checkSources(drive, prepared, fileIds);
+    await checkSources(main, prepared, fileIds);
     await writeLedger(file, { ...ledger, status: 'ready', fileIds });
     return { status: 'ready', name: ledger.name, files: fileIds.length, boundary: prepared.boundary };
 }
@@ -154,7 +155,7 @@ async function recall(client, ledger, { questionIds, output, countTokens, ...set
     await writeFile(resultsFile, '', privateFile);
     for (const { question, request } of questions) {
         const start = performance.now();
-        const retrieved = await drive.search(request);
+        const retrieved = await drive.search({ at, ...request });
         const retrievalMilliseconds = performance.now() - start;
         const delivery = packEvidence(retrieved.hits, sources, settings.evidenceBudget, countTokens);
         const row = { questionId: question.id, request, retrieved, retrievalMilliseconds, delivery,

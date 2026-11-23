@@ -20,9 +20,9 @@ test('external file reads and vector searches return references from the selecte
     assert.deepEqual(await (await open()).describe(), { name, labels: { app: 'fixture' }, metadataSchema, embedding });
     await assert.rejects(MemDrive.open({ client, name }), { code: 'INCOMPATIBLE_STORE' });
 
-    const work = await main.fork({ name: 'vector-draft' });
+    const { at: work } = await main.fork({ name: 'vector-draft' });
     const metadata = { topic: 'owner "one" *', ordinal: 4 };
-    const file = await work.write({ op: 'create', path: '/local/note', content: vector(), metadata });
+    const file = await main.write({ at: work, op: 'create', path: '/local/note', content: vector(), metadata });
     assert.deepEqual(file, { fileId: file.fileId, path: '/local/note', modifiedAt: file.modifiedAt, metadata });
     const writes = calls.filter(({ kind }) => kind === 'upsert');
     assert.equal(writes.length, 1);
@@ -33,19 +33,19 @@ test('external file reads and vector searches return references from the selecte
     assert.equal(Object.hasOwn(doc, 'body'), false);
     assert.equal(Object.hasOwn(doc, 'content'), false);
 
-    const saved = await work.checkpoint({ name: 'before-move' });
-    const moved = await work.write({ op: 'update', fileId: file.fileId, newPath: '/local/updated', metadata: {} });
+    const { at: saved } = await main.checkpoint({ at: work, name: 'before-move' });
+    const moved = await main.write({ at: work, op: 'update', fileId: file.fileId, newPath: '/local/updated', metadata: {} });
     assert.deepEqual(moved, { fileId: file.fileId, path: '/local/updated', modifiedAt: moved.modifiedAt });
     const persisted = collections.get(name).branches.get('fork-vector-draft').docs.get(doc.id);
     assert.deepEqual(persisted.embedding, doc.embedding);
-    assert.deepEqual(await work.read({ paths: [file.path, moved.path] }), [moved]);
-    assert.deepEqual(await work.read({ fileId: file.fileId }), moved);
-    assert.deepEqual((await work.list()).files, [moved]);
-    assert.deepEqual(await saved.read({ path: file.path }), file);
+    assert.deepEqual(await main.read({ at: work, paths: [file.path, moved.path] }), [moved]);
+    assert.deepEqual(await main.read({ at: work, fileId: file.fileId }), moved);
+    assert.deepEqual((await main.list({ at: work })).files, [moved]);
+    assert.deepEqual(await main.read({ at: saved, path: file.path }), file);
 
-    const pinned = await open({ at: { checkpoint: 'before-move' } });
-    for (const view of [main, work, saved, pinned]) assert.equal(view.findText, undefined);
-    assert.deepEqual(await pinned.search({ query: vector(), filter: { and: [
+    const pinned = await open();
+    for (const drive of [main, pinned]) assert.equal(drive.findText, undefined);
+    assert.deepEqual(await pinned.search({ at: saved, query: vector(), filter: { and: [
         { field: 'metadata.topic', op: 'eq', value: metadata.topic },
         { field: 'metadata.ordinal', op: 'gte', value: 2 },
         { field: 'metadata.ordinal', op: 'lt', value: 5 },
@@ -78,7 +78,11 @@ test('external inputs and incompatible modes fail before dispatch', async () => 
     }
     assert.equal(collections.size, 0);
     const main = await MemDrive.create({ client, name, embedding });
-    const work = await main.fork({ name: 'vector-draft' });
+    const { at } = await main.fork({ name: 'vector-draft' });
+    const work = {
+        write: request => main.write({ at, ...request }),
+        search: request => main.search({ at, ...request }),
+    };
     const file = await work.write({ op: 'create', path: '/file', content: vector() });
     const remoteCalls = calls.length;
     const badVectors = [[1], Array(64).fill(0), vector(1e-80), vector(1e80), vector(Infinity), vector(NaN), [1, ...Array(62).fill(0), '2']];

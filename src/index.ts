@@ -1,27 +1,28 @@
-import type { CheckpointFileDrive, CheckpointSelection, ConnectionOptions, CreateExternalFileStoreOptions, CreateFileStoreOptions, EmbeddingMode, ForkSelection, FileDrive, FileListEntry, FileSearchHit,
-    FileHistoryRequest, FileStoreDescription, MainFileDrive, MergeRequest, OpenFileStoreOptions, ReadFileRequest, RequestOptions, SearchExternalFilesRequest, SearchFilesRequest,
-    WorkingFileDrive } from './types.js';
+import type { CheckpointAt, ConnectionOptions, CreateExternalFileStoreOptions, CreateFileStoreOptions, EmbeddingMode, FileAt, FileDrive, FileListEntry, FileSearchHit,
+    FileHistoryRequest, FileStoreDescription, FindTextRequest, ForkAt, ListFilesRequest, OpenFileStoreOptions, ReadFileRequest, ReadFilesRequest, RequestOptions, SearchExternalFilesRequest,
+    SearchFilesRequest, WriteFileRequest, CreateExternalFileRequest, UpdateExternalFileRequest } from './types.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
-import { formatTag, keysOnly, parseStore, storeConfiguration, validRetention } from './config.js';
+import { formatTag, isObject, keysOnly, parseStore, storeConfiguration, validRetention } from './config.js';
 import { decodeFile, decodeFileEntry, resultDocs, validFileId, validPath } from './records.js';
-import { branchRef, fetchOriginals, pathQuery, pinRef, readRef, viewRead, type Handle, type RefSource } from './storage-reads.js';
+import { branchRef, fetchOriginals, pathQuery, pinRef, readRef, viewRead, type Handle, type RefSource, type WithoutAt } from './storage-reads.js';
 import { workingWriter, writeBatchLimit } from './writes.js';
 import { searchQuery, validateReranking, vectorSearchQuery } from './search.js';
 import { fileLister } from './list.js';
 import { fileTextFinder } from './find-text.js';
 import { textChunker } from './text-chunks.js';
-import type { CreateMainFileRefRequest, DoclingChunker } from './types.js';
+import type { DoclingChunker } from './types.js';
 import { createRef, validateRefVersion } from './refs.js';
 import { rangeKeys, readRange, validateReadRange } from './read-range.js';
 import type { DriveFile, FileReadPage, ReadFileRangeRequest } from './types.js';
-import { deletingFormat, deleteReference, destroyStore, guardView, lifecycle } from './lifecycle.js';
+import { deletingFormat, deleteReference, destroyStore, lifecycle } from './lifecycle.js';
 import { publicationIdentity, validateMergeRequest } from './publication-log.js';
 import { publication } from './publication.js';
+import { storeTag } from './cursor-tokens.js';
 export type * from './types.js';
 export { MemDriveError } from './errors.js';
 export { createFileTools, getFileToolDefinitions, fileToolError, fileToolGuide, fileToolGuideTopics } from './tools.js';
 export type { FileToolGuideTopic } from './tool-guide.js';
-export type { FileToolDefinition, FileToolErrorResult, FileToolName, FileToolRefResult, FileTools } from './tools.js';
+export type { FileToolDefinition, FileToolErrorResult, FileToolName, FileTools } from './tools.js';
 
 type Client = ConnectionOptions['client'];
 
@@ -33,6 +34,38 @@ const validName = (name: unknown, maxLength = 52): name is string =>
     typeof name === 'string' && name.length >= 3 && name.length <= maxLength && /^[A-Za-z0-9_-]+$/.test(name);
 const validForkName = (name: unknown): name is string => validName(name, 52 - forkPrefix.length) && name !== main;
 const validCheckpointName = (name: unknown): name is string => validName(name, 52 - checkpointPrefix.length);
+const atShape = 'at must be { kind: "main" }, { kind: "fork", name } or { kind: "checkpoint", name }';
+
+/** Normalize a request's target or source view. Omission selects main. */
+function parseAt(value: unknown): FileAt {
+    if (value === undefined) return { kind: 'main' };
+    requireInput(isObject(value) && (value.kind === 'main' ? keysOnly(value, ['kind'])
+        : (value.kind === 'fork' || value.kind === 'checkpoint') && keysOnly(value, ['kind', 'name']) && Object.hasOwn(value, 'name')),
+    `${atShape}.`);
+    if (value.kind === 'main') return { kind: 'main' };
+    if (value.kind === 'fork') {
+        requireInput(validForkName(value.name), 'A fork name in at must be 3–47 letters, digits, underscores or hyphens and cannot be main.');
+        return { kind: 'fork', name: value.name };
+    }
+    requireInput(validCheckpointName(value.name), 'A checkpoint name in at must be 3–41 letters, digits, underscores or hyphens.');
+    return { kind: 'checkpoint', name: value.name };
+}
+
+/** Split a request object into its normalized view and the remaining SDK input. */
+function target(request: unknown, message: string) {
+    requireInput(isObject(request), message);
+    const { at, ...rest } = request;
+    return { at: parseAt(at), rest };
+}
+
+/** write, diff and merge act only on an explicitly selected working fork. */
+function forkTarget(request: unknown, operation: string) {
+    const message = `${operation} requires an explicit working fork in at, such as { kind: "fork", name }. Main and checkpoints are read-only; there is no default target.`;
+    requireInput(isObject(request) && request.at !== undefined, message);
+    const { at, rest } = target(request, message);
+    requireInput(at.kind === 'fork', message);
+    return { at, rest };
+}
 function validateConnection(options: unknown, keys: string[]): asserts options is ConnectionOptions {
     requireInput(keysOnly(options, keys) && options.client !== null && typeof options.client === 'object'
         && 'collection' in options.client && typeof options.client.collection === 'function',
@@ -50,35 +83,34 @@ async function remote<T>(operation: () => Promise<T>, message: string, signal?: 
 }
 
 type Store = ReturnType<typeof store>;
+type Writer = ReturnType<typeof workingWriter>;
+type RefAt = ForkAt | CheckpointAt;
+type WriteOperation = WriteFileRequest | CreateExternalFileRequest | UpdateExternalFileRequest;
+const refKey = (at: RefAt) => `${at.kind}:${at.name}`;
+
 function store(client: Client, handle: Handle, description: FileStoreDescription<EmbeddingMode>, identity: Awaited<ReturnType<typeof publicationIdentity>>, backend?: DoclingChunker) {
     const { name, metadataSchema, embedding } = description;
     const gate = lifecycle({ client, name });
     let invalid = false;
     let pendingRetention: number | undefined;
-    const refStates = new Map<string, { deleted: boolean; uncertain: boolean }>();
     function assertLive() {
         if (invalid) throw new MemDriveError('STORE_DELETED', 'This store handle has been invalidated by destruction.');
     }
-    function assertRefAvailable(kind: string, ref: string) {
-        if (refStates.get(`${kind}:${ref}`)?.uncertain)
-            throw new MemDriveError('REF_DELETION_UNCONFIRMED', 'Fence outstanding requests and retry delete on the original reference handle.');
-    }
-    function guarded<T extends object>(value: T, state?: { deleted: boolean; uncertain: boolean }): T {
-        return guardView(value, operation => gate.run(async () => {
-            assertLive();
-            if (state?.deleted) throw new MemDriveError('REF_DELETED', 'This reference handle has been deleted.');
-            if (state?.uncertain) throw new MemDriveError('REF_DELETION_UNCONFIRMED', 'Retry deletion only after fencing outstanding requests.');
-            return operation();
-        }));
-    }
+    /** Track complete operations for lifecycle exclusion. */
+    const run = <T>(operation: () => Promise<T>) => gate.run(async () => {
+        assertLive();
+        return operation();
+    });
     const dimensions = embedding.mode === 'external' ? embedding.dimensions : undefined;
     const chunker = 'chunking' in description && description.chunking ? textChunker(description.chunking, backend) : undefined;
     if (!chunker && backend) throw new MemDriveError('INCOMPATIBLE_STORE', 'This store does not support configured structured chunking.');
     const decodeRead = dimensions === undefined ? decodeFile : decodeFileEntry;
-    const forks = new Map<string, WorkingFileDrive<EmbeddingMode>>();
-    const checkpoints = new Map<string, CheckpointFileDrive<EmbeddingMode>>();
+    const cursorStore = storeTag(identity.driveId);
+    // Confirmed forks and checkpoints, keyed by kind and name. Deletion removes
+    // the entry and its cursors; an unconfirmed deletion keeps it fenced.
+    const refs = new Map<string, View>();
     const pendingRefs = new Set<string>();
-    const writers = new Map<string, ReturnType<typeof workingWriter>>();
+    const writers = new Map<string, Writer>();
     function writerFor(branch: string) {
         const existing = writers.get(branch);
         if (existing) return existing;
@@ -88,19 +120,18 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
     }
     const publishing = publication(client, handle, identity, metadataSchema, writerFor, dimensions,
         () => gate.soleOperation() && !invalid && pendingRetention === undefined && pendingRefs.size === 0
-            && ![...refStates.values()].some(state => state.uncertain));
+            && ![...refs.values()].some(view => view.uncertain));
 
-    async function assertDeleteSafe(signal?: AbortSignal, retry?: { uncertain: boolean }) {
+    async function assertDeleteSafe(signal?: AbortSignal, retry?: View) {
         if (pendingRetention !== undefined) throw new MemDriveError('CONFIGURATION_UNCONFIRMED', 'Settle the pending retention configuration before deleting resources.');
         if (pendingRefs.size) throw new MemDriveError('REF_CREATION_UNCONFIRMED', 'Resolve unconfirmed reference creation before deleting.');
-        if ([...refStates.values()].some(state => state !== retry && state.uncertain))
+        if ([...refs.values()].some(view => view !== retry && view.uncertain))
             throw new MemDriveError('REF_DELETION_UNCONFIRMED', 'Settle unconfirmed reference deletion before deleting other resources.');
         await publishing.assertIdle(signal);
         for (const writer of writers.values()) await writer.enqueueRef(async () => undefined, signal);
     }
 
-    async function listRefs(kind: 'fork' | 'checkpoint', options?: RequestOptions) {
-        const { signal } = operationOptions(options);
+    async function listRefs(kind: 'fork' | 'checkpoint', signal?: AbortSignal) {
         const entries = kind === 'fork'
             ? (await remote(() => handle.branches.list(nativeOptions(signal)), 'Could not list forks.', signal))?.branches
             : (await remote(() => handle.tags.list(nativeOptions(signal)), 'Could not list checkpoints.', signal))?.tags;
@@ -114,50 +145,18 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         const prefix = kind === 'fork' ? forkPrefix : checkpointPrefix;
         const valid = kind === 'fork' ? validForkName : validCheckpointName;
         return entries.flatMap(({ name }) => name.startsWith(prefix) && valid(name.slice(prefix.length))
-            ? [{ name: name.slice(prefix.length) }] : []).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
-    }
-
-    function refDeletion(kind: 'fork' | 'checkpoint', ref: string, state: { deleted: boolean; uncertain: boolean }) {
-        return async (options?: RequestOptions) => {
-            const { signal } = operationOptions(options);
-            checkAbort(signal);
-            return gate.exclusive(async () => {
-                assertLive();
-                if (state.deleted) return;
-                await assertDeleteSafe(signal, state);
-                await deleteReference(() => kind === 'fork'
-                    ? handle.branches.delete(forkPrefix + ref, mutationOptions(signal))
-                    : handle.tags.delete(checkpointPrefix + ref, mutationOptions(signal)), async () => {
-                    try {
-                        await nativeRequest<unknown>(() => kind === 'fork'
-                            ? handle.branches.get(forkPrefix + ref, nativeOptions(signal))
-                            : handle.tags.get(checkpointPrefix + ref, nativeOptions(signal)), signal);
-                    } catch (cause) {
-                        if (databaseError(cause, 'Could not confirm reference deletion.').status === 404) return;
-                        throw cause;
-                    }
-                    throw new MemDriveError('INVALID_RESULT', 'The deleted reference is still present.');
-                }, () => { state.uncertain = true; }, signal);
-                state.deleted = true;
-                state.uncertain = false;
-                refStates.delete(`${kind}:${ref}`);
-                if (kind === 'fork') { forks.delete(ref); writers.delete(forkPrefix + ref); }
-                else checkpoints.delete(ref);
-            });
-        };
+            ? [name.slice(prefix.length)] : []).sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
     }
 
     async function describe(options?: RequestOptions) {
         const { signal } = operationOptions(options);
         checkAbort(signal);
-        return structuredClone(description);
+        return run(async () => structuredClone(description));
     }
 
-    function reader(source: RefSource, at: FileDrive['at']) {
-        function read(request: ReadFileRangeRequest, options?: RequestOptions): Promise<FileReadPage | null>;
-        function read(request: ReadFileRequest, options?: RequestOptions): Promise<FileListEntry | null>;
-        function read(request: { paths: string[] }, options?: RequestOptions): Promise<FileListEntry[]>;
-        async function read(request: ReadFileRequest | ReadFileRangeRequest | { paths: string[] }, options?: RequestOptions) {
+    function reader(source: RefSource, at: FileAt) {
+        type Request = WithoutAt<ReadFileRequest | ReadFileRangeRequest | ReadFilesRequest>;
+        async function read(request: Request, options?: RequestOptions): Promise<FileReadPage | FileListEntry | FileListEntry[] | null> {
             const { signal } = operationOptions(options);
             checkAbort(signal);
             requireInput(keysOnly(request, ['fileId', 'path', 'paths', ...rangeKeys])
@@ -166,11 +165,11 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
             const ranged = rangeKeys.some(key => Object.hasOwn(request, key));
             if (ranged) {
                 requireInput(dimensions === undefined && !('paths' in request), 'Ranged reads require one text file.');
-                validateReadRange(request as ReadFileRangeRequest);
+                validateReadRange(request as WithoutAt<ReadFileRangeRequest>);
             }
             const decode = async (doc: Record<string, unknown>) => {
                 const file = decodeRead(doc, metadataSchema);
-                const result = ranged ? await readRange(file as DriveFile, request as ReadFileRangeRequest, at,
+                const result = ranged ? await readRange(file as DriveFile, request as WithoutAt<ReadFileRangeRequest>, at,
                     typeof doc.version === 'string' ? doc.version : undefined) : file;
                 checkAbort(signal);
                 return result;
@@ -266,110 +265,209 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         };
     }
 
-    function view<Selection extends FileDrive['at']>(source: RefSource, at: Selection,
-        enqueueRef?: <T>(operation: () => Promise<T>, signal?: AbortSignal) => Promise<T>) {
+    function view(at: FileAt, source: RefSource, writer?: Writer) {
         Object.freeze(at);
         return {
-            at,
-            name, read: reader(source, at), search: searcher(source), list: fileLister(handle, name, source, metadataSchema),
-            findText: dimensions === undefined ? fileTextFinder(handle, name, source, metadataSchema, enqueueRef) : undefined,
-            describe,
-            listForks: (options?: RequestOptions) => listRefs('fork', options),
-            listCheckpoints: (options?: RequestOptions) => listRefs('checkpoint', options),
-            async status(options?: RequestOptions) {
-                const { signal } = operationOptions(options);
-                checkAbort(signal);
-                return publishing.status(at, signal);
-            },
-            async history(request: FileHistoryRequest = {}, options?: RequestOptions) {
-                const { signal } = operationOptions(options);
-                checkAbort(signal);
-                return publishing.history(request, signal);
-            },
-            async fork(request: CreateMainFileRefRequest, options?: RequestOptions) {
-                const { signal } = operationOptions(options);
-                checkAbort(signal);
-                requireInput(keysOnly(request, at.kind === 'main' ? ['name', 'version'] : ['name']),
-                    at.kind === 'main' ? 'fork accepts name and optional version.' : 'fork accepts only name on this view.');
-                requireInput(validForkName(request.name),
-                    'Fork name must be 3–47 letters, digits, underscores or hyphens and cannot be main.');
-                const { version } = request;
-                validateRefVersion(version, at.kind === 'main');
-                const fork = request.name;
-                assertRefAvailable('fork', fork);
-                const branchName = forkPrefix + fork;
-                const create = async () => {
-                    const ref = version === undefined ? await pinRef(source, signal)
-                        : await publishing.pinVersion(version, signal);
-                    await createRef(pendingRefs, { kind: 'fork', name: fork }, signal,
-                        () => handle.branches.create({ branchName, source: ref }, mutationOptions(signal)),
-                        response => response?.branch?.name === branchName, version);
-                    return working(fork);
-                };
-                return enqueueRef ? enqueueRef(create, signal) : create();
-            },
-            async checkpoint(request: CreateMainFileRefRequest, options?: RequestOptions) {
-                const { signal } = operationOptions(options);
-                checkAbort(signal);
-                requireInput(keysOnly(request, at.kind === 'main' ? ['name', 'version'] : ['name']),
-                    at.kind === 'main' ? 'checkpoint accepts name and optional version.' : 'checkpoint accepts only name on this view.');
-                requireInput(validCheckpointName(request.name),
-                    'Checkpoint name must be 3–41 letters, digits, underscores or hyphens.');
-                const { version } = request;
-                validateRefVersion(version, at.kind === 'main');
-                const checkpoint = request.name;
-                assertRefAvailable('checkpoint', checkpoint);
-                const tagName = checkpointPrefix + checkpoint;
-                const create = async () => {
-                    const ref = version === undefined ? await pinRef(source, signal)
-                        : await publishing.pinVersion(version, signal);
-                    await createRef(pendingRefs, { kind: 'checkpoint', name: checkpoint }, signal,
-                        () => handle.tags.create({ tagName, source: ref }, mutationOptions(signal)),
-                        response => response?.tag?.name === tagName, version);
-                    return pinned(checkpoint);
-                };
-                return enqueueRef ? enqueueRef(create, signal) : create();
-            },
+            at, source, writer, uncertain: false,
+            read: reader(source, at), search: searcher(source),
+            lister: fileLister(handle, name, source, metadataSchema, at),
+            finder: dimensions === undefined ? fileTextFinder(handle, name, source, metadataSchema, at,
+                { enqueue: writer?.enqueueRef, pinVersion: publishing.pinVersion, store: cursorStore }) : undefined,
         };
     }
+    type View = ReturnType<typeof view>;
+    const mainView: View = view({ kind: 'main' }, publishing.main);
 
-    function working(fork: string): WorkingFileDrive<EmbeddingMode> {
-        const existing = forks.get(fork);
+    function refView(at: RefAt): View {
+        const key = refKey(at);
+        const existing = refs.get(key);
         if (existing) return existing;
-        const state = { deleted: false, uncertain: false };
-        refStates.set(`fork:${fork}`, state);
-        const branch = forkPrefix + fork;
-        const writer = writerFor(branch);
-        const { enqueueRef, write, diff } = writer;
-        const drive: WorkingFileDrive<EmbeddingMode> = guarded({
-            ...view(branchRef(branch), { kind: 'fork', name: fork }, enqueueRef), write, diff,
-            delete: refDeletion('fork', fork, state),
-            merge(request: MergeRequest, options?: RequestOptions) {
-                const { signal } = operationOptions(options);
-                checkAbort(signal);
-                validateMergeRequest(request);
-                const bound = { requestId: request.requestId, summary: request.summary, branch };
-                return publishing.merge(bound, writer, signal);
-            },
-        }, state);
-        forks.set(fork, drive);
-        return drive;
+        const created = at.kind === 'fork'
+            ? view({ kind: 'fork', name: at.name }, branchRef(forkPrefix + at.name), writerFor(forkPrefix + at.name))
+            : view({ kind: 'checkpoint', name: at.name }, { kind: 'tag', name: checkpointPrefix + at.name });
+        refs.set(key, created);
+        return created;
     }
 
-    function pinned(checkpoint: string): CheckpointFileDrive<EmbeddingMode> {
-        const existing = checkpoints.get(checkpoint);
-        if (existing) return existing;
-        const state = { deleted: false, uncertain: false };
-        refStates.set(`checkpoint:${checkpoint}`, state);
-        const drive: CheckpointFileDrive<EmbeddingMode> = guarded({
-            ...view({ kind: 'tag', name: checkpointPrefix + checkpoint }, { kind: 'checkpoint', name: checkpoint }),
-            delete: refDeletion('checkpoint', checkpoint, state),
-        }, state);
-        checkpoints.set(checkpoint, drive);
-        return drive;
+    function assertRefAvailable(at: RefAt) {
+        if (refs.get(refKey(at))?.uncertain)
+            throw new MemDriveError('REF_DELETION_UNCONFIRMED', `Fence outstanding requests and retry ${at.kind === 'fork' ? 'deleteFork' : 'deleteCheckpoint'} with the same at.`);
     }
 
-    const mainView: MainFileDrive<EmbeddingMode> = guarded({ ...view(publishing.main, { kind: 'main' }),
+    /** Resolve a view, verifying a fork or checkpoint on its first use in this client. */
+    async function resolve(at: FileAt, signal?: AbortSignal): Promise<View> {
+        if (at.kind === 'main') return mainView;
+        assertRefAvailable(at);
+        const cached = refs.get(refKey(at));
+        if (cached) return cached;
+        if (at.kind === 'fork') {
+            const response = await remote(() => handle.branches.list(nativeOptions(signal)), 'Could not find the working fork.', signal);
+            checkAbort(signal);
+            if (!Array.isArray(response?.branches) || !response.branches.every(branch => typeof branch?.name === 'string'))
+                throw new MemDriveError('INVALID_RESULT', 'Fork lookup returned invalid branches.');
+            if (!response.branches.some(branch => branch.name === forkPrefix + at.name))
+                throw new MemDriveError('BRANCH_NOT_FOUND', 'The working fork does not exist.');
+        } else {
+            const tagName = checkpointPrefix + at.name;
+            const response = await remote(() => handle.tags.get(tagName, nativeOptions(signal)),
+                'Could not inspect the named checkpoint.', signal, { 404: 'CHECKPOINT_NOT_FOUND' });
+            checkAbort(signal);
+            if (response?.tag?.name !== tagName)
+                throw new MemDriveError('INVALID_RESULT', 'Checkpoint lookup returned an invalid tag.');
+        }
+        pendingRefs.delete(refKey(at));
+        return refView(at);
+    }
+
+    /** Reject a live list cursor issued for another view of this store without consuming it. */
+    function assertListView(selected: View, rest: Record<string, unknown>) {
+        const { cursor } = rest;
+        if (Object.keys(rest).length !== 1 || typeof cursor !== 'string' || selected.lister.owns(cursor)) return;
+        for (const other of [mainView, ...refs.values()]) {
+            if (other !== selected && other.lister.owns(cursor))
+                throw new MemDriveError('CURSOR_VIEW_MISMATCH', 'This cursor belongs to another view. Forward the returned next request unchanged, including its at.');
+        }
+    }
+
+    function begin(options?: RequestOptions) {
+        const { signal } = operationOptions(options);
+        checkAbort(signal);
+        return signal;
+    }
+
+    async function createView(kind: 'fork' | 'checkpoint', request: unknown, options?: RequestOptions) {
+        const signal = begin(options);
+        requireInput(keysOnly(request, ['at', 'name', 'version']), `${kind} accepts an optional source at, a name and an optional version.`);
+        const source = parseAt(request.at);
+        requireInput(kind === 'fork' ? validForkName(request.name) : validCheckpointName(request.name), kind === 'fork'
+            ? 'Fork name must be 3–47 letters, digits, underscores or hyphens and cannot be main.'
+            : 'Checkpoint name must be 3–41 letters, digits, underscores or hyphens.');
+        const { version } = request;
+        validateRefVersion(version, source.kind === 'main');
+        const at = { kind, name: request.name } as RefAt;
+        return run(async () => {
+            assertRefAvailable(at);
+            const selected = await resolve(source, signal);
+            const create = async () => {
+                const ref = version === undefined ? await pinRef(selected.source, signal)
+                    : await publishing.pinVersion(version, signal);
+                if (kind === 'fork') {
+                    const branchName = forkPrefix + at.name;
+                    await createRef(pendingRefs, at, signal, () => handle.branches.create({ branchName, source: ref }, mutationOptions(signal)),
+                        response => response?.branch?.name === branchName, version);
+                } else {
+                    const tagName = checkpointPrefix + at.name;
+                    await createRef(pendingRefs, at, signal, () => handle.tags.create({ tagName, source: ref }, mutationOptions(signal)),
+                        response => response?.tag?.name === tagName, version);
+                }
+                refView(at);
+                return { at: { ...at } };
+            };
+            // Captures of a working fork are ordered with its writes.
+            return selected.writer ? selected.writer.enqueueRef(create, signal) : create();
+        });
+    }
+
+    async function deleteView(kind: 'fork' | 'checkpoint', request: unknown, options?: RequestOptions) {
+        const signal = begin(options);
+        const operation = kind === 'fork' ? 'deleteFork' : 'deleteCheckpoint';
+        requireInput(keysOnly(request, ['at']) && isObject(request.at) && request.at.kind === kind,
+            `${operation} requires only at, selecting an existing ${kind}: { kind: "${kind}", name }.`);
+        const at = parseAt(request.at) as RefAt;
+        return gate.exclusive(async () => {
+            assertLive();
+            // A fenced view after an unconfirmed deletion is retried here, not resolved again.
+            const selected = refs.get(refKey(at)) ?? await resolve(at, signal);
+            await assertDeleteSafe(signal, selected);
+            const native = kind === 'fork' ? forkPrefix + at.name : checkpointPrefix + at.name;
+            await deleteReference(() => kind === 'fork'
+                ? handle.branches.delete(native, mutationOptions(signal))
+                : handle.tags.delete(native, mutationOptions(signal)), async () => {
+                try {
+                    await nativeRequest<unknown>(() => kind === 'fork'
+                        ? handle.branches.get(native, nativeOptions(signal))
+                        : handle.tags.get(native, nativeOptions(signal)), signal);
+                } catch (cause) {
+                    if (databaseError(cause, 'Could not confirm reference deletion.').status === 404) return;
+                    throw cause;
+                }
+                throw new MemDriveError('INVALID_RESULT', 'The deleted reference is still present.');
+            }, () => { selected.uncertain = true; }, signal);
+            refs.delete(refKey(at));
+            selected.lister.release();
+            if (kind === 'fork') writers.delete(native);
+            return { at: { ...at } };
+        });
+    }
+
+    async function onFork(operation: string, request: unknown, options: RequestOptions | undefined,
+        apply: (writer: Writer, rest: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>, validate?: (rest: Record<string, unknown>) => void) {
+        const signal = begin(options);
+        const { at, rest } = forkTarget(request, operation);
+        validate?.(rest);
+        return run(async () => {
+            const selected = await resolve(at, signal);
+            return apply(selected.writer!, rest, signal);
+        });
+    }
+
+    async function onView<T>(request: unknown, message: string, options: RequestOptions | undefined,
+        apply: (selected: View, rest: Record<string, unknown>, signal?: AbortSignal) => Promise<T>) {
+        const signal = begin(options);
+        const { at, rest } = target(request, message);
+        return run(async () => apply(await resolve(at, signal), rest, signal));
+    }
+
+    const drive = Object.freeze({
+        name, describe,
+        async status(request: unknown = {}, options?: RequestOptions) {
+            requireInput(keysOnly(request, ['at']), 'status accepts only an optional at.');
+            return onView(request, 'status accepts only an optional at.', options,
+                (selected, _rest, signal) => publishing.status({ ...selected.at }, signal));
+        },
+        async history(request: FileHistoryRequest = {}, options?: RequestOptions) {
+            const signal = begin(options);
+            return run(() => publishing.history(request, signal));
+        },
+        list: (request: unknown = {}, options?: RequestOptions) => onView(request, 'Invalid list options.', options, (selected, rest, signal) => {
+            assertListView(selected, rest);
+            return selected.lister.list(rest as WithoutAt<ListFilesRequest>, { signal });
+        }),
+        read: (request: unknown, options?: RequestOptions) => onView(request, 'Read requires exactly one of fileId, path or paths.', options,
+            (selected, rest, signal) => selected.read(rest as WithoutAt<ReadFileRequest>, { signal })),
+        search: (request: unknown, options?: RequestOptions) => onView(request, 'Search requires a request object.', options,
+            (selected, rest, signal) => selected.search(rest as unknown as SearchFilesRequest, { signal })),
+        findText: dimensions === undefined
+            ? (request: unknown, options?: RequestOptions) => onView(request, 'Invalid text match options.', options,
+                (selected, rest, signal) => selected.finder!(rest as WithoutAt<FindTextRequest>, { signal }))
+            : undefined,
+        fork: (request: unknown, options?: RequestOptions) => createView('fork', request, options),
+        checkpoint: (request: unknown, options?: RequestOptions) => createView('checkpoint', request, options),
+        async listForks(request: unknown = {}, options?: RequestOptions) {
+            const signal = begin(options);
+            requireInput(keysOnly(request, []), 'listForks accepts an empty object.');
+            return run(async () => ({ forks: (await listRefs('fork', signal)).map(name => ({ at: { kind: 'fork' as const, name } })) }));
+        },
+        async listCheckpoints(request: unknown = {}, options?: RequestOptions) {
+            const signal = begin(options);
+            requireInput(keysOnly(request, []), 'listCheckpoints accepts an empty object.');
+            return run(async () => ({ checkpoints: (await listRefs('checkpoint', signal)).map(name => ({ at: { kind: 'checkpoint' as const, name } })) }));
+        },
+        deleteFork: (request: unknown, options?: RequestOptions) => deleteView('fork', request, options),
+        deleteCheckpoint: (request: unknown, options?: RequestOptions) => deleteView('checkpoint', request, options),
+        write: (request: unknown, options?: RequestOptions) => onFork('write', request, options,
+            (writer, rest, signal) => 'operations' in rest
+                ? writer.write(rest.operations as WriteOperation[], { signal })
+                : writer.write(rest as unknown as WriteOperation, { signal }),
+            rest => requireInput(!('operations' in rest) || keysOnly(rest, ['operations']) && Array.isArray(rest.operations),
+                'A batch write accepts only at and an operations array.')),
+        diff: (request: unknown, options?: RequestOptions) => onFork('diff', request, options,
+            (writer, _rest, signal) => writer.diff({ signal }),
+            rest => requireInput(Object.keys(rest).length === 0, 'diff accepts only at.')),
+        merge: (request: unknown, options?: RequestOptions) => onFork('merge', request, options, (writer, rest, signal) => {
+            const { at } = request as { at: ForkAt };
+            return publishing.merge({ requestId: rest.requestId as string, summary: rest.summary as string, branch: forkPrefix + at.name }, writer, signal);
+        }, rest => validateMergeRequest(rest)),
         async configure(request: { retentionInDays: number }, options?: RequestOptions) {
             const { signal } = operationOptions(options);
             checkAbort(signal);
@@ -410,41 +508,15 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
                 return structuredClone(description);
             });
         },
-    });
+    }) as unknown as FileDrive<EmbeddingMode>;
 
     return {
-        main: mainView,
+        drive,
         identity, assertLive, assertDeleteSafe, backendId: backend?.id,
         invalidate() { invalid = true; },
         mode: embedding.mode,
         recover: publishing.recover,
         initialize: publishing.initialize,
-        async openFork(fork: string, signal?: AbortSignal) {
-            assertRefAvailable('fork', fork);
-            const cached = forks.get(fork);
-            if (cached) return cached;
-            const response = await remote(() => handle.branches.list(nativeOptions(signal)), 'Could not find the working fork.', signal);
-            checkAbort(signal);
-            if (!Array.isArray(response?.branches) || !response.branches.every(branch => typeof branch?.name === 'string'))
-                throw new MemDriveError('INVALID_RESULT', 'Fork lookup returned invalid branches.');
-            if (!response.branches.some(branch => branch.name === forkPrefix + fork))
-                throw new MemDriveError('BRANCH_NOT_FOUND', 'The working fork does not exist.');
-            pendingRefs.delete(`fork:${fork}`);
-            return working(fork);
-        },
-        async openCheckpoint(checkpoint: string, signal?: AbortSignal) {
-            assertRefAvailable('checkpoint', checkpoint);
-            const cached = checkpoints.get(checkpoint);
-            if (cached) return cached;
-            const tagName = checkpointPrefix + checkpoint;
-            const response = await remote(() => handle.tags.get(tagName, nativeOptions(signal)),
-                'Could not inspect the named checkpoint.', signal, { 404: 'CHECKPOINT_NOT_FOUND' });
-            checkAbort(signal);
-            if (response?.tag?.name !== tagName)
-                throw new MemDriveError('INVALID_RESULT', 'Checkpoint lookup returned an invalid tag.');
-            pendingRefs.delete(`checkpoint:${checkpoint}`);
-            return pinned(checkpoint);
-        },
     };
 }
 
@@ -456,9 +528,9 @@ function storesFor(client: Client) {
     return stores;
 }
 
-export function create(options: CreateFileStoreOptions, requestOptions?: RequestOptions): Promise<MainFileDrive>;
-export function create(options: CreateExternalFileStoreOptions, requestOptions?: RequestOptions): Promise<MainFileDrive<'external'>>;
-export function create(options: CreateFileStoreOptions | CreateExternalFileStoreOptions, requestOptions?: RequestOptions): Promise<MainFileDrive<EmbeddingMode>>;
+export function create(options: CreateFileStoreOptions, requestOptions?: RequestOptions): Promise<FileDrive>;
+export function create(options: CreateExternalFileStoreOptions, requestOptions?: RequestOptions): Promise<FileDrive<'external'>>;
+export function create(options: CreateFileStoreOptions | CreateExternalFileStoreOptions, requestOptions?: RequestOptions): Promise<FileDrive<EmbeddingMode>>;
 export async function create(options: CreateFileStoreOptions | CreateExternalFileStoreOptions, requestOptions?: RequestOptions) {
     const { signal } = operationOptions(requestOptions);
     checkAbort(signal);
@@ -480,44 +552,20 @@ export async function create(options: CreateFileStoreOptions | CreateExternalFil
         const created = stores.get(name) ?? store(client, client.collection(name), description, identity, options.chunker);
         stores.set(name, created);
         await created.initialize(signal);
-        return created.main;
+        return created.drive;
     });
 }
 
-type AtMain = { at?: undefined; recover?: boolean | undefined };
-type AtFork = { at: ForkSelection; recover?: never };
-type AtCheckpoint = { at: CheckpointSelection; recover?: never };
-
-export function open(options: OpenFileStoreOptions & AtMain, requestOptions?: RequestOptions): Promise<MainFileDrive>;
-export function open(options: OpenFileStoreOptions & AtFork, requestOptions?: RequestOptions): Promise<WorkingFileDrive>;
-export function open(options: OpenFileStoreOptions & AtCheckpoint, requestOptions?: RequestOptions): Promise<CheckpointFileDrive>;
-export function open(options: OpenFileStoreOptions<'external'> & AtMain, requestOptions?: RequestOptions): Promise<MainFileDrive<'external'>>;
-export function open(options: OpenFileStoreOptions<'external'> & AtFork, requestOptions?: RequestOptions): Promise<WorkingFileDrive<'external'>>;
-export function open(options: OpenFileStoreOptions<'external'> & AtCheckpoint, requestOptions?: RequestOptions): Promise<CheckpointFileDrive<'external'>>;
 export function open(options: OpenFileStoreOptions, requestOptions?: RequestOptions): Promise<FileDrive>;
 export function open(options: OpenFileStoreOptions<'external'>, requestOptions?: RequestOptions): Promise<FileDrive<'external'>>;
 export function open(options: OpenFileStoreOptions<EmbeddingMode>, requestOptions?: RequestOptions): Promise<FileDrive<EmbeddingMode>>;
 export async function open(options: OpenFileStoreOptions<EmbeddingMode>, requestOptions?: RequestOptions) {
     const { signal } = operationOptions(requestOptions);
     checkAbort(signal);
-    validateConnection(options, ['client', 'name', 'at', 'recover', 'mode', 'chunker']);
-    const { client, name, at, recover, mode = 'managed' } = options;
+    validateConnection(options, ['client', 'name', 'recover', 'mode', 'chunker']);
+    const { client, name, recover, mode = 'managed' } = options;
     requireInput(mode === 'managed' || mode === 'external', 'Select managed or external embedding mode.');
-    requireInput(recover === undefined || at === undefined && typeof recover === 'boolean',
-        'Recovery can be requested when opening main.');
-    let fork: string | undefined;
-    let checkpoint: string | undefined;
-    if (at !== undefined) {
-        requireInput(keysOnly(at, ['fork', 'checkpoint']) && Object.keys(at).length === 1,
-            'Select exactly one working fork or checkpoint by name.');
-        if ('fork' in at) {
-            requireInput(validForkName(at.fork), 'Select a working fork by its name.');
-            fork = at.fork;
-        } else {
-            requireInput(validCheckpointName(at.checkpoint), 'Select a checkpoint by its name.');
-            checkpoint = at.checkpoint;
-        }
-    }
+    requireInput(recover === undefined || typeof recover === 'boolean', 'recover must be a boolean.');
     return lifecycle(options).run(async () => {
         const stores = storesFor(client);
         let selected = stores.get(name);
@@ -538,13 +586,10 @@ export async function open(options: OpenFileStoreOptions<EmbeddingMode>, request
             throw new MemDriveError('CHUNKER_MISMATCH', 'The cached store is bound to another chunker. Use a separate client instance.');
         if (mode !== selected.mode)
             throw new MemDriveError('INCOMPATIBLE_STORE', `The file store uses ${selected.mode} embedding mode.`);
-        if (fork !== undefined) return selected.openFork(fork, signal);
-        if (checkpoint !== undefined) return selected.openCheckpoint(checkpoint, signal);
         if (recover) await selected.recover(signal);
-        return selected.main;
+        return selected.drive;
     });
 }
-
 export async function destroy(options: ConnectionOptions, requestOptions?: RequestOptions): Promise<void> {
     const { signal } = operationOptions(requestOptions);
     checkAbort(signal);
