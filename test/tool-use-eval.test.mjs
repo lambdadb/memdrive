@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileToolGuide } from '@functional-systems/memdrive';
@@ -9,6 +9,7 @@ import { prepareScenario, scenarios, evaluate } from '../benchmark/tool-use/scen
 import { runAgent, openAI, limits } from '../benchmark/tool-use/agent.mjs';
 import { scriptedAgent } from '../benchmark/tool-use/scripted.mjs';
 import { runEvaluation } from '../benchmark/tool-use/run.mjs';
+import { formatEvaluationSummary, readEvaluationReport } from '../benchmark/tool-use/report.mjs';
 
 const final = (model, text = 'done') => ({ model, status: 'completed', usage: { input_tokens: 10, output_tokens: 5 },
     output: [{ type: 'message', role: 'assistant', phase: 'final_answer', content: [{ type: 'output_text', text }] }] });
@@ -30,6 +31,14 @@ test('scripted smoke exercises actual SDK state across six scenarios and three g
             assert.equal(scored.behavior.guideCalls, guide === 'tool' ? 1 : 0);
             assert.equal(scored.behavior.resourceReadsByHost, guide === 'resource' ? 1 : 0);
         });
+});
+
+test('recall publishes consistent current retention while preserving the dated decision', async () => {
+    await usingScenario('recall', 'none', async context => {
+        assert.match((await context.main.read({ path: '/policy.md' })).content, /Retention is 42 days/);
+        assert.match((await context.main.read({ path: '/faq.md' })).content, /Retention is 42 days/);
+        assert.match((await context.main.read({ path: '/decisions/2026-01-01.md' })).content, /Retention was 30 days/);
+    });
 });
 
 test('allowlists enforce read-only access and the host rebinds only a newly returned authorized fork', async () => {
@@ -147,6 +156,63 @@ test('run reports preserve planned denominators, uncertain usage and cleanup, an
         assert.equal(JSON.parse(saved).status, 'failed_or_uncertain');
         await assert.rejects(runEvaluation({ output, mode: 'scripted', guide: 'none', scenario: 'recall' }), { code: 'EEXIST' });
         await assert.rejects(runEvaluation({ output: path.join(directory, 'missing-key'), mode: 'model' }), /LLM_API_KEY/);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('evaluation export preserves diagnostic outcomes without provider payloads or model text', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'tool-report-'));
+    try {
+        const output = path.join(directory, 'run');
+        const run = await runEvaluation({ output, mode: 'model', scenario: 'recall',
+            askFactory: (_, guide) => {
+                if (guide === 'none') return async () => ({ ...final('private-returned-model'), id: 'private-response-id' });
+                if (guide === 'tool') return async () => {
+                    throw Object.assign(new Error('private-response-body'), { code: 'MODEL_HTTP_ERROR', status: 429,
+                        headers: { authorization: 'private-header' } });
+                };
+                return async (request, { round }) => round === 0 ? response(request.model, [
+                    { type: 'reasoning', id: 'private-reasoning-id', encrypted_content: 'private-reasoning' },
+                    call('read', { path: '/faq.md', extra: 'private-tool-argument' }, 'private-call-id'),
+                    call('read', { path: '/faq.md' }, 'private-call-id-2'),
+                ]) : final(request.model, '42 days, help@example.test. private-final-text');
+            } });
+        const report = await readEvaluationReport(output);
+        const [mismatch, http, passed] = report.cases;
+        assert.equal(report.summary.modelTasksPassed, null);
+        assert.equal(report.summary.passed, 1);
+        assert.equal(report.summary.errors, 2);
+        assert.match(formatEvaluationSummary(report), /Injected test transport/);
+        assert.equal(report.manifest.sources['package-lock.json'], run.manifest.sources['package-lock.json']);
+        assert.equal(mismatch.errorCode, 'MODEL_IDENTITY_MISMATCH');
+        assert.equal(mismatch.requests[0].expectedModelMatched, false);
+        assert.equal(http.errorCode, 'MODEL_REQUEST_FAILED');
+        assert.equal(http.requests[0].httpStatus, 429);
+        assert.equal(passed.evaluation.checks.correctAnswer, true);
+        assert.equal(passed.evaluation.behavior.resourceReadsByHost, 1);
+        assert(passed.finalTextLength > 0);
+        assert.equal(passed.events[0].actor, 'host');
+        assert.equal(passed.events[1].errorCode, 'INVALID_INPUT');
+        assert.equal(passed.events[2].outcome, 'ok');
+        assert(passed.offered[0].tools.includes('read'));
+        assert.equal(passed.requests[1].inputTokens, 10);
+        assert.doesNotMatch(JSON.stringify(report), /private-|encrypted_content|requestId|authorization|\/faq\.md/);
+
+        const interrupted = path.join(output, passed.id);
+        await writeFile(path.join(interrupted, 'result.json'), '{');
+        const { round, request } = run.results[2].receipts[1];
+        await writeFile(path.join(interrupted, 'request-1.json'), JSON.stringify({ round, request, status: 'pending' }));
+        const partial = await readEvaluationReport(output);
+        assert.equal(partial.summary.attempted, 3);
+        assert.equal(partial.summary.planned, 3);
+        assert.equal(partial.summary.complete, false);
+        assert.equal(partial.summary.errors, 3);
+        assert.equal(partial.summary.interrupted, 1);
+        assert.equal(partial.summary.groups.resource.inputTokens, 10);
+        assert.equal(partial.summary.groups.resource.unknownUsageRequests, 1);
+        assert.equal(partial.cases[2].status, 'interrupted');
+        assert.equal(partial.cases[2].requests[1].status, 'pending');
+        assert(partial.cases[2].offered[1].tools.includes('read'));
+        assert.doesNotMatch(JSON.stringify(partial), /private-|encrypted_content|authorization/);
     } finally { await rm(directory, { recursive: true, force: true }); }
 });
 

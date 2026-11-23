@@ -36,6 +36,10 @@ export async function prepareScenario(id) {
     if (['recall', 'past-version', 'unrelated', 'conflict'].includes(id)) {
         const other = await main.fork({ name: 'other' });
         if (id === 'unrelated') await other.write({ op: 'create', path: '/unrelated.md', content: unrelated });
+        else if (id === 'recall') await other.write([
+            { op: 'update', fileId: ids['/faq.md'], content: faq(42) },
+            { op: 'update', fileId: ids['/policy.md'], content: policy(42) },
+        ]);
         else await other.write({ op: 'update', fileId: ids['/faq.md'], content: faq(id === 'conflict' ? 14 : 42) });
         await other.merge({ requestId: 'other', summary: 'Publish a later synthetic change' });
         await other.delete();

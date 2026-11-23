@@ -8,6 +8,33 @@ export const serverInstructions = 'You are connected to an authorized MemDrive v
 export const workflowInstructions = 'Workflow guidance: inspect relevant originals and related current guidance before editing. Preserve dated evidence. Prefer exact edits for small changes. Inspect the full working diff after edits and before publication. Preserve an intermediate working state with an explicit checkpoint when requested. Select an old main state by its history version. Stop and report merge conflicts; do not claim unpublished edits are shared.';
 export const userReminder = 'Use MemDrive to check the relevant originals and related guidance, then verify any requested edits and publication. Preserve dated evidence and report blockers.';
 
+const failureMessages = {
+    CONTEXT_BUDGET_EXHAUSTED: 'Context budget exhausted',
+    TOKEN_BUDGET_EXHAUSTED: 'Token budget exhausted',
+    MODEL_IDENTITY_MISMATCH: 'Model identity mismatch',
+    MODEL_RESPONSE_INCOMPLETE: 'Incomplete model response',
+    MODEL_OUTPUT_INVALID: 'Invalid model output',
+    MODEL_OUTPUT_UNSUPPORTED: 'Unsupported model output',
+    MODEL_USAGE_INVALID: 'Missing usage',
+    FINAL_TEXT_MISSING: 'Missing final text',
+    TOOL_CALL_BUDGET_EXHAUSTED: 'Tool-call budget exhausted',
+    TOOL_CALL_ID_INVALID: 'Duplicate or invalid call ID',
+    TOOL_CALL_INVALID: 'Invalid tool call',
+    ROUND_BUDGET_EXHAUSTED: 'Round budget exhausted',
+    MODEL_REQUEST_FAILED: 'Model request failed or outcome unknown',
+    MODEL_PHASE_TIMEOUT: 'Model phase timed out',
+};
+export const agentFailureCodes = Object.freeze(Object.keys(failureMessages));
+export class AgentFailure extends Error {
+    constructor(code) {
+        super(failureMessages[code]);
+        this.code = code;
+    }
+}
+function requireAgent(condition, code) {
+    if (!condition) throw new AgentFailure(code);
+}
+
 export async function runAgent({ host, scenario, ask, model = 'gpt-6.1-sol', guide = 'tool', instruction = 'server', signal,
     budget = limits, onReceipt = async () => {} }) {
     assert(['none', 'tool', 'resource'].includes(guide));
@@ -36,33 +63,34 @@ export async function runAgent({ host, scenario, ask, model = 'gpt-6.1-sol', gui
                 max_output_tokens: budget.outputTokens, tools,
                 input: [...input, { role: 'developer', content: 'Current host binding: ' + JSON.stringify(binding) }] };
             const reservation = encoder.encode(JSON.stringify(request), [], []).length + budget.outputTokens;
-            assert(reservation <= budget.contextTokens, 'Context budget exhausted');
-            assert(tokens + reservation <= budget.totalTokens, 'Token budget exhausted');
+            requireAgent(reservation <= budget.contextTokens, 'CONTEXT_BUDGET_EXHAUSTED');
+            requireAgent(tokens + reservation <= budget.totalTokens, 'TOKEN_BUDGET_EXHAUSTED');
             usage.requests++;
             const response = await ask(request, { round, signal });
             await onReceipt({ round, request, response });
-            assert.equal(response.model, model, 'Model identity mismatch');
-            assert.equal(response.status, 'completed', 'Incomplete model response');
-            assert(Array.isArray(response.output), 'Invalid model output');
-            assert(response.output.every(item => item && ['reasoning', 'function_call', 'message'].includes(item.type)), 'Unsupported model output');
-            for (const key of ['input_tokens', 'output_tokens']) assert(Number.isSafeInteger(response.usage?.[key]) && response.usage[key] >= 0, 'Missing usage');
+            requireAgent(response?.model === model, 'MODEL_IDENTITY_MISMATCH');
+            requireAgent(response.status === 'completed', 'MODEL_RESPONSE_INCOMPLETE');
+            requireAgent(Array.isArray(response.output), 'MODEL_OUTPUT_INVALID');
+            requireAgent(response.output.every(item => item && ['reasoning', 'function_call', 'message'].includes(item.type)), 'MODEL_OUTPUT_UNSUPPORTED');
+            for (const key of ['input_tokens', 'output_tokens'])
+                requireAgent(Number.isSafeInteger(response.usage?.[key]) && response.usage[key] >= 0, 'MODEL_USAGE_INVALID');
             usage.inputTokens += response.usage.input_tokens;
             usage.outputTokens += response.usage.output_tokens;
             tokens += response.usage.input_tokens + response.usage.output_tokens;
-            assert(tokens <= budget.totalTokens, 'Token budget exhausted');
+            requireAgent(tokens <= budget.totalTokens, 'TOKEN_BUDGET_EXHAUSTED');
             const batch = response.output.filter(item => item.type === 'function_call');
             // Retain opaque reasoning items and message phase fields for stateless continuation.
             input.push(...structuredClone(response.output));
             if (!batch.length) {
                 const messages = response.output.filter(item => item.type === 'message' && item.role === 'assistant');
-                assert(messages.length && messages.every(item => Array.isArray(item.content) && item.content.every(part => part.type === 'output_text' && typeof part.text === 'string')), 'Missing final text');
+                requireAgent(messages.length && messages.every(item => Array.isArray(item.content) && item.content.every(part => part?.type === 'output_text' && typeof part.text === 'string')), 'FINAL_TEXT_MISSING');
                 return { finalText: messages.flatMap(item => item.content.map(part => part.text)).join('\n'), offered, usage, rounds: round + 1 };
             }
-            assert(calls + batch.length <= budget.toolCalls, 'Tool-call budget exhausted');
+            requireAgent(calls + batch.length <= budget.toolCalls, 'TOOL_CALL_BUDGET_EXHAUSTED');
             for (const call of batch) {
-                assert(typeof call.call_id === 'string' && call.call_id && !seen.has(call.call_id), 'Duplicate or invalid call ID');
+                requireAgent(typeof call.call_id === 'string' && call.call_id && !seen.has(call.call_id), 'TOOL_CALL_ID_INVALID');
                 seen.add(call.call_id); calls++;
-                assert(typeof call.name === 'string' && typeof call.arguments === 'string', 'Invalid tool call');
+                requireAgent(typeof call.name === 'string' && typeof call.arguments === 'string', 'TOOL_CALL_INVALID');
                 let result;
                 try { result = await host.toolsCall(call.name, JSON.parse(call.arguments), { signal, expectedGeneration: binding.generation }); }
                 catch (error) {
@@ -77,7 +105,7 @@ export async function runAgent({ host, scenario, ask, model = 'gpt-6.1-sol', gui
                 input.push({ type: 'function_call_output', call_id: call.call_id, output });
             }
         }
-        throw new Error('Round budget exhausted');
+        throw new AgentFailure('ROUND_BUDGET_EXHAUSTED');
     } finally { encoder.free(); }
 }
 

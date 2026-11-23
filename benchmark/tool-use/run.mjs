@@ -9,7 +9,7 @@ import { parseArgs, parseEnv } from 'node:util';
 import { fileToolGuide } from '@functional-systems/memdrive';
 import { createHost } from './host.mjs';
 import { prepareScenario, scenarios, evaluate } from './scenarios.mjs';
-import { runAgent, openAI, protocol, limits, serverInstructions, workflowInstructions, userReminder } from './agent.mjs';
+import { runAgent, openAI, AgentFailure, agentFailureCodes, protocol, limits, serverInstructions, workflowInstructions, userReminder } from './agent.mjs';
 import { scriptedAgent } from './scripted.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -80,7 +80,7 @@ export async function runEvaluation({ output, mode = 'model', guide = 'all', ins
         const directory = path.join(output, entry.id);
         await mkdir(directory);
         const result = { ...entry, status: 'error', stage: 'prepare', receipts: [], cleanup: 'not_started' };
-        let context, host;
+        let context, host, signal;
         try {
             context = await prepare(entry.scenario);
             result.initial = context.initial;
@@ -88,6 +88,7 @@ export async function runEvaluation({ output, mode = 'model', guide = 'all', ins
                 guide: entry.guide, rebindFork: context.scenario.rebindFork });
             const transport = askFactory ? askFactory(context.scenario, entry.guide)
                 : mode === 'scripted' ? scriptedAgent(context.scenario, entry.guide) : modelAsk;
+            signal = AbortSignal.timeout(900_000);
             const ask = async (request, options) => {
                 const receipt = { round: options.round, status: 'pending', request };
                 const file = path.join(directory, `request-${options.round}.json`);
@@ -100,18 +101,21 @@ export async function runEvaluation({ output, mode = 'model', guide = 'all', ins
                     receipt.status = 'failed_or_uncertain';
                     receipt.error = error.code === 'MODEL_HTTP_ERROR' && Number.isInteger(error.status)
                         ? { code: 'MODEL_HTTP_ERROR', status: error.status } : { code: 'REQUEST_FAILED' };
-                    throw new Error('Model request failed or outcome unknown');
+                    throw new AgentFailure(signal.aborted ? 'MODEL_PHASE_TIMEOUT' : 'MODEL_REQUEST_FAILED');
                 } finally { await writeJSON(file, receipt); }
                 return receipt.response;
             };
             result.stage = 'agent';
             result.agent = await runAgent({ host, scenario: context.scenario, ask, model, guide: entry.guide, instruction,
-                signal: AbortSignal.timeout(900_000) });
+                signal });
             result.stage = 'evaluate';
             result.evaluation = await evaluate(context, host, result.agent.finalText);
             result.status = result.evaluation.passed ? 'passed' : 'failed';
-        } catch {
-            result.error = { code: 'EVALUATION_ERROR', message: 'Inspect the stage, request receipts and tool events; no automatic retry was attempted.' };
+        } catch (error) {
+            let code = 'EVALUATION_ERROR';
+            if (error instanceof AgentFailure && agentFailureCodes.includes(error.code)) code = error.code;
+            else if (signal?.aborted && error === signal.reason) code = 'MODEL_PHASE_TIMEOUT';
+            result.error = { code, message: 'Inspect the stage, request receipts and tool events; no automatic retry was attempted.' };
         } finally {
             result.events = host?.events ?? [];
             if (context) {

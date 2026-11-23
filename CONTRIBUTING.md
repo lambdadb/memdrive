@@ -100,6 +100,11 @@ the package archive. Its fixture/scripted tests run in ordinary CI without keys;
 real model calls require explicit model mode and `LLM_API_KEY`. Scripted or
 injected transports must never be reported as model performance, and fixture
 results do not establish live LambdaDB or MCP wire behavior.
+The manual **Model tool-use evaluation** workflow runs only from `main` and
+passes the repository secret to the model step. Follow the benchmark run
+instructions for pilot and full dispatches. Use the Actions summary and
+short-lived JSON artifact for scoring and request diagnostics. Keep raw receipts
+in the local workspace or on the ephemeral runner.
 
 ## Versions and releases
 
