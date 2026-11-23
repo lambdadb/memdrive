@@ -58,10 +58,11 @@ export async function runAgent({ host, scenario, ask, model = 'gpt-6.1-sol', gui
             const binding = host.binding, definitions = host.toolsList().tools;
             const tools = definitions.map(tool => ({ type: 'function', name: tool.name, description: tool.description,
                 parameters: tool.inputSchema, strict: false }));
+            if (offered.at(-1)?.binding.generation !== binding.generation)
+                input.push({ role: 'developer', content: 'Current host binding: ' + JSON.stringify(binding) });
             offered.push({ round, binding, definitions });
             const request = { model, reasoning: { effort: 'low' }, store: false, include: ['reasoning.encrypted_content'], parallel_tool_calls: false,
-                max_output_tokens: budget.outputTokens, tools,
-                input: [...input, { role: 'developer', content: 'Current host binding: ' + JSON.stringify(binding) }] };
+                max_output_tokens: budget.outputTokens, tools, input: [...input] };
             const reservation = encoder.encode(JSON.stringify(request), [], []).length + budget.outputTokens;
             requireAgent(reservation <= budget.contextTokens, 'CONTEXT_BUDGET_EXHAUSTED');
             requireAgent(tokens + reservation <= budget.totalTokens, 'TOKEN_BUDGET_EXHAUSTED');
