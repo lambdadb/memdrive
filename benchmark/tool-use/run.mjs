@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs, parseEnv } from 'node:util';
 import { fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
 import { createHost } from './host.mjs';
-import { prepareScenario, scenarios, evaluate } from './scenarios.mjs';
+import { prepareScenario, scenarios, selectScenarios, evaluate, retrievalMetrics, aggregateRetrieval } from './scenarios.mjs';
 import { runAgent, openAI, AgentFailure, agentFailureCodes, protocol, limits, serverInstructions, workflowInstructions, userReminder } from './agent.mjs';
 import { scriptedAgent } from './scripted.mjs';
 
@@ -37,14 +37,23 @@ export function summarize(manifest, cases) {
             else { group.inputTokens += usage.input_tokens; group.outputTokens += usage.output_tokens; }
         }
     }
+    // Interrupted cases have no recorded events and stay out of the retrieval counts.
+    const recorded = cases.filter(result => Array.isArray(result.events));
+    for (const [guide, group] of Object.entries(groups)) {
+        const own = recorded.filter(result => result.guide === guide);
+        group.retrieval = aggregateRetrieval(own.map(result => retrievalMetrics(result.events)));
+        group.retrievalByScenario = Object.fromEntries([...new Set(own.map(result => result.scenario))].map(scenario =>
+            [scenario, aggregateRetrieval(own.filter(result => result.scenario === scenario).map(result => retrievalMetrics(result.events)))]));
+    }
     const passed = cases.filter(item => item.status === 'passed').length;
     return { protocol, mode: manifest.mode, transport: manifest.transport, backend: 'native-client-fixture', instruction: manifest.instruction,
         planned: manifest.plan.length, attempted: cases.length, complete: cases.length === manifest.plan.length,
         passed, failed: cases.filter(item => item.status === 'failed').length, errors: cases.filter(item => item.status === 'error').length,
         modelTasksPassed: manifest.transport === 'openai-responses' ? passed : null,
         scriptedSmokePassed: manifest.mode === 'scripted' ? passed : null, groups,
-        limitations: ['Synthetic six-scenario task checks with literal final-answer checks, not general model quality or a semantic judge.',
+        limitations: ['Synthetic scenario task checks with literal final-answer checks, not general model quality or a semantic judge.',
             'Real public SDK on an immediate-visibility native-client fixture; not live LambdaDB retrieval or consistency.',
+            'Fixture search returns the same candidates for every query and mode; retrieval counts describe tool selection, not retrieval relevance.',
             'Resource content is fetched and injected by the host, not autonomously fetched by the model.',
             'No MCP wire server/client compatibility, bundled-skill discovery, or automatic conflict resolution is tested.'] };
 }
@@ -56,8 +65,7 @@ export async function runEvaluation({ output, mode = 'model', guide = 'all', ins
     assert(['server', 'workflow', 'user'].includes(instruction), 'Invalid instruction profile');
     assert(Number.isInteger(repeats) && repeats >= 1 && repeats <= 5, 'repeats must be 1..5');
     assert(typeof model === 'string' && model.length > 0 && model.length <= 100, 'Invalid model');
-    const selected = scenario === 'all' ? scenarios : scenarios.filter(item => item.id === scenario);
-    assert(selected.length, 'Unknown scenario');
+    const selected = selectScenarios(scenario);
     // Validate credentials before creating an artifact directory or any SDK state.
     const modelAsk = mode === 'model' && !askFactory ? openAI({ key }) : undefined;
     const guides = guide === 'all' ? ['none', 'tool', 'resource'] : [guide];
@@ -117,6 +125,7 @@ export async function runEvaluation({ output, mode = 'model', guide = 'all', ins
             result.error = { code, message: 'Inspect the stage, request receipts and tool events; no automatic retry was attempted.' };
         } finally {
             result.events = host?.events ?? [];
+            result.retrieval = retrievalMetrics(result.events);
             if (context) {
                 try { await context.cleanup(); result.cleanup = 'completed'; }
                 catch { result.cleanup = 'failed'; result.status = 'error'; }

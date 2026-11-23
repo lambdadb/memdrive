@@ -1,5 +1,5 @@
 // Deterministic transport smoke only. This is never evidence of model behavior.
-import { faq } from './scenarios.mjs';
+import { faq, paraphraseTargets, enumeratedCode } from './scenarios.mjs';
 
 export function scriptedAgent(scenario, guide) {
     const steps = [];
@@ -14,6 +14,12 @@ export function scriptedAgent(scenario, guide) {
     if (scenario.id === 'past-version') {
         add('history', {});
         add('fork', previous => ({ name: 'earlier', version: previous.entries[0].version }));
+    } else if (scenario.id === 'enumerate') {
+        // The literal control: an exact identifier across every directory.
+        add('findText', { query: enumeratedCode });
+    } else if (scenario.id in paraphraseTargets) {
+        add('search', { query: scenario.task });
+        add('read', { path: paraphraseTargets[scenario.id] });
     } else {
         if (scenario.id === 'draft-checkpoint') {
             add('fork', { name: 'trial' });
@@ -32,10 +38,13 @@ export function scriptedAgent(scenario, guide) {
     return async request => {
         const step = steps[index++];
         const prior = request.input.filter(item => item.type === 'function_call_output').at(-1);
+        const previous = prior && JSON.parse(prior.output);
         const output = step ? [{ type: 'function_call', call_id: `script-${index}`, name: step.name,
-            arguments: JSON.stringify(typeof step.args === 'function' ? step.args(JSON.parse(prior.output)) : step.args) }]
+            arguments: JSON.stringify(typeof step.args === 'function' ? step.args(previous) : step.args) }]
             : [{ type: 'message', role: 'assistant', phase: 'final_answer', content: [{ type: 'output_text',
                 text: scenario.id === 'recall' ? faq(42) + 'Source: /faq.md'
+                    : scenario.id === 'enumerate' ? [...new Set(previous.hits.map(hit => hit.path))].join('\n')
+                    : scenario.id in paraphraseTargets ? `${previous.content}Source: ${previous.path}`
                     : scenario.id === 'conflict' ? 'Publication is blocked by a concurrent conflict; the edits are not published.'
                         : scenario.id === 'draft-checkpoint' ? 'Private draft trial and before-edit checkpoint are saved; nothing was published.'
                             : scenario.id === 'past-version' ? 'Created earlier from v1; main is unchanged.' : 'Updated and published the current FAQ.' }] }];
