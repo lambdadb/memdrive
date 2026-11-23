@@ -240,7 +240,7 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         // unfinished merge has already created its target tag.
         if (!positions.has(version)) throw historicalViewUnavailable(version);
         if (version === initialVersion) {
-            // Never synthesize a historical v0 from a legacy store's current main.
+            // Never synthesize a missing v0: after a publication, current main is no longer the initial view.
             if (!await hasInitial(signal)) throw historicalViewUnavailable(version);
             return initialMainRef;
         }
@@ -252,8 +252,9 @@ export function publication(client: ConnectionOptions['client'], content: Handle
     async function read<T>(operation: (ref: ViewRef) => Promise<T>, signal?: AbortSignal) {
         await refresh(signal);
         if (published !== initialVersion || await hasInitial(signal)) return operation(refFor(published));
-        // Older stores have no frozen v0. A merge may have pinned and started
-        // applying during this operation. Recheck before releasing its result.
+        // A store whose creation was interrupted has no frozen v0 yet. A merge
+        // may have pinned and started applying during this operation. Recheck
+        // before releasing its result.
         const provisional = await operation(branchRef('main'))
             .then(value => ({ value } as const), cause => ({ cause } as const));
         await refresh(signal);

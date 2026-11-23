@@ -100,7 +100,7 @@ export async function planEdit(request: EditRequest, doc: Record<string, unknown
     const modifiedAt = !replace && path === current.path ? current.modifiedAt : new Date().toISOString();
     const file = { ...fields, modifiedAt, content };
     const tracking = { revision, generation, baseline, fingerprint: await fingerprintOf(file), version,
-        ...(doc?.chunking === undefined ? {} : { chunking: resolvedChunking(doc.chunking) }) };
+        chunking: resolvedChunking(doc?.chunking) };
     const base = { op: 'update' as const, file, generation };
     return replace
         ? { ...base, moveOnly: false as const, records: await fileRecords(file, tracking, chunker, options) }

@@ -71,14 +71,20 @@ test('missing or expired versions fail without fallback while explicitly preserv
     assert.equal((await drive.read({ at: preserved, fileId: first.fileId })).content, 'Revision 1');
 });
 
-test('legacy main without an initial pin does not synthesize historical v0', async () => {
+test('an interrupted creation leaves v0 unavailable, never synthesized, until a later operation pins it', async () => {
     const fixture = fileClient();
-    await MemDrive.create({ client: fixture.client, name });
-    fixture.collections.get(name).branches.delete('md-main-v0');
+    fixture.beforeBranchCreate = () => { throw Object.assign(new Error('Unavailable'), { statusCode: 503 }); };
+    await assert.rejects(MemDrive.create({ client: fixture.client, name }), { code: 'MAIN_BOOTSTRAP_UNCONFIRMED' });
+    fixture.beforeBranchCreate = undefined;
+    assert(!fixture.collections.get(name).branches.has('md-main-v0'));
     const fresh = await MemDrive.open({ client: { ...fixture.client }, name });
     const count = fixture.calls.length;
     await assert.rejects(fresh.fork({ name: 'unknown-past', version: 'v0' }), { code: 'HISTORICAL_VIEW_UNAVAILABLE' });
     assert(!fixture.calls.slice(count).some(call => ['branch-create', 'tag-create'].includes(call.kind)));
+    // A ref from current main pins the initial view, which is then selectable.
+    await fresh.fork({ name: 'draft' });
+    assert.deepEqual(await fresh.fork({ name: 'initial', version: 'v0' }), { at: { kind: 'fork', name: 'initial' } });
+    assert.deepEqual(fixture.calls.findLast(call => call.kind === 'branch-create').request.source, { kind: 'branch', name: 'md-main-v0' });
 });
 
 test('versioned forks preserve old merge baselines and can be copied through explicit checkpoints', async () => {

@@ -129,9 +129,7 @@ Keep clocks accurate and fence former owners and their outstanding mutations
 before takeover or lifecycle operations. Other clients can keep reading current
 main or explicit refs; use a checkpoint for work that must retain a selected
 version beyond the window. List cursors expire within five minutes, well before the minimum retention window;
-findText and history cursors become unavailable once their pinned version is released. Before adopting automatic cleanup,
-upgrade all history readers to support retained summaries (`0.1.1-dev.21` or
-later); earlier readers require the old captures.
+findText and history cursors become unavailable once their pinned version is released.
 
 Internally, only refs proven to belong to completed SDK requests are removed.
 Bounded history archives retain the summary and up to 100 affected IDs, with no
@@ -141,7 +139,7 @@ immediate physical erasure.
 
 ## Structured text chunking
 
-New managed stores persist `chunking: { strategy: 'auto' }` by default. Explicit
+Managed stores persist `chunking: { strategy: 'auto' }` by default. Explicit
 strategies are `boundary` (the 800-code-point splitter), `none` (one nonblank
 chunk), and `docling` (requires the local adapter and a supported format).
 External-vector stores do not accept chunking settings or adapters.
@@ -198,10 +196,7 @@ An already cached store keeps its adapter binding. Use a separate LambdaDB
 client instance when opening that store with a different adapter; otherwise
 `CHUNKER_MISMATCH` prevents changing active writers implicitly.
 
-Stores created before chunking configuration was introduced keep their existing
-boundary layout and embedding source. They remain readable and writable; opening
-them does not migrate or reindex them. Create a fresh store to adopt configured
-chunking. The package root remains browser-compatible without `docling.rs`;
+The package root remains browser-compatible without `docling.rs`;
 the `/docling` subpath is Node-only.
 
 ## Read a bounded text range
@@ -261,7 +256,7 @@ Each hit carries the file reference, the original matching text in `content`, an
 
 Use a nonempty literal of up to 8192 UTF-8 bytes, including whitespace if needed. The optional prefix is a case-sensitive absolute path prefix. Metadata filters use the same `FileFilter` as `search`. The page limit is 1–100 hits and defaults to 20. The SDK scans the original file records in the selected view in file ID order, reading up to 16 originals per page in batches, and emits each file's matches in offset order. Original text has no text index, so the cost scales with the number of originals in scope rather than with the number of matches; `prefix` and metadata `filter` narrow the originals the scan reads. A page can contain fewer hits than requested, including zero. Forward `next` unchanged until it is absent. It contains the scan's `at` and cursor. Passing a cursor with another `at` (omitted means main) fails with `CURSOR_VIEW_MISMATCH` and leaves the cursor usable. The cursor is a self-contained opaque token: it holds no SDK memory, does not expire by time, and continues on any client of the same store. The SDK revalidates every field and derives the read from the request's `at`; for main it verifies that the pinned publication is still a retained version of this store. For a fork or checkpoint it records the ref's identity and rereads it on each page. It becomes unavailable when that publication is released, the store is replaced, the fork or checkpoint was deleted or recreated under the same name, or a resumed live file changed or disappeared. Restart a search if the SDK returns `FIND_TEXT_CURSOR_UNAVAILABLE`.
 
-Main and checkpoint scans typically return `consistency: 'snapshot'` and keep reading the same published version across pages. Fork scans and scans of legacy main without a pinned published version return `consistency: 'live'`. Each fork page runs in the local writer queue, and the scan excludes file IDs above the initial upper bound. An edit or insertion ahead of the cursor can appear in later pages and a change behind it may be missed. A resumed file that changes or disappears invalidates the cursor.
+Main and checkpoint scans typically return `consistency: 'snapshot'` and keep reading the same published version across pages. Fork scans return `consistency: 'live'`. Each fork page runs in the local writer queue, and the scan excludes file IDs above the initial upper bound. An edit or insertion ahead of the cursor can appear in later pages and a change behind it may be missed. A resumed file that changes or disappears invalidates the cursor.
 
 ## Filter search by metadata
 
@@ -367,7 +362,7 @@ const savedPast = await drive.checkpoint({ at: { kind: 'main' }, name: 'past-sav
 
 From a main source (omitted or explicit main `at`), both methods accept optional
 `version` to select that exact completed publication. Omit it for current main. `v0` selects the retained initial view;
-older stores without that pin cannot reconstruct it. An unfinished merge's
+it is unavailable while an interrupted creation has left that view unpinned. An unfinished merge's
 version cannot be selected even if its target tag already exists.
 
 An unknown, unpublished or expired version fails with
@@ -467,7 +462,7 @@ deletes the fork; delete it explicitly when it is no longer needed. It returns t
 
 Merges queue against the latest published view. A conflicting file baseline or destination rejects the request with `MERGE_CONFLICT` and the affected file IDs and paths. Independent changes on main can coexist. Edits made on the source after capture stay on that fork. When multiple merges are queued on the same fork, the later capture waits for the earlier merge to advance its source baselines.
 
-Main reads, searches, lists, forks, and checkpoints select one published version. A completed merge becomes visible to existing drive objects and new SDK clients after the journal records publication. Working views and named checkpoints keep their own contents. Direct LambdaDB reads of the writable `main` branch and older SDK versions can observe writes during application. Upgrade main readers before enabling merges.
+Main reads, searches, lists, forks, and checkpoints select one published version. A completed merge becomes visible to existing drive objects and new SDK clients after the journal records publication. Working views and named checkpoints keep their own contents. Direct LambdaDB reads of the writable `main` branch can observe writes during application.
 
 - `MERGE_RESUMABLE` identifies a paused request. Retry with its original ID and summary. If its main version is already published, the error includes `details.publishedVersion` and the retry completes the source bookkeeping.
 - `MERGE_BLOCKED` identifies the active request that prevents other publications. If a mutable native write has an unknown outcome, the host must fence the old writer and settle its in-flight operations before a replacement owner resumes it.
@@ -475,7 +470,7 @@ Main reads, searches, lists, forks, and checkpoints select one published version
 
 Run main publication and recovery through one exclusive host-owned writer per store across runtimes and client instances. Continue to enforce one writer per working fork, including its post-merge bookkeeping. Once the previous owner and its in-flight mutations have settled, the replacement owner can call `MemDrive.open({ client, name: 'workspace', recover: true })`. A normal `open` never resumes the merge. A paused merge continues to serve the previous published version until publication, and recovery continues from the retained request. Recovery does not automatically roll back the writable branch.
 
-MemDrive keeps its initial view, request captures, and published versions in reserved refs and creates an internal collection on the first merge. Give the writer permission to provision that collection and readers permission to inspect its records. Keep the journal while the store is in use; completed merges automatically attempt retention cleanup. Earlier file stores are initialized on the first operation that needs a frozen main view. Native tag availability also applies to named checkpoints on an empty or cold view.
+MemDrive keeps its initial view, request captures, and published versions in reserved refs and creates an internal collection on the first merge. Give the writer permission to provision that collection and readers permission to inspect its records. Keep the journal while the store is in use; completed merges automatically attempt retention cleanup. A store whose creation was interrupted before its initial view was pinned is initialized on the first operation that needs a frozen main view. Native tag availability also applies to named checkpoints on an empty or cold view.
 
 ## Inspect publication status and history
 

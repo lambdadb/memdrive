@@ -326,7 +326,7 @@ interface StoreDescription {
 
 export type FileStoreDescription<Mode extends EmbeddingMode = 'managed'> = StoreDescription & (
     Mode extends 'external' ? { embedding: ExternalEmbedding; textSearch?: never } : {
-        chunking?: ChunkingOptions | undefined;
+        chunking: ChunkingOptions;
         textSearch: { analyzers: string[] };
         embedding: {
             mode: 'managed';

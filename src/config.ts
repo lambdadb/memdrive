@@ -13,6 +13,8 @@ export const format = 'files-v0';
 const embeddingTag = 'memdrive.embedding';
 export const managedEmbedding = { mode: 'managed', provider: 'openai', model: 'text-embedding-3-small',
     dimensions: 1536, similarity: 'cosine' } as const;
+/** Managed chunks embed their contextualized text through the native `sources` form. */
+const embeddingSource = { field: 'embeddingText', type: 'text' } as const;
 const fileIndexes = {
     kind: { type: 'keyword' },
     path: { type: 'keyword' },
@@ -129,7 +131,7 @@ export function storeConfiguration(options: CreateFileStoreOptions | CreateExter
         indexConfigs.content = { type: 'text', analyzers };
         indexConfigs.embedding = { type: 'vector', managedEmbedding: true, embedding: {
             provider: managedEmbedding.provider, model: managedEmbedding.model, dimensions: managedEmbedding.dimensions,
-            similarity: managedEmbedding.similarity, sourceField: 'embeddingText',
+            similarity: managedEmbedding.similarity, sources: [{ ...embeddingSource }],
         } };
         description = { name, labels, metadataSchema, retentionInDays, textSearch: { analyzers }, embedding: { ...managedEmbedding }, chunking };
     }
@@ -182,15 +184,19 @@ export function parseStore(collection: unknown, name: string): FileStoreDescript
             return { name, labels, metadataSchema, retentionInDays, embedding: externalEmbedding({ mode: 'external',
                 dimensions: embedding.dimensions, similarity: embedding.similarity, identity: tags[embeddingTag] }) };
         }
+        requireInput(chunking !== undefined, 'Managed file stores require a chunking configuration.');
         requireInput(isObject(embedding) && embedding.type === 'vector' && embedding.managedEmbedding !== false && isObject(embedding.embedding)
             && embedding.embedding.provider === managedEmbedding.provider && embedding.embedding.model === managedEmbedding.model
             && embedding.embedding.dimensions === managedEmbedding.dimensions && embedding.embedding.similarity === managedEmbedding.similarity
-            && embedding.embedding.sourceField === (chunking ? 'embeddingText' : 'content'), 'Managed chunk embedding index is incompatible.');
+            && embedding.embedding.sourceField === undefined && Array.isArray(embedding.embedding.sources)
+            && embedding.embedding.sources.length === 1 && keysOnly(embedding.embedding.sources[0], ['field', 'type'])
+            && embedding.embedding.sources[0].field === embeddingSource.field && embedding.embedding.sources[0].type === embeddingSource.type,
+        'Managed chunk embedding index is incompatible.');
         requireInput(embeddingText === undefined, 'Chunk embedding text must not have a text index.');
         requireInput(isObject(content) && content.type === 'text', 'Chunk text index is missing.');
         requireInput(body === undefined, 'File originals must not have a text index.');
         const analyzers = textAnalyzers({ analyzers: content.analyzers ?? ['standard'] });
-        return { name, labels, metadataSchema, retentionInDays, textSearch: { analyzers }, embedding: { ...managedEmbedding }, ...(chunking ? { chunking } : {}) };
+        return { name, labels, metadataSchema, retentionInDays, textSearch: { analyzers }, embedding: { ...managedEmbedding }, chunking };
     } catch (cause) {
         throw new MemDriveError('INCOMPATIBLE_STORE', 'The collection is not a compatible MemDrive file store.', { cause });
     }

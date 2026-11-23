@@ -209,7 +209,7 @@ test('batched writes and reads share requests, propagate metadata, and validate 
     assert.deepEqual(description.labels, labels);
     assert.deepEqual(description.metadataSchema, metadataSchema);
     assert.deepEqual(description.textSearch, { analyzers: ['english'] });
-    assert.deepEqual(fixture.collections.get('workspace').metadata.indexConfigs.embedding.embedding.sourceField, 'embeddingText');
+    assert.deepEqual(fixture.collections.get('workspace').metadata.indexConfigs.embedding.embedding.sources, [{ field: 'embeddingText', type: 'text' }]);
     assert.deepEqual(await reopened.read({ at: research, paths: ['/second', '/missing', '/first'] }), [second, first]);
 
     await assert.rejects(reopened.write({ at: research, operations: [request('/untouched'), request('/first')] }), { code: 'PATH_EXISTS' });

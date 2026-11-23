@@ -109,7 +109,7 @@ test('ambiguous passages omit ranges and exact front matter remains searchable',
     assert.equal(content.slice(hits[0].range.start, hits[0].range.end), hits[0].content);
 });
 
-test('configuration is persisted, unsupported explicit formats fail, and legacy stores stay readable', async () => {
+test('configuration is persisted, unsupported explicit formats fail, and earlier store formats are rejected', async () => {
     const fixture = fileClient();
     await assert.rejects(create({ client: fixture.client, name: 'missing', chunking: { strategy: 'docling' } }), { code: 'CHUNKER_UNAVAILABLE' });
     assert.equal(fixture.collections.size, 0);
@@ -117,12 +117,28 @@ test('configuration is persisted, unsupported explicit formats fail, and legacy 
     assert.deepEqual((await main.describe()).chunking, { strategy: 'docling' });
     await main.fork({ name: 'draft' });
     await assert.rejects(main.write({ at, op: 'create', path: '/opaque.json', content: '{}' }), { code: 'UNSUPPORTED_FORMAT' });
-    const legacy = fixture.collections.get('configured').metadata;
-    legacy.description = 'memdrive-config-v1:{"retentionInDays":30}';
-    legacy.indexConfigs.embedding.embedding.sourceField = 'content';
-    const old = await open({ client: { ...fixture.client }, name: 'configured' });
-    const file = await old.write({ at, op: 'create', path: '/legacy.txt', content: 'Old format' });
-    assert.equal((await old.read({ at, fileId: file.fileId })).content, 'Old format');
+    const state = fixture.collections.get('configured');
+    const current = structuredClone(state.metadata);
+    const { sources, ...embedding } = current.indexConfigs.embedding.embedding;
+    assert.deepEqual(sources, [{ field: 'embeddingText', type: 'text' }]);
+    // A store needs its persisted chunking configuration and the `sources` embedding form.
+    for (const change of [
+        metadata => { metadata.description = 'memdrive-config-v1:{"retentionInDays":30}'; },
+        metadata => { metadata.indexConfigs.embedding.embedding = { ...embedding, sourceField: 'embeddingText' }; },
+        metadata => {
+            metadata.description = 'memdrive-config-v1:{"retentionInDays":30}';
+            metadata.indexConfigs.embedding.embedding = { ...embedding, sourceField: 'content' };
+        },
+        metadata => { metadata.indexConfigs.embedding.embedding.sourceField = 'embeddingText'; },
+        metadata => { metadata.indexConfigs.embedding.embedding.sources = [{ field: 'content', type: 'text' }]; },
+        metadata => { metadata.indexConfigs.embedding.embedding.sources.push({ field: 'content', type: 'text' }); },
+    ]) {
+        change(state.metadata);
+        await assert.rejects(open({ client: { ...fixture.client }, name: 'configured' }), { code: 'INCOMPATIBLE_STORE' });
+        state.metadata = structuredClone(current);
+    }
+    const reopened = await open({ client: { ...fixture.client }, name: 'configured' });
+    assert.deepEqual((await reopened.describe()).chunking, { strategy: 'docling' });
 });
 
 test('the optional Node adapter runs real Docling Hybrid with a local synthetic tokenizer', async () => {

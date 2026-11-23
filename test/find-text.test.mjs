@@ -60,7 +60,8 @@ test('findText bounds each scan page and continues through files after an empty 
     for (let index = 1; index <= 18; index++) {
         const fileId = `11111111-1111-4111-8111-${String(index).padStart(12, '0')}`;
         const id = `file:${fileId}`;
-        originals.set(id, { id, kind: 'file', fileId, path: `/file-${index}`, modifiedAt, body: index === 18 ? 'Match Match' : '.' });
+        originals.set(id, { id, kind: 'file', fileId, path: `/file-${index}`, modifiedAt, body: index === 18 ? 'Match Match' : '.',
+            chunking: { strategy: 'boundary', version: '1' } });
     }
     const queries = async request => {
         const before = fixture.calls.length;
@@ -360,8 +361,9 @@ test('main findText cursors verify their pinned publication on every page', asyn
     assert.equal(state.v, 'v1');
     const other = await MemDrive.open({ client: { ...fixture.client }, name });
     assert.equal((await other.findText(page.next)).hits[0].content, 'old');
-    // Unpublished, malformed or released versions are unavailable, never substituted.
-    for (const v of ['v2', 'v01', 3])
+    // Unpublished, malformed or released versions and a main without a pinned version
+    // are unavailable, never substituted.
+    for (const v of ['v2', 'v01', 3, null])
         await assert.rejects(drive.findText({ cursor: token({ ...state, v }) }), { code: 'FIND_TEXT_CURSOR_UNAVAILABLE' });
     await assert.rejects(drive.findText({ cursor: token({ ...state, u: state.af ?? state.r.i }) }), { code: 'FIND_TEXT_CURSOR_UNAVAILABLE' });
     fixture.collections.get(name).tags.delete('md-main-v1');
