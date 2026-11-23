@@ -121,10 +121,11 @@ export function storeConfiguration(options: CreateFileStoreOptions | CreateExter
             'Managed embedding accepts only mode.');
         const analyzers = textAnalyzers(options.textSearch);
         chunking = chunkingOptions(options.chunking ?? { strategy: 'auto' });
-        indexConfigs.embeddingText = { type: 'text', analyzers };
         // Originals stay unindexed: findText reads `body` as a returned field, and
         // search queries chunk fields. A future server-side substring index on
-        // `body` would be set when the collection is created.
+        // `body` would be set when the collection is created. The embedding source
+        // `embeddingText` is stored without an index: LambdaDB embeds an unindexed
+        // source field, and keyword search matches `content`.
         indexConfigs.content = { type: 'text', analyzers };
         indexConfigs.embedding = { type: 'vector', managedEmbedding: true, embedding: {
             provider: managedEmbedding.provider, model: managedEmbedding.model, dimensions: managedEmbedding.dimensions,
@@ -185,13 +186,10 @@ export function parseStore(collection: unknown, name: string): FileStoreDescript
             && embedding.embedding.provider === managedEmbedding.provider && embedding.embedding.model === managedEmbedding.model
             && embedding.embedding.dimensions === managedEmbedding.dimensions && embedding.embedding.similarity === managedEmbedding.similarity
             && embedding.embedding.sourceField === (chunking ? 'embeddingText' : 'content'), 'Managed chunk embedding index is incompatible.');
-        requireInput(!chunking || isObject(embeddingText) && embeddingText.type === 'text', 'Chunk embedding text index is missing.');
+        requireInput(embeddingText === undefined, 'Chunk embedding text must not have a text index.');
         requireInput(isObject(content) && content.type === 'text', 'Chunk text index is missing.');
         requireInput(body === undefined, 'File originals must not have a text index.');
         const analyzers = textAnalyzers({ analyzers: content.analyzers ?? ['standard'] });
-        requireInput(!chunking || isObject(embeddingText)
-            && JSON.stringify(analyzers) === JSON.stringify(textAnalyzers({ analyzers: embeddingText.analyzers ?? ['standard'] })),
-        'Chunk text and embedding text analyzers must match.');
         return { name, labels, metadataSchema, retentionInDays, textSearch: { analyzers }, embedding: { ...managedEmbedding }, ...(chunking ? { chunking } : {}) };
     } catch (cause) {
         throw new MemDriveError('INCOMPATIBLE_STORE', 'The collection is not a compatible MemDrive file store.', { cause });

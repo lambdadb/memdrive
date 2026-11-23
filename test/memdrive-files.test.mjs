@@ -219,12 +219,13 @@ test('batched writes and reads share requests, propagate metadata, and validate 
     assert.equal(calls.filter(call => call.kind === 'upsert').length, 1);
 });
 
-test('managed stores leave original bodies unindexed and reject an indexed body or mismatched chunk analyzers', async () => {
+test('managed stores leave original bodies and embedding text unindexed and reject either index', async () => {
     const fixture = fileClient();
     const drive = await create({ client: fixture.client, name: 'workspace', textSearch: { analyzers: ['english'] } });
     const configs = () => fixture.collections.get('workspace').metadata.indexConfigs;
     assert.equal(Object.hasOwn(configs(), 'body'), false);
-    assert.deepEqual([configs().content, configs().embeddingText], [{ type: 'text', analyzers: ['english'] }, { type: 'text', analyzers: ['english'] }]);
+    assert.deepEqual(configs().content, { type: 'text', analyzers: ['english'] });
+    assert.equal(Object.hasOwn(configs(), 'embeddingText'), false);
     // Unindexed originals still round-trip and serve literal scans, including Korean text.
     await drive.fork({ name: 'research' });
     const content = '회의록: 한글 검색과 한글 원문';
@@ -235,7 +236,7 @@ test('managed stores leave original bodies unindexed and reject an indexed body 
     for (const change of [
         indexes => { indexes.body = { type: 'text', analyzers: ['english'] }; },
         indexes => { indexes.body = { type: 'keyword' }; },
-        indexes => { indexes.embeddingText.analyzers = ['standard']; },
+        indexes => { indexes.embeddingText = { type: 'text', analyzers: ['english'] }; },
     ]) {
         change(configs());
         await assert.rejects(open({ client: { ...fixture.client }, name: 'workspace' }), { code: 'INCOMPATIBLE_STORE' });
