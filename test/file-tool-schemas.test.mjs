@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import Ajv from 'ajv';
-import { MemDrive, createFileTools } from '@functional-systems/memdrive';
+import { MemDrive, createFileTools, getFileToolDefinitions } from '@functional-systems/memdrive';
 import { fileClient } from './helpers/file-client.mjs';
 
 test('advertised tool schemas accept SDK inputs and reject ambiguous selectors, scope overrides and mode mismatches', async () => {
@@ -91,6 +91,14 @@ test('ref schemas expose exact version selection only on main and reject asOf ev
     const work = await main.fork({ name: 'working' });
     const saved = await main.checkpoint({ name: 'saved' });
     const ajv = new Ajv({ strict: true });
+    for (const embeddingMode of ['managed', 'external']) {
+        for (const tool of getFileToolDefinitions({ embeddingMode, tools: ['fork', 'checkpoint'] })) {
+            const validate = ajv.compile(tool.inputSchema);
+            assert(validate({ name: 'copy', version: 'v3' }));
+            assert.equal(validate({ name: 'copy', version: 'v01' }), false);
+            assert.equal(validate({ name: 'copy', asOf: '2026-01-01T00:00:00.000Z' }), false);
+        }
+    }
     for (const drive of [main, work, saved]) {
         for (const tool of createFileTools({ drive, tools: ['fork', 'checkpoint'] }).definitions) {
             const validate = ajv.compile(tool.inputSchema);

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { MemDrive, MemDriveError, createFileTools, fileToolError, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
+import { MemDrive, MemDriveError, createFileTools, getFileToolDefinitions, fileToolError, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
 import { fileClient } from './helpers/file-client.mjs';
 
 const all = ['guide', 'status', 'history', 'list', 'read', 'search', 'findText', 'fork', 'checkpoint', 'diff', 'write', 'merge'];
@@ -11,6 +11,66 @@ async function setup(options = {}) {
     const work = await main.fork({ name: 'draft' });
     return { fixture, main, work };
 }
+
+test('fixed tool definitions require an explicit mode and selection without a drive', () => {
+    const selected = ['fork', 'checkpoint', 'write', 'search'];
+    const definitions = getFileToolDefinitions({ embeddingMode: 'managed', tools: selected });
+    selected.push('read');
+    assert.deepEqual(definitions.map(tool => tool.name), ['fork', 'checkpoint', 'write', 'search']);
+    assert.equal(definitions[0].inputSchema.properties.version.type, 'string');
+    assert.equal(definitions[1].inputSchema.properties.version.type, 'string');
+    assert.equal(definitions[3].inputSchema.properties.query.type, 'string');
+    assert(Object.isFrozen(definitions));
+    assert.throws(() => { definitions[0].inputSchema.properties.version.type = 'number'; }, TypeError);
+    const vectors = getFileToolDefinitions({ embeddingMode: 'external', tools: ['write', 'search'] });
+    assert.equal(vectors[0].inputSchema.properties.content.type, 'array');
+    assert.equal(vectors[1].inputSchema.properties.query.type, 'array');
+    assert.deepEqual(getFileToolDefinitions({ embeddingMode: 'managed', tools: [] }), []);
+    for (const options of [undefined, null, {}, { tools: ['read'] }, { embeddingMode: 'managed' },
+        { embeddingMode: 'text', tools: ['read'] }, { embeddingMode: 'managed', tools: ['read', 'read'] },
+        { embeddingMode: 'managed', tools: ['constructor'] }, { embeddingMode: 'managed', tools: ['recover'] },
+        { embeddingMode: 'managed', tools: 'read' }, { embeddingMode: 'managed', tools: ['read'], drive: {} }])
+        assert.throws(() => getFileToolDefinitions(options), { code: 'INVALID_INPUT' });
+    assert.throws(() => getFileToolDefinitions({ embeddingMode: 'external', tools: ['findText'] }), { code: 'TOOL_UNAVAILABLE' });
+});
+
+test('fixed catalogs share canonical definitions but cannot expand bound execution or ref selectors', async () => {
+    for (const external of [false, true]) {
+        const { fixture, main, work } = await setup(external
+            ? { embedding: { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'fixture-v1' } } : {});
+        const saved = await work.checkpoint({ name: 'saved' });
+        const names = all.filter(name => !external || name !== 'findText');
+        const before = fixture.calls.length;
+        const definitions = getFileToolDefinitions({ embeddingMode: external ? 'external' : 'managed', tools: names });
+        const original = JSON.stringify(definitions);
+        const byName = Object.fromEntries(definitions.map(tool => [tool.name, tool]));
+        const content = external ? [1, ...Array(63).fill(0)] : 'Original wording.';
+        for (const drive of [main, work, saved]) {
+            const supported = names.filter(name => drive === work || !['write', 'diff', 'merge'].includes(name));
+            const bound = createFileTools({ drive, tools: supported });
+            for (const definition of bound.definitions) {
+                if (drive !== main && ['fork', 'checkpoint'].includes(definition.name)) {
+                    assert.equal(definition.description, byName[definition.name].description);
+                    assert.equal(definition.inputSchema.properties.version, undefined);
+                } else assert.deepEqual(definition, byName[definition.name]);
+            }
+            if (drive !== main) for (const name of ['fork', 'checkpoint'])
+                await assert.rejects(bound.execute(name, { name: 'past-copy', version: 'v0' }), { code: 'INVALID_INPUT' });
+            if (drive !== work) {
+                assert.throws(() => createFileTools({ drive, tools: ['write'] }), { code: 'TOOL_UNAVAILABLE' });
+                await assert.rejects(bound.execute('write', { op: 'create', path: '/note.txt', content }), { code: 'TOOL_NOT_ALLOWED' });
+            }
+        }
+        const reader = createFileTools({ drive: work, tools: ['read'] });
+        await assert.rejects(reader.execute('write', { op: 'create', path: '/note.txt', content }), { code: 'TOOL_NOT_ALLOWED' });
+        assert.equal(fixture.calls.length, before);
+        const writer = createFileTools({ drive: work, tools: ['write'] });
+        const file = await writer.execute('write', { op: 'create', path: '/note.txt', content });
+        assert.equal(file.path, '/note.txt');
+        assert.equal(await main.read({ fileId: file.fileId }), null);
+        assert.equal(JSON.stringify(definitions), original);
+    }
+});
 
 test('tool execution follows the bound fork through retrieval, exact edits, diff and publication', async () => {
     const { main, work } = await setup({ metadataSchema: { topic: { type: 'string' } } });
