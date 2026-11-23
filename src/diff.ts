@@ -13,7 +13,7 @@ const changedOriginals = [
 ];
 
 type NetChange =
-    | { change: Extract<FileChange, { op: 'create' }>; baseline?: undefined; fingerprint?: string }
+    | { change: Extract<FileChange, { op: 'create' }>; baseline?: undefined; fingerprint: string }
     | { change: Extract<FileChange, { op: 'update' }>; baseline: FileBaseline; fingerprint: string }
     | { change: Extract<FileChange, { op: 'delete' }>; baseline: FileBaseline; fingerprint?: undefined };
 
@@ -27,12 +27,10 @@ export function netChange(doc: Record<string, unknown>): NetChange | undefined {
         throw new MemDriveError('INVALID_RESULT', 'Diff returned inconsistent file version tracking.');
     if (kind === 'tombstone')
         return baseline && { change: { op: 'delete', fileId, previousPath: baseline.path }, baseline };
-    // Files first created on a fork predate persisted fingerprints.
-    if (fingerprint !== undefined && (typeof fingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(fingerprint)))
+    // Every write of a changed live original persists its fingerprint.
+    if (typeof fingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(fingerprint))
         throw new MemDriveError('INVALID_RESULT', 'Diff returned invalid file fingerprint data.');
-    if (!baseline) return { change: { op: 'create', fileId, path }, ...(fingerprint === undefined ? {} : { fingerprint }) };
-    if (fingerprint === undefined)
-        throw new MemDriveError('INVALID_RESULT', 'Diff returned invalid file fingerprint data.');
+    if (!baseline) return { change: { op: 'create', fileId, path }, fingerprint };
     if (fingerprint !== baseline.fingerprint)
         return { change: { op: 'update', fileId, path, ...(path === baseline.path ? {} : { previousPath: baseline.path }) }, baseline, fingerprint };
     if (path !== baseline.path)

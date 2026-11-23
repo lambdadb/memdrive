@@ -887,7 +887,7 @@ test('diff pages across the generated ID boundary and queues following writes', 
     const docs = fixture.collections.get('workspace').branches.get('fork-research').docs;
     const synthetic = Array.from({ length: 1001 }, (_, i) => {
         const fileId = `00000000-0000-4000-8000-${i.toString(16).padStart(12, '0')}`;
-        return { fileId, id: `file:${fileId}`, kind: 'file', changed: true, path: `/synthetic/${i}` };
+        return { fileId, id: `file:${fileId}`, kind: 'file', changed: true, fingerprint: '0'.repeat(64), path: `/synthetic/${i}` };
     });
     for (const doc of [...synthetic].reverse()) docs.set(doc.id, doc);
     let entered, release;
@@ -920,7 +920,11 @@ test('diff rejects invalid records, nonprogress and incomplete pages and recover
     const records = fixture.collections.get('workspace').branches.get('fork-research').docs;
     const original = [...records.values()][0];
     const wrap = (...docs) => ({ isDocsInline: true, total: docs.length, docs: docs.map(doc => ({ collection: 'workspace', doc })) });
+    // Every write of a changed live original persists its fingerprint.
+    const { fingerprint: _fingerprint, ...withoutFingerprint } = original;
     for (const invalid of [
+        withoutFingerprint,
+        { ...original, fingerprint: 'bad' },
         { ...original, kind: 'chunk' },
         { ...original, changed: false },
         { ...original, id: 'wrong' },

@@ -53,10 +53,15 @@ async function loadTargets(handle: Handle, name: string, source: TagRef, schema:
             const { revision, generation } = doc;
             if ((revision !== undefined && !validFileId(revision)) || (generation !== undefined && !validFileId(generation)))
                 throw new MemDriveError('INVALID_RESULT', 'The pinned source original has invalid file tracking.');
-            const file = candidate.change.op === 'delete' ? undefined : decodeStoredFile(doc, schema, dimensions);
-            if (file && candidate.fingerprint !== undefined && await fingerprintOf(file) !== candidate.fingerprint)
+            // Only a deletion has no fingerprint; every live target carries one.
+            if (candidate.fingerprint === undefined) {
+                targets.push({ ...candidate, file: undefined, revision, generation, chunking: undefined });
+                continue;
+            }
+            const file = decodeStoredFile(doc, schema, dimensions);
+            if (await fingerprintOf(file) !== candidate.fingerprint)
                 throw new MemDriveError('INVALID_RESULT', 'The pinned source original disagrees with its fingerprint.');
-            const chunking = file && 'content' in file ? resolvedChunking(doc.chunking) : undefined;
+            const chunking = 'content' in file ? resolvedChunking(doc.chunking) : undefined;
             targets.push({ ...candidate, file, revision, generation, chunking });
         }
     }
