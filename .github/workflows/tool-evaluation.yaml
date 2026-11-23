@@ -1,0 +1,88 @@
+name: Model tool-use evaluation
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: Scenarios to evaluate across all three guide conditions
+        type: choice
+        options: [recall, all]
+        default: recall
+      model:
+        description: OpenAI Responses model ID
+        type: string
+        default: gpt-6.1-sol
+      instruction:
+        description: Instruction profile
+        type: choice
+        options: [server, workflow, user]
+        default: server
+      repeats:
+        description: Repetitions per scenario and guide condition
+        type: choice
+        options: ['1', '2', '3', '4', '5']
+        default: '1'
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    concurrency:
+      group: model-tool-use-evaluation
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - run: npm ci
+      - run: npm run build
+      - name: Run model evaluation
+        id: model
+        shell: bash
+        env:
+          EVAL_SCENARIO: ${{ inputs.scenario }}
+          EVAL_MODEL: ${{ inputs.model }}
+          EVAL_INSTRUCTION: ${{ inputs.instruction }}
+          EVAL_REPEATS: ${{ inputs.repeats }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          if [[ ! "$EVAL_SCENARIO" =~ ^(recall|all)$ || ! "$EVAL_MODEL" =~ ^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,99}$ ||
+                ! "$EVAL_INSTRUCTION" =~ ^(server|workflow|user)$ || ! "$EVAL_REPEATS" =~ ^[1-5]$ ]]; then
+            echo 'Invalid model evaluation inputs.' >&2
+            exit 1
+          fi
+          if [[ -z "$LLM_API_KEY" ]]; then
+            echo 'Set the LLM_API_KEY repository secret before dispatching the workflow.' >&2
+            exit 1
+          fi
+          status=0
+          umask 077
+          timeout --kill-after=10s 60m node benchmark/tool-use/run.mjs --mode model --guide all \
+            --scenario "$EVAL_SCENARIO" --model "$EVAL_MODEL" --instruction "$EVAL_INSTRUCTION" \
+            --repeats "$EVAL_REPEATS" --output "$RUNNER_TEMP/memdrive-tool-eval/raw" || status=$?
+          if [[ "$status" == 124 ]]; then
+            echo 'Model evaluation reached the 60-minute run limit.' >&2
+          fi
+          exit "$status"
+      - name: Export evaluation report
+        id: report
+        if: ${{ !cancelled() && (steps.model.outcome == 'success' || steps.model.outcome == 'failure') }}
+        run: |
+          node benchmark/tool-use/report.mjs "$RUNNER_TEMP/memdrive-tool-eval/raw" \
+            "$RUNNER_TEMP/memdrive-tool-eval/report.json" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload evaluation report
+        if: ${{ !cancelled() && steps.report.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: tool-evaluation-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/memdrive-tool-eval/report.json
+          retention-days: 7
+          if-no-files-found: error

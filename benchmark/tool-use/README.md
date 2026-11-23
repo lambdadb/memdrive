@@ -55,6 +55,36 @@ Oversized results are not silently cut into misleading JSON; the model receives
 an explicit delivery-limit error explaining that the operation already ran.
 Unknown request usage stays unknown in the summary. Charges are not estimated.
 
+## Run in GitHub Actions
+
+Set the `LLM_API_KEY` repository secret under **Settings → Secrets and variables
+→ Actions**. Dispatch **Model tool-use evaluation** from `main` in the Actions
+tab, or use the GitHub CLI:
+
+```sh
+# First pilot: recall, one conversation per guide condition, server profile.
+gh workflow run tool-evaluation.yaml --ref main
+
+# After reviewing the pilot: six tasks, all three guide conditions, two repeats.
+gh workflow run tool-evaluation.yaml --ref main -f scenario=all -f repeats=2
+```
+
+The workflow always compares `none`, `tool` and `resource`. It defaults to
+`gpt-6.1-sol`, the `server` profile and one repetition. The dispatch form also
+accepts an explicit model ID, `workflow` or `user` instructions, and up to five
+repetitions. Each dispatch can incur model charges. Runs execute one at a time,
+with a 60-minute model-step limit and a 75-minute job limit. A time-limited run
+can report fewer completed cases than planned. The job reports failures even
+when the report export succeeds.
+
+Open the run summary for per-guide counts and download the `tool-evaluation-*`
+artifact for the JSON report, retained for seven days. The report includes
+configuration and source hashes, check results, ordered tool names and outcomes,
+offered tool names, model-response validation, HTTP error statuses and token
+usage. It records the length of any final answer. Detailed investigation of
+wording, arguments and SDK results requires a separate local run. The raw trace
+on the hosted runner stays in temporary storage for the lifetime of the job.
+
 ## Conditions and host policy
 
 `--guide` selects `none`, `tool`, `resource`, or `all` (default):
@@ -121,9 +151,11 @@ scenario tasks and planned case denominator. Each case has:
 cases in the planned denominator. A failed cleanup is an error. Exit status is
 nonzero for failed checks or execution errors. Use a fresh run directory for a
 new measurement; no mutation or model request is automatically replayed from an
-uncertain receipt. Synthetic content is safe to inspect, but request receipts can
-contain provider response IDs and opaque reasoning; keep raw runs local and
-publish only reviewed aggregate results with their limitations.
+uncertain receipt. Request receipts can contain provider response IDs and opaque
+reasoning. Keep raw runs in the local workspace or on the ephemeral Actions
+runner, and share only reviewed results with their limitations. Action artifacts
+are built from a fixed projection that omits free-form model text, tool arguments
+and results, provider identifiers, headers and reasoning.
 
 The test suite exercises all six scenarios and guide channels, actual allowlist
 enforcement, rebinding, unchanged resource text, stateless Responses continuation,
