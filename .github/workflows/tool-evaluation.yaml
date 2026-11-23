@@ -6,7 +6,7 @@ on:
       scenario:
         description: Scenarios to evaluate across all three guide conditions
         type: choice
-        options: [recall, all]
+        options: [recall, retrieval, all]
         default: recall
       model:
         description: OpenAI Responses model ID
@@ -54,7 +54,7 @@ jobs:
           EVAL_REPEATS: ${{ inputs.repeats }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: |
-          if [[ ! "$EVAL_SCENARIO" =~ ^(recall|all)$ || ! "$EVAL_MODEL" =~ ^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,99}$ ||
+          if [[ ! "$EVAL_SCENARIO" =~ ^(recall|retrieval|all)$ || ! "$EVAL_MODEL" =~ ^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,99}$ ||
                 ! "$EVAL_INSTRUCTION" =~ ^(server|workflow|user)$ || ! "$EVAL_REPEATS" =~ ^[1-5]$ ]]; then
             echo 'Invalid model evaluation inputs.' >&2
             exit 1

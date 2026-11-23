@@ -19,6 +19,7 @@ and synthetic request/tool traces belong under ignored `artifacts/`.
 
 ```sh
 # No model calls: validate the host, SDK workflows and scoring machinery.
+# Nine tasks and three guide channels: 27 scripted cases per instruction profile.
 npm run benchmark:tools -- --mode scripted --output artifacts/tool-use/smoke
 
 # Provide LLM_API_KEY through the environment or ignored .env.local.
@@ -26,7 +27,11 @@ npm run benchmark:tools -- --mode scripted --output artifacts/tool-use/smoke
 npm run benchmark:tools -- --mode model --scenario recall --guide all \
   --model gpt-6.1-sol --output artifacts/tool-use/model-recall
 
-# Six tasks, three guide channels, two repetitions: 36 separate conversations.
+# Only the three read-only retrieval tasks: 9 conversations per repetition.
+npm run benchmark:tools -- --mode model --scenario retrieval --guide all \
+  --repeats 2 --output artifacts/tool-use/model-retrieval
+
+# Nine tasks, three guide channels, two repetitions: 54 separate conversations.
 npm run benchmark:tools -- --mode model --guide all --repeats 2 \
   --instruction server --output artifacts/tool-use/model-server
 
@@ -36,6 +41,13 @@ npm run benchmark:tools -- --mode model --instruction workflow \
 npm run benchmark:tools -- --mode model --instruction user \
   --output artifacts/tool-use/model-user
 ```
+
+`--scenario` takes `all` (default, every scenario), `retrieval` (`paraphrase`,
+`cross-language` and `enumerate`) or one scenario ID such as the `recall` pilot.
+With all three guide channels a repetition plans 3 conversations for `recall`,
+9 for `retrieval` and 27 for `all`. Scripted mode passes all 81 combinations of
+nine scenarios, three guide channels and three instruction profiles; run it once
+per `--instruction` value to cover them.
 
 Model mode uses OpenAI Responses with the explicit model ID, low reasoning,
 `store: false` and sequential tool calls. The default model follows the existing
@@ -65,7 +77,10 @@ tab, or use the GitHub CLI:
 # First pilot: recall, one conversation per guide condition, server profile.
 gh workflow run tool-evaluation.yaml --ref main
 
-# After reviewing the pilot: six tasks, all three guide conditions, two repeats.
+# Only the read-only retrieval tasks: 18 conversations with two repeats.
+gh workflow run tool-evaluation.yaml --ref main -f scenario=retrieval -f repeats=2
+
+# After reviewing the pilot: nine tasks, all three guide conditions, two repeats.
 gh workflow run tool-evaluation.yaml --ref main -f scenario=all -f repeats=2
 ```
 
@@ -74,14 +89,17 @@ The workflow always compares `none`, `tool` and `resource`. It defaults to
 accepts an explicit model ID, `workflow` or `user` instructions, and up to five
 repetitions. Each dispatch can incur model charges. Runs execute one at a time,
 with a 60-minute model-step limit and a 75-minute job limit. A time-limited run
-can report fewer completed cases than planned. The job reports failures even
+can report fewer completed cases than planned. Those limits are unchanged while
+`all` with two repeats now plans 54 conversations instead of 36; dispatch
+`retrieval` separately if a full run reaches the limit. The job reports failures even
 when the report export succeeds.
 
 Open the run summary for per-guide counts and download the `tool-evaluation-*`
 artifact for the JSON report, retained for seven days. The report includes
 configuration and source hashes, check results, ordered tool names and outcomes,
-offered tool names, model-response validation, HTTP error statuses and token
-usage. It records the length of any final answer. Detailed investigation of
+[retrieval tool-selection counts](#retrieval-tool-selection), offered tool names,
+model-response validation, HTTP error statuses and token usage. The summary adds
+a retrieval table for the read-only scenarios in the run. It records the length of any final answer. Detailed investigation of
 wording, arguments and SDK results requires a separate local run. The raw trace
 on the hosted runner stays in temporary storage for the lifetime of the job.
 
@@ -136,20 +154,87 @@ policy, not hosted authentication or cross-process fencing.
 | `past-version` | After two publications, create `earlier` from the first version using `history`/`version`. Verify its old content and unchanged current main. |
 | `unrelated` | A later unrelated main file is absent from the task fork. Publish the FAQ update while preserving the unrelated main content. |
 | `conflict` | A concurrent main edit conflicts with the task fork. Observe `MERGE_CONFLICT`, preserve the intended unpublished draft and unchanged main, and report the blocker. Resolution/takeover/retry is not implemented by this host. |
+| `paraphrase` | Six more published notes and runbooks. An English question whose distinctive words appear in no stored file is answered by one neutrally named note (a 21-day period and a contact address) beside notes with other periods and contacts. The literal period and address in the final answer and unchanged main are checked. |
+| `cross-language` | The same drive. A Korean question is answered by an English note (a 9-business-day lead time and a contact address) beside a similar note with another lead time and contact. The literal number and address and unchanged main are checked. |
+| `enumerate` | The same drive. Literal control: report every file containing the exact error code `E-4172`, which occurs in three files across two directories beside the near miss `E-4127`. All three paths, no other drive path and unchanged main are checked. |
 
 Ground truth is evaluated independently through public SDK reads, inventories,
 status, fork/checkpoint listings and explicit-`at` reads. State checks compare full synthetic originals and expected
 paths, rather than accepting the model's claim of success. Publication tasks also
 check that the changed original was delivered before editing and that a diff of
 the merged fork was inspected after its last write and before merge. Exact-edit counts are descriptive,
-not a requirement to use one specific sequence for every task. Final recall and
+not a requirement to use one specific sequence for every task. Final recall, retrieval answer, listed-path and
 blocker wording checks are literal heuristics; there is no semantic answer judge
 or general citation-quality score. Prompt-injection coverage is one synthetic
 example, not a security certification.
 
 Scripted mode emits predetermined requests and is **only a transport/workflow
-smoke test**; its passes are not model performance. Its `modelTasksPassed` is `null`. Injected test transports are also
+smoke test**; its passes are not model performance. Its paraphrase cases call
+`search` and its control calls `findText` by construction. Its `modelTasksPassed` is `null`. Injected test transports are also
 identified separately and cannot count as real model measurements.
+
+## Retrieval tool selection
+
+The `retrieval` group measures one concern directly: a model used to local file
+tools may keep repeating literal `findText` where ranked `search` fits. Stored
+wording often differs from the question, so a literal search misses, and a
+`findText` without `prefix` or `filter` scans every original of the view. The
+two paraphrase tasks create that mismatch; `enumerate` is the control where an
+unscoped `findText` is the right tool, so avoiding `findText` everywhere is not
+rewarded. No model has run these scenarios, and no result for them is recorded
+here.
+
+**The fixture's ranked `search` does not rank.** It returns the chunks of the
+selected view whatever the query and mode are. For these three scenarios the
+harness returns them in path order, so every conversation receives the same nine
+candidates: the default limit of 10 returns all of them, with the paraphrase
+target third and the cross-language target fifth, and a smaller `limit` can
+exclude a target. Any `search` call therefore surfaces the answer among
+distractors. These scenarios measure **tool selection and persistence, not
+retrieval relevance**, and their pass rates cannot rank search modes.
+
+`findText` runs the SDK's real literal scan over the fixture's originals. Every
+word of four or more letters in the English question, every word of the Korean
+question and each full sentence has no hit in any file of the drive; the tests
+verify this. A model can still hit by guessing stored vocabulary, or list and
+read all nine files, and passing does not require `search`.
+
+Each conversation records these counts from its ordered tool calls. Attempted
+calls count whatever their outcome, and no argument or model text is kept:
+
+| Field | Meaning |
+| --- | --- |
+| `search`, `findText`, `read`, `list` | Calls of that tool. |
+| `firstTool` | The first of those four tools called, or `none`. |
+| `usedSearch` | Whether `search` was called at all. |
+| `findTextBeforeSearch` | `findText` calls before the first `search` call, or all of them when `search` was never called. |
+| `findTextUnscoped` | New `findText` scans without `filter` and without a `prefix` narrower than `/`. A count, not the arguments. |
+| `findTextContinuations` | `findText` calls that forward a cursor. They resume an earlier scan and are not counted as unscoped. |
+
+A call whose arguments were not a JSON object counts as a call but is neither
+unscoped nor a continuation. The counts are recorded for every scenario and also
+for conversations that failed or ended in an error. They are stored as
+`retrieval` in each case's `result.json`, summed per guide condition in
+`summary.json` as `groups.<guide>.retrieval` and per scenario as
+`groups.<guide>.retrievalByScenario.<scenario>`, and exported as
+`cases[].retrieval` and the same `summary.groups` fields in the Actions JSON
+report. Sums add `cases`, the `firstTool` distribution, `casesUsingSearch`,
+`casesUsingFindText` and `casesWithUnscopedFindText`; interrupted cases without
+recorded events are left out. Reports of older run directories compute the same
+counts from their recorded events.
+
+Read the paraphrase rows for `findText` calls before the first `search` and for
+conversations without any `search`. In `enumerate`, `findText` first and
+unscoped is the expected behavior, since the code spans two directories; its
+unscoped count shows cost, not a mistake. The counts cannot show:
+
+- retrieval quality or the difference between semantic, keyword and hybrid
+  search, because fixture search ignores the query;
+- the real cost of an unscoped scan, because the drive holds nine small files;
+- behavior beyond three synthetic tasks with fixed wording and a few
+  repetitions per guide condition;
+- the effect of different tool descriptions or guide text, because both are
+  unchanged and only their delivery channel varies.
 
 ## Reproducibility and evidence
 
@@ -161,7 +246,8 @@ scenario tasks and planned case denominator. Each case has:
 - the model inputs/outputs, including opaque reasoning items and message phases;
 - offered tool definitions, SDK call arguments (including `at`)/results and
   delivery limits;
-- initial/observed state, individual outcome/behavior checks and fixture cleanup.
+- initial/observed state, individual outcome/behavior checks, retrieval
+  tool-selection counts and fixture cleanup.
 
 `summary.json` is updated after every attempted case and includes failed/error
 cases in the planned denominator. A failed cleanup is an error. Exit status is
@@ -173,7 +259,8 @@ runner, and share only reviewed results with their limitations. Action artifacts
 are built from a fixed projection that omits free-form model text, tool arguments
 and results, provider identifiers, headers and reasoning.
 
-The test suite exercises all six scenarios and guide channels, actual allowlist
+The test suite exercises all nine scenarios, guide channels and instruction
+profiles, the retrieval fixtures, scoring, metrics and scenario groups, actual allowlist
 and target enforcement, explicit `at` provenance, unchanged resource text, stateless Responses continuation,
 malformed JSON, duplicate calls, budgets, failed requests, delivery limits,
 scoring independence and failure accounting. These tests establish the harness,
