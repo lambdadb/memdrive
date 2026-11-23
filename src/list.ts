@@ -28,6 +28,12 @@ const maxCachedBytes = 64 * 1024 * 1024;
 const maxCachedScans = 128;
 const scans = new Map<string, Scan>();
 let cachedBytes = 0;
+// One timer, armed for the earliest expiry, removes expired scans even when
+// no later listing runs. A cached scan reaches its store through `released`,
+// so nothing here may outlive its expiry.
+let expiry: { at: number; timer: unknown } | undefined;
+
+/** The only way a scan leaves the cache: expiry, eviction and release all end here. */
 function drop(id: string) {
     const scan = scans.get(id);
     if (!scan) return;
@@ -35,8 +41,27 @@ function drop(id: string) {
     scans.delete(id);
     scan.released();
 }
+
+/** Arm the timer for the earliest remaining expiry, or stop it when the cache is empty. */
+function schedule() {
+    let earliest = Infinity;
+    for (const scan of scans.values()) if (scan.expiresAt < earliest) earliest = scan.expiresAt;
+    if (expiry?.at === earliest) return;
+    if (expiry) clearTimeout(expiry.timer as ReturnType<typeof setTimeout>);
+    expiry = undefined;
+    if (earliest === Infinity) return;
+    const timer: unknown = setTimeout(() => {
+        expiry = undefined;
+        sweep(Date.now());
+    }, Math.max(1, earliest - Date.now()));
+    // Never keep a Node process alive for the cache. Browsers return a number.
+    if (typeof timer === 'object' && timer !== null && 'unref' in timer && typeof timer.unref === 'function') timer.unref();
+    expiry = { at: earliest, timer };
+}
+
 function sweep(now: number) {
     for (const [id, scan] of scans) if (now >= scan.expiresAt) drop(id);
+    schedule();
 }
 const encoder = new TextEncoder();
 const cursorPattern = /^([0-9a-f-]{36})\.([1-9][0-9]{0,4})$/;
@@ -86,6 +111,7 @@ export function fileLister(handle: Handle, name: string, source: RefSource, sche
     /** Drop this view's scans, for example after its ref is deleted. */
     function release() {
         for (const [id, scan] of scans) if (scan.owner === owner) drop(id);
+        schedule();
     }
 
     async function list(request: WithoutAt<ListFilesRequest> = {}, options?: RequestOptions): Promise<ListFilesResult> {
@@ -206,6 +232,7 @@ export function fileLister(handle: Handle, name: string, source: RefSource, sche
                 drop(scans.keys().next().value!);
             scans.set(id, { owner, entries, limit, bytes: retainedBytes, expiresAt: Date.now() + ttlMs, lastIssuedOffset: limit, released });
             cachedBytes += retainedBytes;
+            schedule();
             result.next = next(`${id}.${limit}`);
         }
         return result;

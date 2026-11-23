@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
@@ -17,10 +18,11 @@ const lost = () => new Error('Response lost');
 /** Whether the target is collected once nothing but the weak reference can reach it. */
 async function collected(ref) {
     for (let attempt = 0; attempt < 50; attempt++) {
-        // deref keeps its target alive until the current job ends.
-        await new Promise(resolve => setTimeout(resolve, 2));
+        // deref keeps its target alive until the current job ends. setImmediate
+        // also works while a test replaces setTimeout with a mock clock.
+        await new Promise(resolve => setImmediate(resolve));
         gc();
-        await new Promise(resolve => setTimeout(resolve, 2));
+        await new Promise(resolve => setImmediate(resolve));
         if (ref.deref() === undefined) return true;
     }
     return false;
@@ -215,7 +217,10 @@ test('an operation in flight and an unexpired list cursor keep the same store re
         ({ next } = page);
     });
     assert(!await collected(ref), 'A store with a live list cursor was released.');
-    assert.deepEqual((await (await open(connection)).list(next)).files.map(file => file.path), ['/file-3']);
+    const reopened = await open(connection);
+    assert.deepEqual((await reopened.list(next)).files.map(file => file.path), ['/file-3']);
+    // Leave the process-wide cache empty for the tests that control its clock.
+    await reopened.deleteFork({ at: draft });
 });
 
 test('an idle lifecycle coordinator is released and an invalidated one is kept', async () => {
@@ -233,4 +238,63 @@ test('an idle lifecycle coordinator is released and an invalidated one is kept',
     ref.deref().reset();
     assert(await collected(ref));
     await assert.rejects(open({ client, name }), { code: 'STORE_NOT_FOUND' });
+});
+
+test('an expired list cursor is removed by the cache timer and frees its store and client', async t => {
+    const { fixture } = await setup();
+    await (await open({ client: fixture.client, name })).write({ at: draft,
+        operations: [1, 2, 3].map(n => ({ op: 'create', path: `/file-${n}`, content: '' })) });
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+    const held = { client: { ...fixture.client } };
+    const client = new WeakRef(held.client);
+    let next;
+    const ref = await scenario({ client: held.client, name }, async drive => {
+        ({ next } = await drive.list({ at: draft, limit: 2 }));
+    });
+    // Inside the window the dropped drive stays registered and continues its listing.
+    t.mock.timers.tick(4 * 60_000);
+    assert(!await collected(ref), 'A store with a live list cursor was released.');
+    await (async () => {
+        const reopened = await open({ client: held.client, name });
+        assert.equal(reopened, ref.deref());
+        assert.deepEqual((await reopened.list(next)).files.map(file => file.path), ['/file-3']);
+    })();
+    held.client = undefined;
+    assert(!await collected(client), 'The pinned store no longer reached its client.');
+    // At expiry the timer removes the scan with no further list call, and nothing
+    // in the process-wide cache reaches the store or its client any more.
+    const lists = fixture.calls.filter(call => call.kind === 'list').length;
+    t.mock.timers.tick(60_000);
+    assert(await collected(ref), 'An expired list cursor kept its store.');
+    assert(await collected(client), 'An expired list cursor kept its client.');
+    assert.equal(fixture.calls.filter(call => call.kind === 'list').length, lists);
+});
+
+test('deleting a fork drops its list cursors and releases the store at once', async () => {
+    const { connection } = await setup();
+    const ref = await scenario(connection, async drive => {
+        await drive.write({ at: draft, operations: [1, 2].map(n => ({ op: 'create', path: `/file-${n}`, content: '' })) });
+        assert((await drive.list({ at: draft, limit: 1 })).next);
+        await drive.deleteFork({ at: draft });
+    });
+    assert(await collected(ref), 'A deleted fork\'s list cursor kept its store.');
+});
+
+test('the list cache timer does not keep a process alive', () => {
+    const sdk = new URL('../dist/esm/index.js', import.meta.url).href;
+    const helper = new URL('./helpers/file-client.mjs', import.meta.url).href;
+    const script = `
+        import { create } from ${JSON.stringify(sdk)};
+        import { fileClient } from ${JSON.stringify(helper)};
+        const drive = await create({ client: fileClient().client, name: 'unref-store' });
+        const { at } = await drive.fork({ name: 'draft' });
+        await drive.write({ at, operations: [1, 2].map(n => ({ op: 'create', path: '/file-' + n, content: '' })) });
+        if (!(await drive.list({ at, limit: 1 })).next) throw new Error('No continuation was cached.');
+        console.log('listed');`;
+    const started = Date.now();
+    // A referenced five-minute timer would hold the child until this timeout kills it.
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 30_000 });
+    assert.equal(result.status, 0, result.stderr || `signal ${result.signal}`);
+    assert.equal(result.stdout.trim(), 'listed');
+    assert(Date.now() - started < 20_000);
 });
