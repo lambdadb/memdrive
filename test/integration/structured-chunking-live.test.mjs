@@ -28,6 +28,16 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
     let phase = 'create store';
     try {
         const main = await MemDrive.create({ client, name, chunker }, options());
+        phase = 'verify default retention settings';
+        const settings = async () => {
+            const { collection } = await client.collection(name).get(options());
+            assert(collection.description.startsWith('memdrive-config-v1:'));
+            return { native: collection.snapshotRetentionInDays,
+                window: JSON.parse(collection.description.slice('memdrive-config-v1:'.length)).retentionInDays };
+        };
+        // Native snapshot retention stays at its minimum; the SDK window is separate.
+        assert.deepEqual(await settings(), { native: 1, window: 30 });
+        assert.equal((await main.describe(options())).retentionInDays, 30);
         phase = 'create working fork';
         const { at } = await main.fork({ name: 'draft' }, options());
         assert.deepEqual(at, { kind: 'fork', name: 'draft' });
@@ -80,7 +90,6 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
             await assert.rejects(main.fork({ ...(source ? { at: source } : {}), name: 'removed-time', asOf: new Date().toISOString() }, options()), { code: 'INVALID_INPUT' });
 
         phase = 'prepare aged retention fixture';
-        await main.configure({ retentionInDays: 1 }, options());
         const { collection } = await client.collection(name).get(options());
         const driveId = createHash('sha256').update(JSON.stringify([name, collection.projectName, collection.createdAt.toISOString()])).digest('hex');
         const journal = client.collection(`md-journal-${driveId.slice(0, 40)}`);
@@ -93,18 +102,34 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
         assert.equal(completion.status, 'published');
         assert.equal(completion.version, 'v1');
         // Age only timestamps in this owned synthetic fixture. This validates
-        // the real cleanup path without pretending a day elapsed in real time.
+        // the real cleanup path without pretending days elapsed in real time.
         const aged = Date.now() - 2 * 86_400_000;
         await journal.docs.update({ branch: 'main', docs: [
             { id: 'reservation:1', startedAt: new Date(aged - 1000).toISOString() },
             { id: 'completion:1', completedAt: new Date(aged).toISOString() },
         ] }, options());
+        const reservation = (await journal.docs.fetch({ ...ref, ids: ['reservation:1'] }, options())).docs[0].doc;
+        assert(reservation.sourceTag.startsWith('merge-capture-'));
+        const capturePresent = async () => {
+            try { await client.collection(name).tags.get(reservation.sourceTag, options()); return true; }
+            catch (error) {
+                if ((error.status ?? error.statusCode) !== 404) throw error;
+                return false;
+            }
+        };
         const retentionClient = new LambdaDBClient(connection);
         const retentionMain = await MemDrive.open({ client: retentionClient, name }, options());
         const history = await retentionMain.history({}, options());
-        const reservation = (await journal.docs.fetch({ ...ref, ids: ['reservation:1'] }, options())).docs[0].doc;
-        assert(reservation.sourceTag.startsWith('merge-capture-'));
         assert.equal('pruneHistory' in retentionMain, false);
+        phase = 'retain capture within the default SDK window';
+        // Two days exceeds one-day native retention but not the 30-day SDK window.
+        assert.equal((await retentionMain.merge({ at, requestId: 'publish-structured', summary: 'Publish synthetic structured note' }, options())).version, 'v1');
+        assert(await capturePresent(), 'A capture inside the SDK window was released.');
+        phase = 'configure one-day SDK window';
+        assert.equal((await retentionMain.configure({ retentionInDays: 1 }, options())).retentionInDays, 1);
+        assert.deepEqual(await settings(), { native: 1, window: 1 });
+        const observer = await MemDrive.open({ client: new LambdaDBClient(connection), name }, options());
+        assert.equal((await observer.describe(options())).retentionInDays, 1);
         phase = 'automatic retention after merge replay';
         assert.equal(await MemDrive.open({ client: retentionClient, name }, options()), retentionMain);
         // Each automatic pass is best effort and has a short budget. A later
@@ -112,11 +137,7 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
         let removed = false;
         for (let attempt = 0; attempt < 5 && !removed; attempt++) {
             assert.equal((await retentionMain.merge({ at, requestId: 'publish-structured', summary: 'Publish synthetic structured note' }, options())).version, 'v1');
-            try { await client.collection(name).tags.get(reservation.sourceTag, options()); }
-            catch (error) {
-                if ((error.status ?? error.statusCode) !== 404) throw error;
-                removed = true;
-            }
+            removed = !await capturePresent();
         }
         assert(removed, 'Automatic retention did not remove the expired capture within five merge replays.');
         assert.deepEqual(await retentionMain.history({}, options()), history);

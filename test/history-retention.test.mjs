@@ -36,9 +36,9 @@ async function reopen(fixture, mode = 'managed') {
 const replay = draft => draft.merge({ requestId: 'first', summary: 'Create note' });
 const deletions = fixture => fixture.calls.filter(call => call.kind === 'tag-delete');
 
-async function setup(external = false) {
+async function setup(external = false, retention = { retentionInDays: 1 }) {
     const fixture = fileClient();
-    const main = await create({ client: fixture.client, name: 'pruning-store', retentionInDays: 1,
+    const main = await create({ client: fixture.client, name: 'pruning-store', ...retention,
         ...(external ? { embedding: { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'fixture' } } : {}) });
     const draft = await fork(main, { name: 'draft' });
     const content = n => external ? new Array(64).fill(n) : `Revision ${n}`;
@@ -92,19 +92,40 @@ test('new publication cleans old captures only after its own bookkeeping complet
     assert(fixture.collections.get('pruning-store').tags.has('md-main-v3')); // Just superseded.
 });
 
-test('supersession timing and fresh native retention determine eligibility', async () => {
+test('supersession timing and the freshly read SDK window determine eligibility', async () => {
     const { fixture } = await setup();
     age(fixture, [20, 10, 0]);
     const { main, draft } = await reopen(fixture);
     await main.configure({ retentionInDays: 31 });
     await replay(draft);
     assert.equal(deletions(fixture).length, 0);
-    fixture.collections.get('pruning-store').metadata.snapshotRetentionInDays = 1;
+    // Another client shortens the window; the next pass rereads it.
+    await (await reopen(fixture)).main.configure({ retentionInDays: 1 });
     await replay(draft);
     const tags = fixture.collections.get('pruning-store').tags;
     assert(!tags.has('md-main-v1'));
     assert(tags.has('md-main-v2'));
     assert(tags.has('md-main-v3'));
+});
+
+test('the SDK window, not one-day native retention, selects expired internal refs in both embedding modes', async () => {
+    for (const external of [false, true]) {
+        const { fixture, records } = await setup(external, {}); // Default 30-day window.
+        assert.equal(fixture.collections.get('pruning-store').metadata.snapshotRetentionInDays, 1);
+        age(fixture, [40, 31, 2]);
+        const { main, draft } = await reopen(fixture, external ? 'external' : 'managed');
+        assert.equal((await main.describe()).retentionInDays, 30);
+        const before = await main.history();
+        await replay(draft);
+        // v1 was superseded 31 days ago; v2 only 2 days ago. Captures age from completion.
+        const tags = fixture.collections.get('pruning-store').tags;
+        assert.equal(deletions(fixture).length, 3);
+        assert(!tags.has('md-main-v1'));
+        assert(tags.has('md-main-v2') && tags.has('md-main-v3') && tags.has('checkpoint-saved'));
+        assert(!tags.has(records.get('reservation:1').sourceTag) && !tags.has(records.get('reservation:2').sourceTag));
+        assert(tags.has(records.get('reservation:3').sourceTag));
+        assert.deepEqual(await main.history(), before);
+    }
 });
 
 test('external stores retain history without loading vectors after cleanup', async () => {
@@ -187,14 +208,18 @@ test('partial and unknown deletes preserve merge success and retry across client
     assert.deepEqual(await fresh.main.history(), before);
 });
 
-test('missing retention, replaced generation and cancellation skip cleanup', async () => {
+test('missing or invalid retention, replaced generation and cancellation skip cleanup', async () => {
     const { fixture } = await setup();
     const { draft } = await reopen(fixture);
     const metadata = fixture.collections.get('pruning-store').metadata;
-    delete metadata.snapshotRetentionInDays;
-    await replay(draft);
-    assert.equal(deletions(fixture).length, 0);
-    metadata.snapshotRetentionInDays = 1;
+    const configured = metadata.description;
+    for (const description of ['memdrive-config-v1:{"chunking":{"strategy":"auto"}}',
+        'memdrive-config-v1:{"chunking":{"strategy":"auto"},"retentionInDays":0}']) {
+        metadata.description = description;
+        await replay(draft);
+        assert.equal(deletions(fixture).length, 0);
+    }
+    metadata.description = configured;
     metadata.createdAt = new Date(9000);
     await replay(draft);
     assert.equal(deletions(fixture).length, 0);

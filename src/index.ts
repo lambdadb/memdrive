@@ -2,7 +2,7 @@ import type { CheckpointAt, ConnectionOptions, CreateExternalFileStoreOptions, C
     FileHistoryRequest, FileStoreDescription, FindTextRequest, ForkAt, ListFilesRequest, OpenFileStoreOptions, ReadFileRequest, ReadFilesRequest, RequestOptions, SearchExternalFilesRequest,
     SearchFilesRequest, WriteFileRequest, CreateExternalFileRequest, UpdateExternalFileRequest } from './types.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
-import { formatTag, isObject, keysOnly, parseStore, storeConfiguration, validRetention } from './config.js';
+import { formatTag, isObject, keysOnly, minimumNativeRetention, parseStore, settingsDescription, storeConfiguration, storeSettings, validRetention } from './config.js';
 import { contentHash, decodeFile, decodeFileEntry, resultDocs, validFileId, validPath } from './records.js';
 import { branchRef, fetchOriginals, pathQuery, pinRef, readRef, viewRead, type Handle, type RefSource, type WithoutAt } from './storage-reads.js';
 import { workingWriter, writeBatchLimit } from './writes.js';
@@ -493,7 +493,8 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         async configure(request: { retentionInDays: number }, options?: RequestOptions) {
             const { signal } = operationOptions(options);
             checkAbort(signal);
-            requireInput(keysOnly(request, ['retentionInDays']) && validRetention(request.retentionInDays), 'Configure requires retentionInDays from 1–31.');
+            requireInput(keysOnly(request, ['retentionInDays']) && validRetention(request.retentionInDays),
+                'Configure requires retentionInDays as an integer from 1 to 365.');
             const days = request.retentionInDays;
             return gate.exclusive(async () => {
                 assertLive();
@@ -501,26 +502,32 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
                     throw new MemDriveError('CONFIGURATION_UNCONFIRMED', 'Fence outstanding requests and retry the same retention value first.');
                 const inspect = async () => {
                     const response = await remote(() => handle.get(nativeOptions(signal)), 'Could not inspect retention configuration.', signal);
-                    const found = parseStore(response.collection, name);
+                    parseStore(response.collection, name);
                     if ((await publicationIdentity(name, response.collection)).driveId !== identity.driveId) {
                         invalid = true;
                         throw new MemDriveError('STORE_REPLACED', 'This handle belongs to a previous store generation.');
                     }
-                    return found;
+                    return storeSettings(response.collection);
                 };
+                // The SDK window lives in the store settings; native snapshot
+                // retention stays at its minimum. One update restores both.
+                const applied = (found: ReturnType<typeof storeSettings>) =>
+                    found.retentionInDays === days && found.nativeRetentionInDays === minimumNativeRetention;
                 let found = await inspect();
-                if (found.retentionInDays !== days) {
+                if (!applied(found)) {
                     pendingRetention = days;
+                    const update = { description: settingsDescription({ chunking: found.chunking, retentionInDays: days }),
+                        snapshotRetentionInDays: minimumNativeRetention };
                     try {
-                        await nativeRequest(() => handle.update({ snapshotRetentionInDays: days }, mutationOptions(signal)), signal);
+                        await nativeRequest(() => handle.update(update, mutationOptions(signal)), signal);
                     } catch (cause) {
-                        const error = databaseError(cause, 'Could not configure snapshot retention.');
+                        const error = databaseError(cause, 'Could not configure retention.');
                         if ([400, 401, 403, 404, 409, 422, 429].includes(error.status ?? 0)) { pendingRetention = undefined; throw error; }
                         throw new MemDriveError('CONFIGURATION_UNCONFIRMED', 'Retention configuration may have succeeded. Fence outstanding requests before retrying the same value.', { cause });
                     }
                     try {
                         found = await inspect();
-                        if (found.retentionInDays !== days) throw new MemDriveError('INVALID_RESULT', 'The configured retention was not observed.');
+                        if (!applied(found)) throw new MemDriveError('INVALID_RESULT', 'The configured retention was not observed.');
                     } catch (cause) {
                         throw new MemDriveError('CONFIGURATION_UNCONFIRMED', 'Could not confirm retention configuration. Fence outstanding requests before retrying the same value.', { cause });
                     }
@@ -563,11 +570,10 @@ export async function create(options: CreateFileStoreOptions | CreateExternalFil
         requireInput(typeof client.createCollection === 'function', 'Client must support collection creation.');
         const { indexConfigs, tags, description, collectionDescription } = storeConfiguration(options);
         if ('chunking' in description && description.chunking) textChunker(description.chunking, options.chunker, true);
-        const response = await remote(() => client.createCollection({ collectionName: name, indexConfigs, tags, ...(options.retentionInDays === undefined ? {} : { snapshotRetentionInDays: options.retentionInDays }),
-            ...(collectionDescription === undefined ? {} : { description: collectionDescription }) },
+        const response = await remote(() => client.createCollection({ collectionName: name, indexConfigs, tags,
+            snapshotRetentionInDays: minimumNativeRetention, description: collectionDescription },
             nativeOptions(signal)), 'Could not create the file store.', signal, { 409: 'STORE_EXISTS' });
         checkAbort(signal);
-        if (validRetention(response.collection?.snapshotRetentionInDays)) description.retentionInDays = response.collection.snapshotRetentionInDays;
         const stores = storesFor(client);
         const identity = await publicationIdentity(name, response.collection);
         checkAbort(signal);

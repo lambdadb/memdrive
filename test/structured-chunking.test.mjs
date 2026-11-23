@@ -118,7 +118,7 @@ test('configuration is persisted, unsupported explicit formats fail, and legacy 
     await main.fork({ name: 'draft' });
     await assert.rejects(main.write({ at, op: 'create', path: '/opaque.json', content: '{}' }), { code: 'UNSUPPORTED_FORMAT' });
     const legacy = fixture.collections.get('configured').metadata;
-    delete legacy.description;
+    legacy.description = 'memdrive-config-v1:{"retentionInDays":30}';
     delete legacy.indexConfigs.embeddingText;
     legacy.indexConfigs.embedding.embedding.sourceField = 'content';
     const old = await open({ client: { ...fixture.client }, name: 'configured' });

@@ -38,9 +38,11 @@ publication against the real backend. It publishes a later revision, then create
 main refs by exact publication version and forks an explicit saved checkpoint,
 verifying their earlier originals before
 destroying its isolated store and journal.
-It also ages timestamps in that isolated synthetic journal to exercise internal
-automatic capture cleanup after merge replay, retained history and checkpoint reads. It does
-not wait a real retention period or measure physical GC.
+It checks that the store keeps native snapshot retention at one day with the
+default 30-day SDK window, then ages timestamps in that isolated synthetic journal.
+A capture inside the window survives merge replay; after configuring a one-day
+window, replay automatically releases it while retained history and checkpoint
+reads remain. It does not wait a real retention period or measure physical GC.
 
 The shared file-tool catalog also lives at the package root. Keep tools one-to-one
 with public SDK operations, one fixed schema set per embedding mode and the
@@ -49,12 +51,18 @@ results, including fork/checkpoint creation, come unchanged from the public SDK.
 Schemas describe JSON input while SDK validation enforces semantic constraints.
 Schema tests use Ajv only as a development dependency. Keep guide
 text independent of host authentication, product policy and provider adapters.
+Change the shared guide `version` only in release pull requests, not for each
+development change. Development builds are identified by their package version
+and `memdriveSourceCommit`, and evaluations record the exact guide text. The
+first release containing the file-SDK guide resets its version to `1`; until
+that release pull request, the current unreleased value stays unchanged.
 The installed-package check exercises the tool workflow, authorization boundary
 and store/ref lifecycle, including partial deletion recovery, as well as ESM,
 CommonJS, TypeScript and browser imports.
 The installed core package also runs history-retention regressions covering
 protected refs, supersession timing, bounded archives, terminal outcomes and
-uncertain or partial cleanup, cancellation and read concurrency. Public type checks
+uncertain or partial cleanup, cancellation and read concurrency, and the SDK window
+kept separate from one-day native retention. Public type checks
 verify that retention needs no separate cleanup API. Historical-ref regressions
 cover exact publication versions, unpublished or expired versions, preserved merge baselines,
 external vectors, uncertain creation and source-dependent version schemas.

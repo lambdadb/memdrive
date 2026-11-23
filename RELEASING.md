@@ -52,6 +52,12 @@ an identical previously published archive, or a dev version below the current
 and release tags are immutable; fixes require a new dev, RC or stable version.
 Prerelease publication preserves the existing `latest` pointer.
 
+The shared tool guide `version` changes only in release pull requests, not for
+each development change. Development builds are identified by their package
+version and `memdriveSourceCommit`, and evaluations record the exact guide text.
+The first release containing the file-SDK guide resets the guide version to `1`;
+the current unreleased value stays until that release pull request.
+
 ## Release cycle
 
 1. Open a release pull request targeting `main` with the intended version and
@@ -131,12 +137,16 @@ immediate checkpoint creation after a first write remains a separate backend
 readiness check. Failure output names the stage and HTTP status without request
 headers or bodies.
 
-That isolated structured scenario also configures one-day retention and ages
-only its synthetic reservation/completion timestamps. Replaying the completed
-merge automatically releases its expired capture; the test verifies tag absence,
-retained history, main and checkpoint reads, and another successful replay. This tests the native cleanup path without waiting a real
-day. Superseded-main selection and failure recovery have fixture coverage;
-neither check measures physical GC after tag removal.
+That isolated structured scenario verifies that native snapshot retention is
+one day and the default SDK history window of 30 days is read back. It ages only
+its synthetic reservation/completion timestamps by two days. A merge replay
+keeps the capture inside the 30-day window. After configuring a one-day window,
+which leaves native retention at one day, replaying the completed merge
+automatically releases the expired capture; the test verifies tag absence,
+retained history, main and checkpoint reads, and another successful replay. This
+tests the native cleanup path without waiting a real day. Superseded-main
+selection and failure recovery have fixture coverage; neither
+check measures physical GC after tag removal.
 
 ## GitHub and npm configuration
 

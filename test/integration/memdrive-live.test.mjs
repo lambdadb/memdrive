@@ -42,7 +42,9 @@ test('live file store writes, searches, lists and reopens a fresh fork with veri
         await assert.rejects(main.write({ op: 'create', path: '/main.txt', content: '' }, options()), { code: 'INVALID_INPUT' });
         await assert.rejects(main.diff({ at: { kind: 'main' } }, options()), { code: 'INVALID_INPUT' });
         assert.equal((await main.configure({ retentionInDays: 7 }, options())).retentionInDays, 7);
-        assert.equal((await client.collection(name).get(options())).collection.snapshotRetentionInDays, 7);
+        // The SDK window is store configuration; native snapshot retention stays at one day.
+        assert.equal((await client.collection(name).get(options())).collection.snapshotRetentionInDays, 1);
+        assert.equal((await (await MemDrive.open({ client: new LambdaDBClient(connection), name }, options())).describe(options())).retentionInDays, 7);
         await assert.rejects(main.status({ at: { kind: 'checkpoint', name: 'never-created' } }, options()),
             { code: 'CHECKPOINT_NOT_FOUND', status: 404 });
         assert.deepEqual(await main.list({}, options()), { files: [], prefixes: [], consistency: 'eventual' });

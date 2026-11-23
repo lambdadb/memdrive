@@ -81,43 +81,54 @@ await drive.configure({ retentionInDays: 14 });
 console.log((await drive.describe()).retentionInDays);
 ```
 
-`retentionInDays` accepts integers from 1 through 31 and maps to LambdaDB's
-`snapshotRetentionInDays`. Omitting it on creation uses the native default.
-The description reports the last observed setting when native metadata supplies
-it. `configure` is a store-level drive method in both embedding modes. It verifies the
-store generation and confirms the setting with a read; repeated confirmed values
-do not send an update. Other clients should reopen to observe configuration
-changes. Coordinate configuration through the same exclusive host ownership
-used for lifecycle operations.
+`retentionInDays` is the SDK history window for MemDrive's internal main
+version tags and completed merge captures. It accepts integers from 1 through
+365 and defaults to 30 days when omitted on creation. The window is stored in
+the store's SDK configuration (the native collection description) and applies
+in both embedding modes.
+
+The SDK keeps LambdaDB's native `snapshotRetentionInDays` at its one-day
+minimum and does not expose it. Native retention only bounds how long deleted or
+superseded data stays readable through untagged snapshots. Explicit forks and
+named checkpoints never expire automatically; they stay until you delete them.
+`history()` summaries and request identities also remain available. Expiry
+removes old internal tags, not data directly.
+
+`describe()` reports the store's window. `configure` is a store-level drive
+method in both embedding modes. In one native update it writes the SDK window
+and sets native retention to one day. It verifies the store generation and
+confirms both settings with a read; repeated confirmed values do not send an
+update. `open` only reads the configuration, and a collection without a valid
+window is not a compatible store. Other clients should reopen to observe
+configuration changes, although automatic cleanup always reads the current
+window. Coordinate configuration through the same exclusive host ownership used
+for lifecycle operations.
 
 Configuration updates disable automatic retries. `CONFIGURATION_UNCONFIRMED`
 blocks a different retention value and resource deletion on that client. After
 the host fences outstanding requests, retry the same value to reconcile it.
-The SDK also applies the observed setting to old published content and completed
-merge captures automatically. User forks and named checkpoints never expire
-automatically, and `history()` summaries and request identities remain available.
 
 After a terminal merge result, including a completed-request replay or an
 unchanged merge, the SDK checks retention inside the serialized merge queue.
 It also checks after explicit recovery finishes outstanding work. A superseded
-main version becomes eligible after the retention period measured from the next
+main version becomes eligible after the window measured from the next
 publication; a merge capture ages from its terminal outcome. The current main,
 initial view, fork baselines and unfinished recovery remain protected.
 
 Cleanup is best effort: each pass selects at most 100 expired refs and has a
 five-second abort budget within the caller's deadline. It confirms retained
 summaries before removing any selected ref. Failure, cancellation, unavailable
-retention metadata or a busy local client defers work to a later merge without
+retention configuration or a busy local client defers work to a later merge without
 changing its durable result. There is no cleanup API, background timer or
 scheduler to configure. No merge activity means cleanup can be delayed; the
-retention setting is not an exact physical deletion deadline. Raising retention
-does not restore already released versions.
+window is not an exact deletion deadline. Raising it does not restore already
+released versions.
 
 The existing exclusive host-owned merge/recovery queue also owns cleanup.
 Keep clocks accurate and fence former owners and their outstanding mutations
 before takeover or lifecycle operations. Other clients can keep reading current
 main or explicit refs; use a checkpoint for work that must retain a selected
-version beyond its retention period. List cursors expire within five minutes, well before the minimum retention window;
+version beyond the window. List cursors expire within five minutes, well before the minimum retention window;
 findText and history cursors become unavailable once their pinned version is released. Before adopting automatic cleanup,
 upgrade all history readers to support retained summaries (`0.1.1-dev.21` or
 later); earlier readers require the old captures.
