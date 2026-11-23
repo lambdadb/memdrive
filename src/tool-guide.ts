@@ -1,6 +1,6 @@
 /** Shared text for the guide tool and host-provided resources. No drive reads are needed. */
 export const fileToolGuide = Object.freeze({
-    version: '4',
+    version: '5',
     content: `# Using MemDrive file tools
 
 The host binds these tools to one authorized drive and view. Tool arguments cannot switch that binding. Use only tools the host offers. If fork is enabled, create a working fork when needed; the host must authorize and bind its tools to that returned view before you can edit it. Authentication, permissions, save policy and coordination belong to the host.
@@ -10,6 +10,10 @@ The host binds these tools to one authorized drive and view. Tool arguments cann
 Start with status and list. status identifies the selected main, fork or checkpoint and the current published main version. A checkpoint's mainVersion is the store's current publication, not the version represented by the checkpoint. Working edits do not advance mainVersion. history shows store-wide main publications, including when called on a fork or checkpoint.
 
 Use search for ranked candidates and read for originals. To bound text output, give read a startLine/endLine range (one-based, inclusive) or maxChars (2–64000 UTF-16 units, default 16000 for ranged reads). A range page includes totalLines, source offsets, revision and an optional next request. Pass next unchanged to continue, including within a long line. READ_VERSION_CHANGED means the original changed; restart without offset and revision. Ranges preserve line endings and do not silently truncate. Full-file and batch reads remain available. In text mode, search returns chunk hits, not an exhaustive inventory or necessarily one hit per file. Its limit defaults to 10 and permits 1–1000. In external-vector mode, queries are vectors and results are file references; the host retrieves their content. findText is available only in text mode and verifies case-insensitive literal occurrences in originals, including across chunk boundaries. Its limit defaults to 20 and permits 1–100.
+
+Choose text search mode by intent: semantic (default) for natural-language meaning and paraphrases, keyword for focused names, identifiers or terms, and hybrid only when you deliberately want both signals. For example, use semantic for "how we preserve work before editing" and keyword for "checkpoint conflict". Keyword search analyzes terms; it does not guarantee literal occurrences or interpret query syntax. Use findText for an exact string such as "CHECKPOINT_CONFLICT". Do not send an entire conversation as a keyword query. Retrieval does not automatically switch modes.
+
+Rerank defaults to false in every text search mode. Enable it explicitly only when additional model scoring of the retrieved candidates is worth the inference cost and latency; it cannot recover evidence outside the retrieved candidate pool. An optional embeddingQuery replaces the embedding and enabled reranking input, while hybrid still uses query for keyword matching. In keyword mode, embeddingQuery requires reranking and is used only for that scoring, without query embedding. Reranking errors fail the request unless onFailure is explicitly returnOriginal; that fallback preserves the selected retrieval mode and reports reranked: false. External-vector search has no mode, embeddingQuery or rerank options.
 
 For an inventory, call list without a delimiter and follow every cursor. list defaults to 100 entries and permits 1–1000. It is an eventual preview: its first scan can miss fresh writes or mix concurrent observations, and continuations reuse that scan. Narrow the prefix if LIST_SCAN_LIMIT occurs. A delimiter groups prefixes; it does not list every descendant file. File IDs remain stable across path changes.
 

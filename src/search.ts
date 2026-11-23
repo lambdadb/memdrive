@@ -23,12 +23,15 @@ function recordFilters(kind: 'chunk' | 'file', filter: FileFilter | undefined, s
 }
 
 export function searchQuery(request: SearchFilesRequest | SearchExternalFilesRequest, schema: MetadataSchema): QueryCollectionInput {
-    requireInput(keysOnly(request, ['query', 'embeddingQuery', 'limit', 'rerank', 'filter']) && usableQuery(request.query),
+    requireInput(keysOnly(request, ['query', 'mode', 'embeddingQuery', 'limit', 'rerank', 'filter']) && usableQuery(request.query),
         'Search requires a nonblank query of at most 8192 UTF-8 bytes.');
-    const { query, embeddingQuery = query, limit = 10, rerank = true, filter } = request;
+    const { query, mode = 'semantic', embeddingQuery = query, limit = 10, rerank = false, filter } = request;
+    requireInput(mode === 'semantic' || mode === 'keyword' || mode === 'hybrid', 'Search mode must be semantic, keyword or hybrid.');
     requireInput(usableQuery(embeddingQuery), 'Embedding query must be nonblank text of at most 8192 UTF-8 bytes.');
     requireInput(Number.isSafeInteger(limit) && limit >= 1 && limit <= 1000, 'Search limit must be 1–1000.');
     requireInput(typeof rerank === 'boolean' || keysOnly(rerank, ['fields', 'onFailure']), 'Invalid reranking options.');
+    requireInput(mode !== 'keyword' || rerank !== false || request.embeddingQuery === undefined,
+        'Keyword search uses embeddingQuery only for reranking. Omit embeddingQuery or enable rerank.');
     const fields = typeof rerank === 'boolean' ? ['content'] : rerank.fields === undefined ? ['content'] : rerank.fields;
     const onFailure = typeof rerank === 'boolean' ? 'error' : rerank.onFailure === undefined ? 'error' : rerank.onFailure;
     requireInput(Array.isArray(fields) && fields.length >= 1 && fields.length <= 8 && new Set(fields).size === fields.length
@@ -38,16 +41,15 @@ export function searchQuery(request: SearchFilesRequest | SearchExternalFilesReq
     requireInput(onFailure === 'error' || onFailure === 'returnOriginal', 'Invalid reranking failure policy.');
     const candidates = Math.max(200, limit);
     const filters = recordFilters('chunk', filter, schema);
+    const semantic = { knn: { field: 'embedding', queryText: embeddingQuery, k: candidates, filter: filters.knn } };
+    const keyword = { bool: [
+        ...filters.clauses,
+        { queryString: { query, defaultField: 'content', skipSyntax: true }, occur: 'must' },
+    ] };
     return {
         size: limit,
-        query: { bayesian: [
-            { knn: { field: 'embedding', queryText: embeddingQuery, k: candidates, filter: filters.knn } },
-            { bool: [
-                ...filters.clauses,
-                { queryString: { query, defaultField: 'content', skipSyntax: true }, occur: 'must' },
-            ] },
-        ] },
-        ...(rerank === false ? { candidateSize: candidates }
+        query: mode === 'semantic' ? semantic : mode === 'keyword' ? keyword : { bayesian: [semantic, keyword] },
+        ...(rerank === false ? mode === 'hybrid' ? { candidateSize: candidates } : {}
             : { rerank: { ...reranker, queryText: embeddingQuery, fields: [...fields], candidateSize: candidates, onFailure } }),
     };
 }

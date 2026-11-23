@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Default text search to semantic retrieval without reranking. Add explicit keyword and hybrid modes with independent reranking, preserve external-vector search, and explain mode selection in shared tools and guide version 5. LongMemEval and BEAM explicitly retain hybrid retrieval.
+
 - Replace prerelease `asOf` ref selection with optional `version` on main fork/checkpoint creation. Select exact completed publications, reject version selectors on working forks/checkpoints and reject `asOf` everywhere. Preserve explicit checkpoint workflows and missing-history errors; update public types, bound tool schemas and guide version 4.
 
 - Automatically enforce configured retention after terminal merges and completed recovery, preserving explicit forks/checkpoints, current main, bounded history summaries and request replay. Cleanup is bounded and best effort; remove the prerelease-only public pruning API.

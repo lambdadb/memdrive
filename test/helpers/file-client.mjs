@@ -101,7 +101,8 @@ export function fileClient() {
                 async query(request, options) {
                     calls.push({ kind: 'query', request: structuredClone(request) });
                     const source = [...sourceDocs(request.ref).values()];
-                    if (request.query.bayesian) {
+                    if (request.query.bayesian || request.query.knn?.queryText !== undefined
+                        || request.query.bool?.some(clause => clause.queryString?.defaultField === 'content')) {
                         const candidates = source.filter(doc => doc.kind === 'chunk');
                         const docs = (fixture.rank?.(candidates, request) ?? candidates).slice(0, request.size);
                         const native = response(docs, request.fields);

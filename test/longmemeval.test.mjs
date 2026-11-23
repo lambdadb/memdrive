@@ -96,7 +96,7 @@ test('the collector preserves opaque Responses state and rejects incomplete resp
 test('file tool input validation stays local and forwards cancellation to the SDK', async () => {
     const controller = new AbortController();
     const drive = { search: async (request, { signal }) => {
-        assert.deepEqual(request, { query: 'key', limit: 1, rerank: true });
+        assert.deepEqual(request, { query: 'key', mode: 'hybrid', limit: 1, rerank: true });
         assert.equal(signal, controller.signal);
         return { hits: [], reranked: false };
     } };

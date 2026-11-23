@@ -108,20 +108,24 @@ test('live file store writes, searches, lists and reopens a fresh fork with veri
         assert.equal(empty.content, '');
         await assert.rejects(reopened.write({ op: 'create', path, content: 'Duplicate' }, options()), { code: 'PATH_EXISTS' });
         assert.equal(await main.read({ fileId: original.fileId }, options()), null);
-        const ranked = await reopened.search({ query: 'synthetic note', limit: 4 }, options());
-        assert.equal(ranked.reranked, true);
-        assert.deepEqual(ranked.hits, [{ ...original, range: { start: 0, end: content.length } }]);
-        const fused = await reopened.search({ query: 'synthetic note', limit: 4, rerank: false }, options());
-        assert.equal(fused.reranked, false);
-        assert.deepEqual(fused.hits, ranked.hits);
+        const semantic = await reopened.search({ query: 'synthetic note', limit: 4 }, options());
+        assert.equal(semantic.reranked, false);
+        assert.deepEqual(semantic.hits, [{ ...original, range: { start: 0, end: content.length } }]);
+        for (const mode of ['semantic', 'keyword', 'hybrid']) {
+            for (const rerank of [false, true]) {
+                const result = await reopened.search({ query: 'synthetic note', mode, rerank, limit: 4 }, options());
+                assert.equal(result.reranked, rerank);
+                assert.deepEqual(result.hits, semantic.hits);
+            }
+        }
 
         const topic = value => ({ field: 'metadata.topic', op: 'eq', value });
         const distractor = await reopened.write({
             op: 'create', path: '/unmatched.txt', content, metadata: { topic: 'unmatched' },
         }, options());
-        const filtered = await reopened.search({ query: 'synthetic note', filter: topic('synthetic'), limit: 1 }, options());
+        const filtered = await reopened.search({ query: 'synthetic note', mode: 'keyword', rerank: true, embeddingQuery: 'synthetic note', filter: topic('synthetic'), limit: 1 }, options());
         assert.equal(filtered.reranked, true);
-        assert.deepEqual(filtered.hits, ranked.hits);
+        assert.deepEqual(filtered.hits, semantic.hits);
         const unmatched = await reopened.search({
             query: 'synthetic note', filter: topic('unmatched'), rerank: false,
         }, options());

@@ -95,6 +95,7 @@ test('external inputs and incompatible modes fail before dispatch', async () => 
     await assert.rejects(work.write({ op: 'create', path: '/bad', content: 'text' }), { code: 'INVALID_INPUT' });
     await assert.rejects(work.write({ op: 'update', fileId: file.fileId, edits: [] }), { code: 'INVALID_INPUT' });
     await assert.rejects(work.search({ query: 'text' }), { code: 'INVALID_INPUT' });
+    await assert.rejects(work.search({ query: vector(), mode: 'semantic' }), { code: 'INVALID_INPUT' });
     await assert.rejects(work.search({ query: vector(), rerank: false }), { code: 'INVALID_INPUT' });
     await assert.rejects(work.search({ query: vector(), filter: { field: 'metadata.undeclared', op: 'eq', value: 5 } }),
         { code: 'INVALID_INPUT' });

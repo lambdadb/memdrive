@@ -37,9 +37,15 @@ export function fileToolSchemas(external: boolean, main: boolean) {
     const remove = object({ op: { const: 'delete' }, fileId }, ['op', 'fileId']);
     const operation = { oneOf: [create, update, remove] };
     const batch = object({ operations: array(operation, 100) }, ['operations']);
-    const searchProperties = { query: external ? array({ type: 'number' }) : { type: 'string', minLength: 1 },
+    const searchProperties = { query: external ? array({ type: 'number' }) : { type: 'string', minLength: 1,
+        description: 'Describe what you need for semantic search. For keyword search, supply focused names, identifiers or terms; not a whole conversation. Keyword input is analyzed, not query syntax or an exact-match guarantee.' },
         filter: { $ref: '#/$defs/filter' }, limit: limit(1000),
-        ...(external ? {} : { embeddingQuery: { type: 'string', minLength: 1 }, rerank: { oneOf: [
+        ...(external ? {} : { mode: { enum: ['semantic', 'keyword', 'hybrid'], default: 'semantic',
+            description: 'semantic: meaning and paraphrases (default). keyword: known terms. hybrid: explicitly combine both signals. No automatic mode switching.' },
+        embeddingQuery: { type: 'string', minLength: 1,
+            description: 'Optional separate input for embeddings and enabled reranking; defaults to query. Hybrid keeps query for keyword matching. Keyword mode permits this only with rerank enabled and does not embed it.' },
+        rerank: { default: false,
+            description: 'Optional additional model scoring of retrieved candidates, independent of mode. Defaults to false. true or an options object enables it, adding inference cost and latency; it cannot recover evidence outside the retrieved candidate pool.', oneOf: [
             { type: 'boolean' }, object({ fields: { ...array(string, 8), uniqueItems: true },
                 onFailure: { enum: ['error', 'returnOriginal'] } }),
         ] } }) };
@@ -58,7 +64,10 @@ export function fileToolSchemas(external: boolean, main: boolean) {
             oneOf: [object({ fileId, ...ranges }, ['fileId']), object({ path, ...ranges }, ['path']),
                 object({ paths: { ...array(path, 100), uniqueItems: true } }, ['paths'])],
             ...(external ? {} : { dependencies: { offset: ['revision'] } }) },
-        search: { ...object(searchProperties, ['query']), $defs: { filter } },
+        search: { ...object(searchProperties, ['query']), $defs: { filter }, ...(external ? {} : {
+            if: { properties: { mode: { const: 'keyword' } }, required: ['mode', 'embeddingQuery'] },
+            then: { properties: { rerank: { not: { const: false } } }, required: ['rerank'] },
+        }) },
         findText: { ...continuation({ query: { type: 'string', minLength: 1 }, prefix: string,
             filter: { $ref: '#/$defs/filter' }, limit: limit(100) }, ['query']), $defs: { filter } },
         diff: object(),

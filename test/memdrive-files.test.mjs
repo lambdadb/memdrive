@@ -169,7 +169,7 @@ test('ranked hybrid search verifies UTF-16 ranges and omits orphan chunks', asyn
     const file = await fork.write({ ...request('/notes', text), metadata: { topic: 'fixture' } });
     fixture.rank = docs => [...docs].reverse();
 
-    const result = await fork.search({ query: 'literal:*?', embeddingQuery: 'Semantic context', limit: 3,
+    const result = await fork.search({ query: 'literal:*?', mode: 'hybrid', embeddingQuery: 'Semantic context', limit: 3,
         rerank: { fields: ['content', 'metadata.topic'], onFailure: 'returnOriginal' } });
     assert.equal(result.reranked, true);
     assert.equal(result.hits.length, 2);
@@ -188,7 +188,7 @@ test('ranked hybrid search verifies UTF-16 ranges and omits orphan chunks', asyn
         { field: 'metadata.topic', op: 'eq', value: 'fixture' },
         { field: 'metadata.topic', op: 'exists', value: true },
     ] };
-    await fork.search({ query: 'notes', filter });
+    await fork.search({ query: 'notes', mode: 'hybrid', rerank: true, filter });
     const filtered = fixture.calls.findLast(call => call.kind === 'query' && call.request.query.bayesian).request;
     const [knn, lexical] = filtered.query.bayesian;
     assert.deepEqual(knn.knn.filter, { bool: [
@@ -219,12 +219,75 @@ test('ranked hybrid search verifies UTF-16 ranges and omits orphan chunks', asyn
 
     fixture.rerank = { status: 'fallback', scoredCount: 0 };
     assert.equal((await fork.search({ query: 'notes', rerank: { onFailure: 'returnOriginal' } })).reranked, false);
-    await assert.rejects(fork.search({ query: 'notes' }), { code: 'RERANK_FAILED' });
+    await assert.rejects(fork.search({ query: 'notes', rerank: true }), { code: 'RERANK_FAILED' });
 
     branch.docs.delete(`file:${file.fileId}`);
     assert.deepEqual(await fork.search({ query: 'notes', rerank: false }), { hits: [], reranked: false });
     fixture.rerank = undefined;
-    assert.deepEqual(await main.search({ query: 'notes' }), { hits: [], reranked: false });
+    assert.deepEqual(await main.search({ query: 'notes', rerank: true }), { hits: [], reranked: false });
+});
+
+test('text search defaults to semantic retrieval and keeps mode, reranking and filters independent', async () => {
+    const fixture = fileClient();
+    const main = await create({ client: fixture.client, name: 'search-modes', metadataSchema: { topic: { type: 'string' } } });
+    const fork = await main.fork({ name: 'draft' });
+    const file = await fork.write({ ...request('/note', 'Preserve the draft before editing.'), metadata: { topic: 'checkpoint' } });
+    const defaultResult = await fork.search({ query: 'preserve work' });
+    assert.equal(defaultResult.reranked, false);
+    assert.deepEqual(defaultResult.hits, [{ ...file, range: { start: 0, end: file.content.length } }]);
+    const initial = fixture.calls.findLast(call => call.kind === 'query').request;
+    assert.deepEqual(initial.query, { knn: { field: 'embedding', queryText: 'preserve work', k: 200,
+        filter: { queryString: { query: '"chunk"', defaultField: 'kind' } } } });
+    assert.equal(initial.size, 10);
+    assert.equal(initial.rerank, undefined);
+    assert.equal(initial.candidateSize, undefined);
+
+    const filter = { field: 'metadata.topic', op: 'eq', value: 'checkpoint' };
+    const clauses = [
+        { queryString: { query: '"chunk"', defaultField: 'kind' }, occur: 'filter' },
+        { queryString: { query: '"checkpoint"', defaultField: 'metadata.topic' }, occur: 'filter' },
+    ];
+    const semantic = { knn: { field: 'embedding', queryText: 'Preserve work before editing', k: 201,
+        filter: { bool: clauses } } };
+    const keyword = { bool: [...clauses,
+        { queryString: { query: 'checkpoint:*?', defaultField: 'content', skipSyntax: true }, occur: 'must' }] };
+    for (const mode of ['semantic', 'keyword', 'hybrid']) {
+        for (const rerank of [false, true, { fields: ['content', 'metadata.topic'], onFailure: 'returnOriginal' }]) {
+            const before = fixture.calls.length;
+            const result = await fork.search({ query: 'checkpoint:*?', mode, limit: 201, filter, rerank,
+                ...(mode !== 'keyword' || rerank !== false ? { embeddingQuery: 'Preserve work before editing' } : {}) });
+            assert.deepEqual(result.hits, defaultResult.hits);
+            assert.equal(result.reranked, rerank !== false);
+            const searches = fixture.calls.slice(before).filter(call => call.kind === 'query');
+            assert.equal(searches.length, 1, 'Each search performs one retrieval without automatic fallback');
+            const actual = searches[0].request;
+            assert.deepEqual(actual.query, mode === 'semantic' ? semantic : mode === 'keyword' ? keyword : { bayesian: [semantic, keyword] });
+            assert.equal(actual.size, 201);
+            assert.deepEqual(actual.ref, { kind: 'branch', name: 'fork-draft' });
+            assert.equal(actual.consistentRead, true);
+            assert.equal(actual.candidateSize, mode === 'hybrid' && rerank === false ? 201 : undefined);
+            if (rerank === false) assert.equal(actual.rerank, undefined);
+            else assert.deepEqual(actual.rerank, { provider: 'typesafe', model: 'jev-1.13.0',
+                queryText: 'Preserve work before editing', candidateSize: 201,
+                fields: typeof rerank === 'object' ? ['content', 'metadata.topic'] : ['content'],
+                onFailure: typeof rerank === 'object' ? 'returnOriginal' : 'error' });
+        }
+    }
+});
+
+test('invalid search modes and unused keyword context fail before database calls', async () => {
+    const fixture = fileClient();
+    const main = await create({ client: fixture.client, name: 'invalid-search' });
+    const fork = await main.fork({ name: 'draft' });
+    const before = fixture.calls.length;
+    for (const options of [
+        { mode: 'auto' }, { mode: null }, { mode: 1 },
+        { mode: 'keyword', embeddingQuery: 'unused' },
+        { mode: 'keyword', rerank: false, embeddingQuery: 'unused' },
+        { mode: 'semantic', embeddingQuery: '' }, { mode: 'hybrid', limit: 1001 },
+        { mode: 'keyword', rerank: { fields: ['metadata.undeclared'] } },
+    ]) await assert.rejects(fork.search({ query: 'checkpoint', ...options }), { code: 'INVALID_INPUT' });
+    assert.equal(fixture.calls.length, before);
 });
 
 test('a large file publishes its original only after all chunk requests succeed', async () => {
