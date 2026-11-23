@@ -15,6 +15,7 @@ const final = (model, text = 'done') => ({ model, status: 'completed', usage: { 
     output: [{ type: 'message', role: 'assistant', phase: 'final_answer', content: [{ type: 'output_text', text }] }] });
 const response = (model, output) => ({ ...final(model), output });
 const call = (name, args, id = 'call-1') => ({ type: 'function_call', name, arguments: JSON.stringify(args), call_id: id });
+const bindingNotices = request => request.input.filter(item => item.role === 'developer' && item.content.startsWith('Current host binding: '));
 async function usingScenario(id, guide, run) {
     const context = await prepareScenario(id);
     const host = createHost({ drive: context.drive, client: context.client, writable: context.scenario.writable,
@@ -78,6 +79,7 @@ test('model continuation preserves reasoning items and message phases and delive
         const ask = async request => {
             assert.equal(request.store, false);
             assert.deepEqual(request.include, ['reasoning.encrypted_content']);
+            assert.deepEqual(bindingNotices(request), [request.input[2]]);
             if (round++ === 0) return response(request.model, [opaque,
                 { type: 'message', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: 'Checking.' }] },
                 { ...call('read', {}), arguments: '{broken' }]);
@@ -88,6 +90,32 @@ test('model continuation preserves reasoning items and message phases and delive
         };
         await runAgent({ host, scenario: context.scenario, guide: 'none', ask });
         assert.equal(host.events[0].result.error.code, 'INVALID_JSON');
+    });
+});
+
+test('binding changes are announced once and retained with stateless tool results', async () => {
+    await usingScenario('draft-checkpoint', 'none', async (context, host) => {
+        const requests = [];
+        const script = scriptedAgent(context.scenario, 'none');
+        const result = await runAgent({ host, scenario: context.scenario, guide: 'none', ask: async request => {
+            requests.push(request);
+            return script(request);
+        } });
+        const [mainRequest, forkRequest, afterCheckpoint] = requests;
+        const mainNotice = { role: 'developer', content: 'Current host binding: ' + JSON.stringify({
+            name: context.name, at: { kind: 'main' }, generation: 0,
+        }) };
+        const forkNotice = { role: 'developer', content: 'Current host binding: ' + JSON.stringify({
+            name: context.name, at: { kind: 'fork', name: 'trial' }, generation: 1,
+        }) };
+        assert.deepEqual(bindingNotices(mainRequest), [mainNotice]);
+        assert.equal(mainRequest.tools.some(tool => tool.name === 'write'), false);
+        assert.equal(forkRequest.tools.some(tool => tool.name === 'write'), true);
+        assert.deepEqual(forkRequest.input.at(-1), forkNotice);
+        assert.deepEqual(JSON.parse(forkRequest.input.at(-2).output), { name: context.name, at: { kind: 'fork', name: 'trial' } });
+        for (const request of requests.slice(1)) assert.deepEqual(bindingNotices(request), [mainNotice, forkNotice]);
+        assert.deepEqual(JSON.parse(afterCheckpoint.input.at(-1).output), { name: context.name, at: { kind: 'checkpoint', name: 'before-edit' } });
+        assert.equal((await evaluate(context, host, result.finalText)).passed, true);
     });
 });
 
@@ -213,6 +241,21 @@ test('evaluation export preserves diagnostic outcomes without provider payloads 
         assert.equal(partial.cases[2].requests[1].status, 'pending');
         assert(partial.cases[2].offered[1].tools.includes('read'));
         assert.doesNotMatch(JSON.stringify(partial), /private-|encrypted_content|authorization/);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('evaluation export identifies duplicate fork and checkpoint errors', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'tool-ref-conflicts-'));
+    try {
+        const output = path.join(directory, 'run');
+        const calls = [call('fork', { name: 'trial' }, 'fork'), call('fork', { name: 'trial' }, 'duplicate-fork'),
+            call('checkpoint', { name: 'before-edit' }, 'checkpoint'),
+            call('checkpoint', { name: 'before-edit' }, 'duplicate-checkpoint')];
+        await runEvaluation({ output, scenario: 'draft-checkpoint', guide: 'none',
+            askFactory: () => async (request, { round }) => calls[round] ? response(request.model, [calls[round]]) : final(request.model) });
+        const { cases: [draft] } = await readEvaluationReport(output);
+        assert.deepEqual(draft.events.filter(event => event.outcome === 'error').map(event => [event.name, event.errorCode]),
+            [['fork', 'BRANCH_CONFLICT'], ['checkpoint', 'CHECKPOINT_CONFLICT']]);
     } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
