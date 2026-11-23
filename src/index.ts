@@ -19,7 +19,8 @@ import { publicationIdentity, validateMergeRequest } from './publication-log.js'
 import { publication } from './publication.js';
 export type * from './types.js';
 export { MemDriveError } from './errors.js';
-export { createFileTools, fileToolError, fileToolGuide } from './tools.js';
+export { createFileTools, fileToolError, fileToolGuide, fileToolGuideTopics } from './tools.js';
+export type { FileToolGuideTopic } from './tool-guide.js';
 export type { FileToolDefinition, FileToolErrorResult, FileToolName, FileToolRefResult, FileTools } from './tools.js';
 
 type Client = ConnectionOptions['client'];

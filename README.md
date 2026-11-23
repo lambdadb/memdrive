@@ -464,7 +464,7 @@ without importing a model-provider adapter. Bind an already authorized SDK handl
 and explicitly select the permitted tools:
 
 ```ts
-import { createFileTools, fileToolError, fileToolGuide } from '@functional-systems/memdrive';
+import { createFileTools, fileToolError, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
 
 const tools = createFileTools({
     drive: work,
@@ -474,10 +474,12 @@ const tools = createFileTools({
 // Register definitions with the host's model or MCP transport.
 const definitions = tools.definitions;
 const state = await tools.execute('status', {});
-const guide = await tools.execute('guide', {}); // { version, content }, no storage calls
+const guide = await tools.execute('guide', {}); // { version, content, topics }, no storage calls
+const editingGuide = await tools.execute('guide', { topic: 'editing' }); // { version, topic, title, description, content }
 
 // A host can expose precisely the same text as a resource.
 const guideResource = fileToolGuide;
+const editingResource = fileToolGuideTopics.editing; // Identical to editingGuide
 
 const controller = new AbortController();
 try {
@@ -531,8 +533,18 @@ create another tool binding with its own allowlist. Ref creation is marked
 
 The `guide` tool is optional, just like the other tools. Its name is the catalog's
 implementation choice for delivering the read-only usage guide. Hosts can omit
-it and use the exported `fileToolGuide` as an MCP resource or other instruction
-channel instead; no guide tool call is required by the executor.
+it and expose the exported `fileToolGuide` index and `fileToolGuideTopics` documents
+as resources or another instruction channel instead; no guide tool call is required
+by the executor. The frozen index lists `retrieval`, `references`, `editing`,
+`publication` and `maintenance`, with descriptions of when to read each.
+`guide({ topic })` returns that topic from the same immutable catalog and version.
+Unknown topics return `INVALID_INPUT` with the valid names. Resource URI mapping
+belongs to the host; clients without resource support can use the guide tool.
+
+Guide version 6 preserves selected conversational wording, examples, qualifications
+and corrections instead of aggressively summarizing stored originals. It does not
+require new metadata or capturing every utterance. Long originals can be delivered
+through ranged reads without reducing their stored detail.
 
 For a read-only connection, select only the needed query tools, for example
 `['guide', 'status', 'history', 'list', 'read', 'search']`. The executor copies the

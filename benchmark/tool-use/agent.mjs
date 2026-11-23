@@ -46,8 +46,8 @@ export async function runAgent({ host, scenario, ask, model = 'gpt-6.1-sol', gui
     if (guide === 'resource') {
         const listed = host.resourcesList();
         assert(listed.resources.some(item => item.uri === guideURI));
-        const resource = host.resourcesRead(guideURI);
-        input.splice(1, 0, { role: 'developer', content: resource.contents[0].text });
+        const resources = listed.resources.map(item => host.resourcesRead(item.uri));
+        input.splice(1, 0, ...resources.map(resource => ({ role: 'developer', content: resource.contents[0].text })));
     }
     const offered = [], seen = new Set();
     let calls = 0, tokens = 0;

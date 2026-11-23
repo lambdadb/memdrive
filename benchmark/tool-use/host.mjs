@@ -1,6 +1,11 @@
-import { MemDrive, createFileTools, fileToolError, fileToolGuide } from '@functional-systems/memdrive';
+import { MemDrive, createFileTools, fileToolError, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
 
 export const guideURI = 'memdrive://docs/file-tools';
+const guideResources = [
+    { uri: guideURI, name: 'MemDrive file tool guide', document: fileToolGuide },
+    ...Object.entries(fileToolGuideTopics).map(([topic, document]) =>
+        ({ uri: `memdrive://docs/${topic}`, name: document.title, document })),
+];
 const reads = ['status', 'history', 'list', 'read', 'search', 'findText'];
 const writes = ['fork', 'checkpoint', 'diff', 'write', 'merge'];
 
@@ -17,11 +22,13 @@ export function createHost({ drive, client, writable, guide, rebindFork = false 
         get binding() { return { name: bound.name, at: bound.at, generation }; },
         toolsList() { return { tools: structuredClone(catalog().definitions) }; },
         resourcesList() { return { resources: guide === 'resource'
-            ? [{ uri: guideURI, name: 'MemDrive file tool guide', mimeType: 'text/markdown' }] : [] }; },
+            ? guideResources.map(({ uri, name }) => ({ uri, name, mimeType: 'text/markdown' })) : [] }; },
         resourcesRead(uri) {
-            if (guide !== 'resource' || uri !== guideURI) throw new Error('Resource unavailable');
-            events.push({ kind: 'resource_read', actor: 'host', uri, version: fileToolGuide.version });
-            return { contents: [{ uri, mimeType: 'text/markdown', text: fileToolGuide.content }], version: fileToolGuide.version };
+            const resource = guideResources.find(item => item.uri === uri);
+            if (guide !== 'resource' || !resource) throw new Error('Resource unavailable');
+            const { document } = resource;
+            events.push({ kind: 'resource_read', actor: 'host', uri, version: document.version });
+            return { contents: [{ uri, mimeType: 'text/markdown', text: document.content }], version: document.version };
         },
         async toolsCall(name, args, { signal, expectedGeneration = generation } = {}) {
             const before = this.binding;

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { MemDrive, MemDriveError, createFileTools, fileToolError, fileToolGuide } from '@functional-systems/memdrive';
+import { MemDrive, MemDriveError, createFileTools, fileToolError, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
 import { fileClient } from './helpers/file-client.mjs';
 
 const all = ['guide', 'status', 'history', 'list', 'read', 'search', 'findText', 'fork', 'checkpoint', 'diff', 'write', 'merge'];
@@ -176,4 +176,32 @@ test('ref tools enforce independent permissions, validate locally and preserve c
     const afterUncertain = fixture.calls.length;
     await assert.rejects(checkpointOnly.execute('checkpoint', { name: 'uncertain' }), { code: 'REF_CREATION_UNCONFIRMED' });
     assert.equal(fixture.calls.length, afterUncertain);
+});
+
+
+test('guide index and all topics share immutable content without accessing the bound drive', async () => {
+    const { fixture, work } = await setup();
+    const tools = createFileTools({ drive: work, tools: ['guide'] });
+    const before = fixture.calls.length;
+    const index = await tools.execute('guide', {});
+    assert.equal(index.version, '6');
+    assert(index.content.length < 2500);
+    assert.match(index.content, /Reading never authorizes a write/);
+    assert.deepEqual(index.topics.map(item => item.topic), ['retrieval', 'references', 'editing', 'publication', 'maintenance']);
+    for (const { topic, description } of index.topics) {
+        const detail = await tools.execute('guide', { topic });
+        assert.equal(detail, fileToolGuideTopics[topic]);
+        assert.equal(detail.version, index.version);
+        assert.equal(detail.topic, topic);
+        assert(index.content.includes(description));
+        assert(Object.isFrozen(detail));
+    }
+    assert(Object.isFrozen(index.topics));
+    assert(Object.isFrozen(index.topics[0]));
+    assert(Object.isFrozen(fileToolGuideTopics));
+    for (const topic of ['unknown', '__proto__', 'constructor', '', null, 1, {}])
+        await assert.rejects(tools.execute('guide', { topic }), error =>
+            error.code === 'INVALID_INPUT' && error.message.includes('retrieval, references, editing, publication, maintenance'));
+    await assert.rejects(tools.execute('guide', { topic: 'editing', version: '5' }), { code: 'INVALID_INPUT' });
+    assert.equal(fixture.calls.length, before);
 });

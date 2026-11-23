@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs, parseEnv } from 'node:util';
-import { fileToolGuide } from '@functional-systems/memdrive';
+import { fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
 import { createHost } from './host.mjs';
 import { prepareScenario, scenarios, evaluate } from './scenarios.mjs';
 import { runAgent, openAI, AgentFailure, agentFailureCodes, protocol, limits, serverInstructions, workflowInstructions, userReminder } from './agent.mjs';
@@ -70,7 +70,7 @@ export async function runEvaluation({ output, mode = 'model', guide = 'all', ins
     const manifest = { protocol, mode, transport: askFactory ? 'injected-test' : mode === 'model' ? 'openai-responses' : 'scripted', model, instruction, plan, limits, startedAt: new Date().toISOString(),
         node: process.version, backend: 'native-client-fixture', package: JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')),
         sourceCommit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
-        sources, guide: fileToolGuide, prompts: { serverInstructions, workflowInstructions, userReminder }, scenarios };
+        sources, guide: fileToolGuide, guideTopics: fileToolGuideTopics, prompts: { serverInstructions, workflowInstructions, userReminder }, scenarios };
     output = path.resolve(output);
     await mkdir(path.dirname(output), { recursive: true });
     await mkdir(output); // Existing runs cannot be overwritten or replayed as fresh measurements.

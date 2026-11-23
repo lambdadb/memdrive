@@ -4,7 +4,10 @@ import { faq } from './scenarios.mjs';
 export function scriptedAgent(scenario, guide) {
     const steps = [];
     const add = (name, args) => steps.push({ name, args });
-    if (guide === 'tool') add('guide', {});
+    if (guide === 'tool') {
+        add('guide', {});
+        add('guide', { topic: 'retrieval' });
+    }
     if (scenario.id === 'past-version') {
         add('history', {});
         add('fork', previous => ({ name: 'earlier', version: previous.entries[0].version }));

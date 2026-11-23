@@ -16,7 +16,7 @@ test('advertised tool schemas accept SDK inputs and reject ambiguous selectors, 
         const validators = Object.fromEntries(definitions.map(tool => [tool.name, ajv.compile(tool.inputSchema)]));
         const content = external ? [1, ...Array(63).fill(0)] : 'Original';
         const valid = [
-            ['guide', {}], ['status', {}], ['diff', {}], ['history', {}],
+            ['guide', {}], ['guide', { topic: 'editing' }], ['status', {}], ['diff', {}], ['history', {}],
             ['fork', { name: 'new-fork' }], ['fork', { name: 'x'.repeat(47) }],
             ['checkpoint', { name: 'main' }], ['checkpoint', { name: 'x'.repeat(41) }],
             ['history', { sinceVersion: 'v0', limit: 1 }], ['history', { cursor: 'opaque' }],
@@ -48,6 +48,7 @@ test('advertised tool schemas accept SDK inputs and reject ambiguous selectors, 
         for (const [name, input] of valid)
             assert(validators[name](input), `${external ? 'vector' : 'text'} ${name}: ${JSON.stringify(validators[name].errors)}`);
         const invalid = [
+            ['guide', { topic: 'unknown' }], ['guide', { topic: null }], ['guide', { topic: 'editing', version: '6' }],
             ['fork', {}], ['fork', { name: 'main' }], ['fork', { name: 'xy' }],
             ['fork', { name: 'x'.repeat(48) }], ['checkpoint', { name: 'x'.repeat(42) }],
             ['checkpoint', { name: 'invalid/path' }], ['checkpoint', { name: 'valid', at: { fork: 'other' } }],
@@ -99,5 +100,29 @@ test('ref schemas expose exact version selection only on main and reject asOf ev
             assert.equal(validate({ name: 'copy', version: 'v01' }), false);
             assert.equal(validate({ name: 'copy', asOf: '2026-01-01T00:00:00.000Z' }), false);
         }
+    }
+});
+
+
+test('advertised input properties carry types and descriptions through nested operation and filter schemas', async () => {
+    const fixture = fileClient();
+    function inspect(schema) {
+        for (const [name, property] of Object.entries(schema.properties ?? {})) {
+            assert(property.type, `Missing type for ${name}`);
+            assert.equal(typeof property.description, 'string', `Missing description for ${name}`);
+            assert(property.description.length > 0);
+            inspect(property);
+        }
+        for (const branch of [...(schema.oneOf ?? []), ...(schema.anyOf ?? [])]) inspect(branch);
+        for (const definition of Object.values(schema.$defs ?? {})) inspect(definition);
+        if (schema.items) inspect(schema.items);
+    }
+    for (const external of [false, true]) {
+        const main = await MemDrive.create({ client: fixture.client, name: `documented-${external}`,
+            ...(external ? { embedding: { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'fixture' } } : {}) });
+        const work = await main.fork({ name: 'draft' });
+        const names = ['guide', 'status', 'history', 'list', 'read', 'search', 'fork', 'checkpoint', 'diff', 'write', 'merge', ...(external ? [] : ['findText'])];
+        for (const definition of createFileTools({ drive: work, tools: names }).definitions) inspect(definition.inputSchema);
+        for (const definition of createFileTools({ drive: main, tools: ['fork', 'checkpoint'] }).definitions) inspect(definition.inputSchema);
     }
 });
