@@ -14,7 +14,7 @@ import type { DoclingChunker } from './types.js';
 import { createRef, validateRefVersion } from './refs.js';
 import { rangeKeys, readRange, validateReadRange } from './read-range.js';
 import type { DriveFile, FileReadPage, ReadFileRangeRequest } from './types.js';
-import { deletingFormat, deleteReference, destroyStore, lifecycle } from './lifecycle.js';
+import { deletingFormat, deleteReference, destroyStore, lifecycle, weakRegistry } from './lifecycle.js';
 import { publicationIdentity, validateMergeRequest } from './publication-log.js';
 import { publication } from './publication.js';
 import { storeTag } from './cursor-tokens.js';
@@ -29,7 +29,10 @@ type Client = ConnectionOptions['client'];
 const main = 'main';
 const forkPrefix = 'fork-';
 const checkpointPrefix = 'checkpoint-';
-const clients = new WeakMap<Client, Map<string, Store>>();
+// Stores are held weakly: one is collected after the application drops its
+// drive object, unless it is pinned for state that a new object would lose.
+// A drive's methods reach their store, so a live drive keeps it registered.
+const clients = new WeakMap<Client, ReturnType<typeof weakRegistry<Store>>>();
 const validName = (name: unknown, maxLength = 52): name is string =>
     typeof name === 'string' && name.length >= 3 && name.length <= maxLength && /^[A-Za-z0-9_-]+$/.test(name);
 const validForkName = (name: unknown): name is string => validName(name, 52 - forkPrefix.length) && name !== main;
@@ -93,14 +96,34 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
     const gate = lifecycle({ client, name });
     let invalid = false;
     let pendingRetention: number | undefined;
+    let operations = 0;
+    const self: { store?: object } = {};
     function assertLive() {
         if (invalid) throw new MemDriveError('STORE_DELETED', 'This store handle has been invalidated by destruction.');
     }
+    /**
+     * Keep this object registered while it holds state a reopened store would
+     * lose: running or queued work, fences for unconfirmed configuration,
+     * reference or write outcomes, unsettled merge state, invalidation and
+     * unexpired list cursors. It is re-evaluated whenever an operation or
+     * detached task ends or a cached list scan is dropped.
+     */
+    function retain() {
+        if (self.store) storesFor(client).hold(name, self.store, operations > 0 || invalid || pendingRetention !== undefined
+            || pendingRefs.size > 0 || [mainView, ...refs.values()].some(view => view.uncertain || view.lister.holds())
+            || [...writers.values()].some(writer => writer.fenced()) || publishing.held());
+    }
+    async function tracked<T>(operation: () => Promise<T>): Promise<T> {
+        operations++;
+        retain();
+        try { return await operation(); }
+        finally { operations--; retain(); }
+    }
     /** Track complete operations for lifecycle exclusion. */
-    const run = <T>(operation: () => Promise<T>) => gate.run(async () => {
+    const run = <T>(operation: () => Promise<T>) => gate.run(() => tracked(async () => {
         assertLive();
         return operation();
-    });
+    }));
     const dimensions = embedding.mode === 'external' ? embedding.dimensions : undefined;
     const chunker = 'chunking' in description ? textChunker(description.chunking, backend) : undefined;
     if (!chunker && backend) throw new MemDriveError('INCOMPATIBLE_STORE', 'This store does not support configured structured chunking.');
@@ -120,7 +143,7 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
     }
     const publishing = publication(client, handle, identity, metadataSchema, writerFor, dimensions,
         () => gate.soleOperation() && !invalid && pendingRetention === undefined && pendingRefs.size === 0
-            && ![...refs.values()].some(view => view.uncertain));
+            && ![...refs.values()].some(view => view.uncertain), retain);
 
     async function assertDeleteSafe(signal?: AbortSignal, retry?: View) {
         if (pendingRetention !== undefined) throw new MemDriveError('CONFIGURATION_UNCONFIRMED', 'Settle the pending retention configuration before deleting resources.');
@@ -291,7 +314,7 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         return {
             at, source, writer, uncertain: false,
             read: reader(source, at), search: searcher(source),
-            lister: fileLister(handle, name, source, metadataSchema, at),
+            lister: fileLister(handle, name, source, metadataSchema, at, retain),
             finder: dimensions === undefined ? fileTextFinder(handle, name, source, metadataSchema, at,
                 { enqueue: writer?.enqueueRef, pinVersion: publishing.pinVersion, store: cursorStore,
                     incarnation: at.kind === 'main' ? undefined : signal => refIncarnation(at, signal) }) : undefined,
@@ -396,7 +419,7 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         requireInput(keysOnly(request, ['at']) && isObject(request.at) && request.at.kind === kind,
             `${operation} requires only at, selecting an existing ${kind}: { kind: "${kind}", name }.`);
         const at = parseAt(request.at) as RefAt;
-        return gate.exclusive(async () => {
+        return gate.exclusive(() => tracked(async () => {
             assertLive();
             // A fenced view after an unconfirmed deletion is retried here, not resolved again.
             const selected = refs.get(refKey(at)) ?? await resolve(at, signal);
@@ -419,7 +442,7 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
             selected.lister.release();
             if (kind === 'fork') writers.delete(native);
             return { at: { ...at } };
-        });
+        }));
     }
 
     async function onFork(operation: string, request: unknown, options: RequestOptions | undefined,
@@ -496,7 +519,7 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
             requireInput(keysOnly(request, ['retentionInDays']) && validRetention(request.retentionInDays),
                 'Configure requires retentionInDays as an integer from 1 to 365.');
             const days = request.retentionInDays;
-            return gate.exclusive(async () => {
+            return gate.exclusive(() => tracked(async () => {
                 assertLive();
                 if (pendingRetention !== undefined && pendingRetention !== days)
                     throw new MemDriveError('CONFIGURATION_UNCONFIRMED', 'Fence outstanding requests and retry the same retention value first.');
@@ -535,24 +558,27 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
                 pendingRetention = undefined;
                 description.retentionInDays = days;
                 return structuredClone(description);
-            });
+            }));
         },
     }) as unknown as FileDrive<EmbeddingMode>;
 
-    return {
+    const created = {
         drive,
-        identity, assertLive, assertDeleteSafe, backendId: backend?.id,
-        invalidate() { invalid = true; },
+        identity, assertLive, backendId: backend?.id,
+        assertDeleteSafe: (signal?: AbortSignal) => tracked(() => assertDeleteSafe(signal)),
+        invalidate() { invalid = true; retain(); },
         mode: embedding.mode,
-        recover: publishing.recover,
-        initialize: publishing.initialize,
+        recover: (signal?: AbortSignal) => tracked(() => publishing.recover(signal)),
+        initialize: (signal?: AbortSignal) => tracked(() => publishing.initialize(signal)),
     };
+    self.store = created;
+    return created;
 }
 
 function storesFor(client: Client) {
     const existing = clients.get(client);
     if (existing) return existing;
-    const stores = new Map<string, Store>();
+    const stores = weakRegistry<Store>();
     clients.set(client, stores);
     return stores;
 }

@@ -338,3 +338,151 @@ test('cleanup has its own abort deadline without turning a terminal merge into f
     await replay(draft);
     assert.equal(deletions(fixture).length, 5);
 });
+
+const watermark = records => records.get('retention:watermark')?.slot;
+const lookups = fixture => fixture.calls.filter(call => call.kind === 'tag-get').length;
+
+test('the retention watermark never passes a tag whose deletion failed or is unconfirmed', async () => {
+    for (const uncertain of [false, true]) {
+        const { fixture, records } = await setup();
+        const { draft } = await reopen(fixture);
+        const state = fixture.collections.get('pruning-store');
+        // Slot 2 releases its capture and then the main tag it superseded.
+        fixture[uncertain ? 'afterRefDelete' : 'beforeRefDelete'] = (_kind, tag) => {
+            if (tag === 'md-main-v1') throw Object.assign(new Error('Deletion failed'), uncertain ? {} : { statusCode: 403 });
+        };
+        assert.equal((await replay(draft)).status, 'published');
+        assert.equal(deletions(fixture).length, 3);
+        assert.equal(state.tags.has('md-main-v1'), !uncertain);
+        assert.equal(watermark(records), '2');
+        assert(state.tags.has('md-main-v2') && state.tags.has(records.get('reservation:3').sourceTag));
+        fixture.afterRefDelete = fixture.beforeRefDelete = undefined;
+        // A later pass, on any client, resumes at the unreleased slot and confirms it.
+        await replay((await reopen(fixture)).draft);
+        assert.equal(deletions(fixture).length, uncertain ? 5 : 6);
+        assert.deepEqual([...state.tags.keys()].sort(), ['checkpoint-saved', 'md-main-v3']);
+        assert.equal(watermark(records), '4');
+    }
+});
+
+test('cleanup stops at a slot still inside the window and resumes in order once it expires', async () => {
+    const { fixture, records } = await setup();
+    age(fixture, [8, 0, 3]);
+    const { main, draft } = await reopen(fixture);
+    const before = await main.history();
+    const state = fixture.collections.get('pruning-store');
+    await replay(draft);
+    // Only the first capture is released: the second slot has not expired, so
+    // nothing after it is examined and the watermark stays on it.
+    assert.deepEqual(deletions(fixture).map(call => call.name), [records.get('reservation:1').sourceTag]);
+    assert.equal(watermark(records), '2');
+    for (const tag of ['md-main-v1', 'md-main-v2', 'md-main-v3', records.get('reservation:2').sourceTag, records.get('reservation:3').sourceTag])
+        assert(state.tags.has(tag), tag);
+    await replay(draft);
+    assert.equal(deletions(fixture).length, 1);
+    // Only the second outcome ages; archived publication times stay as recorded.
+    records.get('completion:2').completedAt = new Date(Date.now() - 3 * day).toISOString();
+    await replay(draft);
+    assert.equal(deletions(fixture).length, 5);
+    assert.deepEqual([...state.tags.keys()].sort(), ['checkpoint-saved', 'md-main-v3']);
+    assert.equal(watermark(records), '4');
+    const summary = ({ version, summary, fileIds }) => ({ version, summary, fileIds });
+    assert.deepEqual((await (await reopen(fixture)).main.history()).entries.map(summary), before.entries.map(summary));
+});
+
+test('an unfinished merge leaves the watermark untouched until recovery settles it', async () => {
+    const { fixture, records, original } = await setup();
+    const { draft } = await reopen(fixture);
+    await draft.write({ op: 'update', fileId: original.fileId, content: 'Revision 4' });
+    fixture.beforeUpsert = request => {
+        if (request.docs.some(doc => doc.kind === 'merge-result-v1')) throw new Error('Lost completion');
+    };
+    await assert.rejects(draft.merge({ requestId: 'fourth', summary: 'New revision' }), { code: 'MERGE_RESUMABLE' });
+    fixture.beforeUpsert = undefined;
+    const observer = await reopen(fixture);
+    await replay(observer.draft); // A settled request replays beside the unfinished head.
+    assert.equal(deletions(fixture).length, 0);
+    assert.equal(watermark(records), undefined);
+    await open({ client: { ...fixture.client }, name: 'pruning-store', recover: true });
+    // The recovered publication is new, so the version it superseded stays.
+    assert.equal(deletions(fixture).length, 5);
+    assert.equal(watermark(records), '4');
+    assert(fixture.collections.get('pruning-store').tags.has('md-main-v3'));
+});
+
+test('a lost watermark write only repeats confirmed work on the next pass', async () => {
+    for (const applied of [false, true]) {
+        const { fixture, records } = await setup();
+        const { main, draft } = await reopen(fixture);
+        const before = await main.history();
+        fixture[applied ? 'afterUpsert' : 'beforeUpsert'] = request => {
+            if (request.docs.some(doc => doc.kind === 'retention-watermark-v1')) throw new Error('Lost watermark response');
+        };
+        assert.equal((await replay(draft)).status, 'published');
+        assert.equal(deletions(fixture).length, 5);
+        assert.equal(watermark(records), applied ? '4' : undefined);
+        fixture.afterUpsert = fixture.beforeUpsert = undefined;
+        // A client without the lost value starts lower, finds nothing left to delete
+        // and confirms each absent tag directly before storing the watermark.
+        const fresh = await reopen(fixture);
+        const confirmed = lookups(fixture);
+        await replay(fresh.draft);
+        assert.equal(deletions(fixture).length, 5);
+        assert.equal(lookups(fixture) - confirmed, applied ? 0 : 5);
+        assert.equal(watermark(records), '4');
+        assert.deepEqual(await fresh.main.history(), before);
+    }
+});
+
+test('a fresh client continues cleanup from the stored watermark without rereading earlier slots', async () => {
+    const fixture = fileClient();
+    const main = await create({ client: fixture.client, name: 'pruning-store', retentionInDays: 1 });
+    const draft = await fork(main, { name: 'draft' });
+    const file = await draft.write({ op: 'create', path: '/note', content: '0' });
+    await draft.merge({ requestId: 'first', summary: 'Create note' });
+    for (let i = 1; i < 52; i++) {
+        await draft.write({ op: 'update', fileId: file.fileId, content: String(i) });
+        await draft.merge({ requestId: `revision-${i}`, summary: 'Update note' });
+    }
+    const records = age(fixture, []);
+    const latest = draft => draft.merge({ requestId: 'revision-51', summary: 'Update note' });
+    await latest((await reopen(fixture)).draft);
+    assert.equal(deletions(fixture).length, 100);
+    assert.equal(watermark(records), '51');
+
+    const fresh = await reopen(fixture);
+    const start = fixture.calls.length;
+    await latest(fresh.draft);
+    assert.equal(deletions(fixture).length, 103);
+    assert.equal(watermark(records), '53');
+    const fetches = fixture.calls.slice(start).filter(call => call.kind === 'fetch' && call.request.ref.name === 'main'
+        && call.request.ids.some(id => /^(?:reservation|completion|bookkeeping|request|history|retention):/.test(id)));
+    // Outcomes are read only from the watermark on, plus the superseded
+    // publication just below it whose summary is confirmed before its tag goes.
+    // The cold head search also probes the first slot.
+    const outcomes = new Set(fetches.flatMap(call => call.request.ids).filter(id => id.startsWith('completion:'))
+        .map(id => Number(id.slice('completion:'.length))));
+    assert.deepEqual([...outcomes].sort((a, b) => a - b), [1, 50, 51, 52]);
+    assert(fetches.length <= 16, `${fetches.length} journal fetches`);
+    await latest(fresh.draft);
+    assert.equal(deletions(fixture).length, 103);
+});
+
+test('a history page reads its archives in one fetch and rereads only entries served from a capture', async () => {
+    const { fixture } = await setup();
+    const archiveReads = async drive => {
+        const start = fixture.calls.length;
+        const page = await drive.history();
+        const reads = fixture.calls.slice(start).filter(call => call.kind === 'fetch' && call.request.ids.some(id => id.startsWith('history:')));
+        return { page, reads: reads.map(call => call.request.ids) };
+    };
+    const { main, draft } = await reopen(fixture);
+    // Before cleanup no archive exists: one batch, then each capture's final check.
+    const before = await archiveReads(main);
+    assert.deepEqual(before.reads, [['history:v1', 'history:v2', 'history:v3'], ['history:v1'], ['history:v2'], ['history:v3']]);
+    await replay(draft);
+    assert.equal(deletions(fixture).length, 5);
+    const after = await archiveReads((await reopen(fixture)).main);
+    assert.deepEqual(after.reads, [['history:v1', 'history:v2', 'history:v3']]);
+    assert.deepEqual(after.page, before.page);
+});

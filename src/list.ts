@@ -13,6 +13,8 @@ type Scan = {
     bytes: number;
     expiresAt: number;
     lastIssuedOffset: number;
+    /** Tells the owning store that this scan no longer needs it. */
+    released: () => void;
 };
 
 const pageSize = 500;
@@ -31,6 +33,7 @@ function drop(id: string) {
     if (!scan) return;
     cachedBytes -= scan.bytes;
     scans.delete(id);
+    scan.released();
 }
 function sweep(now: number) {
     for (const [id, scan] of scans) if (now >= scan.expiresAt) drop(id);
@@ -47,8 +50,11 @@ export const validPathPrefix = (value: unknown): value is string =>
     legalText(value) && (value === '' || value.startsWith('/')) && !value.includes('\\');
 export const prefixAncestor = (prefix: string) => prefix.slice(0, prefix.lastIndexOf('/') + 1);
 
-/** List one view. Its cursors live in the shared process-wide scan cache. */
-export function fileLister(handle: Handle, name: string, source: RefSource, schema: MetadataSchema, at: FileAt) {
+/**
+ * List one view. Its cursors live in the shared process-wide scan cache;
+ * `released` runs whenever one of them leaves that cache.
+ */
+export function fileLister(handle: Handle, name: string, source: RefSource, schema: MetadataSchema, at: FileAt, released: () => void = () => {}) {
     const owner = {};
     const next = (cursor: string) => ({ at: { ...at }, cursor });
     const live = (id: string | undefined) => {
@@ -68,6 +74,13 @@ export function fileLister(handle: Handle, name: string, source: RefSource, sche
     /** Whether an unexpired cursor was issued by this view; never consumes it. */
     function owns(cursor: string) {
         return live(cursorPattern.exec(cursor)?.[1]);
+    }
+
+    /** Whether an unexpired cursor of this view is cached. */
+    function holds() {
+        const now = Date.now();
+        for (const scan of scans.values()) if (scan.owner === owner && now < scan.expiresAt) return true;
+        return false;
     }
 
     /** Drop this view's scans, for example after its ref is deleted. */
@@ -191,11 +204,11 @@ export function fileLister(handle: Handle, name: string, source: RefSource, sche
             sweep(Date.now());
             while (scans.size && (scans.size >= maxCachedScans || cachedBytes + retainedBytes > maxCachedBytes))
                 drop(scans.keys().next().value!);
-            scans.set(id, { owner, entries, limit, bytes: retainedBytes, expiresAt: Date.now() + ttlMs, lastIssuedOffset: limit });
+            scans.set(id, { owner, entries, limit, bytes: retainedBytes, expiresAt: Date.now() + ttlMs, lastIssuedOffset: limit, released });
             cachedBytes += retainedBytes;
             result.next = next(`${id}.${limit}`);
         }
         return result;
     }
-    return { list, owns, release };
+    return { list, owns, holds, release };
 }

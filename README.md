@@ -48,7 +48,13 @@ created forks and checkpoints and continuations, always carry an explicit `at`,
 including `{ kind: 'main' }`. The first use of a fork or checkpoint `at` on a client
 verifies that it exists (`BRANCH_NOT_FOUND` or `CHECKPOINT_NOT_FOUND`); later uses
 reuse the cached view. Opening the same store through the same client returns the
-same drive object, which keeps per-fork writer queues and cursors.
+same drive object, which keeps per-fork writer queues and cursors, for as long as
+that object is in use. The SDK holds an idle drive weakly: once the application
+drops it and no operation is running, its memory can be reclaimed and a later
+`open` builds a new object from the stored state. A drive stays registered, and
+is returned again by `open`, while it holds something a new object would lose:
+running or queued operations, an unexpired list cursor, or a fence for an
+unconfirmed configuration change, reference creation or deletion, write or merge.
 
 `read` returns the original file or `null` when absent. Content can be empty and the SDK preserves whitespace and line endings. Paths are case-sensitive, absolute and slash-separated. Pass `{ at, operations: [...] }` with up to 100 operations to write files in batches. Pass up to 100 distinct paths in `read({ paths })` to read existing files in request order. An existing path in the same fork rejects creation with `PATH_EXISTS`. Main is the published file view and the default source for creating a fork. Working edits are scoped to that fork. A store can declare scalar metadata fields with `metadataSchema` and carry collection labels. File writes attach optional `metadata` and record the modification time.
 
@@ -117,7 +123,11 @@ initial view, fork baselines and unfinished recovery remain protected.
 
 Cleanup is best effort: each pass selects at most 100 expired refs and has a
 five-second abort budget within the caller's deadline. It confirms retained
-summaries before removing any selected ref. Failure, cancellation, unavailable
+summaries before removing any selected ref. Passes work through merges in order
+from a watermark stored in the journal, which advances only past merges whose
+internal refs are confirmed released, so any client resumes where the last pass
+stopped. A pass stops at the first merge whose outcome is still inside the
+window; later merges wait for it. Failure, cancellation, unavailable
 retention configuration or a busy local client defers work to a later merge without
 changing its durable result. There is no cleanup API, background timer or
 scheduler to configure. No merge activity means cleanup can be delayed; the
@@ -488,7 +498,7 @@ if (page.next) {
 
 The starting `sinceVersion` is exclusive and defaults to `v0`. Unchanged and conflicting requests create version gaps. A gap or future version returns `VERSION_NOT_FOUND`, and an invalid version format returns `INVALID_INPUT`. The page size defaults to 20 and accepts 1–100. The first page captures the latest publication as `throughVersion`. Pass the returned `next` (`{ cursor }`) unchanged to continue through that same version while main advances. The cursor is a self-contained opaque token: it holds no SDK memory, does not expire by time and continues on any client of the same store. It becomes unavailable (`HISTORY_CURSOR_UNAVAILABLE`) when it is malformed, belongs to another or replaced store, or names versions this store did not publish. If a cursor is unavailable, start again with the last version you processed.
 
-These methods read the publication journal without initializing main, advancing a merge, or reading file bodies or vectors. A cold client may need to read the retained journal before returning the first result. History uses the bounded archive saved by automatic retention cleanup, or reads affected IDs from the retained capture before archival. If both are missing, `history()` returns `HISTORY_UNAVAILABLE` for that entry's version. Read the selected view to retrieve its current files.
+These methods read the publication journal without initializing main, advancing a merge, or reading file bodies or vectors. The SDK reads journal records on demand and keeps no per-merge state in memory: a cold client locates the latest merge with a few batched reads, a number that grows logarithmically with the number of merges, and each history page, version selection and request replay reads only the records it needs. History uses the bounded archive saved by automatic retention cleanup, or reads affected IDs from the retained capture before archival. If both are missing, `history()` returns `HISTORY_UNAVAILABLE` for that entry's version. Read the selected view to retrieve its current files.
 
 ## Shared file tools
 

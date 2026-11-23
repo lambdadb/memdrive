@@ -16,7 +16,16 @@ export type Applied = RecordBase & { kind: 'merge-applied-v1' };
 export type Bookkeeping = RecordBase & { kind: 'merge-bookkeeping-v1' };
 export type HistoryArchive = RecordBase & { kind: 'merge-history-v1'; version: string; publishedAt: string; summary: string;
     sourceTag: string; fileIds: string[]; fileIdsTruncated: boolean };
-export type PublicationRecord = Reservation | Completion | Applied | Bookkeeping | HistoryArchive;
+/**
+ * Locates a request's reservation by a document ID derived from the request ID.
+ * It is written once, after the reservation it names, and never changes.
+ */
+export type RequestIndex = RecordBase & { kind: 'merge-request-v1'; requestId: string; slot: string };
+/** Every slot below `slot` has no remaining internal tag to release. */
+export type RetentionWatermark = RecordBase & { kind: 'retention-watermark-v1'; slot: string };
+/** One slot as read from the journal: its reservation and, once terminal, its outcome. */
+export type SlotState = { reservation: Reservation; outcome?: Outcome & { completedAt: string } };
+export type PublicationRecord = Reservation | Completion | Applied | Bookkeeping | HistoryArchive | RequestIndex;
 
 export const versionFor = (slot: bigint) => `v${slot}`;
 export const tagFor = (version: string) => `md-main-${version}`;
@@ -24,6 +33,15 @@ export const reservationId = (slot: bigint) => `reservation:${slot}`;
 export const completionId = (slot: bigint) => `completion:${slot}`;
 export const appliedId = (slot: bigint) => `applied:${slot}`;
 export const bookkeepingId = (slot: bigint) => `bookkeeping:${slot}`;
+export const requestIndexId = async (requestId: string) => `request:${await contentHash(requestId)}`;
+export const watermarkId = 'retention:watermark';
+/** LambdaDB accepts 1–1,000 IDs per fetch. */
+export const fetchLimit = 1000;
+
+const canonicalSlot = (value: unknown): value is string => typeof value === 'string' && /^[1-9][0-9]{0,42}$/.test(value);
+export const canonicalVersion = (value: unknown): value is string => typeof value === 'string'
+    && value.length <= 52 - 'md-main-'.length && /^v(?:0|[1-9][0-9]*)$/.test(value);
+export const slotOf = (version: string) => BigInt(version.slice(1));
 
 const requestId = (value: unknown): value is string => validText(value) && value.length > 0 && value.length <= 128;
 const summary = (value: unknown): value is string => validText(value) && value.trim().length > 0 && value.length <= 1024;
@@ -34,8 +52,15 @@ export function validateMergeRequest(request: unknown): asserts request is Omit<
         'Provide a merge request ID and a nonempty summary.');
 }
 
-export function parseReservation(doc: Record<string, unknown>, slot: bigint, priorVersion: string): Reservation {
-    if (doc.kind !== 'merge-reservation-v1' || doc.version !== versionFor(slot) || doc.priorVersion !== priorVersion
+/**
+ * Validate one reservation. Pass the prior version when the preceding slots
+ * were observed; a record read on demand must still name an earlier version.
+ */
+export function parseReservation(doc: Record<string, unknown>, slot: bigint, expectedPrior?: string): Reservation {
+    const { priorVersion } = doc;
+    if (doc.kind !== 'merge-reservation-v1' || doc.id !== reservationId(slot) || doc.version !== versionFor(slot)
+        || !canonicalVersion(priorVersion) || slotOf(priorVersion) >= slot
+        || (expectedPrior !== undefined && priorVersion !== expectedPrior)
         || !validDate(doc.startedAt) || !requestId(doc.requestId) || !summary(doc.summary) || !branch(doc.branch)
         || (doc.sourceTag !== null && (typeof doc.sourceTag !== 'string' || !doc.sourceTag.startsWith('merge-capture-')
             || !validFileId(doc.sourceTag.slice('merge-capture-'.length)))))
@@ -54,6 +79,18 @@ export function parseOutcome(doc: Record<string, unknown>, reservation: Reservat
         && Array.isArray(doc.paths) && doc.paths.every(validPath) && doc.fileIds.length + doc.paths.length > 0)
         return { status: 'conflict', fileIds: doc.fileIds as string[], paths: doc.paths as string[], completedAt: doc.completedAt };
     throw invalid();
+}
+
+/** The slot a request index record names for the expected request. */
+export function parseRequestIndex(doc: Record<string, unknown>, expected: string): bigint {
+    if (doc.kind !== 'merge-request-v1' || doc.requestId !== expected || !canonicalSlot(doc.slot)) throw invalid();
+    return BigInt(doc.slot);
+}
+
+export function parseWatermark(doc: Record<string, unknown> | undefined): bigint {
+    if (!doc) return 1n;
+    if (doc.kind !== 'retention-watermark-v1' || !canonicalSlot(doc.slot)) throw invalid();
+    return BigInt(doc.slot);
 }
 
 export function returnOutcome(value: Outcome, requestId: string): MergeResult {
@@ -113,19 +150,49 @@ export function publicationLog(content: Handle, internal: Handle, driveId: strin
             throw databaseError(cause, 'Could not create the merge publication journal.');
     }
 
-    async function read(id: string, signal?: AbortSignal) {
+    /** Fetch records by ID in one native request. Absent IDs are omitted from the result. */
+    async function readMany(ids: readonly string[], signal?: AbortSignal, fields?: string[]) {
+        if (ids.length < 1 || ids.length > fetchLimit) throw new MemDriveError('INVALID_RESULT', 'A journal read exceeded the native fetch limit.');
         let response;
         try {
-            response = await nativeRequest(() => internal.docs.fetch({ ids: [id], ...branchRead('main') }, nativeOptions(signal)), signal);
+            response = await nativeRequest(() => internal.docs.fetch({ ids: [...ids], ...branchRead('main'),
+                ...(fields ? { fields: { include: fields } } : {}) }, nativeOptions(signal)), signal);
         } catch (cause) {
             throw databaseError(cause, 'Could not read the merge publication journal.');
         }
         checkAbort(signal);
-        const [doc] = resultDocs(response, name, 1);
-        if (response.isDocsInline !== true || response.total !== Number(Boolean(doc))
-            || (doc && (doc.id !== id || doc.driveId !== driveId)))
-            throw invalid();
-        return doc;
+        const docs = resultDocs(response, name, ids.length);
+        const requested = new Set(ids), found = new Map<string, Record<string, unknown>>();
+        if (response.isDocsInline !== true || response.total !== docs.length) throw invalid();
+        for (const doc of docs) {
+            if (typeof doc.id !== 'string' || !requested.has(doc.id) || found.has(doc.id) || doc.driveId !== driveId) throw invalid();
+            found.set(doc.id, doc);
+        }
+        return found;
+    }
+
+    async function read(id: string, signal?: AbortSignal) {
+        return (await readMany([id], signal)).get(id);
+    }
+
+    /** Read the reservations and outcomes of slots `from` through `to`, plus any `extra` slots, in one fetch. */
+    async function readSlots(from: bigint, to: bigint, signal?: AbortSignal, extra: readonly bigint[] = []) {
+        const slots = [...extra];
+        for (let slot = from; slot <= to; slot++) slots.push(slot);
+        const states = new Map<bigint, SlotState>();
+        if (!slots.length) return states;
+        const records = await readMany(slots.flatMap(slot => [reservationId(slot), completionId(slot)]), signal);
+        for (const slot of slots) {
+            const reservation = records.get(reservationId(slot)), completion = records.get(completionId(slot));
+            if (!reservation) {
+                if (completion) throw invalid();
+                continue;
+            }
+            const state: SlotState = { reservation: parseReservation(reservation, slot) };
+            if (completion) state.outcome = parseOutcome(completion, state.reservation);
+            states.set(slot, state);
+        }
+        return states;
     }
 
     async function confirmed(record: PublicationRecord, signal?: AbortSignal) {
@@ -154,5 +221,15 @@ export function publicationLog(content: Handle, internal: Handle, driveId: strin
             { cause, details: { record: record.id } });
     }
 
-    return { exists, ensure, read, confirmed, write };
+    /** Store the retention watermark. A lost or stale write only repeats idempotent cleanup. */
+    async function saveWatermark(slot: bigint, signal?: AbortSignal) {
+        const record: RetentionWatermark = { id: watermarkId, driveId, kind: 'retention-watermark-v1', slot: String(slot) };
+        try {
+            await nativeRequest(() => internal.docs.upsert({ branch: 'main', docs: [record] }, mutationOptions(signal)), signal);
+        } catch (cause) {
+            throw databaseError(cause, 'Could not store the retention watermark.');
+        }
+    }
+
+    return { exists, ensure, read, readMany, readSlots, confirmed, write, saveWatermark };
 }
