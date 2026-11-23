@@ -56,6 +56,7 @@ export function fileClient() {
                 branches: {
                     async create({ branchName, source }, options) {
                         calls.push({ kind: 'branch-create', request: { branchName, source }, retries: options?.retries });
+                        await fixture.beforeBranchCreate?.(branchName, source);
                         if (state().branches.has(branchName)) fail(409, 'Branch already exists');
                         state().branches.set(branchName, { docs: copyView(source), createdAt: createdAt() });
                         return { branch: { name: branchName } };

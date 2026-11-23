@@ -102,7 +102,7 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         return operation();
     });
     const dimensions = embedding.mode === 'external' ? embedding.dimensions : undefined;
-    const chunker = 'chunking' in description && description.chunking ? textChunker(description.chunking, backend) : undefined;
+    const chunker = 'chunking' in description ? textChunker(description.chunking, backend) : undefined;
     if (!chunker && backend) throw new MemDriveError('INCOMPATIBLE_STORE', 'This store does not support configured structured chunking.');
     const decodeRead = dimensions === undefined ? decodeFile : decodeFileEntry;
     const cursorStore = storeTag(identity.driveId);
@@ -569,7 +569,7 @@ export async function create(options: CreateFileStoreOptions | CreateExternalFil
         storesFor(client).get(name)?.assertLive();
         requireInput(typeof client.createCollection === 'function', 'Client must support collection creation.');
         const { indexConfigs, tags, description, collectionDescription } = storeConfiguration(options);
-        if ('chunking' in description && description.chunking) textChunker(description.chunking, options.chunker, true);
+        if ('chunking' in description) textChunker(description.chunking, options.chunker, true);
         const response = await remote(() => client.createCollection({ collectionName: name, indexConfigs, tags,
             snapshotRetentionInDays: minimumNativeRetention, description: collectionDescription },
             nativeOptions(signal)), 'Could not create the file store.', signal, { 409: 'STORE_EXISTS' });

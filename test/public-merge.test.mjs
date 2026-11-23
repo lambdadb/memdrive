@@ -191,16 +191,19 @@ test('unknown mutable writes fence the runtime and an exclusive drained owner ca
     assert.deepEqual(await writer.merge(request('uncertain')), status('uncertain', 'v1'));
 });
 
-test('a read-only legacy store safely rechecks main if an upgrade and publication race its read', async () => {
+test('a reader of a store whose creation left v0 unpinned safely rechecks main if a publication races its read', async () => {
     const fixture = fileClient();
-    await MemDrive.create({ client: fixture.client, name });
-    const legacy = fixture.collections.get(name);
-    legacy.branches.delete('md-main-v0');
+    fixture.beforeBranchCreate = () => { throw Object.assign(new Error('Unavailable'), { statusCode: 503 }); };
+    await assert.rejects(MemDrive.create({ client: fixture.client, name }), { code: 'MAIN_BOOTSTRAP_UNCONFIRMED' });
+    fixture.beforeBranchCreate = undefined;
+    const state = fixture.collections.get(name);
     const observer = await MemDrive.open(withClient(fixture));
     assert.deepEqual(await observer.status(), { at: { kind: 'main' }, mainVersion: 'v0' });
     assert.deepEqual(await observer.history(), { entries: [], throughVersion: 'v0' });
     assert.deepEqual(await observer.list(), { files: [], prefixes: [], consistency: 'eventual' });
-    assert(!legacy.branches.has('md-main-v0'));
+    // The unpinned main is empty, so its live scan ends without a cursor.
+    assert.deepEqual(await observer.findText({ query: 'update' }), { hits: [], consistency: 'live' });
+    assert(!state.branches.has('md-main-v0'));
 
     const oldRead = gate(), release = gate();
     let pause = true;
@@ -214,15 +217,15 @@ test('a read-only legacy store safely rechecks main if an upgrade and publicatio
     };
     await fixture.client.collection(name).branches.create({ branchName: 'fork-research', source: { kind: 'branch', name: 'main' } });
     const work = scoped(await MemDrive.open(withClient(fixture)), forkAt('research'));
-    const saved = await work.write(file('/legacy-update'));
+    const saved = await work.write(file('/first-update'));
     const read = observer.read({ fileId: saved.fileId });
     await oldRead.promise;
-    // Recreate the frozen initial reference with a different owner runtime
+    // Pin the frozen initial reference with a different owner runtime
     // before physically applying the first merge.
     const takeover = { ...fixture.client };
     await MemDrive.open({ client: takeover, name, recover: true });
     const owner = await MemDrive.open({ client: takeover, name });
-    await owner.merge({ at: forkAt('research'), ...request('legacy') });
+    await owner.merge({ at: forkAt('research'), ...request('first') });
     release.resolve();
     assert.deepEqual(await read, saved);
 });

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { create } from '@functional-systems/memdrive';
 import { captureMergeSource, prepareMerge } from '../dist/esm/merge-preflight.js';
+import { textChunker } from '../dist/esm/text-chunks.js';
 import { workingWriter } from '../dist/esm/writes.js';
 import { fileClient } from './helpers/file-client.mjs';
 
@@ -13,7 +14,8 @@ const fileId = id => `00000000-0000-4000-8000-${id.toString(16).padStart(12, '0'
 const idOf = id => `file:${fileId(id)}`;
 
 function original(id, path, fields = {}) {
-    return { id: idOf(id), kind: 'file', fileId: fileId(id), path, body: '', modifiedAt: '2026-01-01T00:00:00.000Z', ...fields };
+    return { id: idOf(id), kind: 'file', fileId: fileId(id), path, body: '', modifiedAt: '2026-01-01T00:00:00.000Z',
+        chunking: { strategy: 'boundary', version: '1' }, ...fields };
 }
 
 async function setup(seeds = []) {
@@ -24,7 +26,7 @@ async function setup(seeds = []) {
     const mainDocs = branches.get('main').docs;
     for (const [id, path] of seeds) mainDocs.set(idOf(id), original(id, path, { version: 'v1', changed: false }));
     await handle.branches.create({ branchName: branch.name, source: main });
-    const work = workingWriter(handle, name, branch.name, schema);
+    const work = workingWriter(handle, name, branch.name, schema, undefined, textChunker({ strategy: 'auto' }));
     const pending = new Set();
     const capture = (tagName = 'merge-input') => captureMergeSource(handle, branch, tagName, work.enqueueRef, pending);
     const publishFixture = async (tagName = 'published-current') => {
@@ -142,6 +144,11 @@ test('merge preflight fails on missing frozen payloads and inconsistent destinat
     stored.body = 'changed in transit';
     await assert.rejects(prepareMerge(handle, name, source, published, schema), { code: 'INVALID_RESULT' });
     stored.body = 'edit';
+    // A text original always records the chunking that produced its chunks.
+    const { chunking } = stored;
+    delete stored.chunking;
+    await assert.rejects(prepareMerge(handle, name, source, published, schema), { code: 'INVALID_RESULT' });
+    stored.chunking = chunking;
 
     fixture.pathLookup = () => ({ isDocsInline: true, total: 0, docs: [] });
     await assert.rejects(prepareMerge(handle, name, source, published, schema), { code: 'INVALID_RESULT' });

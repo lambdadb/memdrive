@@ -3,6 +3,7 @@ import test from 'node:test';
 import { create } from '@functional-systems/memdrive';
 import { mergeCaptureJournal } from '../dist/esm/merge-journal.js';
 import { prepareMerge } from '../dist/esm/merge-preflight.js';
+import { textChunker } from '../dist/esm/text-chunks.js';
 import { workingWriter } from '../dist/esm/writes.js';
 import { fileClient } from './helpers/file-client.mjs';
 
@@ -10,6 +11,7 @@ const name = 'workspace';
 const identity = { name: 'workspace-internal', driveId: 'drive-generation' };
 const request = { requestId: 'request-1', branch: 'fork-research', summary: 'Publish the research' };
 const published = { kind: 'tag', name: 'published-main' };
+const writerFor = (handle, branch) => workingWriter(handle, name, branch, {}, undefined, textChunker({ strategy: 'auto' }));
 
 async function setup() {
     const fixture = fileClient();
@@ -19,7 +21,7 @@ async function setup() {
     const internal = fixture.client.collection(identity.name);
     await content.tags.create({ tagName: published.name, source: { kind: 'branch', name: 'main' } });
     await content.branches.create({ branchName: request.branch, source: published });
-    const work = workingWriter(content, name, request.branch, {});
+    const work = writerFor(content, request.branch);
     return { fixture, content, internal, work, capture: mergeCaptureJournal(content, internal, identity) };
 }
 
@@ -34,7 +36,7 @@ test('journal captures between working writes and a new owner can prepare the ex
     fixture.collections.get(name).branches.delete(request.branch);
 
     const reopened = mergeCaptureJournal(fixture.client.collection(name), fixture.client.collection(identity.name), identity);
-    const replay = await reopened(request, workingWriter(content, name, request.branch, {}).enqueueCapture);
+    const replay = await reopened(request, writerFor(content, request.branch).enqueueCapture);
     assert.deepEqual(replay, source);
     const prepared = await prepareMerge(content, name, replay, published, {});
     assert.deepEqual(prepared.targets.map(target => target.file), [file]);
@@ -42,7 +44,7 @@ test('journal captures between working writes and a new owner can prepare the ex
     assert.equal(writes.length, 1);
     assert.deepEqual(writes[0].retries, { strategy: 'none' });
     await assert.rejects(reopened({ ...request, summary: 'Changed summary' }, work.enqueueCapture), { code: 'MERGE_REQUEST_CONFLICT' });
-    const another = workingWriter(content, name, 'fork-another', {});
+    const another = writerFor(content, 'fork-another');
     await assert.rejects(reopened({ ...request, branch: 'fork-another' }, another.enqueueCapture), { code: 'MERGE_REQUEST_CONFLICT' });
     const wrongGeneration = mergeCaptureJournal(content, fixture.client.collection(identity.name), { ...identity, driveId: 'another-drive' });
     await assert.rejects(wrongGeneration(request, work.enqueueCapture), { code: 'INVALID_RESULT' });
@@ -52,7 +54,7 @@ test('journal reconciles a lost acknowledgment and serializes duplicate requests
     const { fixture, content, work, capture } = await setup();
     const competingBranch = 'fork-other';
     await content.branches.create({ branchName: competingBranch, source: published });
-    const other = workingWriter(content, name, competingBranch, {});
+    const other = writerFor(content, competingBranch);
     fixture.afterUpsert = request => {
         if (request.docs[0].kind === 'merge-capture-v1') throw new Error('acknowledgment lost');
     };

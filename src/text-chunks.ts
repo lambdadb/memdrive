@@ -7,8 +7,8 @@ export type TextChunk = { text: string; contextualized: string; start?: number |
 export type ResolvedChunking = { strategy: 'boundary' | 'none' | 'docling'; version: string };
 export type TextChunker = (file: { path: string; content: string }, options?: RequestOptions) => Promise<{ chunks: TextChunk[]; resolved: ResolvedChunking }>;
 
-export function resolvedChunking(value: unknown): ResolvedChunking | undefined {
-    if (value === undefined) return undefined;
+/** Every text original records the chunking that produced its chunks. */
+export function resolvedChunking(value: unknown): ResolvedChunking {
     if (!keysOnly(value, ['strategy', 'version']) || typeof value.strategy !== 'string' || !['boundary', 'none', 'docling'].includes(value.strategy)
         || typeof value.version !== 'string' || !value.version || value.version.length > 200)
         throw new MemDriveError('INVALID_RESULT', 'The original has invalid chunking provenance.');

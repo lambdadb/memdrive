@@ -4,7 +4,7 @@ import { compileFilter } from './filter.js';
 import { prefixAncestor, validPathPrefix } from './list.js';
 import { initialMainRef } from './merge-preflight.js';
 import { decodeFile, decodeFileEntry, fingerprintOf, originalId, resultDocs, validPath, validText } from './records.js';
-import { afterId, ancestorFilter, branchRef, readRef, viewRead, type Handle, type RefSource, type ViewRef, type WithoutAt } from './storage-reads.js';
+import { afterId, ancestorFilter, readRef, viewRead, type Handle, type RefSource, type ViewRef, type WithoutAt } from './storage-reads.js';
 import type { DriveFile, FileAt, FileFilter, FindTextRequest, FindTextResult, MetadataSchema, RequestOptions } from './types.js';
 import { decodeToken, encodeToken } from './cursor-tokens.js';
 import { tagFor } from './publication-log.js';
@@ -78,7 +78,10 @@ export function fileTextFinder(handle: Handle, name: string, source: RefSource, 
             throw cause;
         }
     }
-    /** The main publication a ref pins, or null for a legacy live main. */
+    /**
+     * The main publication a ref pins, or null while main has no frozen initial view.
+     * Such a main is empty, so its scan ends without a cursor and null is never continued.
+     */
     const mainVersion = (ref: ViewRef) => ref.kind === 'tag' && ref.name.startsWith(tagFor('')) ? ref.name.slice(tagFor('').length)
         : ref.name === initialMainRef.name ? 'v0' : null;
 
@@ -125,7 +128,6 @@ export function fileTextFinder(handle: Handle, name: string, source: RefSource, 
             ref = source;
         }
         else if (Object.hasOwn(value, 'i')) throw unavailable();
-        else if (value.v === null) ref = branchRef('main');
         else if (typeof value.v === 'string' && /^v(?:0|[1-9][0-9]*)$/.test(value.v) && value.v.length <= 44) {
             try { ref = await pinVersion(value.v, signal); }
             catch (cause) {
@@ -258,17 +260,7 @@ export function fileTextFinder(handle: Handle, name: string, source: RefSource, 
         if ('cursor' in request) {
             const cursor = request.cursor;
             requireInput(Object.keys(request).length === 1 && typeof cursor === 'string', 'Pass only cursor when continuing text matching.');
-            run = async () => {
-                const scan = await decode(cursor, signal);
-                if (!isSnapshot(scan.ref) && published) {
-                    // A legacy main may gain a published tag between pages.
-                    return readRef(source, ref => {
-                        if (ref.kind !== scan.ref.kind || ref.name !== scan.ref.name) throw unavailable();
-                        return page(scan, signal);
-                    }, signal);
-                }
-                return page(scan, signal);
-            };
+            run = async () => page(await decode(cursor, signal), signal);
         } else {
             const { query, prefix = '', limit = 20, filter } = request;
             const criteria = prepare({ query, prefix, limit, ...(filter === undefined ? {} : { filter }) }, schema);

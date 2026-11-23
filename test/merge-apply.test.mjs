@@ -4,6 +4,7 @@ import { create } from '@functional-systems/memdrive';
 import { applyMerge, advanceMergeSource, verifyMerge } from '../dist/esm/merge-apply.js';
 import { confirmedMergeSource, prepareMerge } from '../dist/esm/merge-preflight.js';
 import { originalId } from '../dist/esm/records.js';
+import { textChunker } from '../dist/esm/text-chunks.js';
 import { workingWriter } from '../dist/esm/writes.js';
 import { fileClient } from './helpers/file-client.mjs';
 
@@ -11,6 +12,7 @@ const name = 'workspace';
 const branch = 'fork-research';
 const main = { kind: 'branch', name: 'main' };
 const schema = { label: { type: 'string' } };
+const chunker = textChunker({ strategy: 'auto' });
 
 async function setup() {
     const fixture = fileClient();
@@ -23,7 +25,7 @@ async function setup() {
     }
     const initial = await tag('initial');
     await handle.branches.create({ branchName: branch, source: initial });
-    const writer = workingWriter(handle, name, branch, schema);
+    const writer = workingWriter(handle, name, branch, schema, undefined, chunker);
     async function prepare(tagName, previous = initial) {
         await writer.enqueueRef(() => tag(tagName, { kind: 'branch', name: branch }));
         return prepareMerge(handle, name, confirmedMergeSource(handle, tagName), previous, schema);
@@ -125,42 +127,41 @@ test('unknown mutation outcomes stop application and fence later source writes u
         { code: 'MERGE_MUTATION_UNCONFIRMED' });
     await assert.rejects(writer.write(later), { code: 'MERGE_MUTATION_UNCONFIRMED' });
     fixture.afterUpsert = undefined;
-    const recovered = workingWriter(handle, name, branch, schema);
+    const recovered = workingWriter(handle, name, branch, schema, undefined, chunker);
     await advanceMergeSource(handle, name, plan, 'v1', schema, recovered.enqueueBaseline);
     assert.equal((await recovered.write(later)).content, 'later');
     assert.equal((await recovered.diff())[0].op, 'update');
 });
 
-test('same-body publication copies exact persisted vectors while replacing path and removing metadata', async () => {
+test('publication copies the exact persisted vectors of the captured chunks, including after a move', async () => {
     const { fixture, state, handle, writer, tag, prepare } = await setup();
     const saved = await writer.write({ op: 'create', path: '/old', content: 'original passage', metadata: { label: 'old' } });
-    const plan = await prepare('old');
+    // Persist the vector the backend would infer for the working chunk.
     const vector = [0.125, ...Array(1535).fill(0)];
+    for (const doc of state.branches.get(branch).docs.values()) if (doc.kind === 'chunk') doc.embedding = vector;
     let inferred = 0;
-    fixture.afterUpsert = ({ branch, docs }, persisted) => {
-        if (branch !== 'main') return;
-        for (const doc of docs) {
-            if (doc.kind === 'chunk' && doc.embedding === undefined) {
-                inferred++;
-                persisted.get(doc.id).embedding = vector;
-            }
-        }
+    fixture.afterUpsert = ({ branch, docs }) => {
+        if (branch === 'main') inferred += docs.filter(doc => doc.kind === 'chunk' && doc.embedding === undefined).length;
     };
+    const plan = await prepare('old');
     await applyMerge(handle, name, plan, 'v1');
     const v1 = await tag('v1');
+    await verifyMerge(handle, name, plan, 'v1', v1);
     await advanceMergeSource(handle, name, plan, 'v1', schema, writer.enqueueBaseline);
-    assert.equal(inferred, 1);
 
-    await writer.write({ op: 'update', fileId: saved.fileId, newPath: '/new', metadata: {} });
+    await writer.write({ op: 'update', fileId: saved.fileId, newPath: '/new' });
     const move = await prepare('move', v1);
     await applyMerge(handle, name, move, 'v2');
-    assert.equal(inferred, 1);
     const v2 = await tag('v2');
     await verifyMerge(handle, name, move, 'v2', v2);
-    const chunks = [...state.tags.get(v2.name).docs.values()].filter(doc => doc.kind === 'chunk');
-    assert.equal(chunks.length, 1);
-    assert.equal(chunks[0].path, '/new');
-    assert.equal(chunks[0].content, saved.content);
-    assert.equal(chunks[0].metadata, undefined);
-    assert.deepEqual(chunks[0].embedding, vector);
+    assert.equal(inferred, 0);
+    for (const [version, path] of [[v1, '/old'], [v2, '/new']]) {
+        const chunks = [...state.tags.get(version.name).docs.values()].filter(doc => doc.kind === 'chunk');
+        assert.equal(chunks.length, 1);
+        assert.equal(chunks[0].path, path);
+        assert.equal(chunks[0].content, saved.content);
+        assert.equal(chunks[0].embeddingText, saved.content);
+        assert.deepEqual(chunks[0].metadata, { label: 'old' });
+        assert.deepEqual(chunks[0].embedding, vector);
+    }
 });
