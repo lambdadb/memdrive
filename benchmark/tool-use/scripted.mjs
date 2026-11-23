@@ -3,6 +3,9 @@ import { faq } from './scenarios.mjs';
 
 export function scriptedAgent(scenario, guide) {
     const steps = [];
+    // Work on the host-named starting view, or on the requested draft.
+    const at = scenario.id === 'draft-checkpoint' ? { kind: 'fork', name: 'trial' } : scenario.start;
+    const target = at ? { at } : {};
     const add = (name, args) => steps.push({ name, args });
     if (guide === 'tool') {
         add('guide', {});
@@ -14,15 +17,15 @@ export function scriptedAgent(scenario, guide) {
     } else {
         if (scenario.id === 'draft-checkpoint') {
             add('fork', { name: 'trial' });
-            add('checkpoint', { name: 'before-edit' });
+            add('checkpoint', previous => ({ at: previous.at, name: 'before-edit' }));
         }
-        add('search', { query: 'current support retention', rerank: false });
-        add('read', { path: '/faq.md' });
+        add('search', { ...target, query: 'current support retention', rerank: false });
+        add('read', { ...target, path: '/faq.md' });
         if (scenario.id !== 'recall') {
-            add('write', previous => ({ op: 'update', fileId: previous.fileId,
+            add('write', previous => ({ at, op: 'update', fileId: previous.fileId,
                 edits: [{ oldText: 'Retention is 30 days.', newText: 'Retention is 42 days.' }] }));
-            add('diff', {});
-            if (scenario.id !== 'draft-checkpoint') add('merge', { requestId: 'task', summary: 'Update current retention guidance' });
+            add('diff', { at });
+            if (scenario.id !== 'draft-checkpoint') add('merge', { at, requestId: 'task', summary: 'Update current retention guidance' });
         }
     }
     let index = 0;

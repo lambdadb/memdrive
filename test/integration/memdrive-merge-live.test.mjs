@@ -95,21 +95,23 @@ test('live public merge publishes immutable views and resumes one interrupted re
             httpClient, timeoutMs: 60_000, retryConfig: { strategy: 'none' }, debugLogger: { log() {}, group() {}, groupEnd() {} } });
     }
 
-    async function freshMain() { return MemDrive.open({ client: native(), name }, options()); }
-    async function freshFork(fork) { return MemDrive.open({ client: native(), name, at: { fork } }, options()); }
+    // A view is one drive object plus an explicit at; omitted at selects main.
+    const forkAt = fork => ({ kind: 'fork', name: fork });
+    async function freshMain() { return { drive: await MemDrive.open({ client: native(), name }, options()) }; }
+    async function freshFork(fork) { return { drive: await MemDrive.open({ client: native(), name }, options()), at: forkAt(fork) }; }
     async function read(view, path, expected) {
-        const file = await view.read({ path }, options());
+        const file = await view.drive.read({ at: view.at, path }, options());
         assert.equal(file?.content ?? null, expected, path);
         return file;
     }
     async function search(view, text, fileId, expected) {
-        const result = await view.search({ query: text, limit: 8, rerank: false }, options());
+        const result = await view.drive.search({ at: view.at, query: text, limit: 8, rerank: false }, options());
         const hits = result.hits.filter(hit => hit.fileId === fileId);
         assert(hits.some(hit => hit.content.includes(expected)), 'Published search omitted the expected source.');
         assert(hits.every(hit => hit.content.includes(expected)), 'Published search exposed a different source revision.');
     }
     async function verifyList(view, expected) {
-        const listing = await view.list({}, options());
+        const listing = await view.drive.list({ at: view.at }, options());
         const byPath = (a, b) => a.path.localeCompare(b.path);
         const entries = listing.files.map(({ fileId, path }) => ({ fileId, path })).sort(byPath);
         const wanted = [...expected].sort(byPath);
@@ -117,53 +119,57 @@ test('live public merge publishes immutable views and resumes one interrupted re
         t.diagnostic(`Published list returned ${entries.length}/${wanted.length} expected IDs and paths; exact=${complete}; consistency=${listing.consistency}.`);
         assert.deepEqual(entries, wanted);
     }
+    const merge = (view, request) => view.drive.merge({ at: view.at, ...request }, options());
 
     const client = native();
     try {
         const main = await MemDrive.create({ client, name, labels: { 'eval.owner': owner } }, options());
-        assert.deepEqual(await (await freshMain()).list({}, options()).then(value => value.files), []);
-        await read(main, '/working.txt', null);
-        const work = await main.fork({ name: 'source' }, options());
-        const [moved, removed] = await work.write([
+        assert.deepEqual(await (await freshMain()).drive.list({}, options()).then(value => value.files), []);
+        await read({ drive: main }, '/working.txt', null);
+        const work = { drive: main, at: (await main.fork({ name: 'source' }, options())).at };
+        assert.deepEqual(work.at, forkAt('source'));
+        const [moved, removed] = await main.write({ at: work.at, operations: [
             { op: 'create', path: '/working.txt', content: original },
             { op: 'create', path: '/delete.txt', content: deletion },
-        ], options());
+        ] }, options());
         await read(await freshMain(), '/working.txt', null);
 
         phase = 'Publish the first merge from a new store';
         const first = { requestId: randomUUID(), summary: 'Publish synthetic originals' };
         const firstStarted = Date.now();
-        const firstResult = await work.merge(first, options());
+        const firstResult = await merge(work, first);
         t.diagnostic(`First cold publication completed in one public call after ${Date.now() - firstStarted} ms.`);
         assert.equal(firstResult.requestId, first.requestId);
         assert.equal(firstResult.status, 'published');
         assert(typeof firstResult.version === 'string' && firstResult.version);
+        // merge publishes only; the source fork remains.
+        assert.deepEqual(await main.listForks({}, options()), { forks: [{ at: work.at }] });
         const beforeFirstReplay = mutations;
-        assert.deepEqual(await (await freshFork('source')).merge(first, options()), firstResult);
+        assert.deepEqual(await merge(await freshFork('source'), first), firstResult);
         assert.equal(mutations, beforeFirstReplay, 'Terminal replay sent a mutation.');
         const initial = await freshMain();
         await read(initial, '/working.txt', original);
         await read(initial, '/delete.txt', deletion);
         await search(initial, 'Alpine compass', moved.fileId, original);
         await verifyList(initial, [{ fileId: moved.fileId, path: '/working.txt' }, { fileId: removed.fileId, path: '/delete.txt' }]);
-        const retained = await initial.checkpoint({ name: 'initial-publication' }, options());
-        const stale = await initial.fork({ name: 'conflicting-edit' }, options());
-        const unrelated = await retained.fork({ name: 'unrelated-edit' }, options());
+        const retained = { drive: initial.drive, at: (await initial.drive.checkpoint({ name: 'initial-publication' }, options())).at };
+        const stale = { drive: initial.drive, at: (await initial.drive.fork({ name: 'conflicting-edit' }, options())).at };
+        const unrelated = { drive: initial.drive, at: (await initial.drive.fork({ at: retained.at, name: 'unrelated-edit' }, options())).at };
         await read(stale, '/working.txt', original);
         await read(unrelated, '/delete.txt', deletion);
-        await stale.write({ op: 'update', fileId: moved.fileId, content: 'Conflicting synthetic edit.' }, options());
-        await unrelated.write({ op: 'create', path: '/unrelated.txt', content: '' }, options());
+        await stale.drive.write({ at: stale.at, op: 'update', fileId: moved.fileId, content: 'Conflicting synthetic edit.' }, options());
+        await unrelated.drive.write({ at: unrelated.at, op: 'create', path: '/unrelated.txt', content: '' }, options());
 
         phase = 'Stop after one real physical mutation';
         const second = { requestId: randomUUID(), summary: 'Publish the moved, removed, and new files' };
-        const edits = await work.write([
+        const edits = await main.write({ at: work.at, operations: [
             { op: 'update', fileId: moved.fileId, newPath: '/moved.txt', content: changed },
             { op: 'delete', fileId: removed.fileId },
             { op: 'create', path: newPath, content: '' },
-        ], options());
+        ] }, options());
         const partial = { kind: 'partial', accepted: 0, applied: 0, rejected: 0 };
         fault = partial;
-        await assert.rejects(work.merge(second, options()), { code: 'MERGE_RESUMABLE' });
+        await assert.rejects(merge(work, second), { code: 'MERGE_RESUMABLE' });
         fault = undefined;
         assert.equal(partial.applied, 1);
         assert(partial.rejected >= 1);
@@ -187,25 +193,25 @@ test('live public merge publishes immutable views and resumes one interrupted re
         await read(oldMain, newPath, null);
         await search(oldMain, 'Alpine compass', moved.fileId, original);
         await verifyList(oldMain, [{ fileId: moved.fileId, path: '/working.txt' }, { fileId: removed.fileId, path: '/delete.txt' }]);
-        const faultCheckpoint = await oldMain.checkpoint({ name: 'during-failure' }, options());
-        const faultFork = await oldMain.fork({ name: 'during-failure' }, options());
+        const faultCheckpoint = { drive: oldMain.drive, at: (await oldMain.drive.checkpoint({ name: 'during-failure' }, options())).at };
+        const faultFork = { drive: oldMain.drive, at: (await oldMain.drive.fork({ name: 'during-failure' }, options())).at };
         await read(faultFork, '/working.txt', original);
         await read(faultFork, '/moved.txt', null);
         const unrelatedRequest = { requestId: randomUUID(), summary: 'Publish an unrelated file' };
         const blockedFork = await freshFork('unrelated-edit');
         const beforeBlocked = mutations;
-        await assert.rejects(blockedFork.merge(unrelatedRequest, options()), { code: 'MERGE_BLOCKED' });
-        // Drain this handle's source queue so a stray background capture is observable.
-        await blockedFork.diff(options());
+        await assert.rejects(merge(blockedFork, unrelatedRequest), { code: 'MERGE_BLOCKED' });
+        // Drain this fork's source queue so a stray background capture is observable.
+        await blockedFork.drive.diff({ at: blockedFork.at }, options());
         assert.equal(mutations, beforeBlocked, 'A blocked request sent a mutation.');
         await read(await freshMain(), '/unrelated.txt', null);
 
         phase = 'Resume the same request while preserving later working edits';
-        await work.write({ op: 'update', fileId: moved.fileId, content: later }, options());
+        await main.write({ at: work.at, op: 'update', fileId: moved.fileId, content: later }, options());
         const terminal = { kind: 'terminal', dropped: 0 };
         fault = terminal;
         let resumed;
-        try { resumed = await (await freshFork('source')).merge(second, options()); }
+        try { resumed = await merge(await freshFork('source'), second); }
         catch (error) {
             assert(error instanceof MemDriveError && terminal.dropped === 1, 'The recovery did not reach the terminal write.');
             t.diagnostic(`The native reply loss surfaced as ${error.code} before terminal replay.`);
@@ -213,13 +219,13 @@ test('live public merge publishes immutable views and resumes one interrupted re
         fault = undefined;
         assert.equal(terminal.dropped, 1);
         const beforeReplay = mutations;
-        const replay = await (await freshFork('source')).merge(second, options());
+        const replay = await merge(await freshFork('source'), second);
         assert.equal(replay.requestId, second.requestId);
         assert.equal(replay.status, 'published');
         assert.notEqual(replay.version, firstResult.version);
         if (resumed !== undefined) assert.deepEqual(replay, resumed);
-        assert.deepEqual(await (await freshFork('source')).merge(second, options()), replay);
-        await assert.rejects((await freshFork('source')).merge({ ...second, summary: 'Different summary' }, options()),
+        assert.deepEqual(await merge(await freshFork('source'), second), replay);
+        await assert.rejects(merge(await freshFork('source'), { ...second, summary: 'Different summary' }),
             { code: 'MERGE_REQUEST_CONFLICT' });
         assert.equal(mutations, beforeReplay, 'Terminal replay sent a mutation.');
         t.diagnostic('Terminal reply dropped after a real HTTP 202; the same request replayed from two fresh clients.');
@@ -235,20 +241,21 @@ test('live public merge publishes immutable views and resumes one interrupted re
         await read(faultFork, '/working.txt', original);
         const reopened = await freshFork('source');
         await read(reopened, '/moved.txt', later);
-        assert.deepEqual(await reopened.diff(options()), [{ op: 'update', fileId: moved.fileId, path: '/moved.txt' }]);
+        assert.deepEqual(await reopened.drive.diff({ at: reopened.at }, options()), [{ op: 'update', fileId: moved.fileId, path: '/moved.txt' }]);
 
         phase = 'Reject a stale target and publish an unrelated fork';
-        await assert.rejects((await freshFork('conflicting-edit')).merge({ requestId: randomUUID(), summary: 'Conflicting file' }, options()),
+        await assert.rejects(merge(await freshFork('conflicting-edit'), { requestId: randomUUID(), summary: 'Conflicting file' }),
             { code: 'MERGE_CONFLICT' });
         await read(await freshMain(), '/moved.txt', changed);
-        await (await freshFork('unrelated-edit')).merge(unrelatedRequest, options());
+        await merge(await freshFork('unrelated-edit'), unrelatedRequest);
         await read(await freshMain(), '/unrelated.txt', '');
         await read(retained, '/unrelated.txt', null);
 
-        phase = 'Delete a source ref while retaining history, then destroy the store';
-        const historyBefore = await final.history({}, options());
-        await reopened.delete(options());
-        assert.deepEqual(await final.history({}, options()), historyBefore);
+        phase = 'Delete a source fork explicitly while retaining history, then destroy the store';
+        const historyBefore = await final.drive.history({}, options());
+        assert.deepEqual(await reopened.drive.deleteFork({ at: reopened.at }, options()), { at: reopened.at });
+        assert.deepEqual(await final.drive.history({}, options()), historyBefore);
+        assert(!(await final.drive.listForks({}, options())).forks.some(fork => fork.at.name === 'source'));
         await MemDrive.destroy({ client: native(), name }, options());
         for (const collection of created)
             await assert.rejects(client.collection(collection).get(options()), error => statusOf(error) === 404);

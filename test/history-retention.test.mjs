@@ -18,11 +18,20 @@ const age = (fixture, days) => {
     }
     return journal.branches.get('main').docs;
 };
+const draftAt = { kind: 'fork', name: 'draft' };
+/** Test shorthand that forwards one explicit at with every view request. */
+function scoped(drive, at) {
+    return {
+        write: input => drive.write(Array.isArray(input) ? { at, operations: input } : { at, ...input }),
+        read: input => drive.read({ at, ...input }),
+        merge: (input, options) => drive.merge({ at, ...input }, options),
+    };
+}
+const fork = async (drive, request) => scoped(drive, (await drive.fork(request)).at);
 async function reopen(fixture, mode = 'managed') {
     const client = { ...fixture.client };
     const main = await open({ client, name: 'pruning-store', mode });
-    const draft = await open({ client, name: 'pruning-store', mode, at: { fork: 'draft' } });
-    return { main, draft, client };
+    return { main, draft: scoped(main, draftAt), client };
 }
 const replay = draft => draft.merge({ requestId: 'first', summary: 'Create note' });
 const deletions = fixture => fixture.calls.filter(call => call.kind === 'tag-delete');
@@ -31,12 +40,12 @@ async function setup(external = false) {
     const fixture = fileClient();
     const main = await create({ client: fixture.client, name: 'pruning-store', retentionInDays: 1,
         ...(external ? { embedding: { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'fixture' } } : {}) });
-    const draft = await main.fork({ name: 'draft' });
+    const draft = await fork(main, { name: 'draft' });
     const content = n => external ? new Array(64).fill(n) : `Revision ${n}`;
     const original = await draft.write({ op: 'create', path: '/note', content: content(1) });
     await draft.merge({ requestId: 'first', summary: 'Create note' });
-    const saved = await main.checkpoint({ name: 'saved' });
-    const oldFork = await main.fork({ name: 'alternate' });
+    const saved = scoped(main, (await main.checkpoint({ name: 'saved' })).at);
+    const oldFork = await fork(main, { name: 'alternate' });
     await draft.write({ op: 'update', fileId: original.fileId, content: content(2) });
     await draft.merge({ requestId: 'second', summary: 'Update note' });
     await draft.write({ op: 'update', fileId: original.fileId, content: content(3) });
@@ -63,7 +72,7 @@ test('terminal merge automatically expires internal tags while preserving refs, 
     assert.equal((await oldFork.read({ fileId: original.fileId })).content, 'Revision 1');
     assert.equal((await main.read({ fileId: original.fileId })).content, 'Revision 3');
     assert.deepEqual(await main.history(), before);
-    assert.deepEqual((await main.history({ cursor: page.cursor })).entries, before.entries.slice(1, 2));
+    assert.deepEqual((await main.history(page.next)).entries, before.entries.slice(1, 2));
     const fresh = await reopen(fixture);
     assert.deepEqual(await fresh.main.history(), before);
     await replay(fresh.draft);
@@ -115,7 +124,7 @@ test('conflict and unchanged outcomes trigger cleanup without changing replay se
     const unchanged = await draft.merge({ requestId: 'unchanged', summary: 'No changes' });
     age(fixture, [8, 3, 2, 2, 2]);
     const fresh = await reopen(fixture);
-    const freshOld = await open({ client: fresh.client, name: 'pruning-store', at: { fork: 'alternate' } });
+    const freshOld = scoped(fresh.main, { kind: 'fork', name: 'alternate' });
     await assert.rejects(freshOld.merge({ requestId: 'conflict', summary: 'Conflicting change' }), { code: 'MERGE_CONFLICT' });
     assert.equal(deletions(fixture).length, 6);
     assert.deepEqual(await fresh.draft.merge({ requestId: 'unchanged', summary: 'No changes' }), unchanged);
@@ -124,7 +133,7 @@ test('conflict and unchanged outcomes trigger cleanup without changing replay se
 test('bounded archives preserve 100 affected IDs and the truncation marker', async () => {
     const fixture = fileClient();
     const main = await create({ client: fixture.client, name: 'pruning-store', retentionInDays: 1 });
-    const draft = await main.fork({ name: 'draft' });
+    const draft = await fork(main, { name: 'draft' });
     await draft.write(Array.from({ length: 100 }, (_, i) => ({ op: 'create', path: `/file-${i}`, content: '' })));
     await draft.write({ op: 'create', path: '/extra', content: '' });
     await draft.merge({ requestId: 'first', summary: 'Create note' });
@@ -229,7 +238,7 @@ test('corrupt archives cannot justify deletion or replace a successful merge res
 test('cleanup is capped at 100 tags and the next merge continues the backlog', async () => {
     const fixture = fileClient();
     const main = await create({ client: fixture.client, name: 'pruning-store', retentionInDays: 1 });
-    const draft = await main.fork({ name: 'draft' });
+    const draft = await fork(main, { name: 'draft' });
     const file = await draft.write({ op: 'create', path: '/note', content: '0' });
     await draft.merge({ requestId: 'first', summary: 'Create note' });
     for (let i = 1; i < 52; i++) {
@@ -247,7 +256,7 @@ test('cleanup is capped at 100 tags and the next merge continues the backlog', a
 test('a history read racing cleanup uses the complete confirmed archive', async () => {
     const fixture = fileClient();
     const main = await create({ client: fixture.client, name: 'pruning-store', retentionInDays: 1 });
-    const draft = await main.fork({ name: 'draft' });
+    const draft = await fork(main, { name: 'draft' });
     await draft.write([{ op: 'create', path: '/one', content: '' }, { op: 'create', path: '/two', content: '' }]);
     await draft.merge({ requestId: 'first', summary: 'Create note' });
     age(fixture, [2]);
@@ -291,7 +300,7 @@ test('cleanup has its own abort deadline without turning a terminal merge into f
             return handle.get(options);
         } };
     } };
-    const draft = await open({ client, name: 'pruning-store', at: { fork: 'draft' } });
+    const draft = scoped(await open({ client, name: 'pruning-store' }), draftAt);
     fixture.beforeUpsert = request => {
         if (request.docs.some(doc => doc.kind === 'merge-history-v1')) return new Promise((_, reject) => {
             maintenanceSignal.addEventListener('abort', () => reject(new Error('Cleanup deadline')), { once: true });

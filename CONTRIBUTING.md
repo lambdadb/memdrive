@@ -42,9 +42,10 @@ It also ages timestamps in that isolated synthetic journal to exercise internal
 automatic capture cleanup after merge replay, retained history and checkpoint reads. It does
 not wait a real retention period or measure physical GC.
 
-The shared file-tool catalog also lives at the package root. Preserve the bound
-view and explicit allowlist when adding tools. File and publication results come
-from the public SDK. Ref creation returns a serializable store/view identity.
+The shared file-tool catalog also lives at the package root. Keep tools one-to-one
+with public SDK operations, one fixed schema set per embedding mode and the
+explicit allowlist when adding tools. Each request selects its view with `at`;
+results, including fork/checkpoint creation, come unchanged from the public SDK.
 Schemas describe JSON input while SDK validation enforces semantic constraints.
 Schema tests use Ajv only as a development dependency. Keep guide
 text independent of host authentication, product policy and provider adapters.
@@ -56,7 +57,7 @@ protected refs, supersession timing, bounded archives, terminal outcomes and
 uncertain or partial cleanup, cancellation and read concurrency. Public type checks
 verify that retention needs no separate cleanup API. Historical-ref regressions
 cover exact publication versions, unpublished or expired versions, preserved merge baselines,
-external vectors, uncertain creation and bound tool schemas.
+external vectors, uncertain creation and source-dependent version schemas.
 
 The LambdaDB dependency is pinned to an exact release. Update it deliberately with relevant API and regression checks. Tooling versions initially follow the native client's lockfile; updating tooling is separate from adopting a new database API.
 
@@ -94,8 +95,8 @@ bookkeeping finishes. The test verifies cleanup of its isolated collection
 and publication journal.
 
 The [model tool-use harness](benchmark/tool-use/README.md) consumes the shared
-SDK tool catalog in an in-process host with explicit allowlists and binding
-changes. Keep its scenarios, provider transport and scoring outside `src/` and
+SDK tool catalog in an in-process host with explicit allowlists and per-call
+`at` targets. Keep its scenarios, provider transport and scoring outside `src/` and
 the package archive. Its fixture/scripted tests run in ordinary CI without keys;
 real model calls require explicit model mode and `LLM_API_KEY`. Scripted or
 injected transports must never be reported as model performance, and fixture

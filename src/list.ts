@@ -1,12 +1,13 @@
 import { keysOnly } from './config.js';
 import { checkAbort, databaseError, MemDriveError, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
 import { bytes, decodeFileEntry, resultDocs, validPath } from './records.js';
-import { afterId, ancestorFilter, readRef, viewRead, type RefSource } from './storage-reads.js';
-import type { ConnectionOptions, FileListEntry, ListFilesRequest, ListFilesResult, MetadataSchema, RequestOptions } from './types.js';
+import { afterId, ancestorFilter, readRef, viewRead, type RefSource, type WithoutAt } from './storage-reads.js';
+import type { ConnectionOptions, FileAt, FileListEntry, ListFilesRequest, ListFilesResult, MetadataSchema, RequestOptions } from './types.js';
 
 type Handle = ReturnType<ConnectionOptions['client']['collection']>;
 type Entry = FileListEntry | string;
 type Scan = {
+    owner: object;
     entries: Entry[];
     limit: number;
     bytes: number;
@@ -18,22 +19,42 @@ const pageSize = 500;
 const maxScanPages = 100;
 const maxScanRows = 10_000;
 const maxBytes = 8 * 1024 * 1024;
-const maxScans = 8;
 const ttlMs = 5 * 60 * 1000;
+// One process-wide budget shared by every store and view. Insertion order is
+// recency order: continuations move a scan to the end; the oldest is evicted.
+const maxCachedBytes = 64 * 1024 * 1024;
+const maxCachedScans = 128;
+const scans = new Map<string, Scan>();
+let cachedBytes = 0;
+function drop(id: string) {
+    const scan = scans.get(id);
+    if (!scan) return;
+    cachedBytes -= scan.bytes;
+    scans.delete(id);
+}
+function sweep(now: number) {
+    for (const [id, scan] of scans) if (now >= scan.expiresAt) drop(id);
+}
 const encoder = new TextEncoder();
 const cursorPattern = /^([0-9a-f-]{36})\.([1-9][0-9]{0,4})$/;
 const fields = { include: ['id', 'kind', 'fileId', 'path', 'modifiedAt', 'metadata'] };
 const legalText = (value: unknown): value is string => typeof value === 'string'
     && !/[\p{Cc}\p{Surrogate}]/u.test(value) && encoder.encode(value).length <= 4096;
 const exceeded = () => new MemDriveError('LIST_SCAN_LIMIT', 'Listing exceeded the preview scan budget. Narrow the directory prefix and start again.');
-const cursorUnavailable = () => new MemDriveError('LIST_CURSOR_UNAVAILABLE', 'Listing cursor is unavailable on this handle. Start again without a cursor.');
+const cursorUnavailable = () => new MemDriveError('LIST_CURSOR_UNAVAILABLE', 'Listing cursor is unavailable. Start again without a cursor.');
 
 export const validPathPrefix = (value: unknown): value is string =>
     legalText(value) && (value === '' || value.startsWith('/')) && !value.includes('\\');
 export const prefixAncestor = (prefix: string) => prefix.slice(0, prefix.lastIndexOf('/') + 1);
 
-export function fileLister(handle: Handle, name: string, source: RefSource, schema: MetadataSchema) {
-    const scans = new Map<string, Scan>();
+/** List one view. Its cursors live in the shared process-wide scan cache. */
+export function fileLister(handle: Handle, name: string, source: RefSource, schema: MetadataSchema, at: FileAt) {
+    const owner = {};
+    const next = (cursor: string) => ({ at: { ...at }, cursor });
+    const live = (id: string | undefined) => {
+        const scan = id === undefined ? undefined : scans.get(id);
+        return scan?.owner === owner && Date.now() < scan.expiresAt;
+    };
 
     function page(entries: Entry[], offset: number, limit: number): ListFilesResult {
         const files: FileListEntry[] = [], prefixes: string[] = [];
@@ -44,12 +65,21 @@ export function fileLister(handle: Handle, name: string, source: RefSource, sche
         return { files, prefixes, consistency: 'eventual' };
     }
 
-    return async function list(request: ListFilesRequest = {}, options?: RequestOptions): Promise<ListFilesResult> {
+    /** Whether an unexpired cursor was issued by this view; never consumes it. */
+    function owns(cursor: string) {
+        return live(cursorPattern.exec(cursor)?.[1]);
+    }
+
+    /** Drop this view's scans, for example after its ref is deleted. */
+    function release() {
+        for (const [id, scan] of scans) if (scan.owner === owner) drop(id);
+    }
+
+    async function list(request: WithoutAt<ListFilesRequest> = {}, options?: RequestOptions): Promise<ListFilesResult> {
         const { signal } = operationOptions(options);
         checkAbort(signal);
         requireInput(keysOnly(request, ['prefix', 'nameContains', 'delimiter', 'limit', 'cursor']), 'Invalid list options.');
-        const now = Date.now();
-        for (const [id, scan] of scans) if (now >= scan.expiresAt) scans.delete(id);
+        sweep(Date.now());
         if ('cursor' in request) {
             const cursor = request.cursor;
             requireInput(Object.keys(request).length === 1 && typeof cursor === 'string', 'Pass only cursor when continuing a listing.');
@@ -57,12 +87,14 @@ export function fileLister(handle: Handle, name: string, source: RefSource, sche
             if (!match) throw cursorUnavailable();
             const id = match[1]!, offset = Number(match[2]);
             const scan = scans.get(id);
-            if (!scan || offset >= scan.entries.length || offset % scan.limit !== 0 || offset > scan.lastIssuedOffset)
+            if (!scan || scan.owner !== owner || offset >= scan.entries.length || offset % scan.limit !== 0 || offset > scan.lastIssuedOffset)
                 throw cursorUnavailable();
+            scans.delete(id);
+            scans.set(id, scan);
             const result = page(scan.entries, offset, scan.limit);
             if (offset + scan.limit < scan.entries.length) {
                 scan.lastIssuedOffset = Math.max(scan.lastIssuedOffset, offset + scan.limit);
-                result.cursor = `${id}.${offset + scan.limit}`;
+                result.next = next(`${id}.${offset + scan.limit}`);
             }
             return result;
         }
@@ -156,15 +188,14 @@ export function fileLister(handle: Handle, name: string, source: RefSource, sche
         if (entries.length > limit) {
             const id = globalThis.crypto.randomUUID();
             const retainedBytes = entries.reduce((total, entry) => total + bytes(entry), 0);
-            let cachedBytes = [...scans.values()].reduce((sum, scan) => sum + scan.bytes, 0);
-            while (scans.size >= maxScans || cachedBytes + retainedBytes > maxBytes) {
-                const oldest = scans.keys().next().value!;
-                cachedBytes -= scans.get(oldest)!.bytes;
-                scans.delete(oldest);
-            }
-            scans.set(id, { entries, limit, bytes: retainedBytes, expiresAt: Date.now() + ttlMs, lastIssuedOffset: limit });
-            result.cursor = `${id}.${limit}`;
+            sweep(Date.now());
+            while (scans.size && (scans.size >= maxCachedScans || cachedBytes + retainedBytes > maxCachedBytes))
+                drop(scans.keys().next().value!);
+            scans.set(id, { owner, entries, limit, bytes: retainedBytes, expiresAt: Date.now() + ttlMs, lastIssuedOffset: limit });
+            cachedBytes += retainedBytes;
+            result.next = next(`${id}.${limit}`);
         }
         return result;
-    };
+    }
+    return { list, owns, release };
 }

@@ -29,49 +29,55 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
     try {
         const main = await MemDrive.create({ client, name, chunker }, options());
         phase = 'create working fork';
-        const fork = await main.fork({ name: 'draft' }, options());
+        const { at } = await main.fork({ name: 'draft' }, options());
+        assert.deepEqual(at, { kind: 'fork', name: 'draft' });
         phase = 'write structured original';
-        const file = await fork.write({ op: 'create', path: '/note.md', content: '# Heading\n\nHello world.' }, options());
+        const file = await main.write({ at, op: 'create', path: '/note.md', content: '# Heading\n\nHello world.' }, options());
         phase = 'search working chunks';
-        const before = await fork.search({ query: 'Hello world', rerank: false }, options());
+        const before = await main.search({ at, query: 'Hello world', rerank: false }, options());
         assert.equal(before.hits.length, 1);
         assert.equal(before.hits[0].content, 'Hello world.');
         assert.deepEqual(before.hits[0].range, { start: 11, end: 23 });
         phase = 'publish structured chunks';
         // Publication already waits for definite cold-snapshot rejections.
         // Allow both source and target stages their documented wait budgets.
-        await fork.merge({ requestId: 'publish-structured', summary: 'Publish synthetic structured note' },
+        await main.merge({ at, requestId: 'publish-structured', summary: 'Publish synthetic structured note' },
             { signal: AbortSignal.timeout(270_000) });
         phase = 'checkpoint published snapshot';
         // First-write tag visibility is a separate backend readiness check.
         // This test pins the already confirmed published tag instead.
-        const checkpoint = await main.checkpoint({ name: 'saved' }, options());
+        const checkpoint = (await main.checkpoint({ name: 'saved' }, options())).at;
         phase = 'reopen published original without parser';
         const reopened = await MemDrive.open({ client: new LambdaDBClient(connection), name }, options());
         assert.deepEqual(await reopened.read({ fileId: file.fileId }, options()), file);
-        assert.deepEqual(await checkpoint.read({ fileId: file.fileId }, options()), file);
+        assert.deepEqual(await reopened.read({ at: checkpoint, fileId: file.fileId }, options()), file);
         phase = 'search published chunks';
         const after = await reopened.search({ query: 'Hello world', rerank: false }, options());
         assert.deepEqual(after.hits, before.hits);
 
         phase = 'preserve explicit working checkpoint';
         const firstVersion = (await main.history({}, options())).entries[0].version;
-        const workingSaved = await fork.checkpoint({ name: 'working-saved' }, options());
-        assert.deepEqual(await workingSaved.read({ fileId: file.fileId }, options()), file);
+        const workingSaved = (await main.checkpoint({ at, name: 'working-saved' }, options())).at;
+        assert.deepEqual(await main.read({ at: workingSaved, fileId: file.fileId }, options()), file);
         phase = 'publish a later revision';
-        const updated = await fork.write({ op: 'update', fileId: file.fileId, content: '# Heading\n\nGoodbye world.' }, options());
-        await fork.merge({ requestId: 'publish-later', summary: 'Publish later synthetic revision' },
+        const updated = await main.write({ at, op: 'update', fileId: file.fileId, content: '# Heading\n\nGoodbye world.' }, options());
+        const later = await main.merge({ at, requestId: 'publish-later', summary: 'Publish later synthetic revision' },
             { signal: AbortSignal.timeout(270_000) });
         phase = 'create historical refs after later publication';
-        const mainPast = await main.fork({ name: 'main-past', version: firstVersion }, options());
-        const savedPast = await main.checkpoint({ name: 'main-past', version: firstVersion }, options());
-        const forkPast = await workingSaved.fork({ name: 'fork-past' }, options());
+        // merge publishes only; the source fork remains until deleted explicitly.
+        assert.equal(later.status, 'published');
+        assert.deepEqual(await main.listForks({}, options()), { forks: [{ at }] });
+        const mainPast = (await main.fork({ name: 'main-past', version: firstVersion }, options())).at;
+        const savedPast = (await main.checkpoint({ at: { kind: 'main' }, name: 'main-past', version: firstVersion }, options())).at;
+        const forkPast = (await main.fork({ at: workingSaved, name: 'fork-past' }, options())).at;
         for (const past of [mainPast, savedPast, forkPast])
-            assert.deepEqual(await past.read({ fileId: file.fileId }, options()), file);
+            assert.deepEqual(await main.read({ at: past, fileId: file.fileId }, options()), file);
         assert.deepEqual(await main.read({ fileId: file.fileId }, options()), updated);
+        for (const source of [at, workingSaved])
+            await assert.rejects(main.fork({ at: source, name: 'past-copy', version: firstVersion }, options()), { code: 'INVALID_INPUT' });
 
-        for (const view of [main, fork, workingSaved])
-            await assert.rejects(view.fork({ name: 'removed-time', asOf: new Date().toISOString() }, options()), { code: 'INVALID_INPUT' });
+        for (const source of [undefined, at, workingSaved])
+            await assert.rejects(main.fork({ ...(source ? { at: source } : {}), name: 'removed-time', asOf: new Date().toISOString() }, options()), { code: 'INVALID_INPUT' });
 
         phase = 'prepare aged retention fixture';
         await main.configure({ retentionInDays: 1 }, options());
@@ -100,12 +106,12 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
         assert(reservation.sourceTag.startsWith('merge-capture-'));
         assert.equal('pruneHistory' in retentionMain, false);
         phase = 'automatic retention after merge replay';
-        const retry = await MemDrive.open({ client: retentionClient, name, at: { fork: 'draft' } }, options());
+        assert.equal(await MemDrive.open({ client: retentionClient, name }, options()), retentionMain);
         // Each automatic pass is best effort and has a short budget. A later
         // terminal replay retries unfinished cleanup without changing its result.
         let removed = false;
         for (let attempt = 0; attempt < 5 && !removed; attempt++) {
-            assert.equal((await retry.merge({ requestId: 'publish-structured', summary: 'Publish synthetic structured note' }, options())).version, 'v1');
+            assert.equal((await retentionMain.merge({ at, requestId: 'publish-structured', summary: 'Publish synthetic structured note' }, options())).version, 'v1');
             try { await client.collection(name).tags.get(reservation.sourceTag, options()); }
             catch (error) {
                 if ((error.status ?? error.statusCode) !== 404) throw error;
@@ -115,9 +121,9 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
         assert(removed, 'Automatic retention did not remove the expired capture within five merge replays.');
         assert.deepEqual(await retentionMain.history({}, options()), history);
         assert.deepEqual(await retentionMain.read({ fileId: file.fileId }, options()), updated);
-        assert.deepEqual(await savedPast.read({ fileId: file.fileId }, options()), file);
-        assert.deepEqual(await checkpoint.read({ fileId: file.fileId }, options()), file);
-        assert.equal((await retry.merge({ requestId: 'publish-structured', summary: 'Publish synthetic structured note' }, options())).version, 'v1');
+        assert.deepEqual(await retentionMain.read({ at: savedPast, fileId: file.fileId }, options()), file);
+        assert.deepEqual(await retentionMain.read({ at: checkpoint, fileId: file.fileId }, options()), file);
+        assert.equal((await retentionMain.merge({ at, requestId: 'publish-structured', summary: 'Publish synthetic structured note' }, options())).version, 'v1');
     } catch (error) {
         collision = error?.code === 'STORE_EXISTS';
         const detail = error instanceof assert.AssertionError ? ` ${error.message}` : '';

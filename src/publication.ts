@@ -8,6 +8,7 @@ import { appliedId, bookkeepingId, completionId, parseOutcome, parseReservation,
     tagFor, versionFor, type BoundRequest, type Outcome, type PublicationRecord, type Reservation } from './publication-log.js';
 import { awaitMergeTag, historicalViewUnavailable, refBackoff } from './refs.js';
 import { branchRef, type Handle, type ViewRef } from './storage-reads.js';
+import { decodeToken, encodeToken, storeTag } from './cursor-tokens.js';
 import type { ConnectionOptions, FileHistoryEntry, FileHistoryRequest, FileHistoryResult, FileStoreStatus, MetadataSchema } from './types.js';
 import type { workingWriter } from './writes.js';
 
@@ -15,8 +16,11 @@ type Writer = ReturnType<typeof workingWriter>;
 type Entry = { slot: bigint; reservation: Reservation; outcome?: Outcome & { completedAt: string } };
 type HistoryPage = { start: number; end: number; limit: number; throughVersion: string };
 
-const historyCursorLifetime = 5 * 60 * 1000;
-const historyCursorLimit = 64;
+const historyToken = 'h1';
+const canonicalVersion = (value: unknown): value is string => typeof value === 'string'
+    && value.length <= 52 - 'md-main-'.length && /^v(?:0|[1-9][0-9]*)$/.test(value);
+const historyUnavailable = () => new MemDriveError('HISTORY_CURSOR_UNAVAILABLE',
+    'History cursor is malformed or its versions are no longer available. Start again from the last processed version.');
 
 function tagRef(name: string) {
     return { kind: 'tag' as const, name };
@@ -37,7 +41,7 @@ export function publication(client: ConnectionOptions['client'], content: Handle
     const publications: RetainedPublication[] = [];
     const retained = historyRetention(content, journal, driveId, hasTag);
     const positions = new Map([[initialVersion, 0]]);
-    const cursors = new Map<string, HistoryPage & { expiresAt: number }>();
+    const cursorStore = storeTag(driveId);
     let published = initialVersion;
     let slot = 1n;
     let active: Entry | undefined;
@@ -181,22 +185,26 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         return result;
     }
 
+    // A stateless cursor records the last returned version, the fixed
+    // throughVersion and the page size. Any client of the same store resumes it.
     async function history(request: FileHistoryRequest, signal?: AbortSignal): Promise<FileHistoryResult> {
         requireInput(keysOnly(request, ['sinceVersion', 'limit', 'cursor']), 'Invalid history options.');
-        const now = Date.now();
-        for (const [id, page] of cursors) if (page.expiresAt <= now) cursors.delete(id);
         let page: HistoryPage;
         if ('cursor' in request) {
             requireInput(Object.keys(request).length === 1 && typeof request.cursor === 'string',
                 'Pass only cursor when continuing history.');
-            const found = cursors.get(request.cursor);
-            if (!found) throw new MemDriveError('HISTORY_CURSOR_UNAVAILABLE', 'History cursor is unavailable on this store handle. Start again without a cursor.');
-            page = found;
+            const token = decodeToken(historyToken, request.cursor);
+            if (!token || Object.keys(token).sort().join() !== 'd,l,s,t' || token.d !== await cursorStore
+                || !canonicalVersion(token.s) || !canonicalVersion(token.t)
+                || !Number.isSafeInteger(token.l) || (token.l as number) < 1 || (token.l as number) > 100) throw historyUnavailable();
+            await refresh(signal);
+            checkAbort(signal);
+            const start = positions.get(token.s), end = positions.get(token.t);
+            if (start === undefined || end === undefined || start > end) throw historyUnavailable();
+            page = { start, end, limit: token.l as number, throughVersion: token.t };
         } else {
             const { sinceVersion = initialVersion, limit = 20 } = request;
-            requireInput(typeof sinceVersion === 'string' && sinceVersion.length <= 52 - 'md-main-'.length
-                && /^v(?:0|[1-9][0-9]*)$/.test(sinceVersion),
-                'Provide a canonical version such as v0 or v1.');
+            requireInput(canonicalVersion(sinceVersion), 'Provide a canonical version such as v0 or v1.');
             requireInput(Number.isSafeInteger(limit) && limit >= 1 && limit <= 100, 'History limit must be 1–100.');
             await refresh(signal);
             checkAbort(signal);
@@ -214,12 +222,8 @@ export function publication(client: ConnectionOptions['client'], content: Handle
             entries.push(await retained.entry(publication, signal));
         checkAbort(signal);
         const result: FileHistoryResult = { entries, throughVersion };
-        if (stop < end) {
-            const cursor = globalThis.crypto.randomUUID();
-            if (cursors.size >= historyCursorLimit) cursors.delete(cursors.keys().next().value!);
-            cursors.set(cursor, { start: stop, end, limit, throughVersion, expiresAt: Date.now() + historyCursorLifetime });
-            result.cursor = cursor;
-        }
+        if (stop < end)
+            result.next = { cursor: encodeToken(historyToken, { d: await cursorStore, s: publications[stop - 1]!.version, t: throughVersion, l: limit }) };
         return result;
     }
 

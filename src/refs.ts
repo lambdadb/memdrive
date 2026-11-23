@@ -6,7 +6,7 @@ const rejected = new Set([400, 401, 403, 404, 409, 422, 429]);
 
 export function validateRefVersion(version: unknown, main: boolean): asserts version is string | undefined {
     requireInput(version === undefined || main && typeof version === 'string' && /^v(0|[1-9][0-9]*)$/.test(version),
-        'version is supported only on main and must identify a publication, such as v3 or the initial v0.');
+        'version is supported only from a main source and must identify a publication, such as v3 or the initial v0.');
 }
 
 export function historicalViewUnavailable(version: string, cause?: unknown) {
@@ -21,7 +21,7 @@ export async function createRef<T>(pending: Set<string>, ref: CreatedRef, signal
     function unconfirmed(cause?: unknown) {
         const message = kind === 'merge source'
             ? 'Merge source capture may have succeeded. Start a new capture with a new tag name.'
-            : 'Reference creation may have succeeded. Pause source mutations and open the reference by name to inspect it.';
+            : 'Reference creation may have succeeded. Pause source mutations and inspect the reference with its at, for example by listing refs.';
         return new MemDriveError('REF_CREATION_UNCONFIRMED', message, { cause, details: { [kind === 'merge source' ? 'tag' : kind]: name } });
     }
     if (pending.has(key)) throw unconfirmed();

@@ -1,22 +1,23 @@
 import { create } from '@functional-systems/memdrive';
-import type { ConnectionOptions, CreateFileRefRequest, CreateMainFileRefRequest, WorkingFileDrive, CheckpointFileDrive } from '@functional-systems/memdrive';
+import type { CheckpointAt, ConnectionOptions, CreateFileRefRequest, FileRef, ForkAt } from '@functional-systems/memdrive';
 export async function historicalConsumer(connection: ConnectionOptions) {
-    const main = await create(connection);
-    const request: CreateMainFileRefRequest = { name: 'earlier', version: 'v1' };
-    const work: WorkingFileDrive = await main.fork(request);
-    const saved: CheckpointFileDrive = await main.checkpoint(request);
-    const current: CreateFileRefRequest = { name: 'current' };
-    await work.checkpoint(current);
-    await saved.fork(current);
-    // @ts-expect-error Time selection is removed from main.
-    await main.fork({ name: 'invalid', asOf: new Date().toISOString() });
-    // @ts-expect-error Version selection is only supported on main.
-    await work.fork({ name: 'invalid', version: 'v1' });
+    const drive = await create(connection);
+    const request: CreateFileRefRequest = { name: 'earlier', version: 'v1' };
+    const work: FileRef<ForkAt> = await drive.fork(request);
+    const saved: FileRef<CheckpointAt> = await drive.checkpoint(request);
+    await drive.fork({ at: { kind: 'main' }, name: 'explicit-main', version: 'v0' });
+    const current: CreateFileRefRequest = { at: work.at, name: 'current' };
+    await drive.checkpoint(current);
+    await drive.fork({ at: saved.at, name: 'current' });
+    // @ts-expect-error Time selection is removed.
+    await drive.fork({ name: 'invalid', asOf: new Date().toISOString() });
+    // @ts-expect-error Version selection is only supported from a main source.
+    await drive.fork({ at: work.at, name: 'invalid', version: 'v1' });
     // @ts-expect-error Checkpoints already identify a fixed state.
-    await saved.checkpoint({ name: 'invalid', version: 'v1' });
+    await drive.checkpoint({ at: saved.at, name: 'invalid', version: 'v1' });
     // @ts-expect-error Working snapshot time selection is removed.
-    await work.checkpoint({ name: 'invalid', asOf: new Date().toISOString() });
+    await drive.checkpoint({ at: work.at, name: 'invalid', asOf: new Date().toISOString() });
     const external = await create({ ...connection, embedding: { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'fixture' } });
-    const vector: WorkingFileDrive<'external'> = await external.fork(request);
+    const vector: FileRef<ForkAt> = await external.fork(request);
     return { saved, vector };
 }

@@ -16,15 +16,27 @@ export interface DoclingChunker {
     chunk(file: { path: string; content: string; format: string }, options?: RequestOptions): Promise<Array<{ text: string; contextualized: string }>>;
 }
 
-export type ForkSelection = { fork: string; checkpoint?: never };
-export type CheckpointSelection = { checkpoint: string; fork?: never };
+/** Main, the published view. Omitting `at` selects it. */
+export type MainAt = { kind: 'main' };
+/** A named working fork; the only writable target. */
+export type ForkAt = { kind: 'fork'; name: string };
+/** A named read-only checkpoint. */
+export type CheckpointAt = { kind: 'checkpoint'; name: string };
+/** One serializable view identity shared by requests, results and continuations. */
+export type FileAt = MainAt | ForkAt | CheckpointAt;
+
+/** Select a source view; omission selects main. */
+export interface FileAtRequest {
+    at?: FileAt | undefined;
+}
 
 export type EmbeddingMode = 'managed' | 'external';
 
-export type OpenFileStoreOptions<Mode extends EmbeddingMode = 'managed'> = ConnectionOptions & ModeOption<Mode> & (
-    { at?: undefined; recover?: boolean | undefined }
-    | { at: ForkSelection | CheckpointSelection; recover?: never }
-) & { chunker?: DoclingChunker | undefined };
+export type OpenFileStoreOptions<Mode extends EmbeddingMode = 'managed'> = ConnectionOptions & ModeOption<Mode> & {
+    /** Resume an unfinished main merge as the exclusive host-owned writer. */
+    recover?: boolean | undefined;
+    chunker?: DoclingChunker | undefined;
+};
 
 type ModeOption<Mode extends EmbeddingMode> = Mode extends 'external' ? { mode: 'external' } : { mode?: 'managed' | undefined };
 
@@ -39,7 +51,7 @@ export interface DriveFile extends FileListEntry {
     content: string;
 }
 
-export type ListFilesRequest = {
+export type ListFilesRequest = FileAtRequest & ({
     prefix?: string | undefined;
     nameContains?: string | undefined;
     delimiter?: '/' | undefined;
@@ -51,16 +63,25 @@ export type ListFilesRequest = {
     nameContains?: never;
     delimiter?: never;
     limit?: never;
-};
+});
+
+/** Continue a list or findText scan on the view that issued the cursor. Forward it unchanged. */
+export interface FileCursorRequest {
+    at: FileAt;
+    cursor: string;
+}
 
 export interface ListFilesResult {
     files: FileListEntry[];
     prefixes: string[];
     consistency: 'eventual';
-    cursor?: string | undefined;
+    next?: FileCursorRequest | undefined;
 }
 
-export type ReadFileRequest = { fileId: string; path?: never } | { path: string; fileId?: never };
+export type ReadFileRequest = FileAtRequest & ({ fileId: string; path?: never } | { path: string; fileId?: never });
+export interface ReadFilesRequest extends FileAtRequest {
+    paths: string[];
+}
 export interface ReadFileRangeOptions {
     startLine?: number | undefined;
     endLine?: number | undefined;
@@ -72,7 +93,7 @@ export type ReadFileRangeRequest = ReadFileRequest & ReadFileRangeOptions & (
     { startLine: number } | { endLine: number } | { maxChars: number } | { offset: number; revision: string } | { revision: string }
 );
 export interface FileReadPage extends DriveFile {
-    at: FileDrive['at'];
+    at: FileAt;
     /** Fingerprint of the original path, content and metadata, checked on continuation. */
     revision: string;
     /** Main publication last assigned to this original, when present. */
@@ -80,7 +101,8 @@ export interface FileReadPage extends DriveFile {
     totalLines: number;
     /** One-based inclusive line numbers and half-open UTF-16 offsets in the original. */
     range: { startLine: number; endLine: number; start: number; end: number };
-    next?: ReadFileRangeRequest | undefined;
+    /** Forward unchanged to continue on the same view. */
+    next?: (ReadFileRangeRequest & { at: FileAt }) | undefined;
 }
 export interface CreateFileRequest {
     op: 'create';
@@ -137,45 +159,44 @@ type ViewFile<Mode extends EmbeddingMode> = Mode extends 'external' ? FileListEn
 type ViewSearch<Mode extends EmbeddingMode> = Mode extends 'external' ? SearchExternalFilesRequest : SearchFilesRequest;
 type ViewSearchResult<Mode extends EmbeddingMode> = Mode extends 'external' ? SearchExternalFilesResult : SearchFilesResult;
 
-export interface FileRefEntry { name: string }
-
-interface FileView<Mode extends EmbeddingMode, RefRequest extends CreateFileRefRequest = CreateFileRefRequest> {
-    readonly name: string;
-    listForks(options?: RequestOptions): Promise<FileRefEntry[]>;
-    listCheckpoints(options?: RequestOptions): Promise<FileRefEntry[]>;
-    fork(request: RefRequest, options?: RequestOptions): Promise<WorkingFileDrive<Mode>>;
-    checkpoint(request: RefRequest, options?: RequestOptions): Promise<CheckpointFileDrive<Mode>>;
-    list(request?: ListFilesRequest, options?: RequestOptions): Promise<ListFilesResult>;
-    describe(options?: RequestOptions): Promise<FileStoreDescription<Mode>>;
-    status(options?: RequestOptions): Promise<FileStoreStatus>;
-    history(request?: FileHistoryRequest, options?: RequestOptions): Promise<FileHistoryResult>;
-    search(request: ViewSearch<Mode>, options?: RequestOptions): Promise<ViewSearchResult<Mode>>;
-    readonly findText: Mode extends 'external' ? undefined
-        : (request: FindTextRequest, options?: RequestOptions) => Promise<FindTextResult>;
-    read(request: Mode extends 'external' ? never : ReadFileRangeRequest, options?: RequestOptions): Promise<FileReadPage | null>;
-    read(request: ReadFileRequest, options?: RequestOptions): Promise<ViewFile<Mode> | null>;
-    read(request: { paths: string[] }, options?: RequestOptions): Promise<ViewFile<Mode>[]>;
-}
-
-/** Create a named ref from the currently bound view. */
-export interface CreateFileRefRequest {
+/** Create a named ref from a source view; omission selects main. */
+export type CreateFileRefRequest = {
+    at?: MainAt | undefined;
     name: string;
-}
-
-/** Create a ref from main, optionally selecting an exact retained publication. */
-export interface CreateMainFileRefRequest extends CreateFileRefRequest {
-    /** A main version such as v3, or the retained initial v0. Only supported on main. */
+    /** A main version such as v3, or the retained initial v0. Only supported from main. */
     version?: string | undefined;
+} | {
+    at: ForkAt | CheckpointAt;
+    name: string;
+    version?: never;
+};
+
+/** Serializable identity of an existing fork or checkpoint. */
+export interface FileRef<At extends ForkAt | CheckpointAt = ForkAt | CheckpointAt> {
+    at: At;
 }
 
-export interface MainFileDrive<Mode extends EmbeddingMode = 'managed'> extends FileView<Mode, CreateMainFileRefRequest> {
-    readonly at: { readonly kind: 'main' };
-    configure(request: { retentionInDays: number }, options?: RequestOptions): Promise<FileStoreDescription<Mode>>;
+/** User forks sorted by name. */
+export interface ForkList {
+    forks: FileRef<ForkAt>[];
 }
 
-export interface CheckpointFileDrive<Mode extends EmbeddingMode = 'managed'> extends FileView<Mode> {
-    readonly at: { readonly kind: 'checkpoint'; readonly name: string };
-    delete(options?: RequestOptions): Promise<void>;
+/** User checkpoints sorted by name. */
+export interface CheckpointList {
+    checkpoints: FileRef<CheckpointAt>[];
+}
+
+/** Fork and checkpoint listings take no options. */
+export type ListFileRefsRequest = Record<string, never>;
+
+/** Requests that act on one existing working fork. */
+export interface ForkRequest {
+    at: ForkAt;
+}
+
+export type WriteFileOperation<Mode extends EmbeddingMode = 'managed'> = FileMutation<Mode> | DeleteFileRequest;
+export interface WriteFilesRequest<Operation> extends ForkRequest {
+    operations: Operation[];
 }
 
 export type FileChange =
@@ -183,7 +204,7 @@ export type FileChange =
     | { op: 'update'; fileId: string; path: string; previousPath?: string | undefined }
     | { op: 'delete'; fileId: string; previousPath: string };
 
-export interface MergeRequest {
+export interface MergeRequest extends ForkRequest {
     requestId: string;
     summary: string;
 }
@@ -195,7 +216,7 @@ export interface MergeResult {
 }
 
 export interface FileStoreStatus {
-    at: FileDrive['at'];
+    at: FileAt;
     mainVersion: string;
     /** An observed unfinished main merge. Its writer may still be running. */
     merge?: { requestId: string; phase: 'publication' | 'bookkeeping' } | undefined;
@@ -224,23 +245,38 @@ export interface FileHistoryResult {
     entries: FileHistoryEntry[];
     /** The latest published main version observed when the first page was requested. */
     throughVersion: string;
-    cursor?: string | undefined;
+    /** Store-wide continuation; forward unchanged. */
+    next?: { cursor: string } | undefined;
 }
 
-export interface WorkingFileDrive<Mode extends EmbeddingMode = 'managed'> extends FileView<Mode> {
-    readonly at: { readonly kind: 'fork'; readonly name: string };
-    delete(options?: RequestOptions): Promise<void>;
+/** One store object. Each request selects its view with `at`; omission selects main. */
+export interface FileDrive<Mode extends EmbeddingMode = 'managed'> {
+    readonly name: string;
+    describe(options?: RequestOptions): Promise<FileStoreDescription<Mode>>;
+    configure(request: { retentionInDays: number }, options?: RequestOptions): Promise<FileStoreDescription<Mode>>;
+    status(request?: FileAtRequest, options?: RequestOptions): Promise<FileStoreStatus>;
+    history(request?: FileHistoryRequest, options?: RequestOptions): Promise<FileHistoryResult>;
+    list(request?: ListFilesRequest, options?: RequestOptions): Promise<ListFilesResult>;
+    read(request: Mode extends 'external' ? never : ReadFileRangeRequest, options?: RequestOptions): Promise<FileReadPage | null>;
+    read(request: ReadFileRequest, options?: RequestOptions): Promise<ViewFile<Mode> | null>;
+    read(request: ReadFilesRequest, options?: RequestOptions): Promise<ViewFile<Mode>[]>;
+    search(request: ViewSearch<Mode>, options?: RequestOptions): Promise<ViewSearchResult<Mode>>;
+    readonly findText: Mode extends 'external' ? undefined
+        : (request: FindTextRequest, options?: RequestOptions) => Promise<FindTextResult>;
+    fork(request: CreateFileRefRequest, options?: RequestOptions): Promise<FileRef<ForkAt>>;
+    checkpoint(request: CreateFileRefRequest, options?: RequestOptions): Promise<FileRef<CheckpointAt>>;
+    listForks(request?: ListFileRefsRequest, options?: RequestOptions): Promise<ForkList>;
+    listCheckpoints(request?: ListFileRefsRequest, options?: RequestOptions): Promise<CheckpointList>;
+    deleteFork(request: { at: ForkAt }, options?: RequestOptions): Promise<FileRef<ForkAt>>;
+    deleteCheckpoint(request: { at: CheckpointAt }, options?: RequestOptions): Promise<FileRef<CheckpointAt>>;
+    write(request: ForkRequest & FileMutation<Mode>, options?: RequestOptions): Promise<ViewFile<Mode>>;
+    write(request: ForkRequest & DeleteFileRequest, options?: RequestOptions): Promise<DeleteFileResult>;
+    write(request: ForkRequest & WriteFileOperation<Mode>, options?: RequestOptions): Promise<ViewFile<Mode> | DeleteFileResult>;
+    write(request: WriteFilesRequest<FileMutation<Mode>>, options?: RequestOptions): Promise<ViewFile<Mode>[]>;
+    write(request: WriteFilesRequest<WriteFileOperation<Mode>>, options?: RequestOptions): Promise<(ViewFile<Mode> | DeleteFileResult)[]>;
+    diff(request: ForkRequest, options?: RequestOptions): Promise<FileChange[]>;
     merge(request: MergeRequest, options?: RequestOptions): Promise<MergeResult>;
-    diff(options?: RequestOptions): Promise<FileChange[]>;
-    write(request: FileMutation<Mode>, options?: RequestOptions): Promise<ViewFile<Mode>>;
-    write(request: DeleteFileRequest, options?: RequestOptions): Promise<DeleteFileResult>;
-    write(request: FileMutation<Mode> | DeleteFileRequest, options?: RequestOptions): Promise<ViewFile<Mode> | DeleteFileResult>;
-    write(request: FileMutation<Mode>[], options?: RequestOptions): Promise<ViewFile<Mode>[]>;
-    write(request: (FileMutation<Mode> | DeleteFileRequest)[], options?: RequestOptions): Promise<(ViewFile<Mode> | DeleteFileResult)[]>;
 }
-
-export type FileDrive<Mode extends EmbeddingMode = 'managed'> =
-    MainFileDrive<Mode> | WorkingFileDrive<Mode> | CheckpointFileDrive<Mode>;
 
 export type MetadataType = 'string' | 'number' | 'boolean' | 'datetime';
 export type Metadata = Record<string, string | number | boolean>;
@@ -303,7 +339,7 @@ export type FileFilter =
     | { field: `metadata.${string}`; op: 'in'; value: (string | number | boolean)[] }
     | { field: `metadata.${string}`; op: 'exists'; value: boolean };
 
-interface SearchOptions {
+interface SearchOptions extends FileAtRequest {
     limit?: number | undefined;
     filter?: FileFilter | undefined;
 }
@@ -340,8 +376,7 @@ export interface SearchFilesResult {
     reranked: boolean;
 }
 
-
-export type FindTextRequest = {
+export type FindTextRequest = FileAtRequest & ({
     query: string;
     prefix?: string | undefined;
     filter?: FileFilter | undefined;
@@ -353,7 +388,7 @@ export type FindTextRequest = {
     prefix?: never;
     filter?: never;
     limit?: never;
-};
+});
 
 export interface FileTextHit extends DriveFile {
     /** Verified half-open UTF-16 offsets into the file's original text. */
@@ -365,6 +400,6 @@ export interface FileTextHit extends DriveFile {
 export interface FindTextResult {
     hits: FileTextHit[];
     consistency: 'snapshot' | 'live';
-    /** Continue with this cursor even when the current page has no hits. */
-    cursor?: string | undefined;
+    /** Forward unchanged even when the current page has no hits. */
+    next?: FileCursorRequest | undefined;
 }

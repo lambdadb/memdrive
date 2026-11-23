@@ -1,6 +1,6 @@
 import { MemDriveError, requireInput } from './errors.js';
 import { fingerprintOf } from './records.js';
-import type { DriveFile, FileDrive, FileReadPage, ReadFileRangeOptions } from './types.js';
+import type { DriveFile, FileAt, FileReadPage, ReadFileRangeOptions } from './types.js';
 
 export const rangeKeys = ['startLine', 'endLine', 'maxChars', 'offset', 'revision'];
 
@@ -17,7 +17,7 @@ export function validateReadRange(request: ReadFileRangeOptions) {
         'Continuation offset requires a nonnegative integer and the returned revision.');
 }
 
-export async function readRange(file: DriveFile, request: ReadFileRangeOptions, at: FileDrive['at'], version?: string): Promise<FileReadPage> {
+export async function readRange(file: DriveFile, request: ReadFileRangeOptions, at: FileAt, version?: string): Promise<FileReadPage> {
     const revision = await fingerprintOf(file);
     if (request.revision !== undefined && request.revision !== revision)
         throw new MemDriveError('READ_VERSION_CHANGED', 'The file changed between reads. Restart without offset and revision.');
@@ -40,7 +40,7 @@ export async function readRange(file: DriveFile, request: ReadFileRangeOptions, 
         while (low < high) { const middle = (low + high) >>> 1; if (starts[middle]! <= offset) low = middle + 1; else high = middle; }
         return low;
     };
-    return { ...file, content: text.slice(start, end), at, revision, ...(version === undefined ? {} : { version }), totalLines,
+    return { ...file, content: text.slice(start, end), at: { ...at }, revision, ...(version === undefined ? {} : { version }), totalLines,
         range: { startLine: lineAt(start), endLine: lineAt(Math.max(start, end - 1)), start, end },
-        ...(end < upper ? { next: { fileId: file.fileId, startLine, endLine: Math.min(endLine, totalLines), maxChars, offset: end, revision } } : {}) };
+        ...(end < upper ? { next: { at: { ...at }, fileId: file.fileId, startLine, endLine: Math.min(endLine, totalLines), maxChars, offset: end, revision } } : {}) };
 }

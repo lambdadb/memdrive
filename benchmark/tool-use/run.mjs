@@ -84,8 +84,7 @@ export async function runEvaluation({ output, mode = 'model', guide = 'all', ins
         try {
             context = await prepare(entry.scenario);
             result.initial = context.initial;
-            host = createHost({ drive: context.drive, client: context.client, writable: context.scenario.writable,
-                guide: entry.guide, rebindFork: context.scenario.rebindFork });
+            host = createHost({ drive: context.drive, writable: context.scenario.writable, guide: entry.guide, start: context.at });
             const transport = askFactory ? askFactory(context.scenario, entry.guide)
                 : mode === 'scripted' ? scriptedAgent(context.scenario, entry.guide) : modelAsk;
             signal = AbortSignal.timeout(900_000);

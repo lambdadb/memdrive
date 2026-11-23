@@ -15,19 +15,20 @@ export function fileTools(config) {
 
 const toolError = (code, message) => ({ ok: false, error: { code, message } });
 
-export async function runTool(drive, name, args, config, signal) {
+/** Execute a benchmark tool against the corpus view `{ drive, at }`. */
+export async function runTool({ drive, at }, name, args, config, signal) {
     if (args && typeof args === 'object' && !Array.isArray(args)) {
         const keys = Object.keys(args);
         if (name === 'search_files' && keys.every(key => ['query', 'limit'].includes(key))
             && typeof args.query === 'string' && args.query.trim()) {
             const limit = args.limit === undefined ? config.retrieval.limit : args.limit;
             if (Number.isSafeInteger(limit) && limit > 0 && limit <= config.retrieval.limit) {
-                const value = await drive.search({ query: args.query, mode: 'hybrid', limit, rerank: config.retrieval.rerank }, { signal });
+                const value = await drive.search({ at, query: args.query, mode: 'hybrid', limit, rerank: config.retrieval.rerank }, { signal });
                 return { ok: true, value };
             }
         }
         if (name === 'read_file' && keys.length === 1 && typeof args.fileId === 'string' && fileIdPattern.test(args.fileId)) {
-            const value = await drive.read({ fileId: args.fileId }, { signal });
+            const value = await drive.read({ at, fileId: args.fileId }, { signal });
             return value === null ? toolError('FILE_NOT_FOUND', 'The file was not found.') : { ok: true, value };
         }
     }

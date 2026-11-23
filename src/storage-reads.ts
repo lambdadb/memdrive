@@ -3,6 +3,8 @@ import { originalId, resultDocs, validFileId, validPath } from './records.js';
 import type { ConnectionOptions } from './types.js';
 
 export type Handle = ReturnType<ConnectionOptions['client']['collection']>;
+/** A view-local request after the store has resolved its `at`. */
+export type WithoutAt<T> = T extends unknown ? Omit<T, 'at'> : never;
 
 export type ViewRef = { kind: 'branch'; name: string } | { kind: 'tag'; name: string };
 export type RefSource = ViewRef | {

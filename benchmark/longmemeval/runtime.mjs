@@ -149,11 +149,11 @@ function validateDescriptor(descriptor, entry, profile) {
     assert.deepEqual(descriptor.embedding, profile.embedding, 'Corpus embedding configuration differs');
     assert.deepEqual(descriptor.textSearch, profile.textSearch, 'Corpus text search configuration differs');
 }
-async function validateOriginals(drive, journal, sources) {
+async function validateOriginals({ drive, at }, journal, sources) {
     let batch = [], bytes = 0;
     const readBatch = async () => {
         if (!batch.length) return;
-        const files = await drive.read({ paths: batch.map(([, file]) => file.path) }, { signal: journal.signal });
+        const files = await drive.read({ at, paths: batch.map(([, file]) => file.path) }, { signal: journal.signal });
         const originals = files.map(({ fileId, path, content, metadata }) => ({ fileId, path, content, metadata }));
         assert.deepEqual(originals, batch.map(([fileId, file]) => ({ fileId, ...file })), 'Stored original readback differs');
         batch = []; bytes = 0;
@@ -172,24 +172,26 @@ export async function ingest(journal, prepared, entry, profile = storageProfile(
     const main = await MemDrive.create({ client: journal.native(), name: entry.collection, metadataSchema: profile.metadataSchema,
         labels: { 'eval.owner': entry.owner, 'eval.scope': entry.scope }, textSearch: profile.textSearch }, options);
     validateDescriptor(await main.describe(options), entry, profile);
-    const drive = await main.fork({ name: profile.fork }, options);
+    const { at } = await main.fork({ name: profile.fork }, options);
     const fileIds = [];
     for (let index = 0; index < prepared.files.length; index += 20) {
         const batch = prepared.files.slice(index, index + 20);
-        const created = await drive.write(batch.map(file => ({ op: 'create', ...file })), options);
+        const created = await main.write({ at, operations: batch.map(file => ({ op: 'create', ...file })) }, options);
         assert.deepEqual(created.map(file => file.path), batch.map(file => file.path), 'File creation paths differ');
         fileIds.push(...created.map(file => file.fileId));
     }
-    await validateOriginals(drive, journal, sourceFiles(prepared, fileIds));
+    await validateOriginals({ drive: main, at }, journal, sourceFiles(prepared, fileIds));
     return fileIds;
 }
 
+/** Reopen the corpus and return the drive with the corpus fork's explicit view. */
 export async function reuseDrive(journal, entry, sources, profile) {
     const options = { signal: journal.signal };
-    const drive = await MemDrive.open({ client: journal.native(), name: entry.collection, at: { fork: profile.fork } }, options);
+    const drive = await MemDrive.open({ client: journal.native(), name: entry.collection }, options);
     validateDescriptor(await drive.describe(options), entry, profile);
-    await validateOriginals(drive, journal, sources);
-    return drive;
+    const corpus = { drive, at: { kind: 'fork', name: profile.fork } };
+    await validateOriginals(corpus, journal, sources);
+    return corpus;
 }
 
 export async function cleanup(journal, entry) {
