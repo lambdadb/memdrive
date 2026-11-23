@@ -14,6 +14,8 @@ type Resume = { id: string; offset: number; fingerprint?: string };
 type Criteria = { query: string; prefix: string; filter?: FileFilter | undefined; limit: number };
 type Scan = Criteria & {
     ref: ViewRef;
+    /** Fork or checkpoint incarnation the scan started on. */
+    incarnation?: string | undefined;
     pattern: string;
     clauses: Clause[];
     upper?: string | undefined;
@@ -30,6 +32,7 @@ const contextUnits = 80;
 const filesPerPage = 16;
 const token = 't1';
 const fingerprintPattern = /^[0-9a-f]{64}$/;
+const incarnationPattern = /^[0-9a-f]{32}$/;
 const originalPattern = /^file:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const unavailable = (cause?: unknown) => new MemDriveError('FIND_TEXT_CURSOR_UNAVAILABLE',
     'Text match cursor is malformed, or its pinned view or resumed file is no longer available. Start again without a cursor.', { cause });
@@ -59,12 +62,21 @@ function prepare(criteria: Criteria, schema: MetadataSchema) {
  * verified from the request on every page.
  */
 export function fileTextFinder(handle: Handle, name: string, source: RefSource, schema: MetadataSchema, at: FileAt,
-    { enqueue, pinVersion, store }: {
+    { enqueue, pinVersion, store, incarnation }: {
         enqueue?: (<T>(operation: () => Promise<T>, signal?: AbortSignal) => Promise<T>) | undefined;
         pinVersion: (version: string, signal?: AbortSignal) => Promise<ViewRef>;
         store: Promise<string>;
+        /** A fresh identity of a fork or checkpoint, so a recreated ref with the same name is never continued. */
+        incarnation?: ((signal?: AbortSignal) => Promise<string>) | undefined;
     }) {
     const published = 'read' in source;
+    async function current(signal?: AbortSignal) {
+        try { return await incarnation!(signal); }
+        catch (cause) {
+            if (cause instanceof MemDriveError && (cause.code === 'BRANCH_NOT_FOUND' || cause.code === 'CHECKPOINT_NOT_FOUND')) throw unavailable(cause);
+            throw cause;
+        }
+    }
     /** The main publication a ref pins, or null for a legacy live main. */
     const mainVersion = (ref: ViewRef) => ref.kind === 'tag' && ref.name.startsWith(tagFor('')) ? ref.name.slice(tagFor('').length)
         : ref.name === initialMainRef.name ? 'v0' : null;
@@ -72,6 +84,7 @@ export function fileTextFinder(handle: Handle, name: string, source: RefSource, 
     async function encode(scan: Scan) {
         const { query, prefix, filter, limit, upper, after, resume } = scan;
         return encodeToken(token, { d: await store, a: at, ...(published ? { v: mainVersion(scan.ref) } : {}),
+            ...(scan.incarnation === undefined ? {} : { i: scan.incarnation }),
             q: query, p: prefix, ...(filter === undefined ? {} : { f: filter }), l: limit,
             ...(upper === undefined ? {} : { u: upper }), ...(after === undefined ? {} : { af: after }),
             ...(resume === undefined ? {} : { r: { i: resume.id, o: resume.offset, ...(resume.fingerprint === undefined ? {} : { h: resume.fingerprint }) } }) });
@@ -80,7 +93,7 @@ export function fileTextFinder(handle: Handle, name: string, source: RefSource, 
     /** Rebuild a scan from an untrusted token without granting it any authority. */
     async function decode(cursor: string, signal?: AbortSignal): Promise<Scan> {
         const value = decodeToken(token, cursor);
-        if (!value || !keysOnly(value, ['d', 'a', 'v', 'q', 'p', 'f', 'l', 'u', 'af', 'r']) || value.d !== await store || !validAt(value.a))
+        if (!value || !keysOnly(value, ['d', 'a', 'v', 'i', 'q', 'p', 'f', 'l', 'u', 'af', 'r']) || value.d !== await store || !validAt(value.a))
             throw unavailable();
         if (!sameAt(value.a, at))
             throw new MemDriveError('CURSOR_VIEW_MISMATCH', 'This cursor belongs to another view. Forward the returned next request unchanged, including its at.');
@@ -105,9 +118,12 @@ export function fileTextFinder(handle: Handle, name: string, source: RefSource, 
         // Derive the read ref from the request's view, never from the token.
         let ref: ViewRef;
         if (!published) {
-            if (Object.hasOwn(value, 'v')) throw unavailable();
+            if (Object.hasOwn(value, 'v') || typeof value.i !== 'string' || !incarnationPattern.test(value.i)) throw unavailable();
+            // Reject a fork or checkpoint deleted or recreated under the same name since the scan began.
+            if (value.i !== await current(signal)) throw unavailable();
             ref = source;
         }
+        else if (Object.hasOwn(value, 'i')) throw unavailable();
         else if (value.v === null) ref = branchRef('main');
         else if (typeof value.v === 'string' && /^v(?:0|[1-9][0-9]*)$/.test(value.v) && value.v.length <= 44) {
             try { ref = await pinVersion(value.v, signal); }
@@ -120,7 +136,7 @@ export function fileTextFinder(handle: Handle, name: string, source: RefSource, 
         const snapshot = isSnapshot(ref);
         if (snapshot ? upper !== undefined || resume?.fingerprint !== undefined
             : upper === undefined || (resume !== undefined && resume.fingerprint === undefined)) throw unavailable();
-        return { ...criteria, ref, ...(upper === undefined ? {} : { upper: upper as string }),
+        return { ...criteria, ref, ...(published ? {} : { incarnation: value.i as string }), ...(upper === undefined ? {} : { upper: upper as string }),
             ...(after === undefined ? {} : { after: after as string }), ...(resume === undefined ? {} : { resume }) };
     }
     const isSnapshot = (ref: ViewRef) => ref.kind === 'tag' || ('read' in source && ref.name === initialMainRef.name);
@@ -221,7 +237,7 @@ export function fileTextFinder(handle: Handle, name: string, source: RefSource, 
             const { query, prefix = '', limit = 20, filter } = request;
             const criteria = prepare({ query, prefix, limit, ...(filter === undefined ? {} : { filter }) }, schema);
             run = () => readRef(source, async ref => {
-                const scan = { ...criteria, ref };
+                const scan = { ...criteria, ref, ...(published ? {} : { incarnation: await incarnation!(signal) }) };
                 if (isSnapshot(ref)) return page(scan, signal);
                 const last = await original(ref, criteria.clauses, signal, true);
                 if (!last) return { result: { hits: [], consistency: 'live' } };

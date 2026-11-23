@@ -192,3 +192,31 @@ test('main findText cursors verify their pinned publication on every page', asyn
     fixture.collections.get(name).tags.delete('md-main-v1');
     await assert.rejects(other.findText(page.next), { code: 'FIND_TEXT_CURSOR_UNAVAILABLE' });
 });
+
+test('findText cursors never continue on a fork or checkpoint recreated under the same name', async () => {
+    const { fixture, name, drive } = await setup();
+    const file = await drive.write({ at, op: 'create', path: '/note', content: 'saved saved' });
+    const { at: saved } = await drive.checkpoint({ at, name: 'saved' });
+    const page = await drive.findText({ at: saved, query: 'saved', limit: 1 });
+    assert.equal(page.consistency, 'snapshot');
+    assert.equal(decoded(page.next.cursor).i.length, 32);
+    // The original incarnation still continues, including on another client.
+    const other = await MemDrive.open({ client: { ...fixture.client }, name });
+    assert.equal((await other.findText(page.next)).hits[0].range.start, 6);
+    await drive.deleteCheckpoint({ at: saved });
+    await assert.rejects(other.findText(page.next), { code: 'FIND_TEXT_CURSOR_UNAVAILABLE' });
+    await drive.write({ at, op: 'update', fileId: file.fileId, content: 'saved but replaced' });
+    await drive.checkpoint({ at, name: 'saved' });
+    await assert.rejects(drive.findText(page.next), { code: 'FIND_TEXT_CURSOR_UNAVAILABLE' });
+    await assert.rejects(other.findText(page.next), { code: 'FIND_TEXT_CURSOR_UNAVAILABLE' });
+    assert.equal((await drive.findText({ at: saved, query: 'saved' })).hits.length, 1);
+
+    // A recreated fork is likewise a different view, even with unchanged files.
+    await drive.write({ at, op: 'create', path: '/second', content: 'saved' });
+    const { at: copy } = await drive.fork({ at, name: 'copy' });
+    const copied = await drive.findText({ at: copy, query: 'saved', limit: 1 });
+    await drive.deleteFork({ at: copy });
+    await drive.fork({ at, name: 'copy' });
+    assert(copied.next);
+    await assert.rejects(drive.findText(copied.next), { code: 'FIND_TEXT_CURSOR_UNAVAILABLE' });
+});

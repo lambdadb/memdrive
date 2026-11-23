@@ -3,7 +3,7 @@ import type { CheckpointAt, ConnectionOptions, CreateExternalFileStoreOptions, C
     SearchFilesRequest, WriteFileRequest, CreateExternalFileRequest, UpdateExternalFileRequest } from './types.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
 import { formatTag, isObject, keysOnly, parseStore, storeConfiguration, validRetention } from './config.js';
-import { decodeFile, decodeFileEntry, resultDocs, validFileId, validPath } from './records.js';
+import { contentHash, decodeFile, decodeFileEntry, resultDocs, validFileId, validPath } from './records.js';
 import { branchRef, fetchOriginals, pathQuery, pinRef, readRef, viewRead, type Handle, type RefSource, type WithoutAt } from './storage-reads.js';
 import { workingWriter, writeBatchLimit } from './writes.js';
 import { searchQuery, validateReranking, vectorSearchQuery } from './search.js';
@@ -265,6 +265,27 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         };
     }
 
+    /** Read a fork or checkpoint's current identity; a recreated ref with the same name differs. */
+    async function refIncarnation(at: RefAt, signal?: AbortSignal) {
+        const time = (value: unknown) => value instanceof Date ? value.getTime() : value;
+        let identity: unknown[];
+        if (at.kind === 'fork') {
+            const branchName = forkPrefix + at.name;
+            const { branch } = await remote(() => handle.branches.get(branchName, nativeOptions(signal)),
+                'Could not inspect the working fork.', signal, { 404: 'BRANCH_NOT_FOUND' });
+            identity = [branch?.name === branchName ? time(branch.createdAt) : undefined, branch?.parentSnapshot?.snapshotId ?? null];
+        } else {
+            const tagName = checkpointPrefix + at.name;
+            const { tag } = await remote(() => handle.tags.get(tagName, nativeOptions(signal)),
+                'Could not inspect the named checkpoint.', signal, { 404: 'CHECKPOINT_NOT_FOUND' });
+            identity = [tag?.name === tagName ? time(tag.createdAt) : undefined, tag?.snapshotId];
+        }
+        checkAbort(signal);
+        if (!Number.isSafeInteger(identity[0]) || (identity[1] !== null && (typeof identity[1] !== 'string' || !identity[1])))
+            throw new MemDriveError('INVALID_RESULT', 'Reference lookup returned an invalid identity.');
+        return (await contentHash(JSON.stringify(identity))).slice(0, 32);
+    }
+
     function view(at: FileAt, source: RefSource, writer?: Writer) {
         Object.freeze(at);
         return {
@@ -272,7 +293,8 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
             read: reader(source, at), search: searcher(source),
             lister: fileLister(handle, name, source, metadataSchema, at),
             finder: dimensions === undefined ? fileTextFinder(handle, name, source, metadataSchema, at,
-                { enqueue: writer?.enqueueRef, pinVersion: publishing.pinVersion, store: cursorStore }) : undefined,
+                { enqueue: writer?.enqueueRef, pinVersion: publishing.pinVersion, store: cursorStore,
+                    incarnation: at.kind === 'main' ? undefined : signal => refIncarnation(at, signal) }) : undefined,
         };
     }
     type View = ReturnType<typeof view>;

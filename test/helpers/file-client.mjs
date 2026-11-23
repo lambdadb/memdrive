@@ -1,4 +1,8 @@
 // Models the file SDK's native requests with immediate visibility.
+// Like LambdaDB, a recreated ref gets a later creation time and a new snapshot ID.
+let lastCreated = 0;
+const createdAt = () => new Date(lastCreated = Math.max(Date.now(), lastCreated + 1));
+
 export function fileClient() {
     const collections = new Map();
     let generation = 0;
@@ -53,7 +57,7 @@ export function fileClient() {
                     async create({ branchName, source }, options) {
                         calls.push({ kind: 'branch-create', request: { branchName, source }, retries: options?.retries });
                         if (state().branches.has(branchName)) fail(409, 'Branch already exists');
-                        state().branches.set(branchName, { docs: copyView(source), createdAt: new Date() });
+                        state().branches.set(branchName, { docs: copyView(source), createdAt: createdAt() });
                         return { branch: { name: branchName } };
                     },
                     async get(branchName) {
@@ -87,7 +91,7 @@ export function fileClient() {
                         calls.push({ kind: 'tag-create', request: { tagName, source }, retries: options?.retries });
                         await fixture.beforeTagCreate?.(tagName, source);
                         if (state().tags.has(tagName)) fail(409, 'Tag already exists');
-                        const tag = { name: tagName };
+                        const tag = { name: tagName, snapshotId: globalThis.crypto.randomUUID(), snapshotCommittedAt: new Date(), createdAt: createdAt() };
                         state().tags.set(tagName, { tag, docs: copyView(source) });
                         await fixture.afterTagCreate?.(tag);
                         return { tag };
