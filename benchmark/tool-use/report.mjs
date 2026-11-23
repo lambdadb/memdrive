@@ -3,6 +3,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { agentFailureCodes } from './agent.mjs';
 import { summarize } from './run.mjs';
+import { retrievalMetrics } from './scenarios.mjs';
 
 const toolNames = ['guide', 'status', 'history', 'list', 'read', 'search', 'findText',
     'fork', 'checkpoint', 'listForks', 'listCheckpoints', 'deleteFork', 'deleteCheckpoint', 'diff', 'write', 'merge'];
@@ -66,6 +67,8 @@ function caseDiagnostic(entry, result, receipts, model) {
             behavior: { toolCalls: count(behavior.toolCalls), guideCalls: count(behavior.guideCalls),
                 resourceReadsByHost: count(behavior.resourceReadsByHost), exactEdits: count(behavior.exactEdits),
                 readBeforeWrite: behavior.readBeforeWrite, reviewedDiff: behavior.reviewedDiff } },
+        // Counts and tool names recomputed from the recorded events; no arguments are exported.
+        retrieval: Array.isArray(result?.events) ? retrievalMetrics(result.events) : undefined,
         events: (result?.events ?? []).map(toolEvent).filter(Boolean),
         offered: offered.map(round => ({ round: count(round.round),
             tools: (round.definitions ?? []).map(tool => toolName(tool.name)) })),
@@ -100,6 +103,7 @@ export async function readEvaluationReport(directory) {
     return { version: 1, manifest: { protocol, mode, transport, model, instruction, backend, node, startedAt, sourceCommit,
         packageVersion: manifest.package.version, lambdaDBVersion: manifest.package.dependencies['@functional-systems/lambdadb'],
         guideVersion: manifest.guide.version, plan,
+        readOnlyScenarios: (manifest.scenarios ?? []).filter(item => item.writable === false && plan.some(entry => entry.scenario === item.id)).map(item => item.id),
         limits: { rounds, toolCalls, contextTokens, totalTokens, outputTokens, resultBytes, requestSeconds },
         sources: manifest.sources }, summary, cases };
 }
@@ -116,9 +120,19 @@ export function formatEvaluationSummary(report) {
         const planned = manifest.plan.filter(entry => entry.guide === guide).length;
         return `| ${guide} | ${planned} | ${group?.attempted ?? 0} | ${group?.passed ?? 0} | ${group?.failed ?? 0} | ${group?.errors ?? 0} |`;
     });
+    const retrieval = manifest.readOnlyScenarios.flatMap(scenario => ['none', 'tool', 'resource'].flatMap(guide => {
+        const counts = summary.groups[guide]?.retrievalByScenario?.[scenario];
+        if (!counts) return [];
+        const first = ['search', 'findText', 'list', 'read', 'none'].map(name => counts.firstTool[name]).join(' / ');
+        return [`| ${scenario} | ${guide} | ${counts.cases} | ${first} | ${counts.search} | ${counts.findText} | ${counts.findTextBeforeSearch} | ${counts.cases - counts.casesUsingSearch} | ${counts.findTextUnscoped} |`];
+    }));
     return [heading, '', description, '',
         `Attempted ${summary.attempted} of ${summary.planned} planned cases. Passed ${summary.passed}, failed ${summary.failed}, errors ${summary.errors} (including ${summary.interrupted} interrupted).`, '',
         '| Guide | Planned | Attempted | Passed | Failed | Errors |', '| --- | ---: | ---: | ---: | ---: | ---: |', ...rows, '',
+        ...(retrieval.length ? ['### Retrieval tool selection in read-only scenarios', '',
+            'Totals over recorded conversations. First tool counts conversations by their first retrieval call. Fixture search returns the same candidates for every query, so these counts describe tool selection, not retrieval relevance.', '',
+            '| Scenario | Guide | Cases | First tool: search / findText / list / read / none | search calls | findText calls | findText before first search | Cases without search | Unscoped findText calls |',
+            '| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |', ...retrieval, ''] : []),
         'Coverage is limited to synthetic scenarios and literal answer checks, the public SDK on the native-client fixture, and in-process host tools. The host fetches and injects the resource guide.', '',
         'The JSON artifact includes the run configuration, scoring checks, tool outcomes and request diagnostics.', ''].join('\n');
 }

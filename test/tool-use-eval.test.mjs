@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
 import { createHost, guideURI } from '../benchmark/tool-use/host.mjs';
-import { prepareScenario, scenarios, evaluate } from '../benchmark/tool-use/scenarios.mjs';
+import { prepareScenario, scenarios, selectScenarios, evaluate, retrievalMetrics, aggregateRetrieval, paraphraseTargets, enumeratedCode,
+    enumeratedPaths } from '../benchmark/tool-use/scenarios.mjs';
 import { runAgent, openAI, limits, startingView } from '../benchmark/tool-use/agent.mjs';
 import { scriptedAgent } from '../benchmark/tool-use/scripted.mjs';
 import { runEvaluation } from '../benchmark/tool-use/run.mjs';
@@ -23,14 +24,19 @@ async function usingScenario(id, guide, run) {
     try { await run(context, host); } finally { await context.cleanup(); }
 }
 
-test('scripted smoke exercises actual SDK state across six scenarios and three guide channels', async () => {
-    for (const scenario of scenarios) for (const guide of ['none', 'tool', 'resource'])
+test('scripted smoke exercises actual SDK state across nine scenarios, three guide channels and three instruction profiles', async () => {
+    assert.equal(scenarios.length, 9);
+    for (const scenario of scenarios) for (const guide of ['none', 'tool', 'resource']) for (const instruction of ['server', 'workflow', 'user'])
         await usingScenario(scenario.id, guide, async (context, host) => {
-            const result = await runAgent({ host, scenario, guide, ask: scriptedAgent(scenario, guide) });
+            const result = await runAgent({ host, scenario, guide, instruction, ask: scriptedAgent(scenario, guide) });
             const scored = await evaluate(context, host, result.finalText);
-            assert(scored.passed, JSON.stringify({ scenario: scenario.id, guide, checks: scored.checks }));
+            assert(scored.passed, JSON.stringify({ scenario: scenario.id, guide, instruction, checks: scored.checks }));
             assert.equal(scored.behavior.guideCalls, guide === 'tool' ? 2 : 0);
             assert.equal(scored.behavior.resourceReadsByHost, guide === 'resource' ? 1 + Object.keys(fileToolGuideTopics).length : 0);
+            // Scripted paraphrase recall uses ranked search; the literal control uses findText.
+            const { firstTool, usedSearch } = retrievalMetrics(host.events);
+            if (scenario.group === 'retrieval') assert.deepEqual([firstTool, usedSearch],
+                scenario.id === 'enumerate' ? ['findText', false] : ['search', true], scenario.id);
         });
 });
 
@@ -336,4 +342,173 @@ test('checkpoint scoring requires draft provenance before its first mutation', a
             assert.equal(scored.checks.checkpointOfDraftBeforeEditing, false, timing);
             assert.equal(scored.passed, false, timing);
         });
+});
+
+test('paraphrase targets are ranked candidates for any query while the question wording has no literal hit', async () => {
+    for (const id of ['paraphrase', 'cross-language']) await usingScenario(id, 'none', async (context, host) => {
+        const { task } = context.scenario, target = paraphraseTargets[id];
+        const candidates = async args => (await host.toolsCall('search', args)).hits.map(hit => hit.path);
+        const ranked = await candidates({ query: task });
+        assert.equal(ranked.length, 9, 'the default limit returns every chunk of the drive');
+        assert.equal(ranked.indexOf(target), id === 'paraphrase' ? 2 : 4);
+        // The fixture ignores the query and the mode: this measures tool selection, not retrieval relevance.
+        for (const mode of ['semantic', 'keyword', 'hybrid'])
+            assert.deepEqual(await candidates({ query: 'unrelated wording', mode }), ranked, mode);
+        const words = [...new Set(task.match(/\p{L}{2,}/gu).filter(word => /\P{ASCII}/u.test(word) || word.length >= 4))];
+        assert(words.length >= 10, 'the question has distinctive words to try');
+        for (const query of [task, ...task.split(/(?<=[?.]) /), ...words]) {
+            const found = await host.toolsCall('findText', { query });
+            assert.deepEqual([found.hits, found.next], [[], undefined], query);
+        }
+        // The stored wording itself is literally findable, so the miss comes from the paraphrase.
+        const stored = await host.toolsCall('findText', { query: id === 'paraphrase' ? 'overdue' : 'laptop' });
+        assert.deepEqual(stored.hits.map(hit => hit.path), [target]);
+    });
+});
+
+test('the literal control is fully enumerated only by an unscoped findText', async () => {
+    await usingScenario('enumerate', 'none', async (context, host) => {
+        assert(context.scenario.task.includes(enumeratedCode));
+        assert.deepEqual([...enumeratedPaths].sort(), ['/notes/2026-02-10.md', '/runbooks/export.md', '/runbooks/import.md']);
+        const paths = async args => [...new Set((await host.toolsCall('findText', { query: enumeratedCode, ...args })).hits.map(hit => hit.path))].sort();
+        assert.deepEqual(await paths({}), [...enumeratedPaths].sort());
+        assert.deepEqual(await paths({ prefix: '/runbooks/' }), ['/runbooks/export.md', '/runbooks/import.md']);
+        assert.deepEqual(await paths({ query: 'E-4127' }), ['/notes/2026-02-24.md', '/runbooks/import.md']);
+    });
+});
+
+test('retrieval scoring requires the stored fact, complete literal enumeration and unchanged main', async () => {
+    const scored = async (id, text, prepare = async () => {}) => {
+        let result;
+        await usingScenario(id, 'none', async (context, host) => {
+            await prepare(context);
+            result = await evaluate(context, host, text);
+        });
+        return result;
+    };
+    const english = await scored('paraphrase', 'Access ends 21 days after the unpaid invoice; write to renewals@example.test (/notes/2026-02-03.md).');
+    assert.deepEqual([english.passed, english.checks.correctAnswer, english.checks.mainUnchanged], [true, true, true]);
+    for (const wrong of ['Refunds take 14 days; write to refunds@example.test.', 'It takes 21 days.', '210 days; renewals@example.test', 'Retention is 30 days; help@example.test'])
+        assert.equal((await scored('paraphrase', wrong)).checks.correctAnswer, false, wrong);
+    const korean = await scored('cross-language', '입사일 9영업일 전까지 kit-desk@example.test 로 요청합니다. 근거: /notes/2026-02-17.md');
+    assert.equal(korean.passed, true);
+    for (const wrong of ['2영업일 전까지 front-desk@example.test 로 요청합니다.', '19영업일 전까지 kit-desk@example.test', '9영업일 전까지 신청합니다.'])
+        assert.equal((await scored('cross-language', wrong)).checks.correctAnswer, false, wrong);
+    const published = await scored('paraphrase', '21 days; renewals@example.test', async ({ main }) => {
+        const { at } = await main.fork({ name: 'late' });
+        await main.write({ at, op: 'create', path: '/late.md', content: 'late' });
+        await main.merge({ at, requestId: 'late', summary: 'Publish a late synthetic file' });
+        await main.deleteFork({ at });
+    });
+    assert.deepEqual([published.checks.correctAnswer, published.checks.mainUnchanged, published.passed], [true, false, false]);
+
+    const listed = await scored('enumerate', enumeratedPaths.join('\n'));
+    assert.deepEqual([listed.passed, listed.checks.allOccurrencesListed, listed.checks.noOtherFilesListed], [true, true, true]);
+    const partial = await scored('enumerate', enumeratedPaths.filter(path => path.startsWith('/runbooks/')).join('\n'));
+    assert.deepEqual([partial.passed, partial.checks.allOccurrencesListed, partial.checks.noOtherFilesListed], [false, false, true]);
+    const overbroad = await scored('enumerate', [...enumeratedPaths, '/notes/2026-02-24.md'].join('\n'));
+    assert.deepEqual([overbroad.passed, overbroad.checks.allOccurrencesListed, overbroad.checks.noOtherFilesListed], [false, true, false]);
+});
+
+test('retrieval metrics count tool selection from ordered events without keeping arguments', () => {
+    const tool = (name, args = {}) => ({ kind: 'tool', name, args, result: {} });
+    const literalFirst = retrievalMetrics([{ kind: 'resource_read', actor: 'host' }, tool('guide'), tool('status'),
+        tool('findText', { query: 'one' }), tool('findText', { query: 'two' }), tool('findText', { query: 'three' }),
+        tool('search', { query: 'meaning' }), tool('findText', { query: 'four', prefix: '/notes/' }), tool('read', { path: '/faq.md' })]);
+    assert.deepEqual(literalFirst, { search: 1, findText: 4, read: 1, list: 0, firstTool: 'findText', usedSearch: true,
+        findTextBeforeSearch: 3, findTextUnscoped: 3, findTextContinuations: 0 });
+    // Without any search, every findText call counts; a continuation is not a new unscoped scan.
+    const neverRanked = retrievalMetrics([tool('list'), tool('findText', { query: 'one', at: { kind: 'main' } }),
+        tool('findText', { at: { kind: 'main' }, cursor: 'opaque' }), tool('read'),
+        { kind: 'tool', name: 'findText', rawArguments: '{broken', result: { ok: false, error: { code: 'INVALID_JSON' } } }]);
+    assert.deepEqual(neverRanked, { search: 0, findText: 3, read: 1, list: 1, firstTool: 'list', usedSearch: false,
+        findTextBeforeSearch: 3, findTextUnscoped: 1, findTextContinuations: 1 });
+    const scope = args => retrievalMetrics([tool('search'), tool('findText', { query: 'one', ...args })]);
+    for (const scoped of [{ prefix: '/notes/' }, { filter: { field: 'metadata.project', op: 'eq', value: 'one' } }])
+        assert.deepEqual([scope(scoped).findTextUnscoped, scope(scoped).findTextBeforeSearch], [0, 0], JSON.stringify(scoped));
+    for (const unscoped of [{}, { prefix: '' }, { prefix: '/' }, { limit: 100 }])
+        assert.equal(scope(unscoped).findTextUnscoped, 1, JSON.stringify(unscoped));
+    const none = retrievalMetrics([tool('guide'), tool('fork'), tool('write'), { kind: 'resource_read' }]);
+    assert.deepEqual(none, { search: 0, findText: 0, read: 0, list: 0, firstTool: 'none', usedSearch: false,
+        findTextBeforeSearch: 0, findTextUnscoped: 0, findTextContinuations: 0 });
+    assert.deepEqual(aggregateRetrieval([literalFirst, neverRanked, none]), { cases: 3, search: 1, findText: 7, read: 2, list: 1,
+        findTextBeforeSearch: 6, findTextUnscoped: 4, findTextContinuations: 1,
+        firstTool: { search: 0, findText: 1, list: 1, read: 0, none: 1 }, casesUsingSearch: 1, casesUsingFindText: 2, casesWithUnscopedFindText: 2 });
+    assert.doesNotMatch(JSON.stringify([literalFirst, neverRanked]), /one|two|meaning|notes|opaque|broken/);
+});
+
+test('scenario groups select the pilot, the retrieval scenarios or every scenario', async () => {
+    const ids = selection => selectScenarios(selection).map(item => item.id);
+    assert.deepEqual(ids('recall'), ['recall']);
+    assert.deepEqual(ids('retrieval'), ['paraphrase', 'cross-language', 'enumerate']);
+    assert.deepEqual(ids('all'), ['recall', 'maintain', 'draft-checkpoint', 'past-version', 'unrelated', 'conflict', ...ids('retrieval')]);
+    assert(selectScenarios('retrieval').every(item => item.writable === false && item.start === undefined));
+    assert.throws(() => selectScenarios('findText'), /Unknown scenario/);
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'tool-groups-'));
+    try {
+        await assert.rejects(runEvaluation({ output: path.join(directory, 'unknown'), mode: 'scripted', scenario: 'unknown' }), /Unknown scenario/);
+        const retrieval = await runEvaluation({ output: path.join(directory, 'retrieval'), mode: 'scripted', scenario: 'retrieval' });
+        assert.deepEqual(retrieval.manifest.plan.map(entry => entry.id).slice(0, 4),
+            ['001-paraphrase-none', '002-paraphrase-tool', '003-paraphrase-resource', '004-cross-language-none']);
+        assert.deepEqual([retrieval.summary.planned, retrieval.summary.passed], [9, 9]);
+        const all = await runEvaluation({ output: path.join(directory, 'all'), mode: 'scripted', repeats: 2 });
+        assert.deepEqual([all.summary.planned, all.summary.passed, all.summary.scriptedSmokePassed, all.summary.modelTasksPassed], [54, 54, 54, null]);
+        assert.match(formatEvaluationSummary(await readEvaluationReport(path.join(directory, 'all'))), /Scripted smoke test with predetermined requests/);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('retrieval metrics reach receipts, summaries and the exported report without arguments, including failed and older runs', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'tool-retrieval-'));
+    try {
+        const output = path.join(directory, 'run');
+        const steps = { paraphrase: [call('findText', { query: 'private-literal-one' }, 'a'), call('findText', { query: 'private-literal-two', prefix: '/private-prefix/' }, 'b'),
+            call('search', { query: 'private-ranked-query' }, 'c'), call('read', { path: paraphraseTargets.paraphrase }, 'd')],
+        'cross-language': [call('list', { prefix: '/private-prefix/' }, 'a')], enumerate: [call('findText', { query: enumeratedCode }, 'a')] };
+        const run = await runEvaluation({ output, mode: 'model', scenario: 'retrieval', guide: 'none',
+            askFactory: scenario => async (request, { round }) => steps[scenario.id][round] ? response(request.model, [steps[scenario.id][round]])
+                // The control conversation ends in an agent failure after its tool call.
+                : scenario.id === 'enumerate' ? { ...final(request.model), status: 'incomplete' }
+                    : final(request.model, '21 days; renewals@example.test private-final-text') });
+        assert.deepEqual(run.results.map(result => result.status), ['passed', 'failed', 'error']);
+        const expected = [
+            { search: 1, findText: 2, read: 1, list: 0, firstTool: 'findText', usedSearch: true, findTextBeforeSearch: 2, findTextUnscoped: 1, findTextContinuations: 0 },
+            { search: 0, findText: 0, read: 0, list: 1, firstTool: 'list', usedSearch: false, findTextBeforeSearch: 0, findTextUnscoped: 0, findTextContinuations: 0 },
+            { search: 0, findText: 1, read: 0, list: 0, firstTool: 'findText', usedSearch: false, findTextBeforeSearch: 1, findTextUnscoped: 1, findTextContinuations: 0 },
+        ];
+        assert.deepEqual(run.results.map(result => result.retrieval), expected);
+        const receipt = JSON.parse(await readFile(path.join(output, run.manifest.plan[2].id, 'result.json'), 'utf8'));
+        assert.deepEqual([receipt.error.code, receipt.retrieval], ['MODEL_RESPONSE_INCOMPLETE', expected[2]]);
+        const saved = JSON.parse(await readFile(path.join(output, 'summary.json'), 'utf8'));
+        assert.deepEqual(saved.groups.none.retrieval, aggregateRetrieval(expected));
+        assert.deepEqual(saved.groups.none.retrievalByScenario, { paraphrase: aggregateRetrieval([expected[0]]),
+            'cross-language': aggregateRetrieval([expected[1]]), enumerate: aggregateRetrieval([expected[2]]) });
+        assert.equal(saved.modelTasksPassed, null);
+
+        const report = await readEvaluationReport(output);
+        assert.deepEqual(report.cases.map(item => item.retrieval), expected);
+        assert.deepEqual(report.summary.groups, saved.groups);
+        assert.deepEqual(report.manifest.readOnlyScenarios, ['paraphrase', 'cross-language', 'enumerate']);
+        const text = formatEvaluationSummary(report);
+        assert(text.includes('| paraphrase | none | 1 | 0 / 1 / 0 / 0 / 0 | 1 | 2 | 2 | 0 | 1 |'), text);
+        assert(text.includes('| enumerate | none | 1 | 0 / 1 / 0 / 0 / 0 | 0 | 1 | 1 | 1 | 1 |'), text);
+        assert.doesNotMatch(JSON.stringify(report) + text, /private-|E-4172|\/notes\/|renewals@/);
+
+        // A run directory written before these metrics has no receipt field or scenario group.
+        const manifestFile = path.join(output, 'manifest.json');
+        const manifest = JSON.parse(await readFile(manifestFile, 'utf8'));
+        await writeFile(manifestFile, JSON.stringify({ ...manifest, scenarios: manifest.scenarios.map(({ group: _, ...scenario }) => scenario) }));
+        for (const entry of manifest.plan) {
+            const file = path.join(output, entry.id, 'result.json');
+            const { retrieval: _, ...older } = JSON.parse(await readFile(file, 'utf8'));
+            await writeFile(file, JSON.stringify(older));
+        }
+        assert.deepEqual(await readEvaluationReport(output), report);
+        // An interrupted case has no recorded events and stays out of the retrieval counts.
+        await writeFile(path.join(output, manifest.plan[0].id, 'result.json'), '{');
+        const partial = await readEvaluationReport(output);
+        assert.deepEqual([partial.cases[0].status, partial.cases[0].retrieval], ['interrupted', undefined]);
+        assert.deepEqual(partial.summary.groups.none.retrieval, aggregateRetrieval(expected.slice(1)));
+        assert.equal(partial.summary.groups.none.retrievalByScenario.paraphrase, undefined);
+        assert.doesNotMatch(formatEvaluationSummary(partial), /\| paraphrase \|/);
+    } finally { await rm(directory, { recursive: true, force: true }); }
 });
