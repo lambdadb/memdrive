@@ -397,8 +397,12 @@ export type FindTextRequest = FileAtRequest & ({
 });
 
 export interface FileTextHit extends DriveFile {
-    /** Verified half-open UTF-16 offsets into the file's original text. */
-    range: { start: number; end: number };
+    /**
+     * Verified half-open UTF-16 offsets into the file's original text, and the
+     * one-based inclusive lines of its first and last units, numbered like ranged
+     * `read`. Pass the lines to `read` to retrieve the lines containing the match.
+     */
+    range: { startLine: number; endLine: number; start: number; end: number };
     /** An original text excerpt containing the match, with its own UTF-16 offsets. */
     context: { content: string; range: { start: number; end: number } };
 }

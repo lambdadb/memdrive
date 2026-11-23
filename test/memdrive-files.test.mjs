@@ -219,6 +219,31 @@ test('batched writes and reads share requests, propagate metadata, and validate 
     assert.equal(calls.filter(call => call.kind === 'upsert').length, 1);
 });
 
+test('managed stores leave original bodies unindexed and reject an indexed body or mismatched chunk analyzers', async () => {
+    const fixture = fileClient();
+    const drive = await create({ client: fixture.client, name: 'workspace', textSearch: { analyzers: ['english'] } });
+    const configs = () => fixture.collections.get('workspace').metadata.indexConfigs;
+    assert.equal(Object.hasOwn(configs(), 'body'), false);
+    assert.deepEqual([configs().content, configs().embeddingText], [{ type: 'text', analyzers: ['english'] }, { type: 'text', analyzers: ['english'] }]);
+    // Unindexed originals still round-trip and serve literal scans, including Korean text.
+    await drive.fork({ name: 'research' });
+    const content = '회의록: 한글 검색과 한글 원문';
+    const file = await drive.write({ at: research, ...request('/notes/회의.md', content) });
+    assert.equal((await drive.read({ at: research, fileId: file.fileId })).content, content);
+    assert.deepEqual((await drive.findText({ at: research, query: '한글' })).hits.map(hit => hit.range.start), [5, 12]);
+    const original = structuredClone(configs());
+    for (const change of [
+        indexes => { indexes.body = { type: 'text', analyzers: ['english'] }; },
+        indexes => { indexes.body = { type: 'keyword' }; },
+        indexes => { indexes.embeddingText.analyzers = ['standard']; },
+    ]) {
+        change(configs());
+        await assert.rejects(open({ client: { ...fixture.client }, name: 'workspace' }), { code: 'INCOMPATIBLE_STORE' });
+        fixture.collections.get('workspace').metadata.indexConfigs = structuredClone(original);
+    }
+    assert.deepEqual((await open({ client: { ...fixture.client }, name: 'workspace' }).then(store => store.describe())).textSearch, { analyzers: ['english'] });
+});
+
 test('ranked hybrid search verifies UTF-16 ranges and omits orphan chunks', async () => {
     const fixture = fileClient();
     const drive = await create({ client: fixture.client, name: 'workspace', metadataSchema: { topic: { type: 'string' } } });

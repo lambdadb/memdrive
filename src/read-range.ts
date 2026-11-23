@@ -4,6 +4,26 @@ import type { DriveFile, FileAt, FileReadPage, ReadFileRangeOptions } from './ty
 
 export const rangeKeys = ['startLine', 'endLine', 'maxChars', 'offset', 'revision'];
 
+/** Line breaks for ranged reads and findText line numbers: CRLF, a lone CR or LF. */
+const lineBreak = /\r\n|\r|\n/g;
+
+/**
+ * Number lines incrementally from `line` at the start of `text`. Each call
+ * returns the one-based line containing an offset; offsets must not decrease.
+ */
+export function lineCounter(text: string, line = 1) {
+    const breaks = new RegExp(lineBreak);
+    const nextStart = () => {
+        const match = breaks.exec(text);
+        return match ? match.index + match[0].length : Infinity;
+    };
+    let next = nextStart();
+    return (offset: number) => {
+        while (next <= offset) { line++; next = nextStart(); }
+        return line;
+    };
+}
+
 export function validateReadRange(request: ReadFileRangeOptions) {
     const { startLine = 1, endLine, maxChars = 16000, offset, revision } = request;
     requireInput(Number.isSafeInteger(startLine) && startLine >= 1
@@ -22,7 +42,7 @@ export async function readRange(file: DriveFile, request: ReadFileRangeOptions, 
     if (request.revision !== undefined && request.revision !== revision)
         throw new MemDriveError('READ_VERSION_CHANGED', 'The file changed between reads. Restart without offset and revision.');
     const text = file.content;
-    const starts = [0, ...Array.from(text.matchAll(/\r\n|\r|\n/g), match => match.index + match[0].length)];
+    const starts = [0, ...Array.from(text.matchAll(lineBreak), match => match.index + match[0].length)];
     const totalLines = starts.length;
     const { startLine = 1, endLine = totalLines, maxChars = 16000 } = request;
     requireInput(startLine <= totalLines, 'startLine is beyond the end of the file.');

@@ -148,7 +148,9 @@ export function fileClient() {
                         if (request.sort?.[0]?.id === 'asc') selected.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
                         return response(selected.slice(0, request.size), request.fields);
                     }
-                    if (request.size === 1 && request.sort?.[0]?.id && request.fields?.include?.includes('modifiedAt')) {
+                    // findText scans: ID-ordered original batches with bodies, and the size-1 descending upper bound.
+                    if (request.sort?.[0]?.id && request.fields?.include?.includes('modifiedAt')
+                        && (request.sort[0].id === 'desc' || request.fields.include.includes('body'))) {
                         const override = await fixture.findTextQuery?.(request, options);
                         if (override !== undefined) return override;
                         function matches(doc, { bool, queryString }) {
