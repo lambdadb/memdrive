@@ -69,13 +69,42 @@ function freeze<T>(value: T): T {
     return value;
 }
 
+function validateToolNames(tools: readonly FileToolName[]) {
+    requireInput(Array.isArray(tools) && tools.every(name => typeof name === 'string' && Object.hasOwn(descriptions, name))
+        && new Set(tools).size === tools.length, 'Select distinct known file tool names.');
+}
+
+function definitionsFor(tools: readonly FileToolName[], external: boolean, main: boolean): readonly FileToolDefinition[] {
+    const schemas = fileToolSchemas(external, main);
+    return freeze(tools.map(name => ({ name, inputSchema: schemas[name],
+        description: name === 'search' && external
+            ? 'Search the selected external-vector view with a vector query and optional declared-metadata filters. Default 10, maximum 1000 hits. Returns file references and metadata; content hydration belongs to the host.'
+            : name === 'read' && external
+                ? 'Read file references and metadata by exactly one of fileId, path or paths (1–100 distinct paths). A missing single file returns null; a paths batch omits missing files. Content hydration belongs to the host.'
+            : descriptions[name], readOnly: !['write', 'merge', 'fork', 'checkpoint'].includes(name) })));
+}
+
+/** Describe a fixed catalog without a drive or storage access. Definitions grant no execution permissions. */
+export function getFileToolDefinitions(options: { embeddingMode: EmbeddingMode; tools: readonly FileToolName[] }): readonly FileToolDefinition[] {
+    requireInput(keysOnly(options, ['embeddingMode', 'tools'])
+        && (options.embeddingMode === 'managed' || options.embeddingMode === 'external'),
+    'Provide an embeddingMode of managed or external and explicit tool names.');
+    const { embeddingMode, tools } = options;
+    validateToolNames(tools);
+    const external = embeddingMode === 'external';
+    if (external && tools.includes('findText'))
+        throw new MemDriveError('TOOL_UNAVAILABLE', 'The external embedding mode does not support findText.');
+    // Include main-only ref selectors in the stable schema. Execution still
+    // validates them against the host-authorized view, including non-main refs.
+    return definitionsFor(tools, external, true);
+}
+
 /** Bind a deliberately selected tool subset to a host-authorized SDK handle. */
 export function createFileTools(options: { drive: FileDrive<EmbeddingMode>; tools: readonly FileToolName[] }): FileTools {
     requireInput(keysOnly(options, ['drive', 'tools']) && typeof options.drive === 'object' && options.drive !== null,
         'Provide a bound drive and an explicit tools allowlist.');
     const { drive, tools } = options;
-    requireInput(Array.isArray(tools) && tools.every(name => typeof name === 'string' && Object.hasOwn(descriptions, name))
-        && new Set(tools).size === tools.length, 'Select distinct known file tool names.');
+    validateToolNames(tools);
     const allowed = new Set<FileToolName>(tools);
     const external = drive.findText === undefined;
     for (const name of allowed) {
@@ -83,13 +112,7 @@ export function createFileTools(options: { drive: FileDrive<EmbeddingMode>; tool
             || name === 'findText' && external)
             throw new MemDriveError('TOOL_UNAVAILABLE', `The bound view does not support ${name}.`);
     }
-    const schemas = fileToolSchemas(external, drive.at.kind === 'main');
-    const definitions = freeze([...allowed].map(name => ({ name, inputSchema: schemas[name],
-        description: name === 'search' && external
-            ? 'Search the selected external-vector view with a vector query and optional declared-metadata filters. Default 10, maximum 1000 hits. Returns file references and metadata; content hydration belongs to the host.'
-            : name === 'read' && external
-                ? 'Read file references and metadata by exactly one of fileId, path or paths (1–100 distinct paths). A missing single file returns null; a paths batch omits missing files. Content hydration belongs to the host.'
-            : descriptions[name], readOnly: !['write', 'merge', 'fork', 'checkpoint'].includes(name) })));
+    const definitions = definitionsFor([...allowed], external, drive.at.kind === 'main');
 
     return Object.freeze({ definitions, async execute(name: string, input: unknown, options?: RequestOptions): Promise<unknown> {
         if (!allowed.has(name as FileToolName))

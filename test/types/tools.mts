@@ -1,10 +1,20 @@
-import { createFileTools, fileToolError, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
+import { createFileTools, getFileToolDefinitions, fileToolError, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
 import type { FileToolGuideTopic, FileDrive, FileToolDefinition, FileToolErrorResult, FileToolName, FileToolRefResult, FileTools } from '@functional-systems/memdrive';
 
 export async function toolConsumer(drive: FileDrive, external: FileDrive<'external'>, name: string, input: unknown) {
     const names: readonly FileToolName[] = ['guide', 'status', 'history', 'read', 'fork', 'checkpoint'];
     const tools: FileTools = createFileTools({ drive, tools: names });
     const definitions: readonly FileToolDefinition[] = tools.definitions;
+    const fixedDefinitions: readonly FileToolDefinition[] = getFileToolDefinitions({ embeddingMode: 'managed', tools: names });
+    getFileToolDefinitions({ embeddingMode: 'external', tools: ['search', 'write'] });
+    // @ts-expect-error Definition lookup requires an explicit embedding mode.
+    getFileToolDefinitions({ tools: names });
+    // @ts-expect-error Definition lookup has no drive binding.
+    getFileToolDefinitions({ embeddingMode: 'managed', tools: names, drive });
+    // @ts-expect-error Catalogs are immutable.
+    fixedDefinitions.push(definitions[0]!);
+    // @ts-expect-error Only supported embedding modes are accepted.
+    getFileToolDefinitions({ embeddingMode: 'text', tools: names });
     const schemaType: 'object' = definitions[0]!.inputSchema.type;
     const guideVersion: string = fileToolGuide.version;
     const topic: FileToolGuideTopic = fileToolGuide.topics[0]!.topic;

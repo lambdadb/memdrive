@@ -38,10 +38,12 @@ try {
     assert.equal(installed.memdriveSourceCommit, pkg.memdriveSourceCommit, 'Installed source commit differs');
     assert.deepEqual(Object.keys(installed.exports).sort(), ['.', './docling', './package.json']);
     assert.deepEqual(Object.keys(installed.dependencies), ['@functional-systems/lambdadb']);
-    const assertion = `for (const key of ['create', 'open', 'destroy', 'MemDriveError', 'createFileTools', 'fileToolError']) {
+    const assertion = `for (const key of ['create', 'open', 'destroy', 'MemDriveError', 'createFileTools', 'getFileToolDefinitions', 'fileToolError']) {
         if (typeof sdk[key] !== 'function') throw new Error('Missing export: ' + key);
     }
     if (sdk.MemDrive.create !== sdk.create || sdk.MemDrive.open !== sdk.open || sdk.MemDrive.destroy !== sdk.destroy) throw new Error('Missing static factory');
+    const catalog = sdk.getFileToolDefinitions({ embeddingMode: 'managed', tools: ['fork', 'write'] });
+    if (!Object.isFrozen(catalog) || !catalog[0].inputSchema.properties.version || catalog[1].name !== 'write') throw new Error('Invalid fixed tool catalog');
     if (!sdk.fileToolGuide.version || !sdk.fileToolGuide.content || !sdk.fileToolGuideTopics.editing.content) throw new Error('Missing file-tool guide');
     for (const { topic } of sdk.fileToolGuide.topics) {
         if (sdk.fileToolGuideTopics[topic].version !== sdk.fileToolGuide.version) throw new Error('Mismatched guide version');
@@ -58,7 +60,7 @@ try {
     copyFileSync(join(root, 'test/types/tsconfig.json'), join(temporary, 'tsconfig.json'));
     run(process.execPath, [resolve(root, 'node_modules/typescript/bin/tsc'), '-p', join(temporary, 'tsconfig.json')]);
     await build({
-        stdin: { contents: `export { create, open, destroy, MemDrive, createFileTools, fileToolError, fileToolGuide, fileToolGuideTopics } from ${JSON.stringify(pkg.name)};`,
+        stdin: { contents: `export { create, open, destroy, MemDrive, createFileTools, getFileToolDefinitions, fileToolError, fileToolGuide, fileToolGuideTopics } from ${JSON.stringify(pkg.name)};`,
             resolveDir: temporary, sourcefile: 'consumer.js' },
         bundle: true, platform: 'browser', format: 'esm', target: 'es2022', write: false,
     });

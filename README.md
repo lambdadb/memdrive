@@ -569,6 +569,47 @@ which instructions a model followed.
 
 Repository development includes a [model tool-use evaluation harness](https://github.com/lambdadb/memdrive/tree/main/benchmark/tool-use) for SDK-backed synthetic workflows and guide delivery. It is outside the published package and separate from LongMemEval/BEAM retrieval evaluation.
 
+### Publish a fixed tool catalog
+
+For hosts that cache tool definitions, use `getFileToolDefinitions` to obtain
+names, descriptions and schemas without opening a drive or accessing storage.
+Select an explicit embedding mode and tool list. The returned array is deeply
+frozen and independent of the current main, fork or checkpoint binding.
+
+```ts
+import { createFileTools, getFileToolDefinitions } from '@functional-systems/memdrive';
+
+// Publish this catalog once; keep it unchanged when the authorized view changes.
+const advertised = getFileToolDefinitions({
+    embeddingMode: 'managed',
+    tools: ['guide', 'read', 'fork', 'checkpoint', 'diff', 'write', 'merge'],
+});
+
+// Execution bindings contain only tools authorized and supported in that view.
+const mainTools = createFileTools({ drive: main, tools: ['guide', 'read', 'fork', 'checkpoint'] });
+// The advertised write tool remains visible, but mainTools.execute('write', ...)
+// rejects with TOOL_NOT_ALLOWED. Adding write to this binding fails with TOOL_UNAVAILABLE.
+
+// After the host authorizes a working view and its operations:
+const workTools = createFileTools({ drive: work, tools: ['guide', 'read', 'fork', 'checkpoint', 'diff', 'write', 'merge'] });
+// Recheck caller permissions before each call; do not register workTools.definitions
+// in place of advertised. View binding and authentication remain host responsibilities.
+```
+
+The catalog's `fork` and `checkpoint` schemas always include optional `version`.
+Their descriptions restrict it to main, and SDK execution rejects it on working
+forks and checkpoints even when the input satisfies the advertised schema.
+`createFileTools` keeps its existing view-specific definitions and rejects
+unsupported tools at binding time. A fixed catalog does not change those checks
+or grant permissions; the host must enforce current authorization on every call
+and route execution only to the corresponding authorized binding.
+
+Keep the catalog's embedding mode fixed for that exposed contract. Managed text
+and external-vector tools have different input and result semantics; external
+mode rejects `findText`. Transport registration, catalog caching and changing a
+published contract belong to the host. This API does not implement MCP transport
+or establish compatibility with a particular client or marketplace.
+
 ## List files
 
 ```ts
