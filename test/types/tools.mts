@@ -1,5 +1,5 @@
-import { createFileTools, fileToolError, fileToolGuide } from '@functional-systems/memdrive';
-import type { FileDrive, FileToolDefinition, FileToolErrorResult, FileToolName, FileToolRefResult, FileTools } from '@functional-systems/memdrive';
+import { createFileTools, fileToolError, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
+import type { FileToolGuideTopic, FileDrive, FileToolDefinition, FileToolErrorResult, FileToolName, FileToolRefResult, FileTools } from '@functional-systems/memdrive';
 
 export async function toolConsumer(drive: FileDrive, external: FileDrive<'external'>, name: string, input: unknown) {
     const names: readonly FileToolName[] = ['guide', 'status', 'history', 'read', 'fork', 'checkpoint'];
@@ -7,6 +7,13 @@ export async function toolConsumer(drive: FileDrive, external: FileDrive<'extern
     const definitions: readonly FileToolDefinition[] = tools.definitions;
     const schemaType: 'object' = definitions[0]!.inputSchema.type;
     const guideVersion: string = fileToolGuide.version;
+    const topic: FileToolGuideTopic = fileToolGuide.topics[0]!.topic;
+    const topicContent: string = fileToolGuideTopics[topic].content;
+    // @ts-expect-error The guide catalog is immutable.
+    fileToolGuideTopics.editing.content = '';
+    // @ts-expect-error Unknown guide topics are not part of the catalog.
+    const unknownTopic: FileToolGuideTopic = 'unknown';
+    void unknownTopic;
     const vectorTools = createFileTools({ drive: external, tools: ['search'] });
     const error: FileToolErrorResult = fileToolError(new Error('failure'));
     const ref: FileToolRefResult = { name: drive.name, at: { kind: 'fork', name: 'draft' } };
@@ -17,5 +24,5 @@ export async function toolConsumer(drive: FileDrive, external: FileDrive<'extern
     // @ts-expect-error Tool definitions are immutable.
     tools.definitions.push(definitions[0]!);
     await tools.execute(name, input, { signal: new AbortController().signal });
-    return { schemaType, guideVersion, vectorTools, error, ref };
+    return { schemaType, guideVersion, topicContent, vectorTools, error, ref };
 }

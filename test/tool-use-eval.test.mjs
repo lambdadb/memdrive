@@ -3,7 +3,7 @@ import test from 'node:test';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { fileToolGuide } from '@functional-systems/memdrive';
+import { fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
 import { createHost, guideURI } from '../benchmark/tool-use/host.mjs';
 import { prepareScenario, scenarios, evaluate } from '../benchmark/tool-use/scenarios.mjs';
 import { runAgent, openAI, limits } from '../benchmark/tool-use/agent.mjs';
@@ -29,8 +29,8 @@ test('scripted smoke exercises actual SDK state across six scenarios and three g
             const result = await runAgent({ host, scenario, guide, ask: scriptedAgent(scenario, guide) });
             const scored = await evaluate(context, host, result.finalText);
             assert(scored.passed, JSON.stringify({ scenario: scenario.id, guide, checks: scored.checks }));
-            assert.equal(scored.behavior.guideCalls, guide === 'tool' ? 1 : 0);
-            assert.equal(scored.behavior.resourceReadsByHost, guide === 'resource' ? 1 : 0);
+            assert.equal(scored.behavior.guideCalls, guide === 'tool' ? 2 : 0);
+            assert.equal(scored.behavior.resourceReadsByHost, guide === 'resource' ? 1 + Object.keys(fileToolGuideTopics).length : 0);
         });
 });
 
@@ -66,6 +66,17 @@ test('resource guide is unchanged SDK text and is recorded as host delivery, not
         const read = host.resourcesRead(guideURI);
         assert.equal(read.version, fileToolGuide.version);
         assert.equal(read.contents[0].text, fileToolGuide.content);
+        assert.equal(host.resourcesList().resources.length, 1 + Object.keys(fileToolGuideTopics).length);
+        for (const [topic, document] of Object.entries(fileToolGuideTopics)) {
+            const detail = host.resourcesRead(`memdrive://docs/${topic}`);
+            assert.equal(detail.version, fileToolGuide.version);
+            assert.equal(detail.contents[0].text, document.content);
+        }
+        await runAgent({ host, scenario: { task: 'Inspect the guide.' }, guide: 'resource', ask: async request => {
+            for (const document of [fileToolGuide, ...Object.values(fileToolGuideTopics)])
+                assert(request.input.some(message => message.role === 'developer' && message.content === document.content));
+            return final(request.model);
+        } });
         assert.throws(() => host.resourcesRead('memdrive://other'));
         assert.equal(host.events[0].actor, 'host');
         assert(!host.toolsList().tools.some(tool => tool.name === 'guide'));
@@ -173,6 +184,8 @@ test('run reports preserve planned denominators, uncertain usage and cleanup, an
         const run = await runEvaluation({ output, mode: 'model', guide: 'all', scenario: 'recall',
             askFactory: () => async () => { throw new Error('sensitive transport error'); } });
         assert.equal(run.summary.planned, 3);
+        assert.deepEqual(run.manifest.guide, fileToolGuide);
+        assert.deepEqual(run.manifest.guideTopics, fileToolGuideTopics);
         assert.equal(run.summary.errors, 3);
         assert.equal(run.summary.complete, true);
         assert.equal(run.summary.modelTasksPassed, null);
@@ -216,11 +229,12 @@ test('evaluation export preserves diagnostic outcomes without provider payloads 
         assert.equal(http.errorCode, 'MODEL_REQUEST_FAILED');
         assert.equal(http.requests[0].httpStatus, 429);
         assert.equal(passed.evaluation.checks.correctAnswer, true);
-        assert.equal(passed.evaluation.behavior.resourceReadsByHost, 1);
+        assert.equal(passed.evaluation.behavior.resourceReadsByHost, 1 + Object.keys(fileToolGuideTopics).length);
         assert(passed.finalTextLength > 0);
         assert.equal(passed.events[0].actor, 'host');
-        assert.equal(passed.events[1].errorCode, 'INVALID_INPUT');
-        assert.equal(passed.events[2].outcome, 'ok');
+        const toolEvents = passed.events.filter(event => event.kind === 'tool');
+        assert.equal(toolEvents[0].errorCode, 'INVALID_INPUT');
+        assert.equal(toolEvents[1].outcome, 'ok');
         assert(passed.offered[0].tools.includes('read'));
         assert.equal(passed.requests[1].inputTokens, 10);
         assert.doesNotMatch(JSON.stringify(report), /private-|encrypted_content|requestId|authorization|\/faq\.md/);

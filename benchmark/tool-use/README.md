@@ -92,13 +92,16 @@ on the hosted runner stays in temporary storage for the lifetime of the job.
 | Delivery | Model-visible content | Observation |
 | --- | --- | --- |
 | `none` | SDK tool descriptions and short server instructions | Baseline without full guide text |
-| `tool` | Same descriptions plus the optional SDK `guide` tool | Record whether the model calls it |
-| `resource` | Host lists and reads the guide resource, then injects its unchanged text | Record a **host** resource read; this is not an autonomous model fetch |
+| `tool` | Same descriptions plus the optional SDK `guide` index/topic tool | Record index and topic calls |
+| `resource` | Host lists and reads the index and every topic resource, then injects their unchanged text | Record **host** resource reads; this is not an autonomous model fetch |
 
-All channels use the same exported guide version. Guide version 5 describes the
-semantic/no-rerank defaults and explicit search modes. Earlier guide-4 model
-measurements used the previous search defaults; they do not validate model
-selection with the new descriptions. `--instruction` independently
+All channels use the same exported guide version. Version 6 splits the guide into
+an index and five topics and adds original-wording preservation instructions.
+The tool condition retrieves topics on demand; the resource condition deliberately
+injects all documents through the host. These are different delivery costs, not
+equal-context conditions or autonomous resource selection. The manifest records
+the index and every topic document. Historical guide-4 and guide-5 model results
+do not validate guide-6 behavior; guide 4 also used earlier search defaults. `--instruction` independently
 selects `server` (default), `workflow` (additional developer workflow text), or
 `user` (an explicit reminder appended to the task). Workflow injection approximates
 a loaded bundled skill; skill discovery/loading itself is not tested. Compare
@@ -141,7 +144,7 @@ identified separately and cannot count as real model measurements.
 ## Reproducibility and evidence
 
 `manifest.json` freezes the SDK/benchmark source hashes, dependency lock hash,
-source commit, runtime, model, budgets, guide text/version, instruction profiles,
+source commit, runtime, model, budgets, guide index/topics/version, instruction profiles,
 scenario tasks and planned case denominator. Each case has:
 
 - pending/completed/failed-or-uncertain request receipts, without headers or keys;

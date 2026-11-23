@@ -1,12 +1,14 @@
 import { isObject, keysOnly } from './config.js';
 import { checkAbort, MemDriveError, operationOptions, requireInput } from './errors.js';
-import { fileToolGuide } from './tool-guide.js';
+import { fileToolGuide, fileToolGuideTopics } from './tool-guide.js';
+import type { FileToolGuideTopic } from './tool-guide.js';
 import { fileToolSchemas } from './tool-schemas.js';
 import type { CreateMainFileRefRequest, DeleteFileRequest, EmbeddingMode, FileDrive, FileHistoryRequest, FindTextRequest, ListFilesRequest,
     MergeRequest, ReadFileRequest, RequestOptions, SearchExternalFilesRequest, SearchFilesRequest,
     CreateExternalFileRequest, UpdateExternalFileRequest, WriteFileRequest } from './types.js';
 
-export { fileToolGuide } from './tool-guide.js';
+export { fileToolGuide, fileToolGuideTopics } from './tool-guide.js';
+export type { FileToolGuideTopic } from './tool-guide.js';
 
 export type FileToolName = 'guide' | 'status' | 'history' | 'list' | 'read' | 'search' | 'findText' | 'fork' | 'checkpoint' | 'diff' | 'write' | 'merge';
 
@@ -45,7 +47,7 @@ export function fileToolError(cause: unknown): FileToolErrorResult {
 }
 
 const descriptions: Record<FileToolName, string> = {
-    guide: 'Read the versioned file-tool guide without reading or creating drive files. Covers retrieval, safe edits, publication, pagination and deletion limits.',
+    guide: 'Read the versioned file-tool guide without reading or creating drive files. Omit topic for the short index; supply a listed topic for full details. Read the relevant topic before retrieval, ref creation, editing, publication or maintenance.',
     status: 'Read the selected view and current published main version without changing state. An unfinished merge may still have a running writer; never infer permission to recover.',
     history: 'Read store-wide main publications after an exclusive sinceVersion (default v0), oldest first. Default 20, maximum 100 entries; up to 100 file IDs each with a truncation flag. Continue with only cursor through a fixed throughVersion. Cursors expire after five minutes or eviction; restart from the last processed version.',
     list: 'List file metadata and common prefixes, not bodies. Default 100, maximum 1000 entries. Omit delimiter for descendants and follow every cursor for the observed inventory. Consistency is eventual, not a complete snapshot. Continue with only cursor on this handle; expiry or LIST_SCAN_LIMIT requires a new, possibly narrower traversal.',
@@ -98,11 +100,16 @@ export function createFileTools(options: { drive: FileDrive<EmbeddingMode>; tool
         // Casts only bridge untrusted JSON to public signatures. The SDK validates
         // each request, including unknown keys and mode-specific input, before use.
         switch (name) {
-            case 'guide':
+            case 'guide': {
+                requireInput(keysOnly(input, ['topic']), 'guide accepts only an optional topic.');
+                if (input.topic === undefined) return fileToolGuide;
+                requireInput(typeof input.topic === 'string' && Object.hasOwn(fileToolGuideTopics, input.topic),
+                    `Unknown guide topic. Use one of: ${Object.keys(fileToolGuideTopics).join(', ')}; omit topic for the index.`);
+                return fileToolGuideTopics[input.topic as FileToolGuideTopic];
+            }
             case 'status':
             case 'diff': {
                 requireInput(Object.keys(input).length === 0, `${name} accepts an empty object.`);
-                if (name === 'guide') return fileToolGuide;
                 if (name === 'status') return drive.status(requestOptions);
                 if (drive.at.kind === 'fork' && 'diff' in drive) return drive.diff(requestOptions);
                 break;
