@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { create } from '@functional-systems/memdrive';
 import { captureMergeSource, prepareMerge } from '../dist/esm/merge-preflight.js';
+import { fingerprintOf } from '../dist/esm/records.js';
 import { textChunker } from '../dist/esm/text-chunks.js';
 import { workingWriter } from '../dist/esm/writes.js';
 import { fileClient } from './helpers/file-client.mjs';
@@ -75,7 +76,8 @@ test('merge preflight checks all pinned pages including final-page moves and del
     const { fixture, handle, work, branches, mainDocs, capture, publishFixture } = await setup([[1000, '/old'], [1001, '/remove']]);
     const sourceDocs = branches.get(branch.name).docs;
     for (let i = 999; i >= 0; i--) {
-        const doc = original(i, `/new/${i}`, { changed: true });
+        const path = `/new/${i}`;
+        const doc = original(i, path, { changed: true, fingerprint: await fingerprintOf({ path, content: '' }) });
         sourceDocs.set(doc.id, doc);
     }
     await work.write([
@@ -154,6 +156,24 @@ test('merge preflight fails on missing frozen payloads and inconsistent destinat
     await assert.rejects(prepareMerge(handle, name, source, published, schema), { code: 'INVALID_RESULT' });
     fixture.pathLookup = () => ({ isDocsInline: true, total: 2, docs: [] });
     await assert.rejects(prepareMerge(handle, name, source, published, schema), { code: 'INVALID_RESULT' });
+});
+
+test('merge preflight rejects a created original without a fingerprint before any mutation', async () => {
+    const { fixture, handle, work, mainDocs, tags, capture, publishFixture } = await setup([[1, '/original']]);
+    const created = await work.write({ op: 'create', path: '/created', content: 'new file' });
+    const source = await capture();
+    const published = await publishFixture();
+    assert.deepEqual((await prepareMerge(handle, name, source, published, schema)).targets.map(target => target.change),
+        [{ op: 'create', fileId: created.fileId, path: '/created' }]);
+
+    const stored = tags.get(source.name).docs.get(`file:${created.fileId}`);
+    assert.match(stored.fingerprint, /^[0-9a-f]{64}$/);
+    delete stored.fingerprint;
+    const main = structuredClone([...mainDocs]);
+    const before = fixture.calls.length;
+    await assert.rejects(prepareMerge(handle, name, source, published, schema), { code: 'INVALID_RESULT' });
+    assert.ok(fixture.calls.slice(before).every(call => ['query', 'fetch'].includes(call.kind)));
+    assert.deepEqual([...mainDocs], main);
 });
 
 test('merge capture fences an unconfirmed earlier write and a lost tag response', async () => {

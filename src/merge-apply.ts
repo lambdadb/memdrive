@@ -210,7 +210,7 @@ export async function advanceMergeSource(handle: Handle, name: string, prepared:
                 }
             }
             const baseline = target.file
-                ? { version, path: target.file.path, fingerprint: target.fingerprint ?? await fingerprintOf(target.file) }
+                ? { version, path: target.file.path, fingerprint: target.fingerprint }
                 : undefined;
             if (current?.kind !== 'file' && !baseline) {
                 if (current) {
