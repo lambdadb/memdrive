@@ -409,6 +409,8 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
         write,
         enqueueCapture,
         deferUserOperations,
+        /** Whether this queue holds a fence for a write whose outcome is unknown. */
+        fenced: () => pending.size > 0 || baselineUnconfirmed !== undefined,
         enqueueRef<T>(operation: () => Promise<T>, signal?: AbortSignal) {
             return enqueueUser(() => enqueueCapture(async (_source, confirmSource) => {
                 await confirmSource();

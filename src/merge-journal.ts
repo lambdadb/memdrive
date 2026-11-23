@@ -61,7 +61,11 @@ export function mergeCaptureJournal(content: Handle, internal: Handle, collectio
     let tail = Promise.resolve();
 
     const sourceFor = (tag: string | null): MergeSource | null => tag === null ? null : confirmedMergeSource(content, tag);
-    return function capture(request: CaptureRequest, enqueueSource: ReturnType<typeof workingWriter>['enqueueCapture'],
+    /** Whether a binding write is unconfirmed; only this journal can resubmit the identical record. */
+    const unconfirmed = () => pending.size > 0;
+    return Object.assign(capture, { unconfirmed });
+
+    function capture(request: CaptureRequest, enqueueSource: ReturnType<typeof workingWriter>['enqueueCapture'],
         signal?: AbortSignal): Promise<MergeSource | null> {
         checkAbort(signal);
         requireInput(keysOnly(request, ['requestId', 'branch', 'summary']) && validRequestId(request.requestId)
@@ -127,5 +131,5 @@ export function mergeCaptureJournal(content: Handle, internal: Handle, collectio
             tail = result.then(() => undefined, () => undefined);
             return result;
         }, signal);
-    };
+    }
 }
