@@ -76,7 +76,8 @@ exited before removing a stale guard.
 
 ## Retrieval and answer input
 
-- Question-only search is the default. It uses the literal question for
+- Question-only search is the default. Requests explicitly select `mode: 'hybrid'`
+  to preserve this benchmark profile independently of SDK defaults. It uses the literal question for
   lexical, semantic and reranking queries. Managed embeddings are
   `text-embedding-3-small` with English lexical analysis. The default is
   `--limit 100` with native Jev reranking. Use `--rerank false` to opt out.

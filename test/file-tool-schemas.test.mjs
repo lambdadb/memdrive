@@ -35,6 +35,10 @@ test('advertised tool schemas accept SDK inputs and reject ambiguous selectors, 
             ...(external ? [] : [
                 ['read', { path: '/plan', startLine: 2, endLine: 4, maxChars: 200 }],
                 ['read', { fileId: 'id', offset: 200, revision: 'a'.repeat(64), maxChars: 200 }],
+                ...['semantic', 'keyword', 'hybrid'].flatMap(mode => [
+                    ['search', { query: 'checkpoint', mode }],
+                    ['search', { query: 'checkpoint', mode, rerank: true, embeddingQuery: 'preserve work' }],
+                ]),
                 ['search', { query: 'plan', embeddingQuery: 'travel plan', rerank: { fields: ['content'], onFailure: 'returnOriginal' } }],
                 ['write', { op: 'update', fileId: 'returned-id', edits: [{ oldText: 'Original', newText: '' }] }],
                 ['findText', { query: 'a.b', prefix: '/notes/', filter: { field: 'metadata.topic', op: 'eq', value: 'plan' } }],
@@ -62,8 +66,12 @@ test('advertised tool schemas accept SDK inputs and reject ambiguous selectors, 
             ...(external ? [
                 ['read', { path: '/one', startLine: 1 }],
                 ['search', { query: 'text' }], ['search', { query: content, rerank: false }],
+                ['search', { query: content, mode: 'semantic' }],
                 ['write', { op: 'update', fileId: 'id', edits: [{ oldText: 'a', newText: 'b' }] }],
             ] : [
+                ['search', { query: 'plan', mode: 'auto' }],
+                ['search', { query: 'plan', mode: 'keyword', embeddingQuery: 'unused' }],
+                ['search', { query: 'plan', mode: 'keyword', rerank: false, embeddingQuery: 'unused' }],
                 ['findText', { query: '' }], ['findText', { cursor: 'opaque', query: 'a' }],
                 ['write', { op: 'update', fileId: 'id', content: '', edits: [{ oldText: 'a', newText: 'b' }] }],
             ]),

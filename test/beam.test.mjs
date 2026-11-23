@@ -53,7 +53,7 @@ test('original BEAM partition is question-independent and keeps the first reply 
     assert.deepEqual(prepared.files.map(file => file.path), ['/messages/0.txt', '/messages/1.txt', '/profile.json']);
     assert.deepEqual(prepared.recent.map(message => message.turnId), ['dialogue-2', 'dialogue-3', 'dialogue-4', 'dialogue-5', 'dialogue-0']);
     const raw = { retrievalInput: 'question', limit: 100, rerank: false };
-    assert.deepEqual(searchRequest(source.questions[0], prepared, raw), { query: source.questions[0].text, limit: 100, rerank: false });
+    assert.deepEqual(searchRequest(source.questions[0], prepared, raw), { query: source.questions[0].text, mode: 'hybrid', limit: 100, rerank: false });
     const contextual = searchRequest(source.questions[1], prepared, { ...raw, retrievalInput: 'contextual' });
     assert.equal(contextual.query, source.questions[1].text);
     assert.deepEqual(JSON.parse(contextual.embeddingQuery), { question: source.questions[1].text,

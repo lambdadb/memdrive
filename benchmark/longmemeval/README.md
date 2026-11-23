@@ -133,7 +133,8 @@ preceding user/assistant pair together. Answers and evidence annotations enter
 only scoring and coverage calculations.
 
 Both modes use managed embeddings, English text analysis and reranked hybrid
-search. The agent may reduce the search limit from the configured ceiling.
+search, explicitly selecting `mode: 'hybrid'` instead of inheriting SDK defaults.
+The agent may reduce the search limit from the configured ceiling.
 Read returns a full original by file ID. Search evidence uses the SDK's UTF-16
 ranges when present. The benchmark checks the file ID, path, metadata, text and
 range against the frozen source before delivery. If the SDK omits a range, the

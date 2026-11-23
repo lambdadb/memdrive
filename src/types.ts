@@ -318,8 +318,13 @@ export interface SearchExternalFilesResult {
 }
 
 export interface SearchFilesRequest extends SearchOptions {
+    /** Natural-language retrieval intent, or focused terms for keyword matching. */
     query: string;
+    /** Candidate retrieval method. Defaults to semantic; never switches automatically. */
+    mode?: 'semantic' | 'keyword' | 'hybrid' | undefined;
+    /** Overrides embedding and enabled reranking input. Keyword mode requires reranking to use it. */
     embeddingQuery?: string | undefined;
+    /** Independently rerank retrieved candidates in any mode. Defaults to false. */
     rerank?: boolean | {
         fields?: string[] | undefined;
         onFailure?: 'error' | 'returnOriginal' | undefined;

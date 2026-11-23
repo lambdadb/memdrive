@@ -22,7 +22,7 @@ export async function runTool(drive, name, args, config, signal) {
             && typeof args.query === 'string' && args.query.trim()) {
             const limit = args.limit === undefined ? config.retrieval.limit : args.limit;
             if (Number.isSafeInteger(limit) && limit > 0 && limit <= config.retrieval.limit) {
-                const value = await drive.search({ query: args.query, limit, rerank: config.retrieval.rerank }, { signal });
+                const value = await drive.search({ query: args.query, mode: 'hybrid', limit, rerank: config.retrieval.rerank }, { signal });
                 return { ok: true, value };
             }
         }

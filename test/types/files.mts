@@ -24,6 +24,12 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     listed.files[0]?.content;
     const ranked: SearchFilesResult = await reopened.search({ query: 'Task context', filter: topicFilter, rerank: { onFailure: 'returnOriginal' } });
     ranked.hits[0]?.range?.start;
+    for (const mode of ['semantic', 'keyword', 'hybrid'] as const) {
+        await reopened.search({ query: 'checkpoint', mode });
+        await reopened.search({ query: 'checkpoint', mode, rerank: true, embeddingQuery: 'preserve work' });
+    }
+    // @ts-expect-error Search modes are explicit; there is no automatic routing mode.
+    await reopened.search({ query: 'checkpoint', mode: 'auto' });
     const exact: FindTextResult = await reopened.findText({ query: 'Task context', prefix: '/notes/', filter: topicFilter });
     exact.hits[0]?.context.range.start;
     if (exact.cursor) await reopened.findText({ cursor: exact.cursor });
@@ -111,6 +117,8 @@ export async function externalFileConsumer(client: LambdaDBClient, options: Open
     await work.write({ op: 'update', fileId: file!.fileId, embedding: vector });
     // @ts-expect-error External searches accept vectors through query.
     await main.search({ queryVector: vector });
+    // @ts-expect-error External search has no text retrieval modes.
+    await main.search({ query: vector, mode: 'semantic' });
     // @ts-expect-error External search cannot request a text reranker.
     await main.search({ query: vector, rerank: true });
     // @ts-expect-error Checkpoints do not mutate content.

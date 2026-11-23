@@ -98,7 +98,7 @@ export function searchRequest(question, prepared, { retrievalInput, limit, reran
     }) : undefined;
     assert(Buffer.byteLength(question.text) <= 8192 && (embeddingQuery === undefined || Buffer.byteLength(embeddingQuery) <= 8192),
         'BEAM search input exceeds 8192 UTF-8 bytes; use --retrieval-input question if the recent dialogue or profile is too large');
-    return { query: question.text, ...(embeddingQuery === undefined ? {} : { embeddingQuery }), limit, rerank };
+    return { query: question.text, mode: 'hybrid', ...(embeddingQuery === undefined ? {} : { embeddingQuery }), limit, rerank };
 }
 
 const splitsSurrogate = (text, at) => at > 0 && at < text.length

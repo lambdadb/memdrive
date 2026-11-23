@@ -95,7 +95,10 @@ on the hosted runner stays in temporary storage for the lifetime of the job.
 | `tool` | Same descriptions plus the optional SDK `guide` tool | Record whether the model calls it |
 | `resource` | Host lists and reads the guide resource, then injects its unchanged text | Record a **host** resource read; this is not an autonomous model fetch |
 
-All channels use the same exported guide version. `--instruction` independently
+All channels use the same exported guide version. Guide version 5 describes the
+semantic/no-rerank defaults and explicit search modes. Earlier guide-4 model
+measurements used the previous search defaults; they do not validate model
+selection with the new descriptions. `--instruction` independently
 selects `server` (default), `workflow` (additional developer workflow text), or
 `user` (an explicit reminder appended to the task). Workflow injection approximates
 a loaded bundled skill; skill discovery/loading itself is not tested. Compare
