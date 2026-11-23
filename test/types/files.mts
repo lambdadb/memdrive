@@ -49,6 +49,14 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     await reopened.search({ query: 'checkpoint', mode: 'auto' });
     const exact: FindTextResult = await reopened.findText({ at, query: 'Task context', prefix: '/notes/', filter: topicFilter });
     exact.hits[0]?.context.range.start;
+    const hit = exact.hits[0];
+    if (hit) {
+        // Hit lines feed a bounded read of the lines containing the match.
+        const { startLine, endLine }: { startLine: number; endLine: number } = hit.range;
+        await reopened.read({ at, fileId: hit.fileId, startLine, endLine });
+        // @ts-expect-error Context excerpts keep offsets only.
+        hit.context.range.startLine;
+    }
     if (exact.next) await reopened.findText(exact.next);
     // @ts-expect-error A continuation inherits its original options.
     await reopened.findText({ cursor: 'opaque', filter: topicFilter });

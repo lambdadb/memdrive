@@ -5,9 +5,10 @@ import { prefixAncestor, validPathPrefix } from './list.js';
 import { initialMainRef } from './merge-preflight.js';
 import { decodeFile, decodeFileEntry, fingerprintOf, originalId, resultDocs, validPath, validText } from './records.js';
 import { afterId, ancestorFilter, branchRef, readRef, viewRead, type Handle, type RefSource, type ViewRef, type WithoutAt } from './storage-reads.js';
-import type { FileAt, FileFilter, FindTextRequest, FindTextResult, MetadataSchema, RequestOptions } from './types.js';
+import type { DriveFile, FileAt, FileFilter, FindTextRequest, FindTextResult, MetadataSchema, RequestOptions } from './types.js';
 import { decodeToken, encodeToken } from './cursor-tokens.js';
 import { tagFor } from './publication-log.js';
+import { lineCounter } from './read-range.js';
 
 type Clause = ReturnType<typeof compileFilter> | { queryString: { query: string; defaultField: string; skipSyntax?: boolean }; occur: string };
 type Resume = { id: string; offset: number; fingerprint?: string };
@@ -141,11 +142,16 @@ export function fileTextFinder(handle: Handle, name: string, source: RefSource, 
     }
     const isSnapshot = (ref: ViewRef) => ref.kind === 'tag' || ('read' in source && ref.name === initialMainRef.name);
 
-    async function original(ref: ViewRef, clauses: Clause[], signal?: AbortSignal, upperBound = false) {
+    /**
+     * Read up to `size` originals in ID order, or the last one for a live upper bound.
+     * The native client downloads offloaded (`docsUrl`) results; a response that is
+     * still not inline or disagrees with its total is never treated as complete.
+     */
+    async function originals(ref: ViewRef, clauses: Clause[], size: number, signal?: AbortSignal, upperBound = false) {
         let response;
         try {
             response = await nativeRequest(() => handle.query({
-                ...viewRead(ref), size: 1, sort: [{ id: upperBound ? 'desc' : 'asc' }],
+                ...viewRead(ref), size, sort: [{ id: upperBound ? 'desc' : 'asc' }],
                 fields: { include: upperBound ? entryFields : [...entryFields, 'body'] },
                 query: { bool: clauses },
             }, nativeOptions(signal)), signal);
@@ -153,63 +159,93 @@ export function fileTextFinder(handle: Handle, name: string, source: RefSource, 
             throw databaseError(cause, 'Could not read file originals for text matching.');
         }
         checkAbort(signal);
-        const docs = resultDocs(response, name, 1);
+        const docs = resultDocs(response, name, size);
         if (response.isDocsInline !== true || response.total !== docs.length)
             throw new MemDriveError('INVALID_RESULT', 'Text matching returned an incomplete document page.');
-        return docs[0];
+        return docs;
     }
 
     async function page(scan: Scan, signal?: AbortSignal): Promise<Page> {
-        const { ref, clauses, limit, prefix, pattern, upper } = scan;
+        const { ref, clauses, limit, prefix, pattern, upper, resume } = scan;
         const result: FindTextResult = { hits: [], consistency: isSnapshot(ref) ? 'snapshot' : 'live' };
         const find = new RegExp(pattern, 'giu');
-        let { after, resume } = scan;
-        for (let examined = 0; examined < filesPerPage; examined++) {
-            const exact = resume && { queryString: { query: resume.id, defaultField: 'id', skipSyntax: true }, occur: 'filter' };
-            const doc = await original(ref, [...clauses, ...(exact ? [exact] : afterId(after))], signal);
-            if (!doc) {
-                if (resume) throw unavailable();
-                return { result };
-            }
-            const file = decodeFile(doc, schema);
-            const id = originalId(file.fileId);
-            if ((after !== undefined && id <= after) || (resume && id !== resume.id))
-                throw new MemDriveError('INVALID_RESULT', 'Text matching returned an unexpected file original.');
-            if (upper !== undefined && id > upper) return { result };
-            if (resume?.fingerprint !== undefined && resume.fingerprint !== await fingerprintOf(file))
-                throw unavailable();
-            if (resume && (resume.offset > file.content.length || insidePair(file.content, resume.offset)))
-                throw unavailable();
+        /** The last fully examined original. */
+        let after = scan.after;
+        /** Collect one file's matches from offset, returning the page if the hit limit stops inside or after it. */
+        async function examine(file: DriveFile, id: string, offset: number): Promise<Page | undefined> {
             checkAbort(signal);
             const { content, ...entry } = file;
-            if (file.path.startsWith(prefix)) {
-                find.lastIndex = resume?.offset ?? 0;
-                let match = find.exec(content);
-                while (match) {
-                    const start = match.index;
-                    const end = start + match[0].length;
-                    let contextStart = Math.max(0, start - contextUnits);
-                    let contextEnd = Math.min(end + contextUnits, content.length);
-                    if (insidePair(content, contextStart)) contextStart--;
-                    if (insidePair(content, contextEnd)) contextEnd++;
-                    result.hits.push({ ...entry, content: match[0], range: { start, end },
-                        context: { content: content.slice(contextStart, contextEnd),
-                            range: { start: contextStart, end: contextEnd } } });
-                    // Advance one code point from the start to include overlapping occurrences.
-                    find.lastIndex = start + (insidePair(content, start + 1) ? 2 : 1);
-                    match = find.exec(content);
-                    if (result.hits.length === limit) {
-                        if (match) return { result, next: { ...scan, after, resume: { id, offset: match.index,
-                            ...(isSnapshot(ref) ? {} : { fingerprint: await fingerprintOf(file) }) } } };
-                        if (id === upper) return { result };
-                        return { result, next: { ...scan, after: id, resume: undefined } };
-                    }
+            if (!file.path.startsWith(prefix)) return undefined;
+            find.lastIndex = offset;
+            let match = find.exec(content);
+            // Match starts increase, so one counter numbers them in a single pass.
+            let lines: ((offset: number) => number) | undefined;
+            while (match) {
+                const start = match.index;
+                const end = start + match[0].length;
+                // Lines follow ranged reads: a match ends on the line holding its last unit,
+                // so a trailing line break stays on the line it terminates.
+                const startLine = (lines ??= lineCounter(content))(start);
+                const endLine = lineCounter(content.slice(start, end), startLine)(end - 1 - start);
+                let contextStart = Math.max(0, start - contextUnits);
+                let contextEnd = Math.min(end + contextUnits, content.length);
+                if (insidePair(content, contextStart)) contextStart--;
+                if (insidePair(content, contextEnd)) contextEnd++;
+                result.hits.push({ ...entry, content: match[0], range: { startLine, endLine, start, end },
+                    context: { content: content.slice(contextStart, contextEnd),
+                        range: { start: contextStart, end: contextEnd } } });
+                // Advance one code point from the start to include overlapping occurrences.
+                find.lastIndex = start + (insidePair(content, start + 1) ? 2 : 1);
+                match = find.exec(content);
+                if (result.hits.length === limit) {
+                    if (match) return { result, next: { ...scan, after, resume: { id, offset: match.index,
+                        ...(isSnapshot(ref) ? {} : { fingerprint: await fingerprintOf(file) }) } } };
+                    if (id === upper) return { result };
+                    return { result, next: { ...scan, after: id, resume: undefined } };
                 }
             }
+            return undefined;
+        }
+
+        let examined = 0;
+        if (resume) {
+            // Continue inside exactly the file the previous page stopped in. Its own
+            // query keeps originals inserted before it out of this page.
+            const exact = { queryString: { query: resume.id, defaultField: 'id', skipSyntax: true }, occur: 'filter' };
+            const [doc] = await originals(ref, [...clauses, exact], 1, signal);
+            if (!doc) throw unavailable();
+            const file = decodeFile(doc, schema);
+            if (originalId(file.fileId) !== resume.id)
+                throw new MemDriveError('INVALID_RESULT', 'Text matching returned an unexpected file original.');
+            if (resume.fingerprint !== undefined && resume.fingerprint !== await fingerprintOf(file))
+                throw unavailable();
+            if (resume.offset > file.content.length || insidePair(file.content, resume.offset))
+                throw unavailable();
+            const stopped = await examine(file, resume.id, resume.offset);
+            if (stopped) return stopped;
+            if (resume.id === upper) return { result };
+            after = resume.id;
+            examined = 1;
+        }
+        // One batch fills the rest of the page. Originals fetched after a stop are
+        // refetched by the next page, so none is skipped.
+        const size = filesPerPage - examined;
+        const docs = await originals(ref, [...clauses, ...afterId(after)], size, signal);
+        for (const doc of docs) {
+            const file = decodeFile(doc, schema);
+            const id = originalId(file.fileId);
+            // Strictly ascending IDs after the cursor also exclude duplicates.
+            if (after !== undefined && id <= after)
+                throw new MemDriveError('INVALID_RESULT', 'Text matching returned an unexpected file original.');
+            if (upper !== undefined && id > upper) return { result };
+            const stopped = await examine(file, id, 0);
+            if (stopped) return stopped;
             after = id;
-            resume = undefined;
             if (id === upper) return { result };
         }
+        // Native queries return every requested match or fail; they never cut a page by
+        // bytes, so a short batch ends the scan.
+        if (docs.length < size) return { result };
         return { result, next: { ...scan, after, resume: undefined } };
     }
 
@@ -239,7 +275,7 @@ export function fileTextFinder(handle: Handle, name: string, source: RefSource, 
             run = () => readRef(source, async ref => {
                 const scan = { ...criteria, ref, ...(published ? {} : { incarnation: await incarnation!(signal) }) };
                 if (isSnapshot(ref)) return page(scan, signal);
-                const last = await original(ref, criteria.clauses, signal, true);
+                const [last] = await originals(ref, criteria.clauses, 1, signal, true);
                 if (!last) return { result: { hits: [], consistency: 'live' } };
                 const upper = originalId(decodeFileEntry(last, schema).fileId);
                 return page({ ...scan, upper }, signal);
