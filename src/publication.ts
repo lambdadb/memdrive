@@ -1,4 +1,4 @@
-import { keysOnly, parseStore, validRetention } from './config.js';
+import { keysOnly, parseStore } from './config.js';
 import { historyRetention, type RetainedPublication } from './history-retention.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, requireInput } from './errors.js';
 import { mergeCaptureJournal } from './merge-journal.js';
@@ -465,12 +465,11 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         signal?.addEventListener('abort', abort, { once: true });
         const timer = setTimeout(abort, 5_000);
         try {
-            // Retention can change through another client. Never guess a value
+            // The SDK window can change through another client. Never guess a value
             // or clean a replacement store generation with this client's journal.
             const response = await nativeRequest(() => content.get(nativeOptions(controller.signal)), controller.signal);
             const found = parseStore(response.collection, content.collectionName);
-            if (!validRetention(found.retentionInDays)
-                || (await publicationIdentity(content.collectionName, response.collection)).driveId !== driveId) return;
+            if ((await publicationIdentity(content.collectionName, response.collection)).driveId !== driveId) return;
             const completed = [...requests.values()].flatMap(({ reservation, outcome }) => outcome ? [{ reservation, outcome }] : []);
             await retained.prune(publications, completed, found.retentionInDays, controller.signal);
         } catch {

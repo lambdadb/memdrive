@@ -292,7 +292,10 @@ export interface ExternalEmbedding {
 type StoreOptions = ConnectionOptions & {
     labels?: Record<string, string> | undefined;
     metadataSchema?: MetadataSchema | undefined;
-    /** 1–31 days; also applies to automatic retention cleanup after terminal merges. */
+    /**
+     * SDK history window, 1–365 days (default 30), for internal main version tags and
+     * completed merge captures. Native snapshot retention stays at its one-day minimum.
+     */
     retentionInDays?: number | undefined;
 };
 
@@ -314,8 +317,11 @@ interface StoreDescription {
     name: string;
     labels: Record<string, string>;
     metadataSchema: MetadataSchema;
-    /** Native retention and automatic merge cleanup window; explicit refs and history summaries do not expire. */
-    retentionInDays?: number | undefined;
+    /**
+     * SDK history window for automatic cleanup of internal versions and merge captures.
+     * Explicit forks, checkpoints and history summaries do not expire.
+     */
+    retentionInDays: number;
 }
 
 export type FileStoreDescription<Mode extends EmbeddingMode = 'managed'> = StoreDescription & (
