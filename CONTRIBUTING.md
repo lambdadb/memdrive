@@ -60,7 +60,7 @@ The installed-package check exercises the tool workflow, authorization boundary
 and store/ref lifecycle, including partial deletion recovery, as well as ESM,
 CommonJS, TypeScript and browser imports.
 The installed core package also runs history-retention regressions covering
-protected refs, supersession timing, bounded archives, terminal outcomes and
+protected refs, supersession timing, history kept after release, terminal outcomes and
 uncertain or partial cleanup, the stored cleanup watermark, cancellation and read
 concurrency, and the SDK window kept separate from one-day native retention. Public type checks
 verify that retention needs no separate cleanup API. Historical-ref regressions

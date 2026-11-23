@@ -9,13 +9,16 @@ type RecordBase = { id: string; driveId: string };
 export type Reservation = RecordBase & BoundRequest & {
     kind: 'merge-reservation-v1'; sourceTag: string | null; startedAt: string; priorVersion: string; version: string;
 };
-export type Outcome = { status: 'published' | 'unchanged'; version: string }
+/**
+ * A publication records the files it affected: at most `publishedFileLimit`
+ * IDs in ascending order, and whether it affected more.
+ */
+export type Outcome = { status: 'published'; version: string; fileIds: string[]; fileIdsTruncated: boolean }
+    | { status: 'unchanged'; version: string }
     | { status: 'conflict'; fileIds: string[]; paths: string[] };
 export type Completion = RecordBase & Outcome & { kind: 'merge-result-v1'; completedAt: string };
 export type Applied = RecordBase & { kind: 'merge-applied-v1' };
 export type Bookkeeping = RecordBase & { kind: 'merge-bookkeeping-v1' };
-export type HistoryArchive = RecordBase & { kind: 'merge-history-v1'; version: string; publishedAt: string; summary: string;
-    sourceTag: string; fileIds: string[]; fileIdsTruncated: boolean };
 /**
  * Locates a request's reservation by a document ID derived from the request ID.
  * It is written once, after the reservation it names, and never changes.
@@ -25,7 +28,7 @@ export type RequestIndex = RecordBase & { kind: 'merge-request-v1'; requestId: s
 export type RetentionWatermark = RecordBase & { kind: 'retention-watermark-v1'; slot: string };
 /** One slot as read from the journal: its reservation and, once terminal, its outcome. */
 export type SlotState = { reservation: Reservation; outcome?: Outcome & { completedAt: string } };
-export type PublicationRecord = Reservation | Completion | Applied | Bookkeeping | HistoryArchive | RequestIndex;
+export type PublicationRecord = Reservation | Completion | Applied | Bookkeeping | RequestIndex;
 
 export const versionFor = (slot: bigint) => `v${slot}`;
 export const tagFor = (version: string) => `md-main-${version}`;
@@ -37,6 +40,7 @@ export const requestIndexId = async (requestId: string) => `request:${await cont
 export const watermarkId = 'retention:watermark';
 /** LambdaDB accepts 1–1,000 IDs per fetch. */
 export const fetchLimit = 1000;
+export const publishedFileLimit = 100;
 
 const canonicalSlot = (value: unknown): value is string => typeof value === 'string' && /^[1-9][0-9]{0,42}$/.test(value);
 export const canonicalVersion = (value: unknown): value is string => typeof value === 'string'
@@ -72,9 +76,14 @@ export function parseReservation(doc: Record<string, unknown>, slot: bigint, exp
 
 export function parseOutcome(doc: Record<string, unknown>, reservation: Reservation): Outcome & { completedAt: string } {
     if (doc.kind !== 'merge-result-v1' || !validDate(doc.completedAt)) throw invalid();
+    const { fileIds, fileIdsTruncated } = doc;
     if (doc.status === 'published' && doc.version === reservation.version && reservation.sourceTag !== null
-        || doc.status === 'unchanged' && doc.version === reservation.priorVersion)
-        return { status: doc.status, version: doc.version as string, completedAt: doc.completedAt };
+        && Array.isArray(fileIds) && fileIds.length >= 1 && fileIds.length <= publishedFileLimit
+        && fileIds.every((id, index) => validFileId(id) && (index === 0 || fileIds[index - 1] < id))
+        && typeof fileIdsTruncated === 'boolean' && (!fileIdsTruncated || fileIds.length === publishedFileLimit))
+        return { status: 'published', version: doc.version, fileIds: fileIds as string[], fileIdsTruncated, completedAt: doc.completedAt };
+    if (doc.status === 'unchanged' && doc.version === reservation.priorVersion)
+        return { status: 'unchanged', version: doc.version, completedAt: doc.completedAt };
     if (doc.status === 'conflict' && Array.isArray(doc.fileIds) && doc.fileIds.every(validFileId)
         && Array.isArray(doc.paths) && doc.paths.every(validPath) && doc.fileIds.length + doc.paths.length > 0)
         return { status: 'conflict', fileIds: doc.fileIds as string[], paths: doc.paths as string[], completedAt: doc.completedAt };

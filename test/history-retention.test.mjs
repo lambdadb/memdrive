@@ -35,6 +35,7 @@ async function reopen(fixture, mode = 'managed') {
 }
 const replay = draft => draft.merge({ requestId: 'first', summary: 'Create note' });
 const deletions = fixture => fixture.calls.filter(call => call.kind === 'tag-delete');
+const captures = fixture => [...fixture.collections.get('pruning-store').tags.keys()].filter(tag => tag.startsWith('merge-capture-'));
 
 async function setup(external = false, retention = { retentionInDays: 1 }) {
     const fixture = fileClient();
@@ -55,7 +56,7 @@ async function setup(external = false, retention = { retentionInDays: 1 }) {
 }
 
 test('terminal merge automatically expires internal tags while preserving refs, history, cursors and replay', async () => {
-    const { fixture, saved, oldFork, original } = await setup();
+    const { fixture, saved, oldFork, original, records } = await setup();
     const orphan = `merge-capture-${randomUUID()}`;
     await fixture.client.collection('pruning-store').tags.create({ tagName: orphan, source: { kind: 'branch', name: 'main' } });
     const { main, draft } = await reopen(fixture);
@@ -68,6 +69,9 @@ test('terminal merge automatically expires internal tags while preserving refs, 
     const state = fixture.collections.get('pruning-store');
     assert.deepEqual([...state.tags.keys()].sort(), ['checkpoint-saved', 'md-main-v3', orphan].sort());
     assert(state.branches.has('md-main-v0'));
+    // Every capture of this store is released, and nothing was saved in its place.
+    assert.deepEqual(captures(fixture), [orphan]);
+    assert.deepEqual([...records.keys()].filter(id => !/^(?:reservation|completion|applied|bookkeeping|request|merge-capture-v1|retention):/.test(id)), []);
     assert.equal((await saved.read({ fileId: original.fileId })).content, 'Revision 1');
     assert.equal((await oldFork.read({ fileId: original.fileId })).content, 'Revision 1');
     assert.equal((await main.read({ fileId: original.fileId })).content, 'Revision 3');
@@ -151,20 +155,22 @@ test('conflict and unchanged outcomes trigger cleanup without changing replay se
     assert.deepEqual(await fresh.draft.merge({ requestId: 'unchanged', summary: 'No changes' }), unchanged);
 });
 
-test('bounded archives preserve 100 affected IDs and the truncation marker', async () => {
+test('history keeps 100 affected IDs and the truncation marker after the capture is released', async () => {
     const fixture = fileClient();
     const main = await create({ client: fixture.client, name: 'pruning-store', retentionInDays: 1 });
     const draft = await fork(main, { name: 'draft' });
-    await draft.write(Array.from({ length: 100 }, (_, i) => ({ op: 'create', path: `/file-${i}`, content: '' })));
-    await draft.write({ op: 'create', path: '/extra', content: '' });
+    const files = await draft.write(Array.from({ length: 100 }, (_, i) => ({ op: 'create', path: `/file-${i}`, content: '' })));
+    files.push(await draft.write({ op: 'create', path: '/extra', content: '' }));
     await draft.merge({ requestId: 'first', summary: 'Create note' });
     age(fixture, [2]);
     const fresh = await reopen(fixture);
     const before = await fresh.main.history();
-    assert.equal(before.entries[0].fileIds.length, 100);
+    assert.deepEqual(before.entries[0].fileIds, files.map(({ fileId }) => fileId).sort().slice(0, 100));
     assert.equal(before.entries[0].fileIdsTruncated, true);
+    assert.equal(captures(fixture).length, 1);
     await replay(fresh.draft);
     assert.equal(deletions(fixture).length, 1);
+    assert.deepEqual(captures(fixture), []);
     assert.deepEqual(await (await reopen(fixture)).main.history(), before);
 });
 
@@ -175,20 +181,6 @@ test('unfinished bookkeeping blocks cleanup until explicit recovery settles it',
     await replay(draft); // Old terminal request still replays, but cannot clean.
     assert.equal(deletions(fixture).length, 0);
     await open({ client: { ...fixture.client }, name: 'pruning-store', recover: true });
-    assert.equal(deletions(fixture).length, 5);
-});
-
-test('unconfirmed archives retain all tags and retry automatically on a later merge', async () => {
-    const { fixture } = await setup();
-    const { main, draft } = await reopen(fixture);
-    fixture.beforeUpsert = request => {
-        if (request.docs.some(doc => doc.kind === 'merge-history-v1')) throw new Error('Lost archive response');
-    };
-    assert.equal((await replay(draft)).status, 'published');
-    assert.equal(deletions(fixture).length, 0);
-    await main.configure({ retentionInDays: 2 });
-    fixture.beforeUpsert = undefined;
-    await replay(draft);
     assert.equal(deletions(fixture).length, 5);
 });
 
@@ -248,16 +240,18 @@ test('in-flight reads defer cleanup until another merge without blocking either 
     assert.equal(deletions(fixture).length, 5);
 });
 
-test('corrupt archives cannot justify deletion or replace a successful merge result', async () => {
+test('a malformed publication record cannot justify deletion or replace a successful merge result', async () => {
     const { fixture, records } = await setup();
-    const { draft } = await reopen(fixture);
-    let deletes = 0;
-    fixture.afterRefDelete = () => { if (++deletes === 1) throw new Error('Stop after one tag'); };
+    const { main, draft } = await reopen(fixture);
+    const { fileIds } = records.get('completion:2');
+    delete records.get('completion:2').fileIds;
+    assert.equal((await replay(draft)).status, 'published');
+    assert.equal(deletions(fixture).length, 0);
+    assert.equal(records.has('retention:watermark'), false);
+    await assert.rejects(main.history(), { code: 'INVALID_RESULT' });
+    records.get('completion:2').fileIds = fileIds;
     await replay(draft);
-    fixture.afterRefDelete = undefined;
-    records.get('history:v1').sourceTag = `merge-capture-${randomUUID()}`;
-    await replay(draft);
-    assert.equal(deletions(fixture).length, 1);
+    assert.equal(deletions(fixture).length, 5);
 });
 
 test('cleanup is capped at 100 tags and the next merge continues the backlog', async () => {
@@ -278,7 +272,7 @@ test('cleanup is capped at 100 tags and the next merge continues the backlog', a
     assert.equal(deletions(fixture).length, 103);
 });
 
-test('a history read racing cleanup uses the complete confirmed archive', async () => {
+test('a history read racing cleanup returns the complete entry without reading the capture', async () => {
     const fixture = fileClient();
     const main = await create({ client: fixture.client, name: 'pruning-store', retentionInDays: 1 });
     const draft = await fork(main, { name: 'draft' });
@@ -287,30 +281,35 @@ test('a history read racing cleanup uses the complete confirmed archive', async 
     age(fixture, [2]);
     const reader = await reopen(fixture);
     const before = await reader.main.history();
+    assert.equal(before.entries[0].fileIds.length, 2);
     const cleaner = await reopen(fixture);
-    fixture.diffPage = async request => {
-        if (!request.ref.name.startsWith('merge-capture-')) return;
-        fixture.diffPage = undefined;
-        const docs = fixture.collections.get('pruning-store').tags.get(request.ref.name).docs;
-        const one = [...docs.values()].find(doc => doc.kind === 'file');
+    // Cleanup releases the capture while the reader is fetching the slot records.
+    fixture.beforeFetch = async request => {
+        if (!request.ids.includes('completion:1') || !request.ids.includes('reservation:1') || request.ids.includes('bookkeeping:1')) return;
+        fixture.beforeFetch = undefined;
         await replay(cleaner.draft);
-        return { isDocsInline: true, total: 1, docs: [{ collection: 'pruning-store', doc: one }] };
     };
+    const start = fixture.calls.length;
     assert.deepEqual(await reader.main.history(), before);
+    assert.equal(fixture.beforeFetch, undefined);
     assert.equal(deletions(fixture).length, 1);
+    assert.deepEqual(captures(fixture), []);
+    assert.equal(fixture.calls.slice(start).some(call => call.kind === 'query' && call.request.ref.name.startsWith('merge-capture-')), false);
 });
 
 test('cleanup cancellation after publication preserves success and retries later', async () => {
     const { fixture } = await setup();
     const { draft } = await reopen(fixture);
     const controller = new AbortController();
-    fixture.beforeUpsert = request => {
-        if (request.docs.some(doc => doc.kind === 'merge-history-v1')) controller.abort();
+    // The pass lists tags once, before it deletes any.
+    fixture.listTags = () => {
+        fixture.listTags = undefined;
+        controller.abort();
     };
     const result = await draft.merge({ requestId: 'first', summary: 'Create note' }, { signal: controller.signal });
     assert.equal(result.status, 'published');
+    assert.equal(controller.signal.aborted, true);
     assert.equal(deletions(fixture).length, 0);
-    fixture.beforeUpsert = undefined;
     await replay(draft);
     assert.equal(deletions(fixture).length, 5);
 });
@@ -326,15 +325,14 @@ test('cleanup has its own abort deadline without turning a terminal merge into f
         } };
     } };
     const draft = scoped(await open({ client, name: 'pruning-store' }), draftAt);
-    fixture.beforeUpsert = request => {
-        if (request.docs.some(doc => doc.kind === 'merge-history-v1')) return new Promise((_, reject) => {
-            maintenanceSignal.addEventListener('abort', () => reject(new Error('Cleanup deadline')), { once: true });
-        });
-    };
+    // The tag listing of the pass never answers.
+    fixture.listTags = () => new Promise((_, reject) => {
+        maintenanceSignal.addEventListener('abort', () => reject(new Error('Cleanup deadline')), { once: true });
+    });
     assert.equal((await replay(draft)).status, 'published');
     assert.equal(maintenanceSignal.aborted, true);
     assert.equal(deletions(fixture).length, 0);
-    fixture.beforeUpsert = undefined;
+    fixture.listTags = undefined;
     await replay(draft);
     assert.equal(deletions(fixture).length, 5);
 });
@@ -380,7 +378,7 @@ test('cleanup stops at a slot still inside the window and resumes in order once 
         assert(state.tags.has(tag), tag);
     await replay(draft);
     assert.equal(deletions(fixture).length, 1);
-    // Only the second outcome ages; archived publication times stay as recorded.
+    // Only the second outcome ages. Its recorded time is also its publication time.
     records.get('completion:2').completedAt = new Date(Date.now() - 3 * day).toISOString();
     await replay(draft);
     assert.equal(deletions(fixture).length, 5);
@@ -456,33 +454,39 @@ test('a fresh client continues cleanup from the stored watermark without rereadi
     assert.equal(deletions(fixture).length, 103);
     assert.equal(watermark(records), '53');
     const fetches = fixture.calls.slice(start).filter(call => call.kind === 'fetch' && call.request.ref.name === 'main'
-        && call.request.ids.some(id => /^(?:reservation|completion|bookkeeping|request|history|retention):/.test(id)));
-    // Outcomes are read only from the watermark on, plus the superseded
-    // publication just below it whose summary is confirmed before its tag goes.
-    // The cold head search also probes the first slot.
+        && call.request.ids.some(id => /^(?:reservation|completion|bookkeeping|request|retention):/.test(id)));
+    // Outcomes are read only from the watermark on. The cold head search also
+    // probes the first slot.
     const outcomes = new Set(fetches.flatMap(call => call.request.ids).filter(id => id.startsWith('completion:'))
         .map(id => Number(id.slice('completion:'.length))));
-    assert.deepEqual([...outcomes].sort((a, b) => a - b), [1, 50, 51, 52]);
+    assert.deepEqual([...outcomes].sort((a, b) => a - b), [1, 51, 52]);
     assert(fetches.length <= 16, `${fetches.length} journal fetches`);
     await latest(fresh.draft);
     assert.equal(deletions(fixture).length, 103);
 });
 
-test('a history page reads its archives in one fetch and rereads only entries served from a capture', async () => {
+test('a history page reads only slot records, with the same result before and after cleanup', async () => {
     const { fixture } = await setup();
-    const archiveReads = async drive => {
+    const reads = async drive => {
         const start = fixture.calls.length;
         const page = await drive.history();
-        const reads = fixture.calls.slice(start).filter(call => call.kind === 'fetch' && call.request.ids.some(id => id.startsWith('history:')));
-        return { page, reads: reads.map(call => call.request.ids) };
+        const calls = fixture.calls.slice(start);
+        return { page, kinds: [...new Set(calls.map(call => call.kind))], ids: calls.map(call => call.request.ids) };
     };
     const { main, draft } = await reopen(fixture);
-    // Before cleanup no archive exists: one batch, then each capture's final check.
-    const before = await archiveReads(main);
-    assert.deepEqual(before.reads, [['history:v1', 'history:v2', 'history:v3'], ['history:v1'], ['history:v2'], ['history:v3']]);
+    // A cold client finds the head, then reads the page's slots in one fetch.
+    const before = await reads(main);
+    assert.deepEqual(before.kinds, ['fetch']);
+    assert.deepEqual(before.ids.at(-1), [1, 2, 3].flatMap(slot => [`reservation:${slot}`, `completion:${slot}`]));
+    assert.deepEqual(before.page.entries.map(({ version }) => version), ['v1', 'v2', 'v3']);
+    assert.equal(captures(fixture).length, 3);
     await replay(draft);
     assert.equal(deletions(fixture).length, 5);
-    const after = await archiveReads((await reopen(fixture)).main);
-    assert.deepEqual(after.reads, [['history:v1', 'history:v2', 'history:v3']]);
-    assert.deepEqual(after.page, before.page);
+    assert.deepEqual(captures(fixture), []);
+    const after = await reads((await reopen(fixture)).main);
+    assert.deepEqual(after, before);
+    // A warm client probes the next slot and reads the page.
+    const warm = await reads(main);
+    assert.deepEqual(warm.ids, [['reservation:4', 'completion:4', 'bookkeeping:4'], before.ids.at(-1)]);
+    assert.deepEqual(warm.page, before.page);
 });

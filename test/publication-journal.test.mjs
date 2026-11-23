@@ -12,7 +12,7 @@ const published = (requestId, version) => ({ requestId, status: 'published', ver
 const fresh = fixture => MemDrive.open({ client: { ...fixture.client }, name });
 const journalOf = fixture => [...fixture.collections.values()]
     .find(store => store.metadata.tags['memdrive.format'] === 'merge-publication-v1')?.branches.get('main').docs;
-const journalId = id => /^(?:reservation|completion|applied|bookkeeping|request|history|retention|merge-capture-v1):/.test(id);
+const journalId = id => /^(?:reservation|completion|applied|bookkeeping|request|retention|merge-capture-v1):/.test(id);
 const journalFetches = (fixture, since = 0) => fixture.calls.slice(since)
     .filter(call => call.kind === 'fetch' && call.request.ids.some(journalId));
 const journalWrites = fixture => fixture.calls.filter(call => call.kind === 'upsert' && call.collection !== name).length;
@@ -190,6 +190,60 @@ test('a second client sees the same status, history pages, exact versions and re
     await assert.rejects(replayer.merge({ at: other, ...request('r101') }), { code: 'MERGE_REQUEST_CONFLICT' });
     assert.equal(journalWrites(fixture), writes);
     assert.equal(reservations(fixture).length, 200);
+});
+
+test('a history page at 200 merges costs a head lookup and one fetch of its slot records', async () => {
+    const { fixture, versions } = await populate(200);
+    assert.equal(versions.length, 137);
+    const captures = [...fixture.collections.get(name).tags.keys()].filter(tag => tag.startsWith('merge-capture-'));
+    // Publications and conflicts each keep a capture.
+    assert.equal(captures.length, 137 + 28);
+    // Every native request of a history read, which must be a fetch of slot records by ID.
+    const read = async operation => {
+        const before = fixture.calls.length;
+        const page = await operation();
+        const calls = fixture.calls.slice(before);
+        for (const call of calls) {
+            assert.equal(call.kind, 'fetch');
+            assert.equal(call.request.ref.name, 'main');
+            assert(call.request.ids.every(id => /^(?:reservation|completion|bookkeeping):[1-9][0-9]*$/.test(id)), call.request.ids.join());
+            assert(call.request.ids.length <= 1000);
+        }
+        return { page, fetches: calls.length };
+    };
+    for (const limit of [20, 100]) {
+        const reader = await fresh(fixture);
+        // Cold: the head search, then the page. Warm: a probe of the next slot, then the page.
+        const cold = await read(() => reader.history({ limit }));
+        assert.equal(cold.fetches, 4, `cold page of ${limit}`);
+        assert.deepEqual(cold.page.entries.map(entry => entry.version), versions.slice(0, limit));
+        assert(cold.page.entries.every(entry => entry.fileIds.length === 1 && entry.fileIdsTruncated === false));
+        const warm = await read(() => reader.history({ limit }));
+        assert.equal(warm.fetches, 2, `warm page of ${limit}`);
+        assert.deepEqual(warm.page, cold.page);
+        const next = await read(() => reader.history(cold.page.next));
+        assert.equal(next.fetches, 2, `continued page of ${limit}`);
+        assert.deepEqual(next.page.entries.map(entry => entry.version), versions.slice(limit, 2 * limit));
+        // The whole history costs two fetches per page, independent of its entries.
+        let pageCount = 0;
+        const all = await read(async () => {
+            const entries = [];
+            for (let page = await reader.history({ limit }); ; page = await reader.history(page.next)) {
+                pageCount++;
+                entries.push(...page.entries);
+                if (!page.next) return entries;
+            }
+        });
+        assert.equal(pageCount, Math.ceil(versions.length / limit));
+        assert.equal(all.fetches, 2 * pageCount, `all pages of ${limit}`);
+        assert.deepEqual(all.page.map(entry => entry.version), versions);
+    }
+    // No capture is needed: the same pages come back once they are all gone.
+    const expected = await pages(await fresh(fixture), 100);
+    for (const tag of captures) fixture.collections.get(name).tags.delete(tag);
+    const released = await fresh(fixture);
+    assert.equal((await read(() => released.history({ limit: 100 }))).fetches, 4);
+    assert.deepEqual(await pages(released, 100), expected);
 });
 
 test('per-merge records are read back from the journal instead of being kept in memory', async () => {
