@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileToolInstructions, getFileToolDefinitions, MemDrive } from '@functional-systems/memdrive';
 import { classCounts, defaultJudgeModel, flattenSourceIds, judgeAgreement, judgeItem, judgePrompt, judgePromptSha256, parseJudgeOutput, questionScore,
-    readToolNames, runQuestions, runRejudge, scoreSummary } from '../benchmark/beam/replay-questions.mjs';
+    questionsSucceeded, readToolNames, runQuestions, runRejudge, scoreSummary } from '../benchmark/beam/replay-questions.mjs';
 import { runReplay } from '../benchmark/beam/replay.mjs';
 import { hash } from '../benchmark/beam/replay-sessions.mjs';
 import { fileClient } from './helpers/file-client.mjs';
@@ -261,6 +261,8 @@ test('judging follows the upstream per-rubric-item prompt and reports means with
             instruction_following: stats(1, 0, 1, 1), preference_following: stats(1, 1, 0, null) } });
     assert.deepEqual(summary.tokens.judge, { requests: 7, failedRequests: 2, prompt: 70, completion: 35, unknownUsageRequests: 0 });
     assert.deepEqual([summary.questions.selected, summary.questions.asked, summary.questions.complete], [5, 5, true]);
+    // Every question was attempted, but one was not answered and two were not judged: not a successful measurement.
+    assert.deepEqual([summary.scores.overall.unjudged, questionsSucceeded(summary)], [3, false]);
     assert(summary.limitations.some(text => text.includes('event_ordering') && text.includes('Kendall')));
     assert.deepEqual(await json(path.join(files.root, 'judged', 'summary.json')), JSON.parse(JSON.stringify(summary)));
 });
@@ -306,8 +308,10 @@ test('stored answers are judged again without asking, and agreement is counted p
     const first = await files.stage('first', {
         ask: async (request, { session }) => { if (session === 3) throw new Error('offline'); return message(request, `Stored answer ${session}`); },
         judge: async request => { const [question, item] = marker(request); return scored(original[question]?.[item] ?? 1)(request); } });
-    const asked = files.counts.ask;
     assert.deepEqual(first.results.map(result => result.status), ['answered', 'answered', 'answered', 'failed', 'answered']);
+    assert.equal(questionsSucceeded(first.summary), false);
+    assert.equal(questionsSucceeded((await files.stage('clean')).summary), true);
+    const asked = files.counts.ask;
 
     // Repeat 0 agrees with the original; repeat 1 changes item 0.1 and fails on item 1.0.
     const calls = new Map(), requests = [];

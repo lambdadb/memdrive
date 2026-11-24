@@ -15,7 +15,7 @@ import { fileClient } from '../../test/helpers/file-client.mjs';
 import { createToolHost, failureCodes, limits, openAI, protocol, ReplayFailure, runSession, scriptedTransport, toolDefinitions, toolNames } from './replay-agent.mjs';
 import { conversationMetrics, sessionMetrics } from './replay-metrics.mjs';
 import { fingerprint, hash, loadSessions } from './replay-sessions.mjs';
-import { runQuestions, runRejudge } from './replay-questions.mjs';
+import { questionsSucceeded, runQuestions, runRejudge } from './replay-questions.mjs';
 import { cleanupStore, lambdadbConnection, ledgerFile, newStoreName, storeLabels, storeProtocol, writeLedger } from './replay-store.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -256,7 +256,7 @@ async function main() {
         const { summary } = await runQuestions({ run: values.run, manifest: values.manifest, output: values.output, scope: values.scope,
             model: values.model, judgeModel: values['judge-model'], judgeEffort: values['judge-effort'], limit: count(values.limit), env, key: env.LLM_API_KEY });
         console.log(json(summary));
-        if (!summary.questions.complete) process.exitCode = 1;
+        if (!questionsSucceeded(summary)) process.exitCode = 1;
         return;
     }
     if (values.rejudge) {

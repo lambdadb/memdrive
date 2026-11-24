@@ -167,6 +167,9 @@ export function scoreSummary(records) {
     return { overall: scoreStats(records), byClass: group('class'), byCategory: group('category') };
 }
 
+/** A stage is a usable measurement only when every selected question was asked, answered and judged. */
+export const questionsSucceeded = summary => summary.questions.complete && summary.scores.overall.unjudged === 0;
+
 /** Class counts of every question, overall and per category. */
 export function classCounts(classified) {
     const categories = [...new Set(classified.map(question => question.category))].sort();
