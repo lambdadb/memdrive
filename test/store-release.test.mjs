@@ -168,7 +168,7 @@ test('pending configuration, reference creation, merge and write outcomes pin th
             await assert.rejects(drive.write({ at: draft, op: 'create', path: '/note', content: '' }), { code: 'WRITE_UNCONFIRMED' });
             fixture.afterUpsert = undefined;
             return async reopened => {
-                // The fence still requires the write to be confirmed before the fork is captured.
+                // The fence still requires the write to be confirmed before a ref of the fork is created.
                 fixture.beforeFetch = ({ ref }) => ref.name === 'fork-draft' ? { isDocsInline: true, total: 0, docs: [] } : undefined;
                 await assert.rejects(reopened.checkpoint({ at: draft, name: 'during' }), { code: 'WRITE_UNCONFIRMED' });
                 fixture.beforeFetch = undefined;

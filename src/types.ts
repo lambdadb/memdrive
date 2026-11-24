@@ -293,8 +293,8 @@ type StoreOptions = ConnectionOptions & {
     labels?: Record<string, string> | undefined;
     metadataSchema?: MetadataSchema | undefined;
     /**
-     * SDK history window, 1–365 days (default 30), for internal main version tags and
-     * completed merge captures. Native snapshot retention stays at its one-day minimum.
+     * SDK history window, 1–365 days (default 30), for superseded internal main version
+     * tags. Native snapshot retention stays at its one-day minimum.
      */
     retentionInDays?: number | undefined;
 };
@@ -318,7 +318,7 @@ interface StoreDescription {
     labels: Record<string, string>;
     metadataSchema: MetadataSchema;
     /**
-     * SDK history window for automatic cleanup of internal versions and merge captures.
+     * SDK history window for automatic cleanup of superseded internal versions.
      * Explicit forks, checkpoints and history summaries do not expire.
      */
     retentionInDays: number;

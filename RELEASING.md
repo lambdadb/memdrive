@@ -140,12 +140,12 @@ headers or bodies.
 That isolated structured scenario verifies that native snapshot retention is
 one day and the default SDK history window of 30 days is read back. It ages only
 its synthetic reservation/completion timestamps by two days. A merge replay
-keeps the capture inside the 30-day window. After configuring a one-day window,
-which leaves native retention at one day, replaying the completed merge
-automatically releases the expired capture; the test verifies tag absence,
-retained history, main and checkpoint reads, and another successful replay. This
-tests the native cleanup path without waiting a real day. Superseded-main
-selection and failure recovery have fixture coverage; neither
+keeps the superseded first version's tag inside the 30-day window. After
+configuring a one-day window, which leaves native retention at one day, replaying
+the completed merge automatically releases that expired tag; the test verifies tag
+absence, retained history, main and checkpoint reads, and another successful replay. This
+tests the native cleanup path without waiting a real day. Selection timing
+and failure recovery have fixture coverage; neither
 check measures physical GC after tag removal.
 
 ## GitHub and npm configuration

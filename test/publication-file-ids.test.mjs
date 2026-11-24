@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { MemDrive } from '@functional-systems/memdrive';
-import { changedFiles } from '../dist/esm/diff.js';
 import { parseOutcome } from '../dist/esm/publication-log.js';
 import { fileClient } from './helpers/file-client.mjs';
 
@@ -16,12 +15,32 @@ const completionWrites = fixture => fixture.calls
 const lost = () => new Error('Response lost');
 const sorted = files => files.map(({ fileId }) => fileId).sort();
 
+const forkDocs = fixture => fixture.collections.get(name).branches.get('fork-draft').docs;
+
+/** The first 100 net changes that the fork's stored originals state, without the SDK's diff. */
+function fromRecords(fixture) {
+    const ids = [...forkDocs(fixture).values()]
+        .filter(doc => doc.changed === true && (doc.kind === 'tombstone' ? doc.baseline !== undefined
+            : doc.kind === 'file' && doc.fingerprint !== doc.baseline?.fingerprint))
+        .map(doc => doc.fileId).sort();
+    return { fileIds: ids.slice(0, 100), fileIdsTruncated: ids.length > 100 };
+}
+
 async function setup() {
     const fixture = fileClient();
     const main = await MemDrive.create({ client: fixture.client, name });
     await main.fork({ name: 'draft' });
     const write = input => main.write(Array.isArray(input) ? { at: draft, operations: input } : { at: draft, ...input });
-    const merge = requestId => main.merge({ at: draft, ...request(requestId) });
+    // What the fork holds when a merge is first requested is what that merge may publish.
+    const sources = new Map();
+    const merge = async requestId => {
+        if (!sources.has(requestId)) {
+            const changes = await main.diff({ at: draft });
+            sources.set(requestId, { diff: { fileIds: changes.slice(0, 100).map(change => change.fileId), fileIdsTruncated: changes.length > 100 },
+                records: fromRecords(fixture) });
+        }
+        return main.merge({ at: draft, ...request(requestId) });
+    };
     // One write accepts at most 100 operations.
     const create = async (count, prefix) => {
         const files = [];
@@ -29,50 +48,26 @@ async function setup() {
             (_, i) => ({ op: 'create', path: `/${prefix}-${start + i}`, content: `${prefix} ${start + i}` }))));
         return files;
     };
-    return { fixture, main, write, merge, create };
-}
-
-/**
- * What history returned before publications recorded their files: the first
- * 100 net changes of the retained merge capture, read after the publication.
- */
-async function fromCaptureDiff(fixture, sourceTag) {
-    const fileIds = [];
-    let fileIdsTruncated = false;
-    for await (const { change } of changedFiles(fixture.client.collection(name), name, { kind: 'tag', name: sourceTag })) {
-        if (fileIds.length === 100) { fileIdsTruncated = true; break; }
-        fileIds.push(change.fileId);
+    /** Check one publication's history entry and stored record against the fork as its merge found it. */
+    function assertRecorded(entry, slot, requestId, label = entry.version) {
+        const completion = journalOf(fixture).get(`completion:${slot}`);
+        const { fileIds, fileIdsTruncated } = entry;
+        assert.deepEqual({ fileIds, fileIdsTruncated }, sources.get(requestId).diff, label);
+        assert.deepEqual({ fileIds, fileIdsTruncated }, sources.get(requestId).records, label);
+        assert.deepEqual(Object.keys(completion).sort(),
+            ['completedAt', 'driveId', 'fileIds', 'fileIdsTruncated', 'id', 'kind', 'status', 'version'], label);
+        assert.deepEqual([completion.status, completion.version, completion.fileIds, completion.fileIdsTruncated, completion.completedAt],
+            ['published', entry.version, fileIds, fileIdsTruncated, entry.publishedAt], label);
     }
-    return { fileIds, fileIdsTruncated };
+    return { fixture, main, write, merge, create, assertRecorded };
 }
 
-/** The same value taken from the capture's stored originals, without the SDK's diff. */
-function fromCaptureRecords(fixture, sourceTag) {
-    const ids = [...fixture.collections.get(name).tags.get(sourceTag).docs.values()]
-        .filter(doc => doc.changed === true && (doc.kind === 'tombstone' ? doc.baseline !== undefined
-            : doc.kind === 'file' && doc.fingerprint !== doc.baseline?.fingerprint))
-        .map(doc => doc.fileId).sort();
-    return { fileIds: ids.slice(0, 100), fileIdsTruncated: ids.length > 100 };
-}
-
-/** Check one publication's history entry and stored record against its capture. */
-async function assertRecorded(fixture, entry, slot, label = entry.version) {
-    const records = journalOf(fixture);
-    const completion = records.get(`completion:${slot}`);
-    const { fileIds, fileIdsTruncated } = entry;
-    assert.deepEqual({ fileIds, fileIdsTruncated }, await fromCaptureDiff(fixture, records.get(`reservation:${slot}`).sourceTag), label);
-    assert.deepEqual({ fileIds, fileIdsTruncated }, fromCaptureRecords(fixture, records.get(`reservation:${slot}`).sourceTag), label);
-    assert.deepEqual(Object.keys(completion).sort(),
-        ['completedAt', 'driveId', 'fileIds', 'fileIdsTruncated', 'id', 'kind', 'status', 'version'], label);
-    assert.deepEqual([completion.status, completion.version, completion.fileIds, completion.fileIdsTruncated, completion.completedAt],
-        ['published', entry.version, fileIds, fileIdsTruncated, entry.publishedAt], label);
-}
-
-test('a publication records the affected file IDs that its retained capture yields', async () => {
-    const { fixture, main, write, merge, create } = await setup();
-    const expected = [];
+test('a publication records the affected file IDs that its fork held when the merge started', async () => {
+    const { fixture, main, write, merge, create, assertRecorded } = await setup();
+    const expected = [], requests = [];
     const publish = async (requestId, files, truncated = false) => {
         const slot = expected.length + 1;
+        requests.push(requestId);
         assert.deepEqual(await merge(requestId), published(requestId, `v${slot}`));
         expected.push({ version: `v${slot}`, summary: `Publish ${requestId}`, fileIds: sorted(files).slice(0, 100), fileIdsTruncated: truncated });
     };
@@ -108,19 +103,17 @@ test('a publication records the affected file IDs that its retained capture yiel
     const history = await main.history();
     assert.equal(history.throughVersion, 'v6');
     assert.deepEqual(history.entries.map(({ publishedAt: _publishedAt, ...entry }) => entry), expected);
-    for (const [index, entry] of history.entries.entries()) await assertRecorded(fixture, entry, index + 1);
+    for (const [index, entry] of history.entries.entries()) assertRecorded(entry, index + 1, requests[index]);
     assert.deepEqual(history.entries.map(entry => entry.fileIds.length), [3, 4, 1, 100, 100, 100]);
-    // The record is the whole answer: a client that never saw the merges, and
-    // one that reads after every capture is gone, return the same entries.
-    assert.deepEqual(await (await MemDrive.open({ client: { ...fixture.client }, name })).history(), history);
-    const tags = fixture.collections.get(name).tags;
-    for (const tag of [...tags.keys()]) if (tag.startsWith('merge-capture-')) tags.delete(tag);
+    // The record is the whole answer: a client that never saw the merges returns
+    // the same entries, although the fork no longer states any of those changes.
+    assert.deepEqual(await main.diff({ at: draft }), []);
     assert.deepEqual(await (await MemDrive.open({ client: { ...fixture.client }, name })).history(), history);
 });
 
 test('a lost completion write is retried with the identical record', async () => {
     for (const applied of [false, true]) {
-        const { fixture, main, write, merge, create } = await setup();
+        const { fixture, main, write, merge, create, assertRecorded } = await setup();
         const files = await create(3, 'note');
         await merge('first');
         await write([{ op: 'update', fileId: files[0].fileId, content: 'changed' }, { op: 'delete', fileId: files[1].fileId }]);
@@ -144,9 +137,11 @@ test('a lost completion write is retried with the identical record', async () =>
         const [submitted] = completionWrites(fixture).slice(1);
         assert.deepEqual(submitted.fileIds, sorted([files[0], files[1], added]));
         assert.equal(submitted.fileIdsTruncated, false);
-        // The source moves on before the retry; the publication does not.
-        await write({ op: 'create', path: '/later', content: 'later' });
-        await write({ op: 'update', fileId: files[2].fileId, content: 'later' });
+        // The fork cannot move on before the retry, so the retry derives the same record.
+        const held = structuredClone([...forkDocs(fixture)]);
+        for (const operation of [{ op: 'create', path: '/later', content: 'later' }, { op: 'update', fileId: files[2].fileId, content: 'later' }])
+            await assert.rejects(write(operation), { code: 'MERGE_BLOCKED', details: { requestId: 'second' } });
+        assert.deepEqual([...forkDocs(fixture)], held);
         assert.deepEqual(await merge('second'), published('second', 'v2'));
         // An unapplied write is submitted again unchanged; an applied one is only confirmed.
         const writes = completionWrites(fixture).slice(1);
@@ -155,14 +150,14 @@ test('a lost completion write is retried with the identical record', async () =>
         assert.deepEqual(journalOf(fixture).get('completion:2'), submitted);
         const [, entry] = (await main.history()).entries;
         assert.equal(entry.publishedAt, submitted.completedAt);
-        await assertRecorded(fixture, entry, 2, `applied ${applied}`);
+        assertRecorded(entry, 2, 'second', `applied ${applied}`);
     }
 });
 
-test('a merge resumed by a new process records the same affected files from its capture', async () => {
+test('a merge resumed by a new process records the same affected files from its held fork', async () => {
     for (const stage of ['content', 'applied', 'completion']) for (const resume of ['recover', 'replay']) {
         const label = `${stage} ${resume}`;
-        const { fixture, write, merge, create } = await setup();
+        const { fixture, write, merge, create, assertRecorded } = await setup();
         const files = (await create(104, 'note')).sort((x, y) => x.fileId < y.fileId ? -1 : 1);
         await merge('first');
         // 105 affected files: updates, moves, deletes and creates.
@@ -187,10 +182,15 @@ test('a merge resumed by a new process records the same affected files from its 
         assert.equal(attempted.length, stage === 'completion' ? 1 : 0, label);
         assert.equal(journalOf(fixture).has('completion:2'), false, label);
 
-        // The fork keeps changing while the merge is unfinished.
-        await write({ op: 'create', path: '/after-capture', content: 'later' });
-        await write({ op: 'update', fileId: files[103].fileId, content: 'later' });
-        await write({ op: 'update', fileId: files[0].fileId, content: 'later again' });
+        // Nothing changes the fork while the merge is unfinished, in this process or a new one.
+        const held = structuredClone([...forkDocs(fixture)]);
+        const observer = await MemDrive.open({ client: { ...fixture.client }, name });
+        for (const operation of [{ op: 'create', path: '/after-interruption', content: 'later' },
+            { op: 'update', fileId: files[103].fileId, content: 'later' }, { op: 'update', fileId: files[0].fileId, content: 'later again' }]) {
+            await assert.rejects(write(operation), { code: 'MERGE_BLOCKED', details: { requestId: 'second' } }, label);
+            await assert.rejects(observer.write({ at: draft, ...operation }), { code: 'MERGE_BLOCKED', details: { requestId: 'second' } }, label);
+        }
+        assert.deepEqual([...forkDocs(fixture)], held, label);
 
         const restarted = await MemDrive.open({ client: { ...fixture.client }, name, recover: resume === 'recover' });
         assert.deepEqual(await restarted.merge({ at: draft, ...request('second') }), published('second', 'v2'), label);
@@ -201,7 +201,7 @@ test('a merge resumed by a new process records the same affected files from its 
         for (const record of attempted) assert.deepEqual({ ...record, completedAt: completion.completedAt }, completion, label);
         assert.equal(completionWrites(fixture).length, stage === 'completion' ? 3 : 2, label);
         const [, entry] = (await restarted.history()).entries;
-        await assertRecorded(fixture, entry, 2, label);
+        assertRecorded(entry, 2, 'second', label);
         assert.deepEqual(await (await MemDrive.open({ client: { ...fixture.client }, name })).history(), await restarted.history(), label);
     }
 });
@@ -210,7 +210,7 @@ test('a published completion must carry 1–100 strictly ascending file IDs and 
     const ids = Array.from({ length: 101 }, (_, i) => `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`);
     const at = '2026-01-01T00:00:00.000Z';
     const reservation = { id: 'reservation:3', driveId: 'drive', kind: 'merge-reservation-v1', requestId: 'request', summary: 'Summary',
-        branch: 'fork-draft', sourceTag: `merge-capture-${ids[0]}`, startedAt: at, priorVersion: 'v2', version: 'v3' };
+        branch: 'fork-draft', startedAt: at, priorVersion: 'v2', version: 'v3' };
     const record = fields => ({ id: 'completion:3', driveId: 'drive', kind: 'merge-result-v1', completedAt: at, ...fields });
     const publication = (fileIds, fileIdsTruncated) => record({ status: 'published', version: 'v3', fileIds, fileIdsTruncated });
     const rejected = (doc, label) => assert.throws(() => parseOutcome(doc, reservation), { code: 'INVALID_RESULT' }, label);
@@ -236,7 +236,6 @@ test('a published completion must carry 1–100 strictly ascending file IDs and 
     ]) rejected(publication(fileIds, truncated), label);
     // The existing conditions still apply.
     rejected({ ...publication(ids.slice(0, 1), false), version: 'v2' }, 'another version');
-    assert.throws(() => parseOutcome(publication(ids.slice(0, 1), false), { ...reservation, sourceTag: null }), { code: 'INVALID_RESULT' });
 
     // Other outcomes keep their format and need no file list.
     assert.deepEqual(parseOutcome(record({ status: 'unchanged', version: 'v2' }), reservation),

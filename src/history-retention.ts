@@ -20,7 +20,7 @@ export function publicationOf({ reservation, outcome }: SlotState): FileHistoryE
         : undefined;
 }
 
-/** Release the internal tags of completed merges once they leave the history window. */
+/** Release the main version tags that completed merges superseded once they leave the history window. */
 export function historyRetention(content: Handle, journal: ReturnType<typeof publicationLog>,
     hasTag: (name: string, signal?: AbortSignal) => Promise<boolean>) {
     async function listTags(signal?: AbortSignal) {
@@ -37,10 +37,10 @@ export function historyRetention(content: Handle, journal: ReturnType<typeof pub
         return names;
     }
 
-    // Every slot below the watermark has no internal tag left to release: its
-    // merge capture and, if it published, the main tag of the version it
-    // superseded. The latest publication's own main tag belongs to the slot
-    // that later supersedes it, so the current main is never a candidate.
+    // Every slot below the watermark has no internal tag left to release: if
+    // it published, the main tag of the version it superseded. The latest
+    // publication's own main tag belongs to the slot that later supersedes
+    // it, so the current main is never a candidate.
     // Released tags never return, so a value once reached stays valid and a
     // lower stored value only repeats confirmed work.
     let watermark: bigint | undefined;
@@ -70,15 +70,12 @@ export function historyRetention(content: Handle, journal: ReturnType<typeof pub
                     if (!state?.outcome) throw new MemDriveError('INVALID_RESULT', 'A settled merge is missing from the publication journal.');
                     const { reservation, outcome } = state;
                     if (outcome.completedAt > cutoff) break scan;
-                    const due: string[] = [];
-                    // A capture ages from its terminal outcome. A superseded main
-                    // version ages from the publication that replaced it.
-                    if (reservation.sourceTag !== null) due.push(reservation.sourceTag);
-                    if (outcome.status === 'published' && slotOf(reservation.priorVersion) > 0n) due.push(tagFor(reservation.priorVersion));
-                    if (due.length) names ??= await listTags(signal);
-                    for (const tag of due) {
+                    // A superseded main version ages from the publication that replaced it.
+                    if (outcome.status === 'published' && slotOf(reservation.priorVersion) > 0n) {
+                        const tag = tagFor(reservation.priorVersion);
                         if (owned.has(tag)) throw new MemDriveError('INVALID_RESULT', 'Multiple completed requests claim the same history tag.');
-                        const present = names!.has(tag);
+                        names ??= await listTags(signal);
+                        const present = names.has(tag);
                         // Bound both deletions and the direct checks of tags the listing omits.
                         if ((present ? listed : releases.length - listed) === tagLimit) break scan;
                         if (present) listed++;

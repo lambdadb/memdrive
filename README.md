@@ -87,8 +87,8 @@ await drive.configure({ retentionInDays: 14 });
 console.log((await drive.describe()).retentionInDays);
 ```
 
-`retentionInDays` is the SDK history window for MemDrive's internal main
-version tags and completed merge captures. It accepts integers from 1 through
+`retentionInDays` is the SDK history window for MemDrive's superseded internal
+main version tags. It accepts integers from 1 through
 365 and defaults to 30 days when omitted on creation. The window is stored in
 the store's SDK configuration (the native collection description) and applies
 in both embedding modes.
@@ -118,7 +118,7 @@ After a terminal merge result, including a completed-request replay or an
 unchanged merge, the SDK checks retention inside the serialized merge queue.
 It also checks after explicit recovery finishes outstanding work. A superseded
 main version becomes eligible after the window measured from the next
-publication; a merge capture ages from its terminal outcome. The current main,
+publication. A merge creates no other internal ref. The current main,
 initial view, fork baselines and unfinished recovery remain protected.
 
 Cleanup is best effort: each pass selects at most 100 expired refs and has a
@@ -198,7 +198,7 @@ chunking, not a binary PDF or image ingestion API.
 
 Each original records the resolved strategy and adapter identity, including
 tokenizer hash and options. Moving, publishing and recovering files reuse the
-captured chunks and vectors without rerunning the parser. Replacing content or
+stored chunks and vectors without rerunning the parser. Replacing content or
 updating metadata runs the configured splitter again. Reads, checkpoints and
 publication recovery can reopen without a local adapter. A changed tokenizer
 file requires explicitly creating a new adapter.
@@ -338,6 +338,8 @@ A file keeps its ID across moves and replacements. Pass `content` to replace the
 
 A batch can mix up to 100 `create`, `update`, and `delete` operations and returns results in input order. Duplicate file targets and destination paths fail before any write. Destinations must be free or already belong to the same file at preflight, so a batch cannot reuse a path vacated by another operation in that batch. Updates to missing files fail with `FILE_NOT_FOUND`. Repeating a delete by the same ID finishes cleanup or acknowledges absence.
 
+A write waits in the fork's queue behind earlier operations on that fork, including a running merge of it. While a merge of the fork is unfinished, every write to that fork fails with `MERGE_BLOCKED` and the blocking `details.requestId` before any storage mutation; see [Publish a working fork](#publish-a-working-fork).
+
 The SDK confirms the original revision and chunk changes with consistent branch reads. A failed batch may already have applied some files. Error details identify the stage, affected IDs, and any confirmed original changes or completed operations. Check the original before repeating an exact edit after `WRITE_UNCONFIRMED`. The drive fences another operation on that fork that could conflict with an unconfirmed write. Before retrying through another client or runtime, ensure the previous writer has stopped and its outstanding writes have settled. Reissuing an update with the current path and content can finish stale-chunk cleanup. Reissuing a delete can finish removing physically retained chunks and the deleted file's internal record.
 
 
@@ -357,7 +359,7 @@ search, and list from that pin. Forking any view makes a separate editable branc
 from that source. A fork and a checkpoint may share the same name; `at.kind`
 distinguishes them. Names are scoped to the store. Checkpoint names use 3–41 letters, digits, underscores, or hyphens.
 
-Checkpoint and child fork creation from a working fork run in its local write queue. If a source write is still unconfirmed, resolve that outcome before capturing the fork. The SDK sends one creation request for each call. A rejected checkpoint request preserves the underlying LambdaDB error and HTTP status. If creation returns `REF_CREATION_UNCONFIRMED`, pause source mutations and check whether it exists with `listForks`/`listCheckpoints` or by using its `at`, which verifies it and clears the local uncertainty. If the exact cutoff matters, compare the contents with your expected state before using the reference. The name alone cannot establish which request won or when it captured the source.
+Checkpoint and child fork creation from a working fork run in its local write queue, behind earlier writes and a running merge of that fork. They stay available while an unfinished merge blocks writes to the fork. If a source write is still unconfirmed, resolve that outcome before capturing the fork. The SDK sends one creation request for each call. A rejected checkpoint request preserves the underlying LambdaDB error and HTTP status. If creation returns `REF_CREATION_UNCONFIRMED`, pause source mutations and check whether it exists with `listForks`/`listCheckpoints` or by using its `at`, which verifies it and clears the local uncertainty. If the exact cutoff matters, compare the contents with your expected state before using the reference. The name alone cannot establish which request won or when it captured the source.
 
 Checkpoint search and exact reads use LambdaDB's tag read semantics. Listing retains the eventual preview behavior described below, including on a recently created checkpoint. For live validation of a prepared working view and retained state after source deletion, set `MEMDRIVE_RUN_LIVE_CHECKPOINT_TESTS=1` when running the live suite against a dedicated test project.
 
@@ -452,7 +454,7 @@ for (const change of changes) {
 
 `diff()` reports one net change per file on a working fork. A create uses the current path and a delete reports the original baseline path as `previousPath`. An update uses the current path and includes `previousPath` when the path changed. Files created and deleted in the fork, and files restored to their original state, are omitted.
 
-Diff uses consistent reads and runs in the same queue as writes to that fork on the drive. Completed writes through that drive are visible to the scan, and later writes wait until the scan finishes. Use one active writer per fork. A previously unconfirmed request can still settle, and writes through another client or runtime can change the branch between pages. The result is an inspection of the working fork. It carries no durable snapshot or merge token.
+Diff uses consistent reads and runs in the same queue as writes and merges of that fork on the drive. Completed writes through that drive are visible to the scan, and later writes wait until the scan finishes. A diff requested while a merge of the fork is running waits for it; while that merge is published but its source bookkeeping is unfinished, diff can still list files it already published. Use one active writer per fork. A previously unconfirmed request can still settle, and writes through another client or runtime can change the branch between pages. The result is an inspection of the working fork. It carries no durable snapshot or merge token.
 
 ## Publish a working fork
 
@@ -467,20 +469,28 @@ const published = await drive.read({ path: '/notes/context.md' }); // main
 await drive.deleteFork({ at: work }); // Optional and separate; merge keeps the fork.
 ```
 
-`merge` captures the fork's net changes and publishes them to main. It never
+`merge` publishes the fork's net changes to main. It never
 deletes the fork; delete it explicitly when it is no longer needed. It returns the request ID, status (`published` or `unchanged`), and main version (for example, `v2`). Versions increase when a new view is published and can have gaps. A request ID is scoped to the store. Pass the same fork `at`, ID, and summary to resume or retrieve its original result. Use a new ID to submit a revised change set.
 
-Merges queue against the latest published view. A conflicting file baseline or destination rejects the request with `MERGE_CONFLICT` and the affected file IDs and paths. Independent changes on main can coexist. Edits made on the source after capture stay on that fork. When multiple merges are queued on the same fork, the later capture waits for the earlier merge to advance its source baselines.
+Merges queue against the latest published view. A conflicting file baseline or destination rejects the request with `MERGE_CONFLICT` and the affected file IDs and paths. Independent changes on main can coexist.
+
+A merge reads the fork itself, so the fork is held still until its merge is settled: a terminal outcome and, for a publication, confirmed source bookkeeping.
+
+- While the merge runs, a write, `diff`, fork or checkpoint creation from that fork, and another merge of it wait in the fork's queue and run after it, in the order they were requested. Reads of the fork do not wait. A write made after the merge is a change for the next merge.
+- If the merge ends without settling (`MERGE_RESUMABLE`, or `MERGE_BLOCKED` after a mutation of unknown outcome), every write to that fork fails with `MERGE_BLOCKED` and that request's `details.requestId` until the same request is retried to completion or recovery settles it. Reads, `diff` and creating a fork or checkpoint from it stay available, so work can continue on another fork. A new process learns this from the journal before its first write to a fork.
+- A merge that fails before it reserves anything, such as one rejected while another merge is unfinished or while a write to the fork is still unconfirmed, holds nothing. A conflicting or unchanged merge is terminal and leaves the fork writable.
+
+After a publication the fork remains and its published files take the new version as their baseline, so later edits are the next merge's only changes. That bookkeeping advances a file only if the published version contains exactly its current path, metadata and content or vector. A change that reached the fork in spite of the hold, for example through another runtime, is not marked as published: it stays a change for the next `diff` and merge, which publishes it or reports a conflict. An unfinished merge needs its fork to finish: `deleteFork` refuses while one is unfinished, and the fork branch must not be removed by other means.
 
 Main reads, searches, lists, forks, and checkpoints select one published version. A completed merge becomes visible to existing drive objects and new SDK clients after the journal records publication. Working views and named checkpoints keep their own contents. Direct LambdaDB reads of the writable `main` branch can observe writes during application.
 
 - `MERGE_RESUMABLE` identifies a paused request. Retry with its original ID and summary. If its main version is already published, the error includes `details.publishedVersion` and the retry completes the source bookkeeping.
-- `MERGE_BLOCKED` identifies the active request that prevents other publications. If a mutable native write has an unknown outcome, the host must fence the old writer and settle its in-flight operations before a replacement owner resumes it.
-- The SDK retries a definite rejection when pinning a merge's source or target tag for up to two minutes per stage. Cold collections can take longer to accept their first tag. A source deadline returns `MERGE_SOURCE_NOT_READY`; retry the request once the working snapshot is available. A target deadline is resumable. Pass a request `signal` to bound your wait.
+- `MERGE_BLOCKED` identifies the unfinished request that prevents other publications and writes to its own fork. If a mutable native write has an unknown outcome, the host must fence the old writer and settle its in-flight operations before a replacement owner resumes it; the fenced client keeps rejecting merges and writes to that fork.
+- The SDK retries a definite rejection when pinning a merge's target version tag for up to two minutes. Cold collections can take longer to accept their first tag. That deadline is resumable. Pass a request `signal` to bound your wait.
 
-Run main publication and recovery through one exclusive host-owned writer per store across runtimes and client instances. Continue to enforce one writer per working fork, including its post-merge bookkeeping. Once the previous owner and its in-flight mutations have settled, the replacement owner can call `MemDrive.open({ client, name: 'workspace', recover: true })`. A normal `open` never resumes the merge. A paused merge continues to serve the previous published version until publication, and recovery continues from the retained request. Recovery does not automatically roll back the writable branch.
+Run main publication and recovery through one exclusive host-owned writer per store across runtimes and client instances. Continue to enforce one writer per working fork, including its post-merge bookkeeping. Merge a fork from the runtime that writes to it: the SDK holds the fork still through that runtime's queue and its own record of the unfinished merge, and another runtime reads the journal only before its first write to a fork. Once the previous owner and its in-flight mutations have settled, the replacement owner can call `MemDrive.open({ client, name: 'workspace', recover: true })`. A normal `open` never resumes the merge. A paused merge continues to serve the previous published version until publication, and recovery continues from the journal and the held fork. Recovery does not automatically roll back the writable branch.
 
-MemDrive keeps its initial view, request captures, and published versions in reserved refs and creates an internal collection on the first merge. Give the writer permission to provision that collection and readers permission to inspect its records. Keep the journal while the store is in use; completed merges automatically attempt retention cleanup. A store whose creation was interrupted before its initial view was pinned is initialized on the first operation that needs a frozen main view. Native tag availability also applies to named checkpoints on an empty or cold view.
+MemDrive keeps its initial view and published versions in reserved refs and creates an internal collection on the first merge. Give the writer permission to provision that collection and readers permission to inspect its records. Keep the journal while the store is in use; completed merges automatically attempt retention cleanup. A store whose creation was interrupted before its initial view was pinned is initialized on the first operation that needs a frozen main view. Native tag availability also applies to named checkpoints on an empty or cold view.
 
 ## Inspect publication status and history
 
@@ -498,7 +508,7 @@ if (page.next) {
 
 The starting `sinceVersion` is exclusive and defaults to `v0`. Unchanged and conflicting requests create version gaps. A gap or future version returns `VERSION_NOT_FOUND`, and an invalid version format returns `INVALID_INPUT`. The page size defaults to 20 and accepts 1–100. The first page captures the latest publication as `throughVersion`. Pass the returned `next` (`{ cursor }`) unchanged to continue through that same version while main advances. The cursor is a self-contained opaque token: it holds no SDK memory, does not expire by time and continues on any client of the same store. It becomes unavailable (`HISTORY_CURSOR_UNAVAILABLE`) when it is malformed, belongs to another or replaced store, or names versions this store did not publish. If a cursor is unavailable, start again with the last version you processed.
 
-These methods read the publication journal without initializing main, advancing a merge, or reading file bodies or vectors. The SDK reads journal records on demand and keeps no per-merge state in memory: a cold client locates the latest merge with a few batched reads, a number that grows logarithmically with the number of merges, and each history page, version selection and request replay reads only the records it needs. A merge records its affected file IDs in the journal when it publishes, so a history page reads only its publications' journal records and stays complete after retention cleanup releases their merge captures. Read the selected view to retrieve its current files.
+These methods read the publication journal without initializing main, advancing a merge, or reading file bodies or vectors. The SDK reads journal records on demand and keeps no per-merge state in memory: a cold client locates the latest merge with a few batched reads, a number that grows logarithmically with the number of merges, and each history page, version selection and request replay reads only the records it needs. A merge records its affected file IDs in the journal when it publishes, so a history page reads only its publications' journal records and stays complete after retention cleanup releases the versions they superseded. Read the selected view to retrieve its current files.
 
 ## Shared file tools
 

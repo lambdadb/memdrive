@@ -25,7 +25,7 @@ test('lists all user forks and checkpoints as sorted at values, hides internal r
     await drive.fork({ at: checkpoint, name: 'another' });
     await drive.checkpoint({ name: 'alpha' });
     const storage = collections.get(name);
-    assert([...storage.tags.keys()].some(key => key.startsWith('merge-capture-')));
+    assert(storage.branches.has('md-main-v0'));
     assert(storage.tags.has('md-main-v1'));
     assert.deepEqual(await drive.listForks(), { forks: [{ at: forkAt('another') }, { at: forkAt('draft') }] });
     assert.deepEqual(await drive.listCheckpoints({}), { checkpoints: [{ at: checkpointAt('alpha') }, { at: checkpointAt('saved') }] });

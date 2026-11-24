@@ -1,9 +1,8 @@
 import { keysOnly, parseStore } from './config.js';
 import { historyRetention, publicationOf } from './history-retention.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, requireInput } from './errors.js';
-import { mergeCaptureJournal } from './merge-journal.js';
-import { applyMerge, advanceMergeSource, verifyMerge } from './merge-apply.js';
-import { confirmedMergeSource, initialMainRef, prepareMerge } from './merge-preflight.js';
+import { applyMerge, advanceMergeSource, verifyMerge, type PreparedMerge } from './merge-apply.js';
+import { initialMainRef, prepareMerge } from './merge-preflight.js';
 import { appliedId, bookkeepingId, canonicalVersion, completionId, parseOutcome, parseRequestIndex, parseReservation, publicationIdentity, publicationLog,
     publishedFileLimit, requestIndexId, reservationId, returnOutcome, slotOf, tagFor, versionFor, type BoundRequest, type Outcome, type PublicationRecord,
     type RequestIndex, type Reservation, type SlotState } from './publication-log.js';
@@ -17,6 +16,9 @@ type Writer = ReturnType<typeof workingWriter>;
 // `indexed` is set once this client has confirmed the entry's request index.
 type Entry = { slot: bigint; reservation: Reservation; outcome?: Outcome & { completedAt: string }; indexed?: boolean };
 type Records = Map<string, Record<string, unknown>>;
+// A record this client dispatched whose place in the journal it has not yet
+// observed. `then` is the request index that follows a reservation.
+type Unresolved = { requestId: string; branch: string; record: PublicationRecord; then?: RequestIndex };
 
 const historyToken = 'h1';
 // One fetch probes exponentially spaced slots; later fetches divide the bracket.
@@ -38,13 +40,16 @@ function mergeBlocked(requestId: string, cause?: unknown) {
  * Publication state of one store. Memory stays bounded and independent of the
  * number of merges: the journal is read on demand by document ID, and only
  * the head position, the unfinished merge and unconfirmed records are kept.
+ *
+ * A merge reads its fork directly, so the fork is held still for it. While
+ * the merge runs it owns the fork's queue, taken before the merge queue. If
+ * it ends unsettled, every write to that fork is rejected until the merge has
+ * a terminal outcome and, for a publication, confirmed source bookkeeping.
  */
 export function publication(client: ConnectionOptions['client'], content: Handle, { name, driveId }: { name: string; driveId: string },
-    schema: MetadataSchema, writerFor: (branch: string) => Writer, dimensions: number | undefined, canMaintain: () => boolean,
-    changed: () => void) {
+    schema: MetadataSchema, writerFor: (branch: string) => Writer, dimensions: number | undefined, canMaintain: () => boolean) {
     const internal = client.collection(name);
     const journal = publicationLog(content, internal, driveId);
-    const capture = mergeCaptureJournal(content, internal, { name, driveId }, { captureEmpty: true });
     const initialVersion = 'v0';
     const retained = historyRetention(content, journal, hasTag);
     const cursorStore = storeTag(driveId);
@@ -58,15 +63,14 @@ export function publication(client: ConnectionOptions['client'], content: Handle
     let located = false;
     let executing: string | undefined;
     // A record whose write is unconfirmed. Only the identical record is
-    // submitted again. `then` is the request index that follows a reservation.
-    let unresolved: { requestId: string; record: PublicationRecord; then?: RequestIndex } | undefined;
-    let unsettled: { requestId: string; cause: unknown } | undefined;
-    let capturing = 0;
+    // submitted again.
+    let unresolved: Unresolved | undefined;
+    // A merge with a content mutation of unknown outcome. This client never resumes it.
+    let unsettled: { requestId: string; branch: string; cause: unknown } | undefined;
     let readTail = Promise.resolve();
     let mergeTail = Promise.resolve();
     let boot: Promise<void> | undefined;
     let initialExists = false;
-    const sourceMerges = new Map<string, Promise<void>>();
     let provision: Promise<void> | undefined;
 
     async function hasTag(name: string, signal?: AbortSignal) {
@@ -204,51 +208,62 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         return true;
     }
 
-    function refresh(signal?: AbortSignal) {
+    const following = ({ requestId, branch, then }: Unresolved): Unresolved | undefined =>
+        then && { requestId, branch, record: then };
+
+    /** Observe the journal head: advance past settled slots and keep the unfinished one. */
+    async function observeHead(signal?: AbortSignal) {
+        for (let advanced = false; ;) {
+            let records: Records, searched = false;
+            if (active) {
+                records = await journal.readMany(active.outcome ? [bookkeepingId(slot)] : [completionId(slot), bookkeepingId(slot)], signal);
+            } else {
+                let at = slot;
+                if (located && !advanced) {
+                    // A client that knows the head probes only the next slot:
+                    // it is almost always still free, or the new head itself.
+                    records = await journal.readMany([reservationId(slot), completionId(slot), bookkeepingId(slot)], signal);
+                } else {
+                    // A cold client, or one that just saw the journal move, searches for the head.
+                    const head = await locate(signal);
+                    located = true;
+                    if (!head) return;
+                    ({ slot: at, records } = head);
+                    searched = true;
+                }
+                const record = records.get(reservationId(at));
+                if (!record) {
+                    if (records.size) throw gap();
+                    return;
+                }
+                // A reservation is written only after every earlier slot has
+                // settled, so its prior version is main as of that slot.
+                const reservation = parseReservation(record, at, at === slot ? published : undefined);
+                slot = at;
+                published = reservation.priorVersion;
+                active = { slot, reservation };
+            }
+            const settled = observe(active, records);
+            if (active.outcome?.status === 'published') published = active.outcome.version;
+            if (!settled) return;
+            active = undefined;
+            slot++;
+            // The search already saw the slot after its head free.
+            if (searched) return;
+            advanced = true;
+        }
+    }
+
+    /** Read the journal head. `written` is an unresolved record the caller has just confirmed. */
+    function refresh(signal?: AbortSignal, written?: Unresolved) {
         const task = readTail.then(async () => {
             if (!await journal.exists(signal)) return;
             const previous = unresolved;
-            if (previous && await journal.confirmed(previous.record, signal) && unresolved === previous)
-                unresolved = previous.then ? { requestId: previous.requestId, record: previous.then } : undefined;
-            for (let advanced = false; ;) {
-                let records: Records, searched = false;
-                if (active) {
-                    records = await journal.readMany(active.outcome ? [bookkeepingId(slot)] : [completionId(slot), bookkeepingId(slot)], signal);
-                } else {
-                    let at = slot;
-                    if (located && !advanced) {
-                        // A client that knows the head probes only the next slot:
-                        // it is almost always still free, or the new head itself.
-                        records = await journal.readMany([reservationId(slot), completionId(slot), bookkeepingId(slot)], signal);
-                    } else {
-                        // A cold client, or one that just saw the journal move, searches for the head.
-                        const head = await locate(signal);
-                        located = true;
-                        if (!head) return;
-                        ({ slot: at, records } = head);
-                        searched = true;
-                    }
-                    const record = records.get(reservationId(at));
-                    if (!record) {
-                        if (records.size) throw gap();
-                        return;
-                    }
-                    // A reservation is written only after every earlier slot has
-                    // settled, so its prior version is main as of that slot.
-                    const reservation = parseReservation(record, at, at === slot ? published : undefined);
-                    slot = at;
-                    published = reservation.priorVersion;
-                    active = { slot, reservation };
-                }
-                const settled = observe(active, records);
-                if (active.outcome?.status === 'published') published = active.outcome.version;
-                if (!settled) return;
-                active = undefined;
-                slot++;
-                // The search already saw the slot after its head free.
-                if (searched) return;
-                advanced = true;
-            }
+            const landed = previous !== undefined && (previous === written || await journal.confirmed(previous.record, signal));
+            await observeHead(signal);
+            // A record leaves `unresolved` only after the head that includes it
+            // was observed, so this client never forgets a merge it reserved.
+            if (landed && unresolved === previous) unresolved = following(previous);
         });
         readTail = task.then(() => undefined, () => undefined);
         return task;
@@ -420,25 +435,38 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         return operation(refFor(published));
     }
 
-    async function settleRecord(signal?: AbortSignal) {
-        if (!unresolved) return;
-        while (unresolved) {
-            const pending: NonNullable<typeof unresolved> = unresolved;
-            await journal.write(pending.record, signal);
-            // A confirmed reservation is followed by its request index.
-            if (unresolved === pending) unresolved = pending.then ? { requestId: pending.requestId, record: pending.then } : undefined;
+    /** Release a record that is confirmed in the journal. */
+    async function release(pending: Unresolved, signal?: AbortSignal) {
+        // A confirmed reservation is followed by its request index.
+        if (pending.then) unresolved = following(pending);
+        else {
+            unresolved = pending;
+            await refresh(signal, pending);
         }
-        await refresh(signal);
     }
 
-    function append(requestId: string, record: PublicationRecord, signal?: AbortSignal, then?: RequestIndex) {
-        unresolved = { requestId, record, ...(then ? { then } : {}) };
-        return settleRecord(signal);
+    async function settleRecord(signal?: AbortSignal) {
+        while (unresolved) {
+            const pending: Unresolved = unresolved;
+            await journal.write(pending.record, signal);
+            await release(pending, signal);
+        }
+    }
+
+    /**
+     * Write a record. It is unresolved from the moment its write is
+     * dispatched; a failure before that leaves nothing to settle.
+     */
+    async function append(requestId: string, branch: string, record: PublicationRecord, signal?: AbortSignal, then?: RequestIndex) {
+        const pending: Unresolved = { requestId, branch, record, ...(then ? { then } : {}) };
+        await journal.write(record, signal, () => { unresolved = pending; });
+        await release(pending, signal);
+        await settleRecord(signal);
     }
 
     async function finish(entry: Entry, signal?: AbortSignal) {
         const { reservation, slot } = entry;
-        const { requestId, version, priorVersion, sourceTag, branch } = reservation;
+        const { requestId, version, priorVersion, branch } = reservation;
         if (entry.outcome && entry !== active) return returnOutcome(entry.outcome, requestId);
         if (unsettled) throw mergeBlocked(unsettled.requestId, unsettled.cause);
 
@@ -446,21 +474,23 @@ export function publication(client: ConnectionOptions['client'], content: Handle
             // The slot reaches no terminal record before its request index is
             // confirmed. A head left by an interrupted attempt may lack it.
             if (!entry.indexed) {
-                await append(requestId, await indexFor(entry), signal);
+                await append(requestId, branch, await indexFor(entry), signal);
                 entry.indexed = true;
             }
             const target = tagRef(tagFor(version));
-            const existing = entry.outcome ?? undefined;
-            const plan = sourceTag === null ? undefined : await prepareMerge(content, content.collectionName, confirmedMergeSource(content, sourceTag),
-                refFor(priorVersion), schema, signal, dimensions).catch(cause => {
-                if (!(cause instanceof MemDriveError) || cause.code !== 'MERGE_CONFLICT' || existing) throw cause;
-                const { fileIds, paths } = cause.details as { fileIds: string[]; paths: string[] };
-                return { status: 'conflict' as const, fileIds, paths };
-            });
+            // The plan that this run applied and verified, if it published.
+            let applied: PreparedMerge | undefined;
             if (!entry.outcome) {
+                // Nothing has changed the fork since the reservation, so a resumed
+                // merge reads the same source and rebuilds the same plan.
+                const plan = await prepareMerge(content, content.collectionName, branchRef(branch), refFor(priorVersion),
+                    schema, signal, dimensions).catch(cause => {
+                    if (!(cause instanceof MemDriveError) || cause.code !== 'MERGE_CONFLICT') throw cause;
+                    const { fileIds, paths } = cause.details as { fileIds: string[]; paths: string[] };
+                    return { status: 'conflict' as const, fileIds, paths };
+                });
                 let outcome: Outcome;
-                if (!plan) outcome = { status: 'unchanged', version: priorVersion };
-                else if ('status' in plan) outcome = plan;
+                if ('status' in plan) outcome = plan;
                 else if (!plan.targets.length) outcome = { status: 'unchanged', version: priorVersion };
                 else {
                     if (!await hasTag(target.name, signal)) {
@@ -470,9 +500,9 @@ export function publication(client: ConnectionOptions['client'], content: Handle
                             throw new MemDriveError('INVALID_RESULT', 'The journal contains an invalid merge application record.');
                         if (!applied) {
                             await applyMerge(content, content.collectionName, plan, version, signal);
-                            await append(requestId, { id, driveId, kind: 'merge-applied-v1' }, signal);
+                            await append(requestId, branch, { id, driveId, kind: 'merge-applied-v1' }, signal);
                         }
-                        await awaitMergeTag(() => createTag(target.name, signal), 'target', signal);
+                        await awaitMergeTag(() => createTag(target.name, signal), signal);
                     }
                     // Confirm both pinned lookup and indexed candidate visibility.
                     for (let attempt = 0; ; attempt++) {
@@ -485,23 +515,28 @@ export function publication(client: ConnectionOptions['client'], content: Handle
                             await refBackoff(250 * 2 ** attempt, signal);
                         }
                     }
-                    // The affected files are the plan's targets: the capture's net
-                    // changes in ascending ID order. A resumed merge rebuilds the same
-                    // plan from the same capture, so it records the same IDs.
+                    // The affected files are the plan's targets: the fork's net
+                    // changes in ascending ID order. A resumed merge rebuilds the
+                    // same plan from the same fork, so it records the same IDs.
+                    applied = plan;
                     outcome = { status: 'published', version,
                         fileIds: plan.targets.slice(0, publishedFileLimit).map(({ change }) => change.fileId),
                         fileIdsTruncated: plan.targets.length > publishedFileLimit };
                 }
-                await append(requestId, { id: completionId(slot), driveId, kind: 'merge-result-v1', completedAt: new Date().toISOString(), ...outcome }, signal);
+                await append(requestId, branch, { id: completionId(slot), driveId, kind: 'merge-result-v1', completedAt: new Date().toISOString(), ...outcome }, signal);
             }
 
-            if (entry.outcome?.status === 'published' && entry === active && plan && !('status' in plan)) {
-                await advanceMergeSource(content, content.collectionName, plan, version, schema, writerFor(branch).enqueueBaseline, signal);
-                await append(requestId, { id: bookkeepingId(slot), driveId, kind: 'merge-bookkeeping-v1' }, signal);
+            // The fork changes only from here on, after its publication is
+            // recorded: the originals that the new version holds take it as
+            // their baseline. A resumed merge has no plan and reads its tag.
+            if (entry.outcome?.status === 'published' && entry === active) {
+                await advanceMergeSource(content, content.collectionName, branch, version, applied ? { plan: applied } : { tag: target },
+                    schema, dimensions, signal);
+                await append(requestId, branch, { id: bookkeepingId(slot), driveId, kind: 'merge-bookkeeping-v1' }, signal);
             }
         } catch (cause) {
             if (cause instanceof MemDriveError && cause.code === 'MERGE_MUTATION_UNCONFIRMED') {
-                unsettled = { requestId, cause };
+                unsettled = { requestId, branch, cause };
                 throw mergeBlocked(requestId, cause);
             }
             throw new MemDriveError('MERGE_RESUMABLE', 'Merge processing paused. Retry the same request.',
@@ -522,135 +557,129 @@ export function publication(client: ConnectionOptions['client'], content: Handle
             throw new MemDriveError('MERGE_REQUEST_CONFLICT', 'The merge request ID is already bound to different input.', { details: { requestId } });
     }
 
-    function merge(request: BoundRequest, { enqueueCapture, deferUserOperations }: Writer, signal?: AbortSignal) {
-        const { requestId } = request;
-        // A settled entry never changes, so the capture and the queued merge
-        // share one lookup of it. Any other answer is read again where needed.
-        let lookedUp: Promise<Entry | undefined> | undefined;
-        function find() {
-            const previous = lookedUp;
-            const found = (async () => {
-                const shared = await previous?.catch(() => undefined);
-                return shared?.outcome && shared !== active ? shared : lookup(requestId, signal);
-            })();
-            lookedUp = found;
-            return found;
-        }
-        // Capture independently of the main queue. Its current merge may
-        // need this fork for bookkeeping.
-        const captureSource = () => enqueueCapture(async (branch, confirmSource) => {
-            const existing = await find();
-            if (existing) {
-                checkBinding(existing, request);
-                const tag = existing.reservation.sourceTag;
-                return tag === null ? null : confirmedMergeSource(content, tag);
-            }
-            if (unsettled) throw mergeBlocked(unsettled.requestId, unsettled.cause);
-            const blocking = active?.reservation.requestId ?? unresolved?.requestId;
-            if (blocking && blocking !== requestId && blocking !== executing) throw mergeBlocked(blocking);
-            await ensureJournal(signal);
-            return capture(request, operation => operation(branch, confirmSource), signal);
-        }, signal);
-        // If an earlier merge on this fork is still settling, capture after its
-        // source baselines advance. Otherwise a second capture could retain
-        // baselines from before its own fork's preceding publication.
-        const predecessor = sourceMerges.get(request.branch);
-        capturing++;
-        const source = (predecessor ? predecessor.then(captureSource) : captureSource())
-            .then(value => ({ value } as const), cause => ({ cause } as const))
-            .then(captured => {
-                capturing--;
-                changed();
-                return captured;
-            });
-        if (predecessor) deferUserOperations(source);
+    /** The unsettled merge this client knows of that holds `branch` still. */
+    const holding = (branch: string) => [unsettled, active?.reservation, unresolved].find(merge => merge?.branch === branch);
 
-        const result = enqueue(async () => {
-            executing = requestId;
-            let completed = false;
-            try {
-                checkAbort(signal);
-                const existing = await find();
-                if (existing) {
-                    checkBinding(existing, request);
-                    if (existing.outcome && existing !== active) {
-                        completed = true;
-                        return returnOutcome(existing.outcome, requestId);
-                    }
-                }
-                if (active && active.reservation.requestId !== requestId) throw mergeBlocked(active.reservation.requestId);
-                if (unresolved && unresolved.requestId !== requestId) throw mergeBlocked(unresolved.requestId);
-                if (unsettled) throw mergeBlocked(unsettled.requestId, unsettled.cause);
-                const reserving = unresolved?.record.kind === 'merge-reservation-v1' ? unresolved.record : undefined;
-                if (reserving && (reserving.branch !== request.branch || reserving.summary !== request.summary))
-                    throw new MemDriveError('MERGE_REQUEST_CONFLICT', 'The merge request ID is already bound to different input.', { details: { requestId } });
-                try {
-                    await settleRecord(signal);
-                } catch (cause) {
-                    throw new MemDriveError('MERGE_RESUMABLE', 'Could not confirm the durable merge state. Retry the same request.',
-                        { cause, details: { requestId } });
-                }
-                // Settling may have written this request's own reservation.
-                const reserved = () => active?.reservation.requestId === requestId ? active : undefined;
-                let entry = existing ?? reserved();
-                if (!entry) {
-                    const captured = await source;
-                    if ('cause' in captured) throw captured.cause;
-                    await ensureBootstrap(signal);
-                    const id = await requestIndexId(requestId);
-                    try {
-                        // The reservation is confirmed first, then the index that
-                        // names it, so a request ID maps to one slot for good and
-                        // a repeated or late index write changes nothing.
-                        const reservation: Reservation = { id: reservationId(slot), driveId, kind: 'merge-reservation-v1', ...request,
-                            sourceTag: captured.value?.name ?? null, startedAt: new Date().toISOString(), priorVersion: published, version: versionFor(slot) };
-                        await append(requestId, reservation, signal, { id, driveId, kind: 'merge-request-v1', requestId, slot: String(slot) });
-                    } catch (cause) {
-                        throw new MemDriveError('MERGE_RESUMABLE', 'Could not confirm the merge reservation. Retry the same request.',
-                            { cause, details: { requestId } });
-                    }
-                    entry = reserved();
-                    if (entry) entry.indexed = true;
-                }
-                if (!entry) throw new MemDriveError('INVALID_RESULT', 'The merge reservation was not observed.');
-                try { return await finish(entry, signal); }
-                finally { completed = Boolean(entry.outcome && entry !== active); }
-            } finally {
-                executing = undefined;
-                if (completed) await maintainHistory(signal);
-            }
-        });
-        const settled = result.then(() => undefined, () => undefined);
-        sourceMerges.set(request.branch, settled);
-        void settled.then(() => {
-            if (sourceMerges.get(request.branch) === settled) sourceMerges.delete(request.branch);
-            changed();
-        });
-        return result;
+    /**
+     * Reject a write to a fork that an unsettled merge holds still. This client
+     * owns the fork's queue and the merge queue, so no other merge can name the
+     * fork: after the fork's `first` write has read the journal head, its own
+     * state is enough, and only a known hold is read again before it rejects.
+     */
+    async function requireWritable(branch: string, first: boolean, signal?: AbortSignal) {
+        if (first || holding(branch)) await refresh(signal);
+        const merge = holding(branch);
+        if (merge) throw new MemDriveError('MERGE_BLOCKED', 'An unfinished merge holds this fork still. Retry that merge request or recover it before writing.',
+            { cause: merge === unsettled ? unsettled.cause : undefined, details: { requestId: merge.requestId } });
     }
 
-    function recover(signal?: AbortSignal) {
-        return enqueue(async () => {
-            await ensureBootstrap(signal);
+    async function merge(request: BoundRequest, writer: Writer, signal?: AbortSignal) {
+        const { requestId, branch } = request;
+        let completed = false;
+        try {
+            // The merge is one operation of its fork's queue, taken before the merge
+            // queue. Writes, diffs, references and other merges of the fork wait
+            // until it ends, while it reads and advances the fork directly.
+            return await writer.enqueueMerge(confirmSource => enqueue(async () => {
+                executing = requestId;
+                try {
+                    checkAbort(signal);
+                    const existing = await lookup(requestId, signal);
+                    if (existing) {
+                        checkBinding(existing, request);
+                        if (existing.outcome && existing !== active) {
+                            completed = true;
+                            return returnOutcome(existing.outcome, requestId);
+                        }
+                    }
+                    if (active && active.reservation.requestId !== requestId) throw mergeBlocked(active.reservation.requestId);
+                    if (unresolved && unresolved.requestId !== requestId) throw mergeBlocked(unresolved.requestId);
+                    if (unsettled) throw mergeBlocked(unsettled.requestId, unsettled.cause);
+                    const reserving = unresolved?.record.kind === 'merge-reservation-v1' ? unresolved.record : undefined;
+                    if (reserving && (reserving.branch !== branch || reserving.summary !== request.summary))
+                        throw new MemDriveError('MERGE_REQUEST_CONFLICT', 'The merge request ID is already bound to different input.', { details: { requestId } });
+                    try {
+                        await settleRecord(signal);
+                    } catch (cause) {
+                        throw new MemDriveError('MERGE_RESUMABLE', 'Could not confirm the durable merge state. Retry the same request.',
+                            { cause, details: { requestId } });
+                    }
+                    // Settling may have written this request's own reservation.
+                    const reserved = () => active?.reservation.requestId === requestId ? active : undefined;
+                    let entry = existing ?? reserved();
+                    if (!entry) {
+                        // Nothing is reserved while a write to the fork has an unknown outcome.
+                        await confirmSource();
+                        await ensureJournal(signal);
+                        await ensureBootstrap(signal);
+                        const id = await requestIndexId(requestId);
+                        try {
+                            // The reservation is confirmed first, then the index that
+                            // names it, so a request ID maps to one slot for good and
+                            // a repeated or late index write changes nothing.
+                            const reservation: Reservation = { id: reservationId(slot), driveId, kind: 'merge-reservation-v1', ...request,
+                                startedAt: new Date().toISOString(), priorVersion: published, version: versionFor(slot) };
+                            await append(requestId, branch, reservation, signal, { id, driveId, kind: 'merge-request-v1', requestId, slot: String(slot) });
+                        } catch (cause) {
+                            // A reservation whose write was never dispatched holds nothing.
+                            if (!unresolved && !reserved()) throw cause;
+                            throw new MemDriveError('MERGE_RESUMABLE', 'Could not confirm the merge reservation. Retry the same request.',
+                                { cause, details: { requestId } });
+                        }
+                        entry = reserved();
+                        if (entry) entry.indexed = true;
+                    }
+                    if (!entry) throw new MemDriveError('INVALID_RESULT', 'The merge reservation was not observed.');
+                    try { return await finish(entry, signal); }
+                    finally { completed = Boolean(entry.outcome && entry !== active); }
+                } finally {
+                    executing = undefined;
+                }
+            }), signal);
+        } finally {
+            // Retention stays in the merge queue but no longer needs the fork, whose queue is free again.
+            if (completed) await enqueue(() => maintainHistory(signal));
+        }
+    }
+
+    /** The fork of the unfinished merge, which recovery must hold as its merge would. */
+    const unfinishedBranch = () => (active?.reservation ?? unresolved)?.branch;
+
+    async function recover(signal?: AbortSignal) {
+        await ensureBootstrap(signal);
+        for (;;) {
             await refresh(signal);
             if (unsettled) throw mergeBlocked(unsettled.requestId, unsettled.cause);
-            if (!active && !unresolved) return;
+            const branch = unfinishedBranch();
+            if (branch === undefined) return;
+            // Like a merge, take the fork's queue before the merge queue.
+            let attempted = false;
             try {
-                await settleRecord(signal);
-                if (active) await finish(active, signal);
-            } catch (cause) {
-                if (!(cause instanceof MemDriveError) || cause.code !== 'MERGE_CONFLICT') throw cause;
+                const settled = await writerFor(branch).enqueueMerge(() => enqueue(async () => {
+                    await refresh(signal);
+                    if (unsettled) throw mergeBlocked(unsettled.requestId, unsettled.cause);
+                    // Another operation settled that merge first. Look again.
+                    if (unfinishedBranch() !== branch) return false;
+                    attempted = true;
+                    try {
+                        await settleRecord(signal);
+                        if (active) await finish(active, signal);
+                    } catch (cause) {
+                        if (!(cause instanceof MemDriveError) || cause.code !== 'MERGE_CONFLICT') throw cause;
+                    }
+                    return true;
+                }), signal);
+                if (settled) return;
             } finally {
-                await maintainHistory(signal);
+                if (attempted) await enqueue(() => maintainHistory(signal));
             }
-        });
+        }
     }
 
     async function assertIdle(signal?: AbortSignal) {
         await refresh(signal);
         const blocking = active?.reservation.requestId ?? unresolved?.requestId ?? unsettled?.requestId ?? executing;
         if (blocking) throw mergeBlocked(blocking);
-        if (sourceMerges.size) throw new MemDriveError('STORE_BUSY', 'A merge capture is still in progress.');
     }
 
     async function maintainHistory(signal?: AbortSignal) {
@@ -677,7 +706,7 @@ export function publication(client: ConnectionOptions['client'], content: Handle
     }
 
     /** Whether this client holds merge state or queued work that a new store object would lose. */
-    const held = () => Boolean(unresolved || unsettled || executing !== undefined || capturing || sourceMerges.size || capture.unconfirmed());
+    const held = () => Boolean(unresolved || unsettled || executing !== undefined);
 
-    return { main: { read, pin }, pinVersion, merge, recover, status, history, assertIdle, initialize: ensureBootstrap, held };
+    return { main: { read, pin }, pinVersion, merge, recover, requireWritable, status, history, assertIdle, initialize: ensureBootstrap, held };
 }

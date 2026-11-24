@@ -31,7 +31,7 @@ The Docling adapter uses pinned `docling.rs` as an optional peer. Package checks
 first verify core consumers without that peer, then install it explicitly and
 exercise the real Hybrid chunker with a small synthetic tokenizer. The fixture
 checks integration and deterministic behavior, not retrieval quality. Preserve
-exact originals, avoid invented ranges for rendered text, and reuse captured
+exact originals, avoid invented ranges for rendered text, and reuse stored
 chunks and vectors during publication and recovery.
 The default live suite additionally checks Docling writes, checkpoint reads and
 publication against the real backend. It publishes a later revision, then creates
@@ -40,9 +40,10 @@ verifying their earlier originals before
 destroying its isolated store and journal.
 It checks that the store keeps native snapshot retention at one day with the
 default 30-day SDK window, then ages timestamps in that isolated synthetic journal.
-A capture inside the window survives merge replay; after configuring a one-day
-window, replay automatically releases it while retained history and checkpoint
-reads remain. It does not wait a real retention period or measure physical GC.
+The superseded first version's tag inside the window survives merge replay; after
+configuring a one-day window, replay automatically releases it while retained
+history, checkpoint reads and refs created from that version remain. It does not
+wait a real retention period or measure physical GC.
 
 The shared file-tool catalog also lives at the package root. Keep tools one-to-one
 with public SDK operations, one fixed schema set per embedding mode and the
@@ -77,6 +78,17 @@ journal record except the retention watermark is written once: confirm a
 reservation before its request index, and the index before any terminal record. Stores
 are registered weakly and pinned only while they hold state a new object would
 lose; the release regressions enable `gc` inside their own test file.
+
+A merge reads its fork directly and creates no tag but its target version, so
+the fork must not change until the merge is settled. Keep the order fork queue,
+then merge queue, for every operation that needs both, and keep the journal read
+off the write path after a fork's first write. Source bookkeeping must stay
+independent of the hold and must work without the merge plan: it advances an
+original only when the published version holds its current state, as stated by
+the plan of the run that published, without an extra request, or by the
+version's tag when the merge was resumed. The hold regressions in `test/merge-hold.test.mjs`
+interrupt a merge at each step, in process and from a new client, and assert
+the native tag calls and journal fetch counts.
 
 ## Validation and evidence
 
