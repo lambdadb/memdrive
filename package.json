@@ -36,7 +36,8 @@
     "prepublishOnly": "node scripts/check-publish.mjs",
     "test:live": "npm run build && MEMDRIVE_RUN_LIVE_TESTS=1 node --env-file-if-exists=.env.local --test --test-concurrency=1 test/integration/*-live.test.mjs",
     "benchmark:longmemeval": "npm run build && node benchmark/longmemeval/run.mjs",
-    "benchmark:tools": "npm run build && node benchmark/tool-use/run.mjs"
+    "benchmark:tools": "npm run build && node benchmark/tool-use/run.mjs",
+    "benchmark:beam-replay": "npm run build && node benchmark/beam/replay.mjs"
   },
   "dependencies": {
     "@functional-systems/lambdadb": "0.14.0"

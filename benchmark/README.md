@@ -8,6 +8,7 @@ source preparation, model requests and evaluation logic.
   `single_pass` and `agentic` retrieval with optional answering and judging.
 - [Original BEAM](beam/README.md) uses a reusable file corpus per conversation
   for single-pass retrieval and offline answer preparation.
+- [BEAM session replay](beam/README.md#session-replay-how-a-model-uses-the-file-tools) feeds one conversation's user utterances, session by session, to a Responses model with the SDK tool catalog and counts forks, writes, merges and leftover forks. It uses the native-client fixture and reports process counts for that model, not answer quality or agent-application behavior.
 
 - [Model tool use](tool-use/README.md) exposes the SDK tool catalog to a Responses model and evaluates nine synthetic scenarios, guide delivery and instruction profiles. It uses the real SDK on a native-client fixture; scripted smoke, model measurements and live database validation are distinct.
 

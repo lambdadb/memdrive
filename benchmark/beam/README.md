@@ -119,3 +119,121 @@ The original RAG prompt comes from BEAM revision
 `b2da22eac88bb0874c64665f13457eb99835774a`. The upstream file hashes are pinned in
 [original-config.json](original-config.json), and [original-LICENSE](original-LICENSE)
 preserves the upstream notice.
+
+## Session replay: how a model uses the file tools
+
+`replay.mjs` is a separate runner. It replays one prepared conversation session
+by session and reports how a model used the MemDrive file tools while it
+talked to the user. It makes no retrieval, answer or judge request, and it
+never reads the evaluation annotations.
+
+A session is one original BEAM batch: the messages that share a batch in the
+source, identified by the `s###` part of each prepared source ID. Only the
+list layout carries that batch; other layouts are rejected. The pinned 100K
+split has 20 conversations, 90 sessions and 2,866 user utterances.
+
+Each session is a fresh model conversation. The runner sends the user
+utterances in their original order, one at a time, and lets the model reply
+and call tools until it returns a final message. The model answers every
+utterance itself; the dataset's assistant messages are not replayed, so a
+later utterance can refer to a reply the model never gave. All user utterances
+are replayed, without the last-four-message hold-out of the retrieval runner.
+One conversation uses one new store, and the drive is the only state carried
+from one session to the next.
+
+The model receives only what an MCP deployment could deliver:
+
+- the user utterances, verbatim, with nothing appended;
+- the fixed SDK catalog from `getFileToolDefinitions`: `guide`, `status`,
+  `history`, `list`, `read`, `search`, `findText`, `fork`, `checkpoint`,
+  `listForks`, `listCheckpoints`, `deleteFork`, `deleteCheckpoint`, `diff`,
+  `write` and `merge`, unchanged for the whole run;
+- each tool result as the SDK returned it, the SDK's normalized error, or an
+  explicit delivery-limit error when a result exceeds 64,000 bytes;
+- optionally one developer message standing in for server instructions.
+
+`--instructions sdk` (default) supplies the exported `fileToolInstructions`
+verbatim; `--instructions none` supplies nothing. `--policy-file FILE` appends
+that file's text to the same message after a blank line, or makes it the whole
+message with `none`. The manifest records the exact text and its SHA-256. No
+task, starting view or reminder is added, and nothing is injected during a
+conversation. Every view of the store is authorized, as for a personal drive.
+The runner never writes, merges or deletes for the model. After each session
+it only reads `status`, `history`, `listForks` and each fork's `diff`.
+
+```sh
+npm ci
+npm run build
+
+# No model request: validates the transport, recording and metrics.
+node benchmark/beam/replay.mjs --manifest artifacts/beam-original-100k/manifest.json \
+  --conversation 1 --mode scripted --output artifacts/beam-replay/smoke-1
+
+# Paid model requests. A small first pilot: two sessions, five utterances each.
+node benchmark/beam/replay.mjs --manifest artifacts/beam-original-100k/manifest.json \
+  --conversation 1 --sessions 2 --turns 5 --env-file /path/to/model.env \
+  --output artifacts/beam-replay/pilot-1
+```
+
+Model mode uses OpenAI Responses with the explicit model ID (`gpt-6.1-sol` by
+default, or `--model`), low reasoning, `store: false`, sequential tool calls
+and non-strict function schemas. It needs `LLM_API_KEY` in the environment or
+`--env-file`, and fails before creating a run when it is missing. The runner
+validates the returned model identity and usage. It does not retry a model
+request, switch models or repair invalid model output; invalid tool JSON is
+returned to the model as a recorded tool error. `--sessions` and `--turns`
+limit the sessions and the utterances per session. Each output directory must
+be new.
+
+Host budgets per session: 16 model rounds and 40 tool calls per utterance, a
+120,000-token request reservation, 4,000,000 reported total tokens, 8,192
+output tokens per request, a three-minute request timeout and one hour. The
+estimator is `cl100k_base`, not the model's tokenizer. These are untuned
+defaults. A session that fails or exceeds a budget is recorded as failed and
+ends the run, because the in-memory backend cannot resume and later sessions
+depend on that drive.
+
+### Metrics
+
+`summary.json` is rewritten after every session with per-session metrics and
+conversation totals:
+
+- utterances sent, model requests, reported tokens, tool calls by name and
+  tool errors by code;
+- forks created, fork-name conflicts (`BRANCH_CONFLICT`) and forks deleted;
+- merges that published, returned unchanged or failed;
+- publication lag: for each successful `write` call, the number of utterances
+  until the next `merge` of the same fork that returned a result in that
+  session, or null when there was none. A batch write is one call;
+- republished files: file IDs in two or more publications made during the
+  session, from `history()`. A truncated history entry makes this a lower bound;
+- after the last utterance: forks remaining, forks with unpublished changes,
+  the number of those changes, and fully published forks left behind;
+- sessions without a successful write.
+
+Totals of the end-of-session fork states count a fork once for every session
+it was still present in; the `final*` fields give the last observation.
+
+`manifest.json` freezes the source hashes, runner and SDK build hashes, source
+commit, model, budgets, instruction text, tool definitions and planned
+sessions. Each session directory holds `transcript.jsonl` (every input item in
+order), `requests.jsonl` (a pending and an outcome receipt per request, with
+the number of transcript items it sent), `events.jsonl` (the model's tool
+calls and results), `observation.json` (the runner's reads) and `result.json`.
+Receipts can contain provider response IDs and opaque reasoning. Keep runs
+under ignored `artifacts/`.
+
+### Limits of this measurement
+
+- These are process counts from recorded tool calls. There is no answer
+  generation, judging or score for what was saved.
+- A direct model request is not an agent application. Real agents add their
+  own system prompt and memory features and decide whether server instructions
+  reach the model. Results describe the model with this catalog only.
+- The backend is the native-client fixture used by the unit tests, with the
+  real public SDK above it. Writes are visible immediately and search returns
+  the same candidates for every query; this does not model LambdaDB ranking,
+  latency or consistency. A live backend is not included.
+- Scripted mode and injected test transports report their totals under
+  `smoke`, and `modelBehavior` stays null. The maintained tests use synthetic
+  conversations and establish the harness, not model behavior.
