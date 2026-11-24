@@ -21,6 +21,7 @@ import { storeTag } from './cursor-tokens.js';
 export type * from './types.js';
 export { MemDriveError } from './errors.js';
 export { createFileTools, getFileToolDefinitions, fileToolError, fileToolGuide, fileToolGuideTopics } from './tools.js';
+export { fileToolInstructions } from './tool-guide.js';
 export type { FileToolGuideTopic } from './tool-guide.js';
 export type { FileToolDefinition, FileToolErrorResult, FileToolName, FileTools } from './tools.js';
 

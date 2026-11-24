@@ -570,10 +570,16 @@ result is respectively one file/deletion result or an array. A batch is not a
 transaction. `fork` and `checkpoint` return `{ at }` for the new view, with
 `version` valid only from a main source. `merge` publishes without deleting the
 fork. Continuation results carry `next`; models forward it unchanged.
-`guide` returns the exported versioned text without provisioning or reading drive
-files. `fileToolError` preserves SDK error codes, messages, status and details,
-excludes causes and stacks, and masks unexpected errors. It does not retry calls
-or authorize recovery.
+
+`fileToolInstructions` is the short, transport-neutral guidance shared with the
+guide index. Hosts can supply it to their agents alongside the tool definitions.
+`guide()` returns the index of topics, and `guide({ topic })` returns the selected
+topic. Both return the exported versioned text without provisioning or reading
+drive files.
+
+`fileToolError` preserves SDK error codes, messages, status and details, excludes
+causes and stacks, and masks unexpected errors. It does not retry calls or
+authorize recovery.
 
 ```ts
 const saved = await tools.execute('checkpoint', { at, name: 'before-edit' });
