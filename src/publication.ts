@@ -25,7 +25,7 @@ const historyToken = 'h1';
 const gallopProbes = 20;
 const searchProbes = 250;
 const historyUnavailable = () => new MemDriveError('HISTORY_CURSOR_UNAVAILABLE',
-    'History cursor is malformed or its versions are no longer available. Start again from the last processed version.');
+    'History cursor is malformed or does not belong to this store. Start again from the last processed version.');
 
 function tagRef(name: string) {
     return { kind: 'tag' as const, name };
