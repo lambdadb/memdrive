@@ -50,13 +50,9 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
         assert.equal(before.hits[0].content, 'Hello world.');
         assert.deepEqual(before.hits[0].range, { start: 11, end: 23 });
         phase = 'publish structured chunks';
-        // Publication already waits for definite cold-snapshot rejections
-        // of its target tag. Allow that stage its documented wait budget.
         await main.merge({ at, requestId: 'publish-structured', summary: 'Publish synthetic structured note' },
             { signal: AbortSignal.timeout(270_000) });
         phase = 'checkpoint published snapshot';
-        // First-write tag visibility is a separate backend readiness check.
-        // This test pins the already confirmed published tag instead.
         const checkpoint = (await main.checkpoint({ name: 'saved' }, options())).at;
         phase = 'reopen published original without parser';
         const reopened = await MemDrive.open({ client: new LambdaDBClient(connection), name }, options());
@@ -68,20 +64,7 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
 
         phase = 'preserve explicit working checkpoint';
         const firstVersion = (await main.history({}, options())).entries[0].version;
-        // The backend rejects a tag on a branch whose first snapshot has not
-        // committed, with a definite 400. A merge reads the fork without
-        // tagging it, so nothing has waited for that snapshot before this
-        // point. Retry only that rejection, within the budget publication
-        // gives its own target tag. A checkpoint does not wait by itself.
-        let workingSaved;
-        for (const deadline = Date.now() + 120_000; !workingSaved;) {
-            try {
-                workingSaved = (await main.checkpoint({ at, name: 'working-saved' }, options())).at;
-            } catch (error) {
-                if (error?.code !== 'DATABASE_ERROR' || error.status !== 400 || Date.now() >= deadline) throw error;
-                await new Promise(resolve => setTimeout(resolve, 2_000));
-            }
-        }
+        const workingSaved = (await main.checkpoint({ at, name: 'working-saved' }, options())).at;
         assert.deepEqual(await main.read({ at: workingSaved, fileId: file.fileId }, options()), file);
         phase = 'publish a later revision';
         const updated = await main.write({ at, op: 'update', fileId: file.fileId, content: '# Heading\n\nGoodbye world.' }, options());

@@ -6,7 +6,7 @@ import { initialMainRef, prepareMerge } from './merge-preflight.js';
 import { appliedId, bookkeepingId, canonicalVersion, completionId, parseOutcome, parseRequestIndex, parseReservation, publicationIdentity, publicationLog,
     publishedFileLimit, requestIndexId, reservationId, returnOutcome, slotOf, tagFor, versionFor, type BoundRequest, type Outcome, type PublicationRecord,
     type RequestIndex, type Reservation, type SlotState } from './publication-log.js';
-import { awaitMergeTag, historicalViewUnavailable, refBackoff } from './refs.js';
+import { historicalViewUnavailable, refBackoff } from './refs.js';
 import { branchRef, type Handle, type ViewRef } from './storage-reads.js';
 import { decodeToken, encodeToken, storeTag } from './cursor-tokens.js';
 import type { ConnectionOptions, FileHistoryEntry, FileHistoryRequest, FileHistoryResult, FileStoreStatus, MetadataSchema } from './types.js';
@@ -502,7 +502,7 @@ export function publication(client: ConnectionOptions['client'], content: Handle
                             await applyMerge(content, content.collectionName, plan, version, signal);
                             await append(requestId, branch, { id, driveId, kind: 'merge-applied-v1' }, signal);
                         }
-                        await awaitMergeTag(() => createTag(target.name, signal), signal);
+                        await createTag(target.name, signal);
                     }
                     // Confirm both pinned lookup and indexed candidate visibility.
                     for (let attempt = 0; ; attempt++) {

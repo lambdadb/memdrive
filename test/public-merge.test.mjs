@@ -333,30 +333,23 @@ test('history caps affected IDs and reads a published completion while bookkeepi
     assert.deepEqual(await main.status(), { at: { kind: 'main' }, mainVersion: 'v1' });
 });
 
-test('a known cold target tag rejection retries inside the public call while a queued write waits for the merge', async () => {
+test('a definite target tag rejection pauses the merge, and the same request then publishes once', async () => {
     const { fixture, main } = await setup();
     const work = await fork(main, { name: 'research' });
     const original = await work.write(file('/original'));
-    const observed = gate();
     let rejectedTarget = false;
     fixture.beforeTagCreate = tag => {
         if (tag === 'md-main-v1' && !rejectedTarget) {
             rejectedTarget = true;
-            observed.resolve();
             throw dbRejection();
         }
     };
-    const publication = work.merge(request('cold'), { signal: AbortSignal.timeout(10_000) });
-    await observed.promise;
-    let written = false;
-    const later = work.write(file('/later')).then(() => { written = true; });
-    await new Promise(resolve => setImmediate(resolve));
-    assert.equal(written, false);
-    assert.deepEqual(await publication, status('cold', 'v1'));
-    await later;
+    // Tags no longer wait for a first snapshot (LambdaDB PR #614), so a 400 is
+    // not retried inside the call: the merge pauses and holds the fork.
+    await assert.rejects(work.merge(request('cold')), { code: 'MERGE_RESUMABLE' });
+    await assert.rejects(work.write(file('/blocked')), { code: 'MERGE_BLOCKED' });
+    assert.deepEqual(await work.merge(request('cold')), status('cold', 'v1'));
     assert.deepEqual(await main.read({ fileId: original.fileId }), original);
-    assert.equal(await main.read({ path: '/later' }), null);
-    assert.deepEqual((await work.diff()).map(({ path }) => path), ['/later']);
     assert.equal(fixture.calls.filter(call => call.kind === 'upsert' && call.collection === name
         && call.request.branch === 'main').length, 1);
     // The merge pins nothing but its target version.
