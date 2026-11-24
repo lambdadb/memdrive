@@ -205,8 +205,19 @@ conversation totals:
 - publication lag: for each successful `write` call, the number of utterances
   until the next `merge` of the same fork that returned a result in that
   session, or null when there was none. A batch write is one call;
-- republished files: file IDs in two or more publications made during the
-  session, from `history()`. A truncated history entry makes this a lower bound;
+- utterance-to-publication lag: for each utterance, the number of utterances
+  until the next turn in which a merge published, or null when none followed
+  in that session. A model can postpone the write itself instead of holding
+  edits on a fork, which the publication lag above cannot show. `afterLast`
+  counts the utterances after the session's last publication, or all of them
+  in a session without one. Their content cannot have been published in that
+  session. An earlier utterance may have been saved, but nothing here checks
+  what a publication contained;
+- turns with a successful write and turns with a publication;
+- published and republished files: distinct file IDs in the session's
+  publications, and those in two or more of them, from `history()`. An
+  addition to a file counts like a correction of it. A truncated history
+  entry makes both lower bounds;
 - after the last utterance: forks remaining, forks with unpublished changes,
   the number of those changes, and fully published forks left behind;
 - sessions without a successful write.

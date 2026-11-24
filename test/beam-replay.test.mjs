@@ -101,31 +101,42 @@ test('a scripted replay records fork, publication, republication, leftovers and 
         toolCalls: 8, toolCallsByName: { diff: 2, fork: 1, merge: 2, read: 1, write: 2 }, toolErrorsByCode: {},
         forksCreated: 1, forkNameConflicts: 0, forksDeleted: 0, merges: { published: 2, unchanged: 0, failed: 0 },
         publicationLags: [0, 0], publicationLag: { writes: 2, merged: 2, neverMerged: 0, sameTurn: 2, meanTurns: 0, maxTurns: 0 },
-        noSuccessfulWrite: false, publications: 2, republishedFiles: 1, republishedFilesIsLowerBound: false,
+        noSuccessfulWrite: false, turnsWithWrite: 2, turnsWithPublication: 2, utteranceToPublicationLags: [0, 1, 0],
+        utteranceToPublication: { utterances: 3, followed: 3, afterLast: 0, sameTurn: 2, meanTurns: 1 / 3, maxTurns: 1 },
+        publications: 2, publishedFiles: 1, republishedFiles: 1, republishedFilesIsLowerBound: false,
         forksRemaining: 1, unpublishedForks: 0, unpublishedChanges: 0, publishedForksLeft: 1, unobservedForks: 0 });
     assert.deepEqual(second, { userTurns: 1, modelRequests: 4, inputTokens: 0, outputTokens: 0, unknownUsageRequests: 0,
         toolCalls: 3, toolCallsByName: { fork: 2, write: 1 }, toolErrorsByCode: { BRANCH_CONFLICT: 1 },
         forksCreated: 1, forkNameConflicts: 1, forksDeleted: 0, merges: { published: 0, unchanged: 0, failed: 0 },
         publicationLags: [null], publicationLag: { writes: 1, merged: 0, neverMerged: 1, sameTurn: 0, meanTurns: null, maxTurns: null },
-        noSuccessfulWrite: false, publications: 0, republishedFiles: 0, republishedFilesIsLowerBound: false,
+        noSuccessfulWrite: false, turnsWithWrite: 1, turnsWithPublication: 0, utteranceToPublicationLags: [null],
+        utteranceToPublication: { utterances: 1, followed: 0, afterLast: 1, sameTurn: 0, meanTurns: null, maxTurns: null },
+        publications: 0, publishedFiles: 0, republishedFiles: 0, republishedFilesIsLowerBound: false,
         forksRemaining: 2, unpublishedForks: 1, unpublishedChanges: 1, publishedForksLeft: 1, unobservedForks: 0 });
     assert.deepEqual(third, { userTurns: 2, modelRequests: 2, inputTokens: 0, outputTokens: 0, unknownUsageRequests: 0,
         toolCalls: 0, toolCallsByName: {}, toolErrorsByCode: {},
         forksCreated: 0, forkNameConflicts: 0, forksDeleted: 0, merges: { published: 0, unchanged: 0, failed: 0 },
         publicationLags: [], publicationLag: zeroLag,
-        noSuccessfulWrite: true, publications: 0, republishedFiles: 0, republishedFilesIsLowerBound: false,
+        noSuccessfulWrite: true, turnsWithWrite: 0, turnsWithPublication: 0, utteranceToPublicationLags: [null, null],
+        utteranceToPublication: { utterances: 2, followed: 0, afterLast: 2, sameTurn: 0, meanTurns: null, maxTurns: null },
+        publications: 0, publishedFiles: 0, republishedFiles: 0, republishedFilesIsLowerBound: false,
         forksRemaining: 2, unpublishedForks: 1, unpublishedChanges: 1, publishedForksLeft: 1, unobservedForks: 0 });
     assert.deepEqual(fourth, { userTurns: 2, modelRequests: 7, inputTokens: 0, outputTokens: 0, unknownUsageRequests: 0,
         toolCalls: 5, toolCallsByName: { deleteFork: 1, diff: 1, fork: 1, merge: 1, write: 1 }, toolErrorsByCode: {},
         forksCreated: 1, forkNameConflicts: 0, forksDeleted: 1, merges: { published: 1, unchanged: 0, failed: 0 },
         publicationLags: [1], publicationLag: { writes: 1, merged: 1, neverMerged: 0, sameTurn: 0, meanTurns: 1, maxTurns: 1 },
-        noSuccessfulWrite: false, publications: 1, republishedFiles: 0, republishedFilesIsLowerBound: false,
+        noSuccessfulWrite: false, turnsWithWrite: 1, turnsWithPublication: 1, utteranceToPublicationLags: [1, 0],
+        utteranceToPublication: { utterances: 2, followed: 2, afterLast: 0, sameTurn: 1, meanTurns: 0.5, maxTurns: 1 },
+        publications: 1, publishedFiles: 1, republishedFiles: 0, republishedFilesIsLowerBound: false,
         forksRemaining: 2, unpublishedForks: 1, unpublishedChanges: 1, publishedForksLeft: 1, unobservedForks: 0 });
     assert.deepEqual(summary.smoke, { sessions: 4, userTurns: 8, modelRequests: 24, inputTokens: 0, outputTokens: 0, unknownUsageRequests: 0,
         toolCalls: 16, toolCallsByName: { deleteFork: 1, diff: 3, fork: 4, merge: 3, read: 1, write: 4 }, toolErrorsByCode: { BRANCH_CONFLICT: 1 },
         forksCreated: 3, forkNameConflicts: 1, forksDeleted: 1, merges: { failed: 0, published: 3, unchanged: 0 },
         publicationLag: { writes: 4, merged: 3, neverMerged: 1, sameTurn: 2, meanTurns: 1 / 3, maxTurns: 1 },
-        sessionsWithoutWrite: 1, publications: 3, republishedFiles: 1, republishedFilesIsLowerBound: false,
+        sessionsWithoutWrite: 1, turnsWithWrite: 4, turnsWithPublication: 3,
+        // Three utterances came after their session's last publication or in a session without one.
+        utteranceToPublication: { utterances: 8, followed: 5, afterLast: 3, sameTurn: 3, meanTurns: 0.4, maxTurns: 1 },
+        publications: 3, republishedFiles: 1, republishedFilesIsLowerBound: false,
         sessionsEndingWithUnpublishedForks: 3, finalForksRemaining: 2, finalUnpublishedForks: 1, finalUnpublishedChanges: 1, finalPublishedForksLeft: 1 });
     assert.deepEqual(summary.smoke, conversationMetrics(results.map(result => result.metrics)));
 
@@ -304,16 +315,22 @@ test('metrics separate unchanged and failed merges, truncated history and unobse
     assert.deepEqual(metrics.merges, { published: 1, unchanged: 1, failed: 1 });
     assert.deepEqual(metrics.toolErrorsByCode, { EDIT_CONFLICT: 1, MERGE_CONFLICT: 1 });
     assert.deepEqual([metrics.inputTokens, metrics.outputTokens, metrics.unknownUsageRequests], [5, 1, 1]);
-    assert.deepEqual([metrics.publications, metrics.republishedFiles, metrics.republishedFilesIsLowerBound], [2, 1, true]);
+    assert.deepEqual([metrics.publications, metrics.publishedFiles, metrics.republishedFiles, metrics.republishedFilesIsLowerBound], [2, 2, 1, true]);
+    // Only the published merge in turn 2 counts: the failed and unchanged merges publish nothing.
+    assert.deepEqual([metrics.turnsWithWrite, metrics.turnsWithPublication, metrics.utteranceToPublicationLags], [2, 1, [2, 1, 0, null]]);
+    assert.deepEqual(metrics.utteranceToPublication, { utterances: 4, followed: 3, afterLast: 1, sameTurn: 1, meanTurns: 1, maxTurns: 2 });
     assert.deepEqual([metrics.forksRemaining, metrics.unpublishedForks, metrics.unpublishedChanges, metrics.publishedForksLeft, metrics.unobservedForks], [3, 1, 2, 1, 1]);
 
     const unobserved = sessionMetrics({ userTurns: 1, requests: [], events: [], observation: { publications: null, forks: null } });
-    assert.deepEqual([unobserved.publications, unobserved.republishedFiles, unobserved.republishedFilesIsLowerBound, unobserved.forksRemaining,
-        unobserved.unpublishedForks, unobserved.unobservedForks], [null, null, null, null, null, null]);
+    assert.deepEqual([unobserved.publications, unobserved.publishedFiles, unobserved.republishedFiles, unobserved.republishedFilesIsLowerBound, unobserved.forksRemaining,
+        unobserved.unpublishedForks, unobserved.unobservedForks], [null, null, null, null, null, null, null]);
+    assert.deepEqual(unobserved.utteranceToPublication, { utterances: 1, followed: 0, afterLast: 1, sameTurn: 0, meanTurns: null, maxTurns: null });
     const totals = conversationMetrics([metrics, unobserved]);
     assert.deepEqual([totals.sessions, totals.sessionsWithoutWrite, totals.publications, totals.republishedFiles, totals.sessionsEndingWithUnpublishedForks,
         totals.finalForksRemaining], [2, 1, null, null, null, null]);
+    assert.deepEqual(totals.utteranceToPublication, { utterances: 5, followed: 3, afterLast: 2, sameTurn: 1, meanTurns: 1, maxTurns: 2 });
     assert.deepEqual(conversationMetrics([]).publicationLag, { writes: 0, merged: 0, neverMerged: 0, sameTurn: 0, meanTurns: null, maxTurns: null });
+    assert.deepEqual(conversationMetrics([]).utteranceToPublication, { utterances: 0, followed: 0, afterLast: 0, sameTurn: 0, meanTurns: null, maxTurns: null });
 });
 
 test('the Responses transport sends one bounded request and reports only an HTTP status on failure', async () => {
