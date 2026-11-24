@@ -2,8 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { HTTPClient, LambdaDBClient } from '@functional-systems/lambdadb';
-import { MemDrive } from '@functional-systems/memdrive';
+import { HTTPClient, LambdaDBClient, MemDrive } from '@functional-systems/memdrive';
 
 const enabled = process.env.MEMDRIVE_RUN_LIVE_TESTS === '1';
 const verifyCheckpoints = process.env.MEMDRIVE_RUN_LIVE_CHECKPOINT_TESTS === '1';

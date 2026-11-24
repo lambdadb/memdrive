@@ -19,6 +19,9 @@ import { publicationIdentity, validateMergeRequest } from './publication-log.js'
 import { publication } from './publication.js';
 import { storeTag } from './cursor-tokens.js';
 export type * from './types.js';
+// The LambdaDB client classes at the exact version this SDK pins, so a host
+// constructs its client without depending on @functional-systems/lambdadb itself.
+export { HTTPClient, LambdaDBClient } from '@functional-systems/lambdadb';
 export { MemDriveError } from './errors.js';
 export { createFileTools, getFileToolDefinitions, fileToolError, fileToolGuide, fileToolGuideTopics } from './tools.js';
 export { fileToolInstructions } from './tool-guide.js';

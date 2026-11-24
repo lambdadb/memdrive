@@ -1,8 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import test from 'node:test';
-import { LambdaDBClient } from '@functional-systems/lambdadb';
-import { MemDrive } from '@functional-systems/memdrive';
+import { LambdaDBClient, MemDrive } from '@functional-systems/memdrive';
 import { createDoclingChunker } from '@functional-systems/memdrive/docling';
 
 const enabled = process.env.MEMDRIVE_RUN_LIVE_TESTS === '1';

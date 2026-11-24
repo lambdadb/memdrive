@@ -6,8 +6,7 @@ import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { pathToFileURL } from 'node:url';
 import { parseArgs, parseEnv } from 'node:util';
-import { HTTPClient, LambdaDBClient } from '@functional-systems/lambdadb';
-import { MemDrive } from '@functional-systems/memdrive';
+import { HTTPClient, LambdaDBClient, MemDrive } from '@functional-systems/memdrive';
 import { answerRequest, estimate, frozenConversation, hash, metadataSchema, packEvidence, searchRequest } from './sources.mjs';
 
 const protocol = 'beam-original-file-sdk-v1';
