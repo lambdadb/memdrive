@@ -151,12 +151,14 @@ test('each question is a fresh read-only conversation with the run instructions 
         assert.deepEqual(Object.keys(request), ['model', 'reasoning', 'store', 'include', 'parallel_tool_calls', 'max_output_tokens', 'tools', 'input']);
         assert.deepEqual(request.tools, definitions.map(tool => ({ type: 'function', name: tool.name, description: tool.description,
             parameters: tool.inputSchema, strict: false })));
-        assert.deepEqual(request.input.slice(0, 2), [{ role: 'developer', content: fileToolInstructions },
+        // The date of the run's last completed session follows the run's instructions.
+        assert.deepEqual(request.input.slice(0, 3), [{ role: 'developer', content: fileToolInstructions }, { role: 'developer', content: 'Current date: 2024-03-01' },
             { role: 'user', content: texts[manifest.selected[context.session]] }]);
         const body = JSON.stringify(request);
         for (const hidden of ['RUBRIC-MARKER', 'ANSWER-MARKER', 'source_chat_ids', 'DATASET-ASSISTANT', 'User says']) assert(!body.includes(hidden), hidden);
     }
-    assert.equal(requests[0].request.input.length, 2);
+    assert.equal(requests[0].request.input.length, 3);
+    assert.equal(manifest.currentDate, '2024-03-01');
     assert.equal(requests[1].request.input.at(-1).type, 'function_call_output');
     assert.deepEqual(results.map(result => result.answer), ['Answer 0', 'Answer 1', 'Answer 2', 'Answer 3', 'Answer 4']);
     assert.deepEqual([results[0].metrics.toolCallsByName, results[0].metrics.retrievalCall, results[1].metrics.retrievalCall], [{ search: 1 }, true, false]);
@@ -172,7 +174,14 @@ test('each question is a fresh read-only conversation with the run instructions 
     await writeFile(path.join(files.run, 'manifest.json'), JSON.stringify({ ...runManifest, instructions: none }));
     const bare = [];
     await files.stage('bare', { limit: 1, ask: async request => { bare.push(request.input); return message(request, 'a'); } });
-    assert.deepEqual(bare, [[{ role: 'user', content: files.questions[0].text }]]);
+    assert.deepEqual(bare, [[{ role: 'developer', content: 'Current date: 2024-03-01' }, { role: 'user', content: files.questions[0].text }]]);
+    // A run recorded before sessions were told their date asks without one.
+    const { context, ...earlier } = runManifest;
+    assert.deepEqual(context, { currentDate: 'session-date', trailingMarkers: 'stripped' });
+    await writeFile(path.join(files.run, 'manifest.json'), JSON.stringify({ ...earlier, instructions: none }));
+    const undated = [];
+    await files.stage('undated', { limit: 1, ask: async request => { undated.push(request.input); return message(request, 'a'); } });
+    assert.deepEqual(undated, [[{ role: 'user', content: files.questions[0].text }]]);
 });
 
 const refsAndFiles = async drive => {

@@ -144,23 +144,32 @@ are replayed, without the last-four-message hold-out of the retrieval runner.
 One conversation uses one new store, and the drive is the only state carried
 from one session to the next.
 
-The model receives only what an MCP deployment could deliver:
+The model receives only what an MCP deployment and an agent application
+could deliver:
 
-- the user utterances, verbatim, with nothing appended;
+- the user utterances with nothing appended. They are verbatim except for the
+  dataset's trailing generation marker (`->-> 1,11`, `->-> 5,14)`,
+  `->-> 2,N/A`), which 2,155 of the 2,866 utterances in the 100K split end
+  with and which no user said; the plan records how many each session lost;
 - the fixed SDK catalog from `getFileToolDefinitions`: `guide`, `status`,
   `history`, `list`, `read`, `search`, `findText`, `fork`, `checkpoint`,
   `listForks`, `listCheckpoints`, `deleteFork`, `deleteCheckpoint`, `diff`,
   `write` and `merge`, unchanged for the whole run;
 - each tool result as the SDK returned it, the SDK's normalized error, or an
   explicit delivery-limit error when a result exceeds 64,000 bytes;
-- optionally one developer message standing in for server instructions.
+- optionally one developer message standing in for server instructions;
+- one developer message with the session's date, `Current date: 2024-03-15`,
+  from the batch date in the dataset. Agent applications tell their model the
+  date, and without it a model notices that the dates in the conversation lie
+  in the past and records them as doubtful.
 
 `--instructions sdk` (default) supplies the exported `fileToolInstructions`
 verbatim; `--instructions none` supplies nothing. `--policy-file FILE` appends
 that file's text to the same message after a blank line, or makes it the whole
 message with `none`. The manifest records the exact text and its SHA-256. No
 task, starting view or reminder is added, and nothing is injected during a
-conversation. Every view of the store is authorized, as for a personal drive.
+conversation. The date message is separate from the instructions and is sent
+with either setting. Every view of the store is authorized, as for a personal drive.
 The runner never writes, merges or deletes for the model. After each session
 it only reads `status`, `history`, `listForks` and each fork's `diff`, and
 after each successful model `list` call it reads the paths described under
@@ -381,7 +390,9 @@ class and cited messages, and the selected IDs.
 
 Each question is a fresh model conversation in dataset order with no memory of
 other questions: the run's exact instruction text as the developer message
-(none when the run had none), then the question text verbatim. There is no
+(none when the run had none), the date of the run's last completed session as
+`Current date: …` when the run told its sessions their date, then the question
+text verbatim. There is no
 "answer only from the drive" instruction, so the model can also answer from
 its general knowledge. The tool catalog is read-only: `guide`, `status`,
 `history`, `list`, `read`, `search`, `findText`, `listForks` and

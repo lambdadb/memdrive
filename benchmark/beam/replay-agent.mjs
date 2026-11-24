@@ -78,7 +78,7 @@ export function createToolHost({ drive, resultBytes = limits.resultBytes, tools:
  * Each settled receipt and each tool event carries `elapsedMs` measured with `clock`.
  */
 export async function runSession({ session, turns = session.turns.length, call, ask, model, instructions = null, definitions,
-    budget = limits, signal, state = { input: [], requests: [], events: [], userTurns: 0 }, hooks = {}, clock = () => performance.now() }) {
+    budget = limits, signal, state = { input: [], requests: [], events: [], userTurns: 0 }, hooks = {}, clock = () => performance.now(), date = null }) {
     const encoder = get_encoding('cl100k_base');
     const tools = definitions.map(tool => ({ type: 'function', name: tool.name, description: tool.description,
         parameters: tool.inputSchema, strict: false }));
@@ -87,6 +87,8 @@ export async function runSession({ session, turns = session.turns.length, call, 
     let tokens = 0;
     try {
         if (instructions !== null) await push({ role: 'developer', content: instructions });
+        // An agent application tells its model the date. It is not part of the server instructions.
+        if (date !== null) await push({ role: 'developer', content: `Current date: ${date}` });
         for (let turn = 0; turn < turns; turn++) {
             await push({ role: 'user', content: session.turns[turn].content });
             state.userTurns = turn + 1;

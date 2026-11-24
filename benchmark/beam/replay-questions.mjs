@@ -274,6 +274,9 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
         && Array.isArray(item.rubric) && item.rubric.length > 0 && item.rubric.every(rubric => typeof rubric === 'string')),
     'Evaluation questions differ from the runtime questions');
     const classification = classifyQuestions(runtime.messages, evaluation, sentTurnIds(sessions, runManifest.plan, runSummary.sessions));
+    // A run that told each session its date asks every question on the date of its last completed session.
+    const completed = runManifest.plan.filter(planned => runSummary.sessions.find(session => session.id === planned.id)?.status === 'completed');
+    const date = runManifest.context?.currentDate === 'session-date' ? completed.at(-1)?.date ?? null : null;
     const selected = selectQuestions(classification, scope, limit);
 
     // Read-only from here: open never recovers, and the model gets read tools only.
@@ -298,7 +301,7 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
         source: { split: source.split, conversationId: id, manifestSha256: source.manifestSha256, runtimeSha256: source.runtimeSha256,
             evaluationSha256: entry.evaluationSha256 },
         scope, limit: limit ?? null, model, judgeModel, limits: budget,
-        instructions: { source: runManifest.instructions.source, sha256: instructionsSha256 },
+        instructions: { source: runManifest.instructions.source, sha256: instructionsSha256 }, currentDate: date,
         request: { reasoning: { effort: 'low' }, store: false, include: ['reasoning.encrypted_content'], parallel_tool_calls: false },
         judgeRequest: { ...judgeSettings(judgeEffort), perRubricItem: true, retries: 0 },
         tools: readToolNames, toolDefinitions: definitions, toolDefinitionsSha256: hash(JSON.stringify(definitions)),
@@ -326,7 +329,7 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
         const started = clock();
         try {
             await runSession({ session: { index: ordinal, turns: [{ content: texts.get(question.id) }] }, turns: 1, call, ask: answerTransport,
-                model, instructions, definitions, budget, signal: AbortSignal.timeout(budget.sessionSeconds * 1000), state, clock,
+                model, instructions, definitions, budget, signal: AbortSignal.timeout(budget.sessionSeconds * 1000), state, clock, date,
                 hooks: { item: append('transcript.jsonl'), receipt: append('requests.jsonl'), event: append('events.jsonl') } });
             result.status = 'answered';
             result.answer = finalText(state.requests.at(-1).response);

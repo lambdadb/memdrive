@@ -20,6 +20,11 @@ export async function fingerprint(directory, base) {
 }
 
 const nonblank = text => typeof text === 'string' && Boolean(text.trim()) && !/\p{Surrogate}/u.test(text);
+// Most original user utterances end with a generation marker such as `->-> 1,11`,
+// `->-> 5,14)` or `->-> 2,N/A`. It is not something the user said.
+export const stripMarker = content => content.replace(/\s*->->[\s\dN/A,)]*$/, '');
+/** The calendar date of a batch timestamp, or null. Batch times are a date at noon UTC. */
+export const dateOf = timestamp => typeof timestamp === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(timestamp) ? timestamp.slice(0, 10) : null;
 
 /**
  * Group messages by their original batch and keep each batch's user utterances in order.
@@ -45,13 +50,17 @@ export function groupSessions(conversation) {
         const batch = Number(match[1]);
         if (batch !== lastBatch) {
             assert(batch > lastBatch, 'Session batches must appear in ascending order');
-            sessions.push({ id: `s${match[1]}`, index: sessions.length, timestamp: null, messages: 0, turns: [] });
+            sessions.push({ id: `s${match[1]}`, index: sessions.length, timestamp: null, messages: 0, markersStripped: 0, turns: [] });
             lastBatch = batch;
         }
         const session = sessions.at(-1);
         session.messages++;
         session.timestamp ??= timestamp;
-        if (author.role === 'user') session.turns.push({ sourceId, turnId, content });
+        if (author.role !== 'user') continue;
+        const said = stripMarker(content);
+        assert(nonblank(said), 'A user utterance is only a generation marker');
+        if (said !== content) session.markersStripped++;
+        session.turns.push({ sourceId, turnId, content: said });
     }
     for (const session of sessions) assert(session.turns.length > 0, 'A session has no user utterance');
     return sessions;

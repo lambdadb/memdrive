@@ -7,7 +7,7 @@ import { fileToolInstructions, getFileToolDefinitions, MemDrive } from '@functio
 import { limits, openAI, toolNames } from '../benchmark/beam/replay-agent.mjs';
 import { conversationMetrics, sessionMetrics } from '../benchmark/beam/replay-metrics.mjs';
 import { checkList, runReplay } from '../benchmark/beam/replay.mjs';
-import { groupSessions, hash, loadSessions } from '../benchmark/beam/replay-sessions.mjs';
+import { dateOf, groupSessions, hash, loadSessions, stripMarker } from '../benchmark/beam/replay-sessions.mjs';
 import { cleanupStore, lambdadbConnection } from '../benchmark/beam/replay-store.mjs';
 import { fileClient } from './helpers/file-client.mjs';
 
@@ -61,12 +61,23 @@ const untilAborted = (request, { signal }) => new Promise((resolve, reject) => {
 test('sessions follow the original batches and keep only user utterances', () => {
     const sessions = groupSessions(conversation([2, 1]));
     assert.deepEqual(sessions, [
-        { id: 's000', index: 0, timestamp: '2024-03-01T12:00:00.000Z', messages: 4, turns: [
+        { id: 's000', index: 0, timestamp: '2024-03-01T12:00:00.000Z', messages: 4, markersStripped: 0, turns: [
             { sourceId: '7_s000_t0000', turnId: 'id-0', content: 'User says 0.0 🧭' },
             { sourceId: '7_s000_t0002', turnId: 'id-2', content: 'User says 0.1 🧭' }] },
-        { id: 's001', index: 1, timestamp: '2024-03-02T12:00:00.000Z', messages: 2, turns: [
+        { id: 's001', index: 1, timestamp: '2024-03-02T12:00:00.000Z', messages: 2, markersStripped: 0, turns: [
             { sourceId: '7_s001_t0000', turnId: 'id-4', content: 'User says 1.0 🧭' }] },
     ]);
+    // The dataset's trailing generation marker is removed from user utterances, in every shape it takes.
+    const marked = conversation([2, 1]);
+    marked.messages[0].content += ' ->-> 1,11';
+    marked.messages[2].content += ' ->-> 5,14)';
+    marked.messages[4].content = 'Go left -> then right ->-> 2,N/A';
+    assert.deepEqual(groupSessions(marked).map(session => [session.markersStripped, session.turns.map(turn => turn.content)]),
+        [[2, ['User says 0.0 🧭', 'User says 0.1 🧭']], [1, ['Go left -> then right']]]);
+    assert.deepEqual(['a ->-> 1,2, 3', 'b -> c', 'd ->-> not a marker'].map(stripMarker), ['a', 'b -> c', 'd ->-> not a marker']);
+    marked.messages[0].content = ' ->-> 1,1';
+    assert.throws(() => groupSessions(marked), /only a generation marker/);
+    assert.deepEqual([dateOf('2024-03-01T12:00:00.000Z'), dateOf(null), dateOf('March 1')], ['2024-03-01', null, null]);
     for (const sourceId of ['7_f000001', '7_p001_b0000_g0000_t0000', '8_s000_t0000']) {
         const source = conversation([1]);
         source.messages[0].sourceId = sourceId;
@@ -217,29 +228,32 @@ test('the model request holds only utterances, SDK tool definitions and the sele
     }
     const message = text => ({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] });
     assert.deepEqual(both.requests.map(item => item.request.input), [
-        [{ role: 'developer', content: expected }, { role: 'user', content: 'User says 0.0 🧭' }],
-        [{ role: 'developer', content: expected }, { role: 'user', content: 'User says 0.0 🧭' }, message('ok'), { role: 'user', content: 'User says 0.1 🧭' }],
-        [{ role: 'developer', content: expected }, { role: 'user', content: 'User says 0.0 🧭' }, message('ok'), { role: 'user', content: 'User says 0.1 🧭' },
+        // The session's batch date follows the server instructions as its own developer message.
+        [{ role: 'developer', content: expected }, { role: 'developer', content: 'Current date: 2024-03-01' }, { role: 'user', content: 'User says 0.0 🧭' }],
+        [{ role: 'developer', content: expected }, { role: 'developer', content: 'Current date: 2024-03-01' }, { role: 'user', content: 'User says 0.0 🧭' }, message('ok'), { role: 'user', content: 'User says 0.1 🧭' }],
+        [{ role: 'developer', content: expected }, { role: 'developer', content: 'Current date: 2024-03-01' }, { role: 'user', content: 'User says 0.0 🧭' }, message('ok'), { role: 'user', content: 'User says 0.1 🧭' },
             message('ok'), { role: 'user', content: 'User says 0.2 🧭' }],
         // A new session starts a fresh conversation: only the drive persists.
-        [{ role: 'developer', content: expected }, { role: 'user', content: 'User says 1.0 🧭' }],
+        [{ role: 'developer', content: expected }, { role: 'developer', content: 'Current date: 2024-03-02' }, { role: 'user', content: 'User says 1.0 🧭' }],
     ]);
+    assert.deepEqual([both.manifest.context, both.manifest.plan.map(entry => [entry.date, entry.markersStripped])],
+        [{ currentDate: 'session-date', trailingMarkers: 'stripped' }, [['2024-03-01', 0], ['2024-03-02', 0]]]);
     assert.deepEqual(both.requests.map(item => [item.context.session, item.context.turn, item.context.round]), [[0, 0, 0], [0, 1, 0], [0, 2, 0], [1, 0, 0]]);
     assert.deepEqual(await jsonl(path.join(files.root, 'both', 'session-001-s000', 'transcript.jsonl')), both.requests[2].request.input.concat(message('ok')));
     const receipts = await jsonl(path.join(files.root, 'both', 'session-001-s000', 'requests.jsonl'));
     assert.deepEqual(receipts.map(receipt => [receipt.turn, receipt.round, receipt.inputItems, receipt.status]),
-        [[0, 0, 2, 'pending'], [0, 0, 2, 'completed'], [1, 0, 4, 'pending'], [1, 0, 4, 'completed'], [2, 0, 6, 'pending'], [2, 0, 6, 'completed']]);
+        [[0, 0, 3, 'pending'], [0, 0, 3, 'completed'], [1, 0, 5, 'pending'], [1, 0, 5, 'completed'], [2, 0, 7, 'pending'], [2, 0, 7, 'completed']]);
     assert.deepEqual([both.results[0].metrics.inputTokens, both.results[0].metrics.outputTokens], [9, 6]);
 
     const sdk = await run('sdk', { instructions: 'sdk', turns: 1 });
     assert.deepEqual(sdk.requests.map(item => item.request.input), [
-        [{ role: 'developer', content: fileToolInstructions }, { role: 'user', content: 'User says 0.0 🧭' }],
-        [{ role: 'developer', content: fileToolInstructions }, { role: 'user', content: 'User says 1.0 🧭' }]]);
+        [{ role: 'developer', content: fileToolInstructions }, { role: 'developer', content: 'Current date: 2024-03-01' }, { role: 'user', content: 'User says 0.0 🧭' }],
+        [{ role: 'developer', content: fileToolInstructions }, { role: 'developer', content: 'Current date: 2024-03-02' }, { role: 'user', content: 'User says 1.0 🧭' }]]);
     assert.deepEqual(sdk.manifest.plan.map(entry => entry.plannedTurns), [1, 1]);
     assert.equal(sdk.manifest.instructions.policySha256, null);
 
     const none = await run('none', { instructions: 'none', sessions: 1, turns: 1 });
-    assert.deepEqual(none.requests.map(item => item.request.input), [[{ role: 'user', content: 'User says 0.0 🧭' }]]);
+    assert.deepEqual(none.requests.map(item => item.request.input), [[{ role: 'developer', content: 'Current date: 2024-03-01' }, { role: 'user', content: 'User says 0.0 🧭' }]]);
     assert.deepEqual(none.manifest.instructions, { source: 'none', policySha256: null, text: null, sha256: null });
 
     const policyOnly = await run('policy', { instructions: 'none', policyFile, sessions: 1, turns: 1 });
@@ -280,7 +294,7 @@ test('budget, transport and model-response failures stop the conversation and ke
     const receipts = await jsonl(path.join(files.root, 'transport', 'session-001-s000', 'requests.jsonl'));
     const { elapsedMs, ...receipt } = receipts.at(-1);
     assert(elapsedMs >= 0);
-    assert.deepEqual(receipt, { turn: 0, round: 0, inputItems: 1, status: 'failed_or_uncertain', error: { code: 'MODEL_HTTP_ERROR', status: 429 } });
+    assert.deepEqual(receipt, { turn: 0, round: 0, inputItems: 2, status: 'failed_or_uncertain', error: { code: 'MODEL_HTTP_ERROR', status: 429 } });
     assert(!JSON.stringify(receipts).includes('secret'));
 
     const timedOut = await run('timeout', () => untilAborted, { sessionSeconds: 0.05 });

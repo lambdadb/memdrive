@@ -14,7 +14,7 @@ import { MemDrive, fileToolError, fileToolInstructions } from '@functional-syste
 import { fileClient } from '../../test/helpers/file-client.mjs';
 import { createToolHost, failureCodes, limits, openAI, protocol, ReplayFailure, runSession, scriptedTransport, toolDefinitions, toolNames } from './replay-agent.mjs';
 import { conversationMetrics, sessionMetrics } from './replay-metrics.mjs';
-import { fingerprint, hash, loadSessions } from './replay-sessions.mjs';
+import { dateOf, fingerprint, hash, loadSessions } from './replay-sessions.mjs';
 import { questionsSucceeded, runQuestions, runRejudge } from './replay-questions.mjs';
 import { cleanupStore, lambdadbConnection, ledgerFile, newStoreName, storeLabels, storeProtocol, writeLedger } from './replay-store.mjs';
 
@@ -126,6 +126,7 @@ export async function runReplay({ manifest: manifestFile, conversation, output, 
     const parts = [...(instructions === 'sdk' ? [fileToolInstructions] : []), ...(policy === null ? [] : [policy])];
     const text = parts.length ? parts.join('\n\n') : null;
     const plan = source.sessions.slice(0, sessionLimit).map(session => ({ id: session.id, index: session.index, timestamp: session.timestamp,
+        date: dateOf(session.timestamp), markersStripped: session.markersStripped,
         userTurns: session.turns.length, plannedTurns: Math.min(turnLimit ?? session.turns.length, session.turns.length) }));
     // Validate credentials before creating an artifact directory or any SDK state.
     const transport = askFactory ? askFactory(plan) : mode === 'scripted' ? scriptedTransport(plan.map(entry => entry.plannedTurns)) : openAI({ key });
@@ -144,6 +145,8 @@ export async function runReplay({ manifest: manifestFile, conversation, output, 
         source: { split: source.split, conversationId: source.id, manifestSha256: source.manifestSha256, runtimeSha256: source.runtimeSha256,
             sessions: source.sessions.length },
         instructions: { source: instructions, policySha256: policy === null ? null : hash(policy), text, sha256: text === null ? null : hash(text) },
+        // Each session also gets its batch date as a separate developer message, and utterances lose their trailing generation marker.
+        context: { currentDate: 'session-date', trailingMarkers: 'stripped' },
         request: { reasoning: { effort: 'low' }, store: false, include: ['reasoning.encrypted_content'], parallel_tool_calls: false },
         tools: toolNames, toolDefinitions: definitions, toolDefinitionsSha256: hash(JSON.stringify(definitions)), plan };
     output = path.resolve(output);
@@ -183,7 +186,7 @@ export async function runReplay({ manifest: manifestFile, conversation, output, 
             const started = clock();
             try {
                 await runSession({ session: source.sessions[entry.index], turns: entry.plannedTurns, call, ask: transport, model,
-                    instructions: text, definitions, budget, signal: AbortSignal.timeout(budget.sessionSeconds * 1000), state, clock,
+                    instructions: text, definitions, budget, signal: AbortSignal.timeout(budget.sessionSeconds * 1000), state, clock, date: entry.date,
                     hooks: { item: append('transcript.jsonl'), receipt: append('requests.jsonl'), event } });
                 result.status = 'completed';
             } catch (error) {
