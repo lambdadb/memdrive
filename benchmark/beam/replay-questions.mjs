@@ -97,7 +97,11 @@ export function selectQuestions(classified, scope = 'replayed', limit) {
 }
 
 /** Upstream's substitution order: the rubric item, then the response. The QUESTION is never substituted upstream. */
-export const judgeRequest = (model, item, answer) => ({ model, temperature: 0, messages: [{ role: 'user',
+export const judgeEfforts = Object.freeze(['low', 'medium', 'high']);
+const validEffort = effort => effort === undefined || judgeEfforts.includes(effort);
+/** Upstream sends temperature 0. Reasoning models reject it: with `effort` the request sets `reasoning_effort` and no temperature. */
+const judgeSettings = effort => effort === undefined ? { temperature: 0 } : { reasoning_effort: effort };
+export const judgeRequest = (model, item, answer, effort) => ({ model, ...judgeSettings(effort), messages: [{ role: 'user',
     content: judgePrompt.replaceAll('<rubric_item>', () => item).replaceAll('<llm_response>', () => answer) }] });
 
 /**
@@ -122,10 +126,10 @@ export function parseJudgeOutput(text) {
 }
 
 /** One Chat Completions judge request for one rubric item, without retry. Never records error bodies. */
-export async function judgeItem({ judge, model, item, answer, clock = () => performance.now() }) {
+export async function judgeItem({ judge, model, item, answer, effort, clock = () => performance.now() }) {
     const started = clock();
     let response;
-    try { response = await judge(judgeRequest(model, item, answer), {}); } catch (error) {
+    try { response = await judge(judgeRequest(model, item, answer, effort), {}); } catch (error) {
         return { status: 'failed', code: 'JUDGE_REQUEST_FAILED', elapsedMs: clock() - started,
             ...(error?.code === 'MODEL_HTTP_ERROR' && Number.isInteger(error.status) ? { httpStatus: error.status } : {}) };
     }
@@ -210,7 +214,7 @@ export function summarizeQuestions(manifest, results, store = null) {
         questionResults: results.map(({ id, category, class: kind, status, error, score, judge, metrics }) => ({ id, category, class: kind, status,
             ...(error ? { error: error.code } : {}), score, judge: judge?.status ?? null, retrievalCall: metrics.retrievalCall,
             toolCallsByName: metrics.toolCallsByName })),
-        limitations: ['Rubric judge only: one request per rubric item with upstream BEAM\'s unified judge prompt at temperature 0, no retries and one run. Not a reproduction of the BEAM paper\'s scores.',
+        limitations: ['Rubric judge only: one request per rubric item with upstream BEAM\'s unified judge prompt, no retries and one run. Not a reproduction of the BEAM paper\'s scores.',
             'event_ordering reports only the rubric judge score; upstream\'s headline event-ordering metric (Kendall tau-b times F1 after an LLM alignment) is not computed.',
             'The answering model has the run\'s instructions, read-only file tools and its own general knowledge; nothing restricts its answer to the drive.',
             'needs_assistant and not_replayed questions cite messages the replay never sent; scores are reported per class and must not be pooled across classes.',
@@ -222,12 +226,13 @@ export function summarizeQuestions(manifest, results, store = null) {
  * conversation with the run's instructions and the read-only catalog, then judge every
  * rubric item of each answered question. Everything is validated before `output` exists.
  */
-export async function runQuestions({ run, manifest: manifestFile, output, scope = 'replayed', model, judgeModel = defaultJudgeModel, limit,
+export async function runQuestions({ run, manifest: manifestFile, output, scope = 'replayed', model, judgeModel = defaultJudgeModel, judgeEffort, limit,
     key, env = {}, connect = lambdadbConnection, ask, judge, budget = limits, clock = () => performance.now() }) {
     assert(typeof run === 'string' && run && typeof manifestFile === 'string' && manifestFile, 'Provide --run RUN_DIR and --manifest FILE');
     assert(typeof output === 'string' && output, 'Provide a new output directory');
     selectQuestions([], scope, limit);
     for (const value of [model, judgeModel]) assert(value === undefined || (typeof value === 'string' && value.length > 0 && value.length <= 100), 'Invalid model');
+    assert(validEffort(judgeEffort), 'Use --judge-effort low, medium or high');
     // Credentials first: no run, store or output is touched without them.
     const answerTransport = ask ?? openAI({ key }), judgeTransport = judge ?? openAI({ key, endpoint: 'chat/completions' });
     const connection = connect(env);
@@ -292,7 +297,7 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
         scope, limit: limit ?? null, model, judgeModel, limits: budget,
         instructions: { source: runManifest.instructions.source, sha256: instructionsSha256 },
         request: { reasoning: { effort: 'low' }, store: false, include: ['reasoning.encrypted_content'], parallel_tool_calls: false },
-        judgeRequest: { temperature: 0, perRubricItem: true, retries: 0 },
+        judgeRequest: { ...judgeSettings(judgeEffort), perRubricItem: true, retries: 0 },
         tools: readToolNames, toolDefinitions: definitions, toolDefinitionsSha256: hash(JSON.stringify(definitions)),
         judgePrompt: { file: 'benchmark/beam/original-judge-prompt.json', name: 'unified_llm_judge_base_prompt', sha256: judgeSha256,
             upstreamRevision: judgeSource.upstreamRevision, upstreamFile: judgeSource.upstreamFile, upstreamFileSha256: judgeSource.upstreamFileSha256 },
@@ -333,7 +338,7 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
         if (result.status === 'answered') {
             const outcomes = [], logJudge = append('judge.jsonl');
             for (const [index, item] of items.get(question.id).rubric.entries()) {
-                const outcome = { index, rubricItem: item, ...await judgeItem({ judge: judgeTransport, model: judgeModel, item, answer: result.answer, clock }) };
+                const outcome = { index, rubricItem: item, ...await judgeItem({ judge: judgeTransport, model: judgeModel, item, answer: result.answer, effort: judgeEffort, clock }) };
                 outcomes.push(outcome);
                 await logJudge(outcome);
             }
@@ -376,12 +381,13 @@ const meanOf = values => { const known = values.filter(value => value !== null);
  * the original judgments are read from `answers`, the rubric from the prepared evaluation
  * file the original stage recorded.
  */
-export async function runRejudge({ answers, manifest: manifestFile, output, judgeModel = defaultJudgeModel, repeats = 1, key, judge,
+export async function runRejudge({ answers, manifest: manifestFile, output, judgeModel = defaultJudgeModel, judgeEffort, repeats = 1, key, judge,
     clock = () => performance.now() }) {
     assert(typeof answers === 'string' && answers && typeof manifestFile === 'string' && manifestFile, 'Provide --answers QUESTIONS_DIR and --manifest FILE');
     assert(typeof output === 'string' && output, 'Provide a new output directory');
     assert(typeof judgeModel === 'string' && judgeModel.length > 0 && judgeModel.length <= 100, 'Invalid model');
     assert(Number.isSafeInteger(repeats) && repeats >= 1 && repeats <= 10, 'repeats must be an integer from 1 to 10');
+    assert(validEffort(judgeEffort), 'Use --judge-effort low, medium or high');
     const judgeTransport = judge ?? openAI({ key, endpoint: 'chat/completions' });
 
     const directory = path.resolve(answers);
@@ -413,7 +419,7 @@ export async function runRejudge({ answers, manifest: manifestFile, output, judg
         startedAt: new Date().toISOString(), node: process.version,
         sourceCommit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
         answers: { directory: path.relative(root, directory) || '.', manifestSha256: hash(stageBytes), judgeModel: stage.judgeModel, measured: stage.transport === 'openai-responses' },
-        source, judgeModel, repeats, judgeRequest: { temperature: 0, perRubricItem: true, retries: 0 },
+        source, judgeModel, repeats, judgeRequest: { ...judgeSettings(judgeEffort), perRubricItem: true, retries: 0 },
         judgePrompt: { file: 'benchmark/beam/original-judge-prompt.json', sha256: hash(judgePrompt), sameAsAnswers: stage.judgePrompt.sha256 === hash(judgePrompt) },
         questions: stored.map(({ result }) => result.id) };
     output = path.resolve(output);
@@ -427,7 +433,7 @@ export async function runRejudge({ answers, manifest: manifestFile, output, judg
         const outcomes = results.flatMap(result => result.outcomes);
         const usage = outcomes.filter(outcome => ['prompt_tokens', 'completion_tokens'].every(key => Number.isSafeInteger(outcome.usage?.[key])));
         return { protocol: rejudgeProtocol, judgeTransport: manifest.judgeTransport, measured: manifest.judgeTransport === 'openai-chat-completions',
-            conversationId: id, answers: manifest.answers.directory, originalJudgeModel: stage.judgeModel, judgeModel, repeats,
+            conversationId: id, answers: manifest.answers.directory, originalJudgeModel: stage.judgeModel, judgeModel, judgeRequest: manifest.judgeRequest, repeats,
             questions: { stored: stored.length, judged: results.length, complete: results.length === stored.length },
             agreement: judgeAgreement(items),
             scores: { original: meanOf(results.map(result => result.originalScore)),
@@ -447,7 +453,7 @@ export async function runRejudge({ answers, manifest: manifestFile, output, judg
         for (let repeat = 0; repeat < repeats; repeat++) {
             const round = [];
             for (const [index, item] of rubric.entries()) {
-                const outcome = { repeat, index, rubricItem: item, ...await judgeItem({ judge: judgeTransport, model: judgeModel, item, answer: result.answer, clock }) };
+                const outcome = { repeat, index, rubricItem: item, ...await judgeItem({ judge: judgeTransport, model: judgeModel, item, answer: result.answer, effort: judgeEffort, clock }) };
                 round.push(outcome);
                 await appendFile(path.join(output, name, 'judge.jsonl'), JSON.stringify(outcome) + '\n', privateFile);
             }

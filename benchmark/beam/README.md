@@ -403,7 +403,9 @@ stored in [original-judge-prompt.json](original-judge-prompt.json) with the
 upstream revision and the pinned `src/prompts.py` hash, and its text hash is
 pinned in the runner. The judge is `gpt-4.1-mini-2025-04-14` at temperature 0
 (`--judge-model` overrides it), without retries. Its returned model and usage
-are validated. The reply is parsed as upstream's `parse_json_response` does
+are validated. Reasoning models reject temperature 0: `--judge-effort
+low|medium|high` sends `reasoning_effort` instead of a temperature, which is
+no longer upstream's request. The reply is parsed as upstream's `parse_json_response` does
 (optional code fence, the whole text, then the first embedded JSON object),
 but upstream's `json_repair` fallback is not applied: anything that does not
 yield a score of exactly 1, 0.5 or 0 is a judge failure. A question's score is
@@ -430,7 +432,7 @@ Injected test transports report `measured: false`.
 ### Judging stored answers again
 
 `--rejudge --answers QUESTIONS_DIR --manifest FILE --output NEW_DIR
-[--judge-model ID] [--repeats N]` judges the answers a question stage already
+[--judge-model ID] [--judge-effort low|medium|high] [--repeats N]` judges the answers a question stage already
 stored, without asking anything and without a store. It needs only
 `LLM_API_KEY`. Each rubric item of each answered question is judged
 `--repeats` times (1 to 10, default 1) with the same upstream prompt and

@@ -320,7 +320,8 @@ test('stored answers are judged again without asking, and agreement is counted p
             return scored(repeat === 1 && key === '0.1' ? 1 : original[question]?.[item] ?? 1)(request);
         } });
     assert.equal(files.counts.ask, asked, 'Rejudging asks nothing');
-    assert(requests.every(request => request.model === 'stronger-judge' && request.temperature === 0 && /Stored answer \d/.test(request.messages[0].content)));
+    assert(requests.every(request => request.model === 'stronger-judge' && request.temperature === 0 && !('reasoning_effort' in request)
+        && /Stored answer \d/.test(request.messages[0].content)));
     assert.deepEqual(again.results.map(result => [result.id, result.originalScore, result.scores]), [
         [ids[0], 0.5, [0.5, 2 / 3]], [ids[1], 1, [1, null]], [ids[6], 1, [1, 1]], [ids[9], 1, [1, 1]]]);
     const summary = await json(path.join(files.root, 'again', 'summary.json'));
@@ -342,6 +343,14 @@ test('stored answers are judged again without asking, and agreement is counted p
         output: path.join(files.root, 'rejected'), judge: scored(1), ...options }), message);
     await reject({ answers: files.run }, /question-stage output/);
     await reject({ repeats: 0 }, /repeats/);
+    await reject({ judgeEffort: 'extreme' }, /judge-effort/);
+    // A reasoning judge rejects temperature 0: the effort replaces it and is recorded.
+    const efforts = [];
+    const reasoned = await runRejudge({ answers: path.join(files.root, 'first'), manifest: files.manifest, output: path.join(files.root, 'reasoned'),
+        judgeModel: 'reasoning-judge', judgeEffort: 'high', judge: async request => { efforts.push(request); return scored(1)(request); } });
+    assert(efforts.length === 7 && efforts.every(request => request.reasoning_effort === 'high' && !('temperature' in request)));
+    assert.deepEqual([reasoned.manifest.judgeRequest, reasoned.summary.judgeRequest],
+        [{ reasoning_effort: 'high', perRubricItem: true, retries: 0 }, { reasoning_effort: 'high', perRubricItem: true, retries: 0 }]);
     await reject({ output: path.join(files.root, 'again') }, { code: 'EEXIST' });
     await writeFile(path.join(files.root, 'evaluation', '7.json'), '[]');
     await reject({}, /Prepared evaluation differs/);
