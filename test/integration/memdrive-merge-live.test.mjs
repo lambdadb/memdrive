@@ -2,8 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import test from 'node:test';
-import { HTTPClient, LambdaDBClient } from '@functional-systems/lambdadb';
-import { MemDrive, MemDriveError } from '@functional-systems/memdrive';
+import { HTTPClient, LambdaDBClient, MemDrive, MemDriveError } from '@functional-systems/memdrive';
 
 const enabled = process.env.MEMDRIVE_RUN_LIVE_TESTS === '1' && process.env.MEMDRIVE_RUN_LIVE_MERGE_TESTS === '1';
 const required = ['LAMBDADB_BASE_URL', 'LAMBDADB_PROJECT_NAME', 'LAMBDADB_PROJECT_API_KEY'];

@@ -1,5 +1,4 @@
-import type { LambdaDBClient } from '@functional-systems/lambdadb';
-import { MemDrive, type FileDrive, type ForkAt } from '@functional-systems/memdrive';
+import { LambdaDBClient, MemDrive, type FileDrive, type ForkAt } from '@functional-systems/memdrive';
 
 export async function commonJsConsumer(client: LambdaDBClient) {
     const drive: FileDrive = await MemDrive.open({ client, name: 'workspace' });

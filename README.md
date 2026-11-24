@@ -4,10 +4,12 @@ TypeScript file SDK backed by LambdaDB. MemDrive accepts an initialized LambdaDB
 
 The package is `@functional-systems/memdrive`, licensed under Apache-2.0. It supports ESM, CommonJS, TypeScript, Node.js 20.12+, and browser bundlers.
 
-Install the matching LambdaDB client when your application constructs its own `LambdaDBClient`.
+MemDrive pins `@functional-systems/lambdadb` `0.14.0` and re-exports its `LambdaDBClient` and `HTTPClient`. Import them from `@functional-systems/memdrive` so the client always matches the SDK; do not install a separate copy of the LambdaDB client for MemDrive.
 
-```sh
-npm install @functional-systems/lambdadb@0.14.0
+```ts
+import { LambdaDBClient } from '@functional-systems/memdrive';
+
+const client = new LambdaDBClient({ baseUrl, projectName, projectApiKey });
 ```
 
 Checkpoint lookup and checkpoint-sourced forks require LambdaDB with the versioned reference API supported by client 0.14.0. MemDrive also relies on LambdaDB creating a tag on a branch before its first snapshot commits: the first merge of a new store and a checkpoint of a just-written fork tag such branches. An older self-hosted deployment can fail ref response validation if it omits fields required by this client, or reject those tags.
