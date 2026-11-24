@@ -39,7 +39,7 @@
     "benchmark:tools": "npm run build && node benchmark/tool-use/run.mjs"
   },
   "dependencies": {
-    "@functional-systems/lambdadb": "0.13.0"
+    "@functional-systems/lambdadb": "0.14.0"
   },
   "devDependencies": {
     "@eslint/js": "9.32.0",

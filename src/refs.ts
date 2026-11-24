@@ -57,21 +57,3 @@ export async function refBackoff(ms: number, signal?: AbortSignal) {
         signal?.addEventListener('abort', cancel, { once: true });
     });
 }
-
-/** A cold LambdaDB branch can reject even a valid tag request until its first
- * snapshot commits. Retry only a definite rejection of the same reserved target tag.
- */
-export async function awaitMergeTag<T>(attempt: () => Promise<T>, signal?: AbortSignal) {
-    const deadline = Date.now() + 120_000;
-    for (let interval = 250; ; interval = Math.min(interval * 2, 5_000)) {
-        try {
-            return await attempt();
-        } catch (cause) {
-            if (!(cause instanceof MemDriveError) || cause.code !== 'DATABASE_ERROR' || cause.status !== 400) throw cause;
-            const remaining = deadline - Date.now();
-            if (remaining <= 0)
-                throw new MemDriveError('MERGE_TARGET_NOT_READY', 'Could not pin the merge target snapshot. Retry the same request.', { cause });
-            await refBackoff(Math.min(interval, remaining), signal);
-        }
-    }
-}

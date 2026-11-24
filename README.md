@@ -7,10 +7,10 @@ The package is `@functional-systems/memdrive`, licensed under Apache-2.0. It sup
 Install the matching LambdaDB client when your application constructs its own `LambdaDBClient`.
 
 ```sh
-npm install @functional-systems/lambdadb@0.13.0
+npm install @functional-systems/lambdadb@0.14.0
 ```
 
-Checkpoint lookup and checkpoint-sourced forks require LambdaDB with the versioned reference API supported by client 0.13.0. An older self-hosted deployment can fail ref response validation if it omits fields required by this client.
+Checkpoint lookup and checkpoint-sourced forks require LambdaDB with the versioned reference API supported by client 0.14.0. MemDrive also relies on LambdaDB creating a tag on a branch before its first snapshot commits: the first merge of a new store and a checkpoint of a just-written fork tag such branches. An older self-hosted deployment can fail ref response validation if it omits fields required by this client, or reject those tags.
 
 
 ## File stores
@@ -359,7 +359,7 @@ search, and list from that pin. Forking any view makes a separate editable branc
 from that source. A fork and a checkpoint may share the same name; `at.kind`
 distinguishes them. Names are scoped to the store. Checkpoint names use 3–41 letters, digits, underscores, or hyphens.
 
-Checkpoint and child fork creation from a working fork run in its local write queue, behind earlier writes and a running merge of that fork. They stay available while an unfinished merge blocks writes to the fork. If a source write is still unconfirmed, resolve that outcome before capturing the fork. The SDK sends one creation request for each call. A rejected checkpoint request preserves the underlying LambdaDB error and HTTP status. A LambdaDB deployment that cannot tag a branch before its first snapshot commits rejects a checkpoint of a fork that has no snapshot yet with `DATABASE_ERROR` and status 400. In practice that is the first fork of a new store, shortly after its first write; a fork created from a published main already has one. A merge of that fork does not wait for the snapshot, so retry the checkpoint after a short wait. If creation returns `REF_CREATION_UNCONFIRMED`, pause source mutations and check whether it exists with `listForks`/`listCheckpoints` or by using its `at`, which verifies it and clears the local uncertainty. If the exact cutoff matters, compare the contents with your expected state before using the reference. The name alone cannot establish which request won or when it captured the source.
+Checkpoint and child fork creation from a working fork run in its local write queue, behind earlier writes and a running merge of that fork. They stay available while an unfinished merge blocks writes to the fork. If a source write is still unconfirmed, resolve that outcome before capturing the fork. The SDK sends one creation request for each call. A rejected checkpoint request preserves the underlying LambdaDB error and HTTP status. If creation returns `REF_CREATION_UNCONFIRMED`, pause source mutations and check whether it exists with `listForks`/`listCheckpoints` or by using its `at`, which verifies it and clears the local uncertainty. If the exact cutoff matters, compare the contents with your expected state before using the reference. The name alone cannot establish which request won or when it captured the source.
 
 Checkpoint search and exact reads use LambdaDB's tag read semantics. Listing retains the eventual preview behavior described below, including on a recently created checkpoint. For live validation of a prepared working view and retained state after source deletion, set `MEMDRIVE_RUN_LIVE_CHECKPOINT_TESTS=1` when running the live suite against a dedicated test project.
 

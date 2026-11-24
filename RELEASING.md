@@ -132,10 +132,7 @@ search previews, publication and a checkpoint of the confirmed published tag
 without a parser on the reopened reader. After a second publication it verifies
 main historical forks/checkpoints using the first publication version and a fork
 from an explicit saved working checkpoint. It also rejects the removed `asOf` input. It then destroys the content store
-and its publication journal. Publication gets its full cold-snapshot wait budget.
-The structured-text test retries its working-fork checkpoint on a definite 400
-for up to 120 seconds while the fork's first snapshot commits; the SDK itself
-sends one request. Failure output names the stage and HTTP status without request
+and its publication journal. Failure output names the stage and HTTP status without request
 headers or bodies.
 
 That isolated structured scenario verifies that native snapshot retention is

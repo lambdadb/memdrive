@@ -303,7 +303,10 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
             const tagName = checkpointPrefix + at.name;
             const { tag } = await remote(() => handle.tags.get(tagName, nativeOptions(signal)),
                 'Could not inspect the named checkpoint.', signal, { 404: 'CHECKPOINT_NOT_FOUND' });
-            identity = [tag?.name === tagName ? time(tag.createdAt) : undefined, tag?.snapshotId];
+            // A tag created before its source's first snapshot reports a null
+            // snapshotId that becomes a string once published, so only the
+            // creation time identifies its incarnation.
+            identity = [tag?.name === tagName ? time(tag.createdAt) : undefined, null];
         }
         checkAbort(signal);
         if (!Number.isSafeInteger(identity[0]) || (identity[1] !== null && (typeof identity[1] !== 'string' || !identity[1])))

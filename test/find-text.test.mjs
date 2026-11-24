@@ -370,6 +370,22 @@ test('main findText cursors verify their pinned publication on every page', asyn
     await assert.rejects(other.findText(page.next), { code: 'FIND_TEXT_CURSOR_UNAVAILABLE' });
 });
 
+test('a checkpoint findText cursor survives the first publication of its tag snapshot', async () => {
+    const { fixture, drive } = await setup();
+    await drive.write({ at, op: 'create', path: '/note', content: 'saved saved' });
+    // A tag created before its source's first snapshot reports a null snapshot
+    // until that snapshot is published (LambdaDB PR #614).
+    fixture.afterTagCreate = tag => { tag.snapshotId = null; tag.snapshotCommittedAt = null; };
+    const { at: saved } = await drive.checkpoint({ at, name: 'saved' });
+    const page = await drive.findText({ at: saved, query: 'saved', limit: 1 });
+    assert(page.next);
+    const tag = fixture.collections.get('literal-scan').tags.get('checkpoint-saved')?.tag;
+    assert.equal(tag?.snapshotId, null);
+    tag.snapshotId = 'published-later';
+    tag.snapshotCommittedAt = new Date();
+    assert.equal((await drive.findText(page.next)).hits[0].range.start, 6);
+});
+
 test('findText cursors never continue on a fork or checkpoint recreated under the same name', async () => {
     const { fixture, name, drive } = await setup();
     const file = await drive.write({ at, op: 'create', path: '/note', content: 'saved saved' });
