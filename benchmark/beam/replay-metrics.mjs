@@ -45,22 +45,35 @@ export function sessionMetrics({ userTurns, requests, events, observation, listC
     const succeeded = events.filter(event => event.ok);
     const named = name => succeeded.filter(event => event.name === name);
     const merges = events.filter(event => event.name === 'merge');
-    // A write call is published by the next merge of its fork that returned a result
-    // (published or unchanged). A batch write is one call. Lag counts user turns.
+    const publications = observation?.publications ?? null;
+    // A merge repeated with a completed request ID returns its original `published`
+    // result without publishing again. Count a merge as a publication only the first
+    // time its version is returned, and only for a version published in this session
+    // when history() was observed; any other `published` result is a replay.
+    const sessionVersions = publications && new Set(publications.map(entry => entry.version));
+    const returned = new Set(), publishing = new Set();
+    for (const event of merges) {
+        if (!event.ok || event.result?.status !== 'published') continue;
+        const { version } = event.result;
+        if (!returned.has(version) && (!sessionVersions || sessionVersions.has(version))) publishing.add(event);
+        returned.add(version);
+    }
+    const replayed = merges.filter(event => event.ok && event.result?.status === 'published' && !publishing.has(event));
+    // A write call is published by the next merge of its fork that published or returned
+    // unchanged; a replayed result cannot include it. A batch write is one call. Lag counts user turns.
     const lags = named('write').map(write => {
         const merge = events.slice(events.indexOf(write) + 1)
-            .find(event => event.name === 'merge' && event.ok && forkOf(event) === forkOf(write));
+            .find(event => event.name === 'merge' && event.ok && !replayed.includes(event) && forkOf(event) === forkOf(write));
         return merge ? merge.turn - write.turn : null;
     });
     // A model can defer the write itself instead of holding edits on a fork, so also
     // time each utterance against the next turn that published anything. An utterance
     // followed by a publication may have been saved; one after the last cannot have been.
-    const publicationTurns = turnsOf(merges.filter(event => event.ok && event.result?.status === 'published'));
+    const publicationTurns = turnsOf([...publishing]);
     const utteranceLags = Array.from({ length: userTurns }, (_, turn) => {
         const next = publicationTurns.find(published => published >= turn);
         return next === undefined ? null : next - turn;
     });
-    const publications = observation?.publications ?? null;
     const published = publications && tally(publications.flatMap(entry => entry.fileIds), id => id);
     const forks = observation?.forks ?? null;
     const known = forks?.filter(fork => fork.changes !== null);
@@ -76,7 +89,7 @@ export function sessionMetrics({ userTurns, requests, events, observation, listC
         forksCreated: named('fork').length,
         forkNameConflicts: events.filter(event => event.name === 'fork' && event.error?.code === 'BRANCH_CONFLICT').length,
         forksDeleted: named('deleteFork').length,
-        merges: { published: merges.filter(event => event.ok && event.result?.status === 'published').length,
+        merges: { published: publishing.size, replayed: replayed.length,
             unchanged: merges.filter(event => event.ok && event.result?.status === 'unchanged').length,
             failed: merges.filter(event => !event.ok).length },
         publicationLags: lags,

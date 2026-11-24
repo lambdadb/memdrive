@@ -48,6 +48,16 @@ const reply = request => ({ model: request.model, status: 'completed', usage: { 
 const toolCall = (request, id, name, args) => ({ model: request.model, status: 'completed', usage: { input_tokens: 3, output_tokens: 2 },
     output: [{ type: 'function_call', call_id: id, name, arguments: typeof args === 'string' ? args : JSON.stringify(args) }] });
 
+// Like fetch, reject with the signal's reason, also when already aborted. A real request
+// keeps the event loop alive until the session deadline aborts it; on Node 20 the
+// deadline's own timer does not, so hold a timer until then.
+const untilAborted = (request, { signal }) => new Promise((resolve, reject) => {
+    const pending = setInterval(() => {}, 1000);
+    const abort = () => { clearInterval(pending); reject(signal.reason); };
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+});
+
 test('sessions follow the original batches and keep only user utterances', () => {
     const sessions = groupSessions(conversation([2, 1]));
     assert.deepEqual(sessions, [
@@ -104,7 +114,7 @@ test('a scripted replay records fork, publication, republication, leftovers and 
     const noList = { calls: 0, checked: 0, uncheckedByReason: {}, missedCalls: 0, missedFiles: 0 };
     assert.deepEqual(first, { userTurns: 3, modelRequests: 12, inputTokens: 0, outputTokens: 0, unknownUsageRequests: 0,
         toolCalls: 9, toolCallsByName: { diff: 2, fork: 1, list: 1, merge: 2, read: 1, write: 2 }, toolErrorsByCode: {},
-        forksCreated: 1, forkNameConflicts: 0, forksDeleted: 0, merges: { published: 2, unchanged: 0, failed: 0 },
+        forksCreated: 1, forkNameConflicts: 0, forksDeleted: 0, merges: { published: 2, replayed: 0, unchanged: 0, failed: 0 },
         publicationLags: [0, 0], publicationLag: { writes: 2, merged: 2, neverMerged: 0, sameTurn: 2, meanTurns: 0, maxTurns: 0 },
         noSuccessfulWrite: false, turnsWithWrite: 2, turnsWithPublication: 2, utteranceToPublicationLags: [0, 1, 0],
         utteranceToPublication: { utterances: 3, followed: 3, afterLast: 0, sameTurn: 2, meanTurns: 1 / 3, maxTurns: 1 },
@@ -113,7 +123,7 @@ test('a scripted replay records fork, publication, republication, leftovers and 
         listCheck: { ...noList, calls: 1, checked: 1 } });
     assert.deepEqual(second, { userTurns: 1, modelRequests: 4, inputTokens: 0, outputTokens: 0, unknownUsageRequests: 0,
         toolCalls: 3, toolCallsByName: { fork: 2, write: 1 }, toolErrorsByCode: { BRANCH_CONFLICT: 1 },
-        forksCreated: 1, forkNameConflicts: 1, forksDeleted: 0, merges: { published: 0, unchanged: 0, failed: 0 },
+        forksCreated: 1, forkNameConflicts: 1, forksDeleted: 0, merges: { published: 0, replayed: 0, unchanged: 0, failed: 0 },
         publicationLags: [null], publicationLag: { writes: 1, merged: 0, neverMerged: 1, sameTurn: 0, meanTurns: null, maxTurns: null },
         noSuccessfulWrite: false, turnsWithWrite: 1, turnsWithPublication: 0, utteranceToPublicationLags: [null],
         utteranceToPublication: { utterances: 1, followed: 0, afterLast: 1, sameTurn: 0, meanTurns: null, maxTurns: null },
@@ -121,7 +131,7 @@ test('a scripted replay records fork, publication, republication, leftovers and 
         forksRemaining: 2, unpublishedForks: 1, unpublishedChanges: 1, publishedForksLeft: 1, unobservedForks: 0, listCheck: noList });
     assert.deepEqual(third, { userTurns: 2, modelRequests: 2, inputTokens: 0, outputTokens: 0, unknownUsageRequests: 0,
         toolCalls: 0, toolCallsByName: {}, toolErrorsByCode: {},
-        forksCreated: 0, forkNameConflicts: 0, forksDeleted: 0, merges: { published: 0, unchanged: 0, failed: 0 },
+        forksCreated: 0, forkNameConflicts: 0, forksDeleted: 0, merges: { published: 0, replayed: 0, unchanged: 0, failed: 0 },
         publicationLags: [], publicationLag: zeroLag,
         noSuccessfulWrite: true, turnsWithWrite: 0, turnsWithPublication: 0, utteranceToPublicationLags: [null, null],
         utteranceToPublication: { utterances: 2, followed: 0, afterLast: 2, sameTurn: 0, meanTurns: null, maxTurns: null },
@@ -129,7 +139,7 @@ test('a scripted replay records fork, publication, republication, leftovers and 
         forksRemaining: 2, unpublishedForks: 1, unpublishedChanges: 1, publishedForksLeft: 1, unobservedForks: 0, listCheck: noList });
     assert.deepEqual(fourth, { userTurns: 2, modelRequests: 7, inputTokens: 0, outputTokens: 0, unknownUsageRequests: 0,
         toolCalls: 5, toolCallsByName: { deleteFork: 1, diff: 1, fork: 1, merge: 1, write: 1 }, toolErrorsByCode: {},
-        forksCreated: 1, forkNameConflicts: 0, forksDeleted: 1, merges: { published: 1, unchanged: 0, failed: 0 },
+        forksCreated: 1, forkNameConflicts: 0, forksDeleted: 1, merges: { published: 1, replayed: 0, unchanged: 0, failed: 0 },
         publicationLags: [1], publicationLag: { writes: 1, merged: 1, neverMerged: 0, sameTurn: 0, meanTurns: 1, maxTurns: 1 },
         noSuccessfulWrite: false, turnsWithWrite: 1, turnsWithPublication: 1, utteranceToPublicationLags: [1, 0],
         utteranceToPublication: { utterances: 2, followed: 2, afterLast: 0, sameTurn: 1, meanTurns: 0.5, maxTurns: 1 },
@@ -137,7 +147,7 @@ test('a scripted replay records fork, publication, republication, leftovers and 
         forksRemaining: 2, unpublishedForks: 1, unpublishedChanges: 1, publishedForksLeft: 1, unobservedForks: 0, listCheck: noList });
     assert.deepEqual(summary.smoke, { sessions: 4, userTurns: 8, modelRequests: 25, inputTokens: 0, outputTokens: 0, unknownUsageRequests: 0,
         toolCalls: 17, toolCallsByName: { deleteFork: 1, diff: 3, fork: 4, list: 1, merge: 3, read: 1, write: 4 }, toolErrorsByCode: { BRANCH_CONFLICT: 1 },
-        forksCreated: 3, forkNameConflicts: 1, forksDeleted: 1, merges: { failed: 0, published: 3, unchanged: 0 },
+        forksCreated: 3, forkNameConflicts: 1, forksDeleted: 1, merges: { failed: 0, published: 3, replayed: 0, unchanged: 0 },
         publicationLag: { writes: 4, merged: 3, neverMerged: 1, sameTurn: 2, meanTurns: 1 / 3, maxTurns: 1 },
         sessionsWithoutWrite: 1, turnsWithWrite: 4, turnsWithPublication: 3,
         // Three utterances came after their session's last publication or in a session without one.
@@ -273,11 +283,7 @@ test('budget, transport and model-response failures stop the conversation and ke
     assert.deepEqual(receipt, { turn: 0, round: 0, inputItems: 1, status: 'failed_or_uncertain', error: { code: 'MODEL_HTTP_ERROR', status: 429 } });
     assert(!JSON.stringify(receipts).includes('secret'));
 
-    // Like fetch, the transport rejects with the signal's reason, also when already aborted.
-    const timedOut = await run('timeout', () => (request, { signal }) => new Promise((resolve, reject) => {
-        if (signal.aborted) reject(signal.reason);
-        else signal.addEventListener('abort', () => reject(signal.reason), { once: true });
-    }), { sessionSeconds: 0.05 });
+    const timedOut = await run('timeout', () => untilAborted, { sessionSeconds: 0.05 });
     assert.equal(timedOut.results[0].error.code, 'SESSION_TIMEOUT');
     assert.equal(timedOut.results[0].metrics.userTurns, 1);
     assert.equal(timedOut.summary.cleanup, 'completed');
@@ -329,14 +335,14 @@ test('metrics separate unchanged and failed merges, truncated history and unobse
     const metrics = sessionMetrics({ userTurns: 4, requests: [{ usage: { input_tokens: 5, output_tokens: 1 } }, { usage: undefined }], events: [
         { turn: 0, name: 'write', args: fork('a'), ok: true, result: {} },
         { turn: 1, name: 'merge', args: fork('a'), ok: false, error: { code: 'MERGE_CONFLICT' } },
-        { turn: 2, name: 'merge', args: fork('b'), ok: true, result: { status: 'published' } },
-        { turn: 3, name: 'merge', args: fork('a'), ok: true, result: { status: 'unchanged' } },
+        { turn: 2, name: 'merge', args: fork('b'), ok: true, result: { status: 'published', version: 'v1' } },
+        { turn: 3, name: 'merge', args: fork('a'), ok: true, result: { status: 'unchanged', version: 'v2' } },
         { turn: 3, name: 'write', args: fork('b'), ok: true, result: {} },
         { turn: 3, name: 'write', args: fork('b'), ok: false, error: { code: 'EDIT_CONFLICT' } },
-    ], observation: { publications: [{ fileIds: ['x', 'y'], fileIdsTruncated: true }, { fileIds: ['x'], fileIdsTruncated: false }],
+    ], observation: { publications: [{ version: 'v1', fileIds: ['x', 'y'], fileIdsTruncated: true }, { version: 'v3', fileIds: ['x'], fileIdsTruncated: false }],
         forks: [{ ...fork('a'), changes: 2 }, { ...fork('b'), changes: null }, { ...fork('c'), changes: 0 }] } });
     assert.deepEqual(metrics.publicationLags, [3, null]);
-    assert.deepEqual(metrics.merges, { published: 1, unchanged: 1, failed: 1 });
+    assert.deepEqual(metrics.merges, { published: 1, replayed: 0, unchanged: 1, failed: 1 });
     assert.deepEqual(metrics.toolErrorsByCode, { EDIT_CONFLICT: 1, MERGE_CONFLICT: 1 });
     assert.deepEqual([metrics.inputTokens, metrics.outputTokens, metrics.unknownUsageRequests], [5, 1, 1]);
     assert.deepEqual([metrics.publications, metrics.publishedFiles, metrics.republishedFiles, metrics.republishedFilesIsLowerBound], [2, 2, 1, true]);
@@ -355,6 +361,25 @@ test('metrics separate unchanged and failed merges, truncated history and unobse
     assert.deepEqual(totals.utteranceToPublication, { utterances: 5, followed: 3, afterLast: 2, sameTurn: 1, meanTurns: 1, maxTurns: 2 });
     assert.deepEqual(conversationMetrics([]).publicationLag, { writes: 0, merged: 0, neverMerged: 0, sameTurn: 0, meanTurns: null, maxTurns: null });
     assert.deepEqual(conversationMetrics([]).utteranceToPublication, { utterances: 0, followed: 0, afterLast: 0, sameTurn: 0, meanTurns: null, maxTurns: null });
+});
+
+test('a merge that replays an earlier published result is not a new publication', () => {
+    const at = { at: { kind: 'fork', name: 'a' } };
+    const merge = (turn, version) => ({ turn, name: 'merge', args: at, ok: true, result: { status: 'published', version } });
+    const events = [{ turn: 0, name: 'write', args: at, ok: true, result: {} }, merge(0, 'v2'),
+        // The same request repeated after another write returns v2 again and publishes nothing.
+        { turn: 1, name: 'write', args: at, ok: true, result: {} }, merge(1, 'v2'),
+        // A request completed in an earlier session returns its version, which this session did not publish.
+        merge(2, 'v1')];
+    const observed = sessionMetrics({ userTurns: 3, requests: [], events,
+        observation: { publications: [{ version: 'v2', fileIds: ['x'], fileIdsTruncated: false }], forks: [] } });
+    assert.deepEqual(observed.merges, { published: 1, replayed: 2, unchanged: 0, failed: 0 });
+    assert.deepEqual([observed.turnsWithPublication, observed.utteranceToPublicationLags, observed.publicationLags], [1, [0, null, null], [0, null]]);
+    // Without history, a version returned for the first time in the session still counts once.
+    const unobserved = sessionMetrics({ userTurns: 3, requests: [], events, observation: { publications: null, forks: null } });
+    assert.deepEqual(unobserved.merges, { published: 2, replayed: 1, unchanged: 0, failed: 0 });
+    assert.deepEqual(unobserved.utteranceToPublicationLags, [0, 1, 0]);
+    assert.deepEqual(conversationMetrics([observed, unobserved]).merges, { failed: 0, published: 3, replayed: 3, unchanged: 0 });
 });
 
 test('the Responses transport sends one bounded request and reports only an HTTP status on failure', async () => {
@@ -472,9 +497,7 @@ test('per-session token and time limits reach the session budget and the manifes
         askFactory: () => async request => ({ ...reply(request), usage: { input_tokens: 90000, output_tokens: 20000 } }) });
     assert.equal(tokens.results[0].error.code, 'TOKEN_BUDGET_EXHAUSTED');
     assert.deepEqual(tokens.manifest.limits, { ...limits, sessionTokens: 150000 });
-    const seconds = await run('seconds', { sessionSeconds: 1, askFactory: () => (request, { signal }) => new Promise((resolve, reject) => {
-        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
-    }) });
+    const seconds = await run('seconds', { sessionSeconds: 1, askFactory: () => untilAborted });
     assert.equal(seconds.results[0].error.code, 'SESSION_TIMEOUT');
     assert.deepEqual(seconds.manifest.limits, { ...limits, sessionSeconds: 1 });
     for (const invalid of [{ sessionTokens: 0 }, { sessionSeconds: 1.5 }, { sessionTokens: Number('x') }])

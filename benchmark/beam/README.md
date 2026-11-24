@@ -247,7 +247,9 @@ conversation totals:
 - utterances sent, model requests, reported tokens, tool calls by name and
   tool errors by code;
 - forks created, fork-name conflicts (`BRANCH_CONFLICT`) and forks deleted;
-- merges that published, returned unchanged or failed;
+- merges that published, replayed, returned unchanged or failed. A merge
+  repeated with a completed request ID returns its original `published`
+  result without publishing again; it counts as replayed, not as a publication;
 - publication lag: for each successful `write` call, the number of utterances
   until the next `merge` of the same fork that returned a result in that
   session, or null when there was none. A batch write is one call;
