@@ -138,7 +138,7 @@ Keep clocks accurate and fence former owners and their outstanding mutations
 before takeover or lifecycle operations. Other clients can keep reading current
 main or explicit refs; use a checkpoint for work that must retain a selected
 version beyond the window. List cursors expire within five minutes, well before the minimum retention window;
-findText and history cursors become unavailable once their pinned version is released.
+a main findText cursor becomes unavailable once its pinned version is released. History cursors do not depend on retained versions.
 
 Internally, only refs proven to belong to completed SDK requests are removed.
 A publication's journal records keep its summary and up to 100 affected IDs,
@@ -359,7 +359,7 @@ search, and list from that pin. Forking any view makes a separate editable branc
 from that source. A fork and a checkpoint may share the same name; `at.kind`
 distinguishes them. Names are scoped to the store. Checkpoint names use 3–41 letters, digits, underscores, or hyphens.
 
-Checkpoint and child fork creation from a working fork run in its local write queue, behind earlier writes and a running merge of that fork. They stay available while an unfinished merge blocks writes to the fork. If a source write is still unconfirmed, resolve that outcome before capturing the fork. The SDK sends one creation request for each call. A rejected checkpoint request preserves the underlying LambdaDB error and HTTP status. A LambdaDB deployment that cannot tag a branch before its first snapshot commits rejects a checkpoint of a recently written fork with `DATABASE_ERROR` and status 400. A merge of that fork does not wait for the snapshot, so retry the checkpoint after a short wait. If creation returns `REF_CREATION_UNCONFIRMED`, pause source mutations and check whether it exists with `listForks`/`listCheckpoints` or by using its `at`, which verifies it and clears the local uncertainty. If the exact cutoff matters, compare the contents with your expected state before using the reference. The name alone cannot establish which request won or when it captured the source.
+Checkpoint and child fork creation from a working fork run in its local write queue, behind earlier writes and a running merge of that fork. They stay available while an unfinished merge blocks writes to the fork. If a source write is still unconfirmed, resolve that outcome before capturing the fork. The SDK sends one creation request for each call. A rejected checkpoint request preserves the underlying LambdaDB error and HTTP status. A LambdaDB deployment that cannot tag a branch before its first snapshot commits rejects a checkpoint of a fork that has no snapshot yet with `DATABASE_ERROR` and status 400. In practice that is the first fork of a new store, shortly after its first write; a fork created from a published main already has one. A merge of that fork does not wait for the snapshot, so retry the checkpoint after a short wait. If creation returns `REF_CREATION_UNCONFIRMED`, pause source mutations and check whether it exists with `listForks`/`listCheckpoints` or by using its `at`, which verifies it and clears the local uncertainty. If the exact cutoff matters, compare the contents with your expected state before using the reference. The name alone cannot establish which request won or when it captured the source.
 
 Checkpoint search and exact reads use LambdaDB's tag read semantics. Listing retains the eventual preview behavior described below, including on a recently created checkpoint. For live validation of a prepared working view and retained state after source deletion, set `MEMDRIVE_RUN_LIVE_CHECKPOINT_TESTS=1` when running the live suite against a dedicated test project.
 
@@ -412,7 +412,7 @@ inventory, not a snapshot spanning concurrent changes.
 checkpoint and return `{ at }`. Deleting a fork discards its unpublished edits. Both
 preserve main, other forks and checkpoints and retained publication history; main
 cannot be deleted. After deletion, using that `at` reports `BRANCH_NOT_FOUND` or
-`CHECKPOINT_NOT_FOUND`, and its list and findText cursors are discarded. A new fork
+`CHECKPOINT_NOT_FOUND`, its list cursors are discarded and its findText cursors can no longer be continued. A new fork
 or checkpoint with the same name is a separate view.
 
 `MemDrive.destroy({ client, name })` (also exported as `destroy`) deletes the
@@ -476,7 +476,7 @@ Merges queue against the latest published view. A conflicting file baseline or d
 
 A merge reads the fork itself, so the fork is held still until its merge is settled: a terminal outcome and, for a publication, confirmed source bookkeeping.
 
-- While the merge runs, a write, `diff`, fork or checkpoint creation from that fork, and another merge of it wait in the fork's queue and run after it, in the order they were requested. Reads of the fork do not wait. A write made after the merge is a change for the next merge.
+- While the merge runs, a write, `diff`, fork or checkpoint creation from that fork, and another merge of it wait in the fork's queue and run after it, in the order they were requested. A `findText` page on that fork waits in the same queue. `read`, `search` and `list` on the fork do not wait. A write made after the merge is a change for the next merge.
 - If the merge ends without settling (`MERGE_RESUMABLE`, or `MERGE_BLOCKED` after a mutation of unknown outcome), every write to that fork fails with `MERGE_BLOCKED` and that request's `details.requestId` until the same request is retried to completion or recovery settles it. Reads, `diff` and creating a fork or checkpoint from it stay available, so work can continue on another fork. A new process learns this from the journal before its first write to a fork.
 - A merge that fails before it reserves anything, such as one rejected while another merge is unfinished or while a write to the fork is still unconfirmed, holds nothing. A conflicting or unchanged merge is terminal and leaves the fork writable.
 
@@ -612,10 +612,9 @@ allowlist and rejects every other name with `TOOL_NOT_ALLOWED`, even though the
 drive supports writes. Definitions are deeply frozen. Input Schemas describe JSON
 structure; the public SDK owns target resolution and semantic validation such as
 `at`, UTF-8 limits, paths, declared metadata and embedding dimensions. The
-`readOnly` flag classifies content and ref mutations, not backend credentials:
-inherited SDK snapshot initialization can still require provisioning a retained
-ref on an older uninitialized store. `guide`, `status` and `history` do not
-initialize it.
+`readOnly` flag classifies content and ref mutations, not backend credentials.
+Read tools never provision refs. On a store whose creation was interrupted before
+its initial view was pinned, `fork`, `checkpoint` and `merge` pin it first.
 
 The host owns authentication, authorization and the selection of the authorized
 drive. It must authorize every invocation, including the view in its `at`, and
@@ -668,7 +667,7 @@ if (page.next) {
 
 `prefix` matches the beginning of the full path. `nameContains` checks a case-sensitive literal substring of the filename, including its extension. Omit `delimiter` for recursive results. The `'/'` delimiter groups deeper matches into common prefixes. The limit counts files and prefixes together, defaults to 100, and accepts 1–1000. Results carry file IDs, paths, modification times, and any declared metadata. For text files, use `read` to retrieve the exact original. This preview does not expose datastore or file versions or file sizes.
 
-List results report `consistency: 'eventual'`. The first call scans LambdaDB list pages and can omit recent writes or combine observations taken before and after a concurrent change. When the call succeeds, later pages reuse the collected metadata in path order, including when a cursor is retried. Forward the returned `next` (`{ at, cursor }`) unchanged. The cursor belongs to that view on the same drive object; passing it with another `at` (omitted means main) fails with `CURSOR_VIEW_MISMATCH` without consuming it. It expires after five minutes or when evicted from a process-wide least-recently-used cache shared by all stores and views (128 scans and 64 MiB in total). Listing has no snapshot-pinned native continuation, so these collected scans stay in SDK memory until then. The SDK removes an expired scan on its own timer, which does not keep a Node process alive, so a dropped drive that was kept only for its cursor is released at expiry without another listing. If the cursor is unavailable, start again without it. A continuation does not initiate a new database scan.
+List results report `consistency: 'eventual'`. The first call scans native pages (document listing on forks and checkpoints, ID-ordered queries on main) and can omit recent writes or combine observations taken before and after a concurrent change. When the call succeeds, later pages reuse the collected metadata in path order, including when a cursor is retried. Forward the returned `next` (`{ at, cursor }`) unchanged. The cursor belongs to that view on the same drive object; passing it with another `at` (omitted means main) fails with `CURSOR_VIEW_MISMATCH` without consuming it. It expires after five minutes or when evicted from a process-wide least-recently-used cache shared by all stores and views (128 scans and 64 MiB in total). Listing has no snapshot-pinned native continuation, so these collected scans stay in SDK memory until then. The SDK removes an expired scan on its own timer, which does not keep a Node process alive, so a dropped drive that was kept only for its cursor is released at expiry without another listing. If the cursor is unavailable, start again without it. A continuation does not initiate a new database scan.
 
 The first call can read several native pages even with a small `limit`. The preview stops with `LIST_SCAN_LIMIT` after reaching the scan budget of 100 native pages, 10,000 native rows, or 8 MiB of unique matching file metadata. Filters that need local checking can hit these limits even when few files match. Use a narrower complete directory prefix such as `/notes/projects/` to reduce the database scan. The pinned LambdaDB client does not expose consistent listing. Adopting future support requires an updated public client or adapter and verification against a live deployment.
 

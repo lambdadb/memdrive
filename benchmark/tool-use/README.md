@@ -181,8 +181,8 @@ wording often differs from the question, so a literal search misses, and a
 `findText` without `prefix` or `filter` scans every original of the view. The
 two paraphrase tasks create that mismatch; `enumerate` is the control where an
 unscoped `findText` is the right tool, so avoiding `findText` everywhere is not
-rewarded. No model has run these scenarios, and no result for them is recorded
-here.
+rewarded. No model result for these scenarios is recorded in this repository; a
+run's report is a short-lived Actions artifact.
 
 **The fixture's ranked `search` does not rank.** It returns the chunks of the
 selected view whatever the query and mode are. For these three scenarios the

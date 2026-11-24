@@ -99,7 +99,7 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
     let operations = 0;
     const self: { store?: object } = {};
     function assertLive() {
-        if (invalid) throw new MemDriveError('STORE_DELETED', 'This store handle has been invalidated by destruction.');
+        if (invalid) throw new MemDriveError('STORE_DELETED', 'This drive object has been invalidated by destruction.');
     }
     /**
      * Keep this object registered while it holds state a reopened store would
@@ -529,7 +529,7 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
                     parseStore(response.collection, name);
                     if ((await publicationIdentity(name, response.collection)).driveId !== identity.driveId) {
                         invalid = true;
-                        throw new MemDriveError('STORE_REPLACED', 'This handle belongs to a previous store generation.');
+                        throw new MemDriveError('STORE_REPLACED', 'This drive object belongs to a previous store generation.');
                     }
                     return storeSettings(response.collection);
                 };

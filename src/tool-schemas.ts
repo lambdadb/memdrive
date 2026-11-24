@@ -12,7 +12,7 @@ const array = (items: Schema, maxItems?: number): Schema => ({ type: 'array', it
 const object = (properties: Record<string, Schema> = {}, required: string[] = []) =>
     ({ type: 'object' as const, properties, additionalProperties: false, required });
 const limit = (maximum: number) => ({ type: 'integer', minimum: 1, maximum });
-const cursorValue = described(string, 'Opaque cursor from the previous result\'s next. Forward next unchanged, including any at. list cursors expire after five minutes or eviction; findText and history cursors become unavailable when their pinned view, version or resumed file is no longer available.');
+const cursorValue = described(string, 'Opaque cursor from the previous result\'s next. Forward next unchanged, including any at. list cursors expire after five minutes or eviction; findText cursors become unavailable when their pinned view, version or resumed file is no longer available.');
 const continuation = (properties: Record<string, Schema>, required: string[] = [], scope: Record<string, Schema> = {}) => ({
     ...object({ ...scope, ...properties, cursor: cursorValue }),
     oneOf: [object({ ...scope, ...properties }, required), object({ ...scope, cursor: cursorValue }, ['cursor'])],

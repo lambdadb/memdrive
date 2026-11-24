@@ -161,7 +161,7 @@ export async function destroyStore(connection: ConnectionOptions, before: (metad
         await removeCollection(content, signal);
     } catch (cause) {
         throw new MemDriveError('STORE_DELETION_UNCONFIRMED',
-            'Store cleanup is incomplete or unconfirmed. Fence outstanding requests, then retry destroy with the same client and name.', { cause });
+            'Store cleanup is incomplete or unconfirmed. Fence outstanding requests, then retry destroy with the same store name.', { cause });
     }
 }
 
