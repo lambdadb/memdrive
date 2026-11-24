@@ -107,12 +107,14 @@ export function summarize(manifest, results, cleanup) {
 }
 
 export async function runReplay({ manifest: manifestFile, conversation, output, mode = 'model', model = 'gpt-6.1-sol', instructions = 'sdk',
-    policyFile, sessions: sessionLimit, turns: turnLimit, key, askFactory, budget = limits, sessionTokens, sessionSeconds,
+    policyFile, sessions: sessionLimit, turns: turnLimit, key, askFactory, budget = limits, sessionTokens, sessionSeconds, contextTokens,
     backend = 'fixture', env = {}, connect = lambdadbConnection, clock = () => performance.now() }) {
     assert(['model', 'scripted'].includes(mode), 'Invalid mode');
     assert(Object.hasOwn(backends, backend), 'Use --backend fixture or lambdadb');
-    assert(positive(sessionTokens) && positive(sessionSeconds), 'session-tokens and session-seconds must be positive integers');
-    budget = { ...budget, ...(sessionTokens === undefined ? {} : { sessionTokens }), ...(sessionSeconds === undefined ? {} : { sessionSeconds }) };
+    assert(positive(sessionTokens) && positive(sessionSeconds) && positive(contextTokens),
+        'session-tokens, session-seconds and context-tokens must be positive integers');
+    budget = { ...budget, ...(sessionTokens === undefined ? {} : { sessionTokens }), ...(sessionSeconds === undefined ? {} : { sessionSeconds }),
+        ...(contextTokens === undefined ? {} : { contextTokens }) };
     assert(['none', 'sdk'].includes(instructions), 'Use --instructions none or sdk');
     assert(typeof model === 'string' && model.length > 0 && model.length <= 100, 'Invalid model');
     assert(positive(sessionLimit) && positive(turnLimit), 'sessions and turns must be positive integers');
@@ -214,7 +216,7 @@ export async function runReplay({ manifest: manifestFile, conversation, output, 
 const help = `Replay one prepared original-BEAM conversation against the MemDrive file tools.
   --manifest FILE --conversation ID --output NEW_DIR
   [--mode model|scripted] [--model ID] [--instructions sdk|none] [--policy-file FILE]
-  [--sessions COUNT] [--turns COUNT] [--session-tokens N] [--session-seconds N]
+  [--sessions COUNT] [--turns COUNT] [--session-tokens N] [--session-seconds N] [--context-tokens N]
   [--backend fixture|lambdadb] [--env-file FILE]
 Ask and judge the BEAM questions against the store a LambdaDB run retained:
   --questions --run RUN_DIR --manifest FILE --output NEW_DIR [--scope replayed|all]
@@ -231,7 +233,7 @@ database requests, and leave the store unchanged.
 async function main() {
     const { values } = parseArgs({ options: Object.fromEntries([
         ...['manifest', 'conversation', 'output', 'mode', 'model', 'instructions', 'policy-file', 'sessions', 'turns', 'env-file',
-            'backend', 'session-tokens', 'session-seconds', 'run', 'scope', 'judge-model', 'limit'].map(option => [option, { type: 'string' }]),
+            'backend', 'session-tokens', 'session-seconds', 'context-tokens', 'run', 'scope', 'judge-model', 'limit'].map(option => [option, { type: 'string' }]),
         ['help', { type: 'boolean' }], ['cleanup', { type: 'boolean' }], ['questions', { type: 'boolean' }],
     ]) });
     if (values.help) { console.log(help); return; }
@@ -257,7 +259,8 @@ async function main() {
     const { summary } = await runReplay({ manifest: values.manifest, conversation: values.conversation, output: values.output,
         mode: values.mode, model: values.model, instructions: values.instructions, policyFile: values['policy-file'],
         sessions: count(values.sessions), turns: count(values.turns), sessionTokens: count(values['session-tokens']),
-        sessionSeconds: count(values['session-seconds']), backend: values.backend, env, key: env.LLM_API_KEY });
+        sessionSeconds: count(values['session-seconds']), contextTokens: count(values['context-tokens']), backend: values.backend, env,
+        key: env.LLM_API_KEY });
     console.log(json(summary));
     if (!summary.complete || !['completed', 'retained'].includes(summary.cleanup)) process.exitCode = 1;
 }

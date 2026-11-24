@@ -191,11 +191,15 @@ limit the sessions and the utterances per session. Each output directory must
 be new.
 
 Host budgets per session: 16 model rounds and 40 tool calls per utterance, a
-120,000-token request reservation, 4,000,000 reported total tokens
-(`--session-tokens N`), 8,192 output tokens per request, a three-minute
-request timeout and one hour (`--session-seconds N`). The manifest records the
-budgets used. The estimator is `cl100k_base`, not the model's tokenizer. These
-are untuned defaults. A session that fails or exceeds a budget is recorded as
+120,000-token request reservation (`--context-tokens N`), 4,000,000 reported
+total tokens (`--session-tokens N`), 8,192 output tokens per request, a
+three-minute request timeout and one hour (`--session-seconds N`). The
+manifest records the budgets used. The estimator is `cl100k_base` over the
+serialized request, not the model's tokenizer: it counts opaque reasoning
+items as text and can exceed the provider's reported input by a wide margin.
+One session stopped at this reservation while its largest reported request
+was 85,000 tokens. The conversation is never shortened, so every tool result
+stays in each later request of the session. These are untuned defaults. A session that fails or exceeds a budget is recorded as
 failed and ends the run on either backend. There is no resume: later sessions
 depend on that drive.
 

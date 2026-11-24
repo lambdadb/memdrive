@@ -497,10 +497,14 @@ test('per-session token and time limits reach the session budget and the manifes
         askFactory: () => async request => ({ ...reply(request), usage: { input_tokens: 90000, output_tokens: 20000 } }) });
     assert.equal(tokens.results[0].error.code, 'TOKEN_BUDGET_EXHAUSTED');
     assert.deepEqual(tokens.manifest.limits, { ...limits, sessionTokens: 150000 });
+    // The request reservation is the estimated request plus the output cap, so a small context limit stops the first request.
+    const context = await run('context', { contextTokens: limits.outputTokens, askFactory: () => reply });
+    assert.equal(context.results[0].error.code, 'CONTEXT_BUDGET_EXHAUSTED');
+    assert.deepEqual([context.manifest.limits, context.results[0].metrics.modelRequests], [{ ...limits, contextTokens: limits.outputTokens }, 0]);
     const seconds = await run('seconds', { sessionSeconds: 1, askFactory: () => untilAborted });
     assert.equal(seconds.results[0].error.code, 'SESSION_TIMEOUT');
     assert.deepEqual(seconds.manifest.limits, { ...limits, sessionSeconds: 1 });
-    for (const invalid of [{ sessionTokens: 0 }, { sessionSeconds: 1.5 }, { sessionTokens: Number('x') }])
+    for (const invalid of [{ sessionTokens: 0 }, { sessionSeconds: 1.5 }, { sessionTokens: Number('x') }, { contextTokens: -1 }])
         await assert.rejects(run('invalid', { askFactory: () => reply, ...invalid }), /positive integers/);
     assert.equal(await exists(path.join(files.root, 'invalid')), false);
 });
