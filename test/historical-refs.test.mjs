@@ -99,6 +99,30 @@ test('versioned forks preserve old merge baselines and can be copied through exp
     assert.equal((await drive.read({ at: copy, fileId: first.fileId })).content, 'Revision 1');
 });
 
+test('recreating a deleted file from a retained version preserves later main changes', async () => {
+    const { drive, first } = await setup();
+    const { mainVersion } = await drive.status();
+    const { at: changes } = await drive.fork({ name: 'later-changes' });
+    await drive.write({ at: changes, op: 'delete', fileId: first.fileId });
+    const other = await drive.write({ at: changes, op: 'create', path: '/other', content: 'Later content' });
+    await drive.merge({ at: changes, requestId: 'later-changes', summary: 'Remove the old file and publish later content' });
+    assert.equal(await drive.read({ fileId: first.fileId }), null);
+
+    const { at: beforeDeletion } = await drive.checkpoint({ name: 'before-deletion', version: mainVersion });
+    const original = await drive.read({ at: beforeDeletion, fileId: first.fileId });
+    assert.equal(original.content, 'Revision 2');
+    const { at: recovery } = await drive.fork({ name: 'recovery' });
+    assert.equal(await drive.read({ at: recovery, path: original.path }), null);
+    const restored = await drive.write({ at: recovery, op: 'create', path: original.path, content: original.content });
+    assert.notEqual(restored.fileId, first.fileId);
+    assert.deepEqual(await drive.diff({ at: recovery }), [{ op: 'create', fileId: restored.fileId, path: '/second' }]);
+    const outcome = await drive.merge({ at: recovery, requestId: 'recover-file', summary: 'Recreate the deleted file from its retained version' });
+    assert.equal(outcome.status, 'published');
+    assert.deepEqual(await drive.read({ path: '/second' }), restored);
+    assert.equal(await drive.read({ fileId: first.fileId }), null);
+    assert.deepEqual(await drive.read({ fileId: other.fileId }), other);
+});
+
 test('versioned refs support external vectors without changing the selected mode', async () => {
     const { drive, fixture, first, mode } = await setup(true);
     const historical = await drive.fork({ name: 'vector-main', version: 'v1' });

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { MemDrive, MemDriveError, createFileTools, getFileToolDefinitions, fileToolError, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
+import { MemDrive, MemDriveError, createFileTools, getFileToolDefinitions, fileToolError, fileToolInstructions, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
 import { fileClient } from './helpers/file-client.mjs';
 
 const all = ['guide', 'status', 'history', 'list', 'read', 'search', 'findText', 'fork', 'checkpoint',
@@ -281,6 +281,8 @@ test('guide index and all topics share immutable content without accessing the d
     const index = await tools.execute('guide', {});
     assert.equal(index.version, '7');
     assert(index.content.length < 2500);
+    assert(fileToolInstructions.length > 0 && fileToolInstructions.length <= 512);
+    assert(index.content.includes(fileToolInstructions));
     assert.match(index.content, /Reading never authorizes a write/);
     assert.match(index.content, /Omitting at selects main/);
     assert.doesNotMatch(JSON.stringify(fileToolGuideTopics), /bound view|binding/);

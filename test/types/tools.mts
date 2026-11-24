@@ -1,4 +1,4 @@
-import { createFileTools, getFileToolDefinitions, fileToolError, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
+import { createFileTools, getFileToolDefinitions, fileToolError, fileToolInstructions, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
 import type { FileToolGuideTopic, FileDrive, FileToolDefinition, FileToolErrorResult, FileToolName, FileTools } from '@functional-systems/memdrive';
 
 export async function toolConsumer(drive: FileDrive, external: FileDrive<'external'>, name: string, input: unknown) {
@@ -18,6 +18,7 @@ export async function toolConsumer(drive: FileDrive, external: FileDrive<'extern
     getFileToolDefinitions({ embeddingMode: 'text', tools: names });
     const schemaType: 'object' = definitions[0]!.inputSchema.type;
     const guideVersion: string = fileToolGuide.version;
+    const instructions: string = fileToolInstructions;
     const topic: FileToolGuideTopic = fileToolGuide.topics[0]!.topic;
     const topicContent: string = fileToolGuideTopics[topic].content;
     // @ts-expect-error The guide catalog is immutable.
@@ -34,7 +35,7 @@ export async function toolConsumer(drive: FileDrive, external: FileDrive<'extern
     // @ts-expect-error Tool definitions are immutable.
     tools.definitions.push(definitions[0]!);
     await tools.execute(name, input, { signal: new AbortController().signal });
-    return { schemaType, guideVersion, topicContent, vectorTools, error };
+    return { schemaType, guideVersion, instructions, topicContent, vectorTools, error };
 }
 
 // @ts-expect-error Ref creation returns the SDK result; there is no separate tool ref type.

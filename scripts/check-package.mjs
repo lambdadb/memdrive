@@ -48,6 +48,7 @@ try {
         || catalog[1].name !== 'write' || !catalog[1].inputSchema.required.includes('at') || !catalog[1].inputSchema.$defs.forkAt
         || catalog[2].name !== 'listForks' || catalog[3].readOnly !== false) throw new Error('Invalid fixed tool catalog');
     if (!sdk.fileToolGuide.version || !sdk.fileToolGuide.content || !sdk.fileToolGuideTopics.editing.content) throw new Error('Missing file-tool guide');
+    if (typeof sdk.fileToolInstructions !== 'string' || !sdk.fileToolGuide.content.includes(sdk.fileToolInstructions)) throw new Error('Missing shared file-tool instructions');
     for (const { topic } of sdk.fileToolGuide.topics) {
         if (sdk.fileToolGuideTopics[topic].version !== sdk.fileToolGuide.version) throw new Error('Mismatched guide version');
     }`;
@@ -63,7 +64,7 @@ try {
     copyFileSync(join(root, 'test/types/tsconfig.json'), join(temporary, 'tsconfig.json'));
     run(process.execPath, [resolve(root, 'node_modules/typescript/bin/tsc'), '-p', join(temporary, 'tsconfig.json')]);
     await build({
-        stdin: { contents: `export { create, open, destroy, MemDrive, createFileTools, getFileToolDefinitions, fileToolError, fileToolGuide, fileToolGuideTopics } from ${JSON.stringify(pkg.name)};`,
+        stdin: { contents: `export { create, open, destroy, MemDrive, createFileTools, getFileToolDefinitions, fileToolError, fileToolInstructions, fileToolGuide, fileToolGuideTopics } from ${JSON.stringify(pkg.name)};`,
             resolveDir: temporary, sourcefile: 'consumer.js' },
         bundle: true, platform: 'browser', format: 'esm', target: 'es2022', write: false,
     });
