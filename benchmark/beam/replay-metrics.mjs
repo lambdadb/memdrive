@@ -1,5 +1,6 @@
 // Process metrics for a replayed session. Pure functions over the recorded
 // model tool events, request receipts and harness observations; no model or SDK calls.
+// Durations are recorded separately so these metrics stay deterministic.
 
 const tally = (items, key) => {
     const result = {};
@@ -26,11 +27,21 @@ function utteranceSummary(lags) {
 }
 const turnsOf = events => [...new Set(events.map(event => event.turn))].sort((a, b) => a - b);
 
+// One record per successful model `list` call: { checked, reason?, missed? }.
+function listCheckSummary(checks) {
+    const checked = checks.filter(check => check.checked);
+    return { calls: checks.length, checked: checked.length,
+        uncheckedByReason: tally(checks.filter(check => !check.checked), check => check.reason),
+        missedCalls: checked.filter(check => check.missed.length > 0).length,
+        missedFiles: checked.reduce((sum, check) => sum + check.missed.length, 0) };
+}
+
 /**
  * `events` are the model's tool calls in call order: { turn, name, args, ok, result | error }.
  * `observation` holds the harness reads taken after the session; a failed read is null.
+ * `listChecks` are the harness's checks of the model's successful `list` calls.
  */
-export function sessionMetrics({ userTurns, requests, events, observation }) {
+export function sessionMetrics({ userTurns, requests, events, observation, listChecks = [] }) {
     const succeeded = events.filter(event => event.ok);
     const named = name => succeeded.filter(event => event.name === name);
     const merges = events.filter(event => event.name === 'merge');
@@ -88,6 +99,8 @@ export function sessionMetrics({ userTurns, requests, events, observation }) {
         unpublishedChanges: known ? known.reduce((sum, fork) => sum + fork.changes, 0) : null,
         publishedForksLeft: known ? known.filter(fork => fork.changes === 0).length : null,
         unobservedForks: forks ? forks.length - known.length : null,
+        // Successful list calls that omitted a file a consistent read of the same view found.
+        listCheck: listCheckSummary(listChecks),
     };
 }
 
@@ -104,6 +117,7 @@ const sumMaps = maps => {
  */
 export function conversationMetrics(sessions) {
     const sum = key => sessions.reduce((total, session) => total + session[key], 0);
+    const listSum = key => sessions.reduce((total, session) => total + session.listCheck[key], 0);
     const nullableSum = key => sessions.some(session => session[key] === null) ? null : sum(key);
     const lags = sessions.flatMap(session => session.publicationLags);
     const utteranceLags = sessions.flatMap(session => session.utteranceToPublicationLags);
@@ -127,5 +141,8 @@ export function conversationMetrics(sessions) {
             : sessions.filter(session => session.unpublishedForks > 0).length,
         finalForksRemaining: last?.forksRemaining ?? null, finalUnpublishedForks: last?.unpublishedForks ?? null,
         finalUnpublishedChanges: last?.unpublishedChanges ?? null, finalPublishedForksLeft: last?.publishedForksLeft ?? null,
+        listCheck: { calls: listSum('calls'), checked: listSum('checked'),
+            uncheckedByReason: sumMaps(sessions.map(session => session.listCheck.uncheckedByReason)),
+            missedCalls: listSum('missedCalls'), missedFiles: listSum('missedFiles') },
     };
 }

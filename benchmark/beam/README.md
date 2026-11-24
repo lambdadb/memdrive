@@ -159,7 +159,9 @@ message with `none`. The manifest records the exact text and its SHA-256. No
 task, starting view or reminder is added, and nothing is injected during a
 conversation. Every view of the store is authorized, as for a personal drive.
 The runner never writes, merges or deletes for the model. After each session
-it only reads `status`, `history`, `listForks` and each fork's `diff`.
+it only reads `status`, `history`, `listForks` and each fork's `diff`, and
+after each successful model `list` call it reads the paths described under
+the `list` check below.
 
 ```sh
 npm ci
@@ -186,12 +188,56 @@ limit the sessions and the utterances per session. Each output directory must
 be new.
 
 Host budgets per session: 16 model rounds and 40 tool calls per utterance, a
-120,000-token request reservation, 4,000,000 reported total tokens, 8,192
-output tokens per request, a three-minute request timeout and one hour. The
-estimator is `cl100k_base`, not the model's tokenizer. These are untuned
-defaults. A session that fails or exceeds a budget is recorded as failed and
-ends the run, because the in-memory backend cannot resume and later sessions
+120,000-token request reservation, 4,000,000 reported total tokens
+(`--session-tokens N`), 8,192 output tokens per request, a three-minute
+request timeout and one hour (`--session-seconds N`). The manifest records the
+budgets used. The estimator is `cl100k_base`, not the model's tokenizer. These
+are untuned defaults. A session that fails or exceeds a budget is recorded as
+failed and ends the run on either backend. There is no resume: later sessions
 depend on that drive.
+
+### Backends
+
+`--backend fixture` (default) runs the real public SDK on the in-memory
+native-client fixture used by the unit tests and destroys the store at the
+end. For this runner it differs from LambdaDB in three ways: ranked search
+ignores the query and returns the same candidates with a fixed score for every
+query, `list` is always current, and there is no latency or cost. Reads,
+searches and diffs of a fork use consistent reads on both backends, and main
+and checkpoints read a pinned published version, so the visibility of fresh
+writes to those operations is the same.
+
+`--backend lambdadb` creates the store in a LambdaDB project. Use a dedicated
+test project: the run makes paid requests (managed embeddings on every write,
+searches) on top of any model requests. The LambdaDB deployment must be able
+to create a tag on a branch before its first snapshot commits, as required by
+LambdaDB client `0.14.0` (see the changelog). The environment or an untracked
+`--env-file` must supply `LAMBDADB_BASE_URL` (an HTTPS origin),
+`LAMBDADB_PROJECT_NAME` and `LAMBDADB_PROJECT_API_KEY`; missing or malformed
+settings fail before the run directory exists. Requests are confined to that
+project, have a 30-second deadline and are not retried, and responses that
+need an external download are rejected. The store is created with the same
+settings as on the fixture (default managed embeddings, the default text
+analyzer and chunking), named `beam-replay-<32 hex>`, and labeled with
+`beam.application` and a random `beam.owner`.
+
+Before the create request the runner writes `store.json` in the run
+directory with the store name, endpoint origin, project name, labels and
+status `pending`, and sets `ready` once the store exists. It holds no
+credentials. The store is kept after the run, whether it completed or failed,
+for inspection and later evaluation; `summary.json` reports `cleanup:
+"retained"`. Delete it explicitly:
+
+```sh
+node benchmark/beam/replay.mjs --cleanup --output artifacts/beam-replay/live-1 \
+  --env-file /path/to/evaluation.env
+```
+
+Cleanup requires the same endpoint and project as the ledger, checks the
+store's name and ownership labels, destroys it with its publication journal
+through `MemDrive.destroy`, confirms that it is gone and marks the ledger
+`cleaned`. It deletes nothing else, can be repeated, and also handles a
+`pending` ledger whose create outcome is unknown.
 
 ### Metrics
 
@@ -220,19 +266,46 @@ conversation totals:
   entry makes both lower bounds;
 - after the last utterance: forks remaining, forks with unpublished changes,
   the number of those changes, and fully published forks left behind;
-- sessions without a successful write.
+- sessions without a successful write;
+- the `list` check (`listCheck`): successful model `list` calls, those
+  checked, unchecked ones by reason, checked calls that missed at least one
+  existing file and the number of missed files.
+
+The SDK documents `list` as eventually consistent, while `read`, `search` and
+`diff` see a fork's writes immediately. After each successful model `list`
+call, before the model's next call, the runner reads every path it has seen in
+a successful `write` result in the run, with the same `at`, in batches of 100
+paths. A paths read omits missing files, and every file in the store was
+written by the model, so the result is what existed in that view. A file that
+read returns and the listing lacks is a miss. `prefix` and `nameContains` are
+applied to the expected paths exactly as the SDK applies them: the path starts
+with `prefix` and its last component contains `nameContains`. A call is
+recorded as unchecked when it continues with `cursor`, groups with
+`delimiter`, returns `next` (a partial page) or when the harness read fails
+(`cursor`, `delimiter`, `next`, `read_failed`). The check only observes: the
+model receives the `list` result unchanged and the harness reads are not
+model tool calls. It does not detect a listed file that no longer exists. On
+the fixture `list` is always current, so a miss is expected only on LambdaDB.
 
 Totals of the end-of-session fork states count a fork once for every session
 it was still present in; the `final*` fields give the last observation.
 
 `manifest.json` freezes the source hashes, runner and SDK build hashes, source
-commit, model, budgets, instruction text, tool definitions and planned
-sessions. Each session directory holds `transcript.jsonl` (every input item in
-order), `requests.jsonl` (a pending and an outcome receipt per request, with
-the number of transcript items it sent), `events.jsonl` (the model's tool
-calls and results), `observation.json` (the runner's reads) and `result.json`.
-Receipts can contain provider response IDs and opaque reasoning. Keep runs
-under ignored `artifacts/`.
+commit, backend, model, budgets, instruction text, tool definitions and
+planned sessions. Each session directory holds `transcript.jsonl` (every input
+item in order), `requests.jsonl` (a pending and an outcome receipt per
+request, with the number of transcript items it sent), `events.jsonl` (the
+model's tool calls and results), `list-checks.jsonl` (the runner's `list`
+checks), `observation.json` (the runner's reads) and `result.json`. Receipts
+can contain provider response IDs and opaque reasoning. Keep runs under
+ignored `artifacts/`.
+
+Durations are kept out of the metrics. Each outcome receipt and each tool
+event carries `elapsedMs`, and `result.json` and each session in
+`summary.json` carry `timing`: the session's wall time (model requests, tool
+calls, the runner's `list` checks, token estimation and local recording), the
+total model request time, the total model tool-call time and that time by
+tool name, in milliseconds. Fixture timings show only local overhead.
 
 ### Limits of this measurement
 
@@ -241,10 +314,11 @@ under ignored `artifacts/`.
 - A direct model request is not an agent application. Real agents add their
   own system prompt and memory features and decide whether server instructions
   reach the model. Results describe the model with this catalog only.
-- The backend is the native-client fixture used by the unit tests, with the
-  real public SDK above it. Writes are visible immediately and search returns
-  the same candidates for every query; this does not model LambdaDB ranking,
-  latency or consistency. A live backend is not included.
+- On the fixture, search ignores the query, `list` is always current and
+  there is no latency or cost, so fixture runs do not show whether a model
+  finds the right file among several, how long a save takes or how listings
+  lag. A LambdaDB run is one measurement on one store; its timings include
+  network and service variance.
 - Scripted mode and injected test transports report their totals under
   `smoke`, and `modelBehavior` stays null. The maintained tests use synthetic
   conversations and establish the harness, not model behavior.

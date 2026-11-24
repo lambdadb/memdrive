@@ -3,11 +3,13 @@ import { access, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:f
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { fileToolInstructions, getFileToolDefinitions } from '@functional-systems/memdrive';
+import { fileToolInstructions, getFileToolDefinitions, MemDrive } from '@functional-systems/memdrive';
 import { limits, openAI, toolNames } from '../benchmark/beam/replay-agent.mjs';
 import { conversationMetrics, sessionMetrics } from '../benchmark/beam/replay-metrics.mjs';
-import { runReplay } from '../benchmark/beam/replay.mjs';
+import { checkList, runReplay } from '../benchmark/beam/replay.mjs';
 import { groupSessions, hash, loadSessions } from '../benchmark/beam/replay-sessions.mjs';
+import { cleanupStore, lambdadbConnection } from '../benchmark/beam/replay-store.mjs';
+import { fileClient } from './helpers/file-client.mjs';
 
 const config = JSON.parse(await readFile(new URL('../benchmark/beam/original-config.json', import.meta.url)));
 const json = async file => JSON.parse(await readFile(file, 'utf8'));
@@ -88,7 +90,9 @@ test('loading verifies the prepared manifest and runtime checksum without readin
 
 test('a scripted replay records fork, publication, republication, leftovers and deletion per session', async t => {
     const files = await prepared(t);
-    const { summary, manifest, results } = await runReplay({ manifest: files.manifest, conversation: '7', output: files.output, mode: 'scripted', instructions: 'none' });
+    let now = 0;
+    const { summary, manifest, results } = await runReplay({ manifest: files.manifest, conversation: '7', output: files.output, mode: 'scripted', instructions: 'none',
+        clock: () => now++ });
     assert.equal(manifest.transport, 'scripted');
     assert.deepEqual(manifest.plan.map(entry => [entry.id, entry.userTurns, entry.plannedTurns]), [['s000', 3, 3], ['s001', 1, 1], ['s002', 2, 2], ['s003', 2, 2]]);
     assert.deepEqual({ planned: summary.planned, attempted: summary.attempted, completed: summary.completed, failed: summary.failed,
@@ -97,14 +101,16 @@ test('a scripted replay records fork, publication, republication, leftovers and 
 
     const [first, second, third, fourth] = results.map(result => result.metrics);
     const zeroLag = { writes: 0, merged: 0, neverMerged: 0, sameTurn: 0, meanTurns: null, maxTurns: null };
-    assert.deepEqual(first, { userTurns: 3, modelRequests: 11, inputTokens: 0, outputTokens: 0, unknownUsageRequests: 0,
-        toolCalls: 8, toolCallsByName: { diff: 2, fork: 1, merge: 2, read: 1, write: 2 }, toolErrorsByCode: {},
+    const noList = { calls: 0, checked: 0, uncheckedByReason: {}, missedCalls: 0, missedFiles: 0 };
+    assert.deepEqual(first, { userTurns: 3, modelRequests: 12, inputTokens: 0, outputTokens: 0, unknownUsageRequests: 0,
+        toolCalls: 9, toolCallsByName: { diff: 2, fork: 1, list: 1, merge: 2, read: 1, write: 2 }, toolErrorsByCode: {},
         forksCreated: 1, forkNameConflicts: 0, forksDeleted: 0, merges: { published: 2, unchanged: 0, failed: 0 },
         publicationLags: [0, 0], publicationLag: { writes: 2, merged: 2, neverMerged: 0, sameTurn: 2, meanTurns: 0, maxTurns: 0 },
         noSuccessfulWrite: false, turnsWithWrite: 2, turnsWithPublication: 2, utteranceToPublicationLags: [0, 1, 0],
         utteranceToPublication: { utterances: 3, followed: 3, afterLast: 0, sameTurn: 2, meanTurns: 1 / 3, maxTurns: 1 },
         publications: 2, publishedFiles: 1, republishedFiles: 1, republishedFilesIsLowerBound: false,
-        forksRemaining: 1, unpublishedForks: 0, unpublishedChanges: 0, publishedForksLeft: 1, unobservedForks: 0 });
+        forksRemaining: 1, unpublishedForks: 0, unpublishedChanges: 0, publishedForksLeft: 1, unobservedForks: 0,
+        listCheck: { ...noList, calls: 1, checked: 1 } });
     assert.deepEqual(second, { userTurns: 1, modelRequests: 4, inputTokens: 0, outputTokens: 0, unknownUsageRequests: 0,
         toolCalls: 3, toolCallsByName: { fork: 2, write: 1 }, toolErrorsByCode: { BRANCH_CONFLICT: 1 },
         forksCreated: 1, forkNameConflicts: 1, forksDeleted: 0, merges: { published: 0, unchanged: 0, failed: 0 },
@@ -112,7 +118,7 @@ test('a scripted replay records fork, publication, republication, leftovers and 
         noSuccessfulWrite: false, turnsWithWrite: 1, turnsWithPublication: 0, utteranceToPublicationLags: [null],
         utteranceToPublication: { utterances: 1, followed: 0, afterLast: 1, sameTurn: 0, meanTurns: null, maxTurns: null },
         publications: 0, publishedFiles: 0, republishedFiles: 0, republishedFilesIsLowerBound: false,
-        forksRemaining: 2, unpublishedForks: 1, unpublishedChanges: 1, publishedForksLeft: 1, unobservedForks: 0 });
+        forksRemaining: 2, unpublishedForks: 1, unpublishedChanges: 1, publishedForksLeft: 1, unobservedForks: 0, listCheck: noList });
     assert.deepEqual(third, { userTurns: 2, modelRequests: 2, inputTokens: 0, outputTokens: 0, unknownUsageRequests: 0,
         toolCalls: 0, toolCallsByName: {}, toolErrorsByCode: {},
         forksCreated: 0, forkNameConflicts: 0, forksDeleted: 0, merges: { published: 0, unchanged: 0, failed: 0 },
@@ -120,7 +126,7 @@ test('a scripted replay records fork, publication, republication, leftovers and 
         noSuccessfulWrite: true, turnsWithWrite: 0, turnsWithPublication: 0, utteranceToPublicationLags: [null, null],
         utteranceToPublication: { utterances: 2, followed: 0, afterLast: 2, sameTurn: 0, meanTurns: null, maxTurns: null },
         publications: 0, publishedFiles: 0, republishedFiles: 0, republishedFilesIsLowerBound: false,
-        forksRemaining: 2, unpublishedForks: 1, unpublishedChanges: 1, publishedForksLeft: 1, unobservedForks: 0 });
+        forksRemaining: 2, unpublishedForks: 1, unpublishedChanges: 1, publishedForksLeft: 1, unobservedForks: 0, listCheck: noList });
     assert.deepEqual(fourth, { userTurns: 2, modelRequests: 7, inputTokens: 0, outputTokens: 0, unknownUsageRequests: 0,
         toolCalls: 5, toolCallsByName: { deleteFork: 1, diff: 1, fork: 1, merge: 1, write: 1 }, toolErrorsByCode: {},
         forksCreated: 1, forkNameConflicts: 0, forksDeleted: 1, merges: { published: 1, unchanged: 0, failed: 0 },
@@ -128,24 +134,40 @@ test('a scripted replay records fork, publication, republication, leftovers and 
         noSuccessfulWrite: false, turnsWithWrite: 1, turnsWithPublication: 1, utteranceToPublicationLags: [1, 0],
         utteranceToPublication: { utterances: 2, followed: 2, afterLast: 0, sameTurn: 1, meanTurns: 0.5, maxTurns: 1 },
         publications: 1, publishedFiles: 1, republishedFiles: 0, republishedFilesIsLowerBound: false,
-        forksRemaining: 2, unpublishedForks: 1, unpublishedChanges: 1, publishedForksLeft: 1, unobservedForks: 0 });
-    assert.deepEqual(summary.smoke, { sessions: 4, userTurns: 8, modelRequests: 24, inputTokens: 0, outputTokens: 0, unknownUsageRequests: 0,
-        toolCalls: 16, toolCallsByName: { deleteFork: 1, diff: 3, fork: 4, merge: 3, read: 1, write: 4 }, toolErrorsByCode: { BRANCH_CONFLICT: 1 },
+        forksRemaining: 2, unpublishedForks: 1, unpublishedChanges: 1, publishedForksLeft: 1, unobservedForks: 0, listCheck: noList });
+    assert.deepEqual(summary.smoke, { sessions: 4, userTurns: 8, modelRequests: 25, inputTokens: 0, outputTokens: 0, unknownUsageRequests: 0,
+        toolCalls: 17, toolCallsByName: { deleteFork: 1, diff: 3, fork: 4, list: 1, merge: 3, read: 1, write: 4 }, toolErrorsByCode: { BRANCH_CONFLICT: 1 },
         forksCreated: 3, forkNameConflicts: 1, forksDeleted: 1, merges: { failed: 0, published: 3, unchanged: 0 },
         publicationLag: { writes: 4, merged: 3, neverMerged: 1, sameTurn: 2, meanTurns: 1 / 3, maxTurns: 1 },
         sessionsWithoutWrite: 1, turnsWithWrite: 4, turnsWithPublication: 3,
         // Three utterances came after their session's last publication or in a session without one.
         utteranceToPublication: { utterances: 8, followed: 5, afterLast: 3, sameTurn: 3, meanTurns: 0.4, maxTurns: 1 },
         publications: 3, republishedFiles: 1, republishedFilesIsLowerBound: false,
-        sessionsEndingWithUnpublishedForks: 3, finalForksRemaining: 2, finalUnpublishedForks: 1, finalUnpublishedChanges: 1, finalPublishedForksLeft: 1 });
+        sessionsEndingWithUnpublishedForks: 3, finalForksRemaining: 2, finalUnpublishedForks: 1, finalUnpublishedChanges: 1, finalPublishedForksLeft: 1,
+        listCheck: { ...noList, calls: 1, checked: 1 } });
     assert.deepEqual(summary.smoke, conversationMetrics(results.map(result => result.metrics)));
 
     // Harness reads are recorded apart from the model's tool events.
     const sessionDirectory = path.join(files.output, 'session-001-s000');
     assert.deepEqual((await readdir(files.output)).sort(), ['manifest.json', 'session-001-s000', 'session-002-s001', 'session-003-s002', 'session-004-s003', 'summary.json']);
     const events = await jsonl(path.join(sessionDirectory, 'events.jsonl'));
-    assert.deepEqual(events.map(event => [event.turn, event.name, event.ok]), [[0, 'fork', true], [0, 'write', true], [0, 'diff', true], [0, 'merge', true],
-        [2, 'read', true], [2, 'write', true], [2, 'diff', true], [2, 'merge', true]]);
+    assert.deepEqual(events.map(event => [event.turn, event.name, event.ok]), [[0, 'fork', true], [0, 'write', true], [0, 'list', true], [0, 'diff', true],
+        [0, 'merge', true], [2, 'read', true], [2, 'write', true], [2, 'diff', true], [2, 'merge', true]]);
+    // The list check is a harness read, logged apart from the model's tool calls.
+    assert.deepEqual(await jsonl(path.join(sessionDirectory, 'list-checks.jsonl')), [{ turn: 0, round: 2, at: { kind: 'fork', name: 'notes' }, delivered: true,
+        checked: true, existing: 1, listed: 1, missed: [] }]);
+    // Each clock reading advances by one, so every timed request and tool call lasts exactly 1.
+    const receipts = await jsonl(path.join(sessionDirectory, 'requests.jsonl'));
+    assert(receipts.every(receipt => receipt.status === 'pending' ? !('elapsedMs' in receipt) : receipt.elapsedMs === 1));
+    assert(events.every(event => event.elapsedMs === 1));
+    for (const [index, result] of results.entries()) {
+        const { wallMs, ...timing } = result.timing;
+        assert.deepEqual(timing, { modelRequestMs: result.metrics.modelRequests, toolMs: result.metrics.toolCalls, toolMsByName: result.metrics.toolCallsByName });
+        assert(wallMs > timing.modelRequestMs + timing.toolMs);
+        assert.deepEqual(summary.sessions[index].timing, result.timing);
+        assert.deepEqual(await json(path.join(files.output, `session-00${index + 1}-${result.id}`, 'result.json')), JSON.parse(JSON.stringify(result)));
+    }
+    assert.deepEqual([manifest.backend, manifest.store, summary.backend, summary.store], ['native-client-fixture', null, 'native-client-fixture', null]);
     const observation = await json(path.join(sessionDirectory, 'observation.json'));
     assert.deepEqual({ before: observation.mainVersionBefore, publications: observation.publications.length, errors: observation.errors,
         forks: observation.forks }, { before: 'v0', publications: 2, errors: [], forks: [{ at: { kind: 'fork', name: 'notes' }, changes: 0 }] });
@@ -246,7 +268,9 @@ test('budget, transport and model-response failures stop the conversation and ke
     assert.equal(failed.results[0].error.code, 'MODEL_REQUEST_FAILED');
     assert.equal(failed.results[0].metrics.unknownUsageRequests, 1);
     const receipts = await jsonl(path.join(files.root, 'transport', 'session-001-s000', 'requests.jsonl'));
-    assert.deepEqual(receipts.at(-1), { turn: 0, round: 0, inputItems: 1, status: 'failed_or_uncertain', error: { code: 'MODEL_HTTP_ERROR', status: 429 } });
+    const { elapsedMs, ...receipt } = receipts.at(-1);
+    assert(elapsedMs >= 0);
+    assert.deepEqual(receipt, { turn: 0, round: 0, inputItems: 1, status: 'failed_or_uncertain', error: { code: 'MODEL_HTTP_ERROR', status: 429 } });
     assert(!JSON.stringify(receipts).includes('secret'));
 
     // Like fetch, the transport rejects with the signal's reason, also when already aborted.
@@ -346,4 +370,167 @@ test('the Responses transport sends one bounded request and reports only an HTTP
         ['POST', 'error', 'Bearer synthetic-key', '{"model":"m","input":[]}']);
     assert(seen[0].options.signal instanceof AbortSignal);
     await assert.rejects(ask({ model: 'm', input: [] }, {}), error => error.code === 'MODEL_HTTP_ERROR' && error.status === 503 && !error.message.includes('provider detail'));
+});
+
+// A synthetic LambdaDB connection backed by the in-memory fixture; no network.
+const endpoint = 'https://lambdadb.example', project = 'replay-test';
+function liveFixture(createCollection) {
+    const fixture = fileClient();
+    const client = { ...fixture.client, createCollection: request => createCollection?.(request, fixture) ?? fixture.client.createCollection(request) };
+    return { fixture, connection: { client, endpoint, project }, connect: () => ({ client, endpoint, project }) };
+}
+
+test('backend and LambdaDB configuration are validated before any directory or store exists', async t => {
+    const files = await prepared(t);
+    const env = { LAMBDADB_BASE_URL: 'https://lambdadb.example', LAMBDADB_PROJECT_NAME: 'p', LAMBDADB_PROJECT_API_KEY: 'synthetic-key' };
+    const run = options => runReplay({ manifest: files.manifest, conversation: '7', output: files.output, mode: 'scripted', ...options });
+    await assert.rejects(run({ backend: 'memory' }), /--backend fixture or lambdadb/);
+    for (const missing of ['LAMBDADB_BASE_URL', 'LAMBDADB_PROJECT_NAME', 'LAMBDADB_PROJECT_API_KEY'])
+        await assert.rejects(run({ backend: 'lambdadb', env: { ...env, [missing]: ' ' } }), /Missing LambdaDB configuration/);
+    for (const url of ['http://lambdadb.example', 'https://user:pass@lambdadb.example', 'https://lambdadb.example/api', 'https://lambdadb.example/?a=1', 'not a url'])
+        await assert.rejects(run({ backend: 'lambdadb', env: { ...env, LAMBDADB_BASE_URL: url } }), error => /HTTPS LambdaDB origin/.test(error.message) && !error.message.includes('synthetic-key'));
+    assert.equal(await exists(files.output), false);
+
+    // Requests stay inside the configured project and carry a deadline; nothing is retried.
+    const seen = [];
+    const { client, endpoint: origin, project: name } = lambdadbConnection(env, { fetcher: async (request, init) => {
+        seen.push({ url: request.url, init });
+        return new Response('{}', { status: 404, headers: { 'content-type': 'application/json' } });
+    } });
+    assert.deepEqual([origin, name], ['https://lambdadb.example', 'p']);
+    await assert.rejects(client.collection('beam-replay-x').get());
+    assert.equal(seen.length, 1);
+    assert(seen[0].url.startsWith('https://lambdadb.example/projects/p/'));
+    assert.equal(seen[0].init.redirect, 'error');
+    assert(seen[0].init.signal instanceof AbortSignal);
+});
+
+test('a LambdaDB run records ownership before create, retains its store and cleans up only that store', async t => {
+    const files = await prepared(t);
+    const outputs = ['completed', 'failed', 'lost'].map(name => path.join(files.root, name));
+    const ledgers = [];
+    let current;
+    // The store's publication journal is created through the same client later.
+    const live = liveFixture(async (request, fixture) => {
+        if (request.collectionName.startsWith('beam-replay-')) ledgers.push(await json(path.join(current, 'store.json')));
+        return fixture.client.createCollection(request);
+    });
+    const run = (index, options) => runReplay({ manifest: files.manifest, conversation: '7', output: current = outputs[index], backend: 'lambdadb',
+        connect: live.connect, ...options });
+
+    const completed = await run(0, { mode: 'scripted', instructions: 'none' });
+    assert.equal(ledgers[0].status, 'pending', 'The ledger exists before the create request');
+    const ledger = await json(path.join(outputs[0], 'store.json'));
+    assert.deepEqual(ledger, { ...ledgers[0], status: 'ready' });
+    assert.deepEqual(Object.keys(ledger), ['protocol', 'name', 'endpoint', 'project', 'labels', 'status']);
+    assert.match(ledger.name, /^beam-replay-[0-9a-f]{32}$/);
+    assert.deepEqual([ledger.endpoint, ledger.project, ledger.labels['beam.application']], [endpoint, project, 'memdrive-beam-session-replay-store-v1']);
+    assert(!JSON.stringify(ledger).includes('key'));
+    assert.deepEqual([completed.manifest.backend, completed.manifest.store, completed.summary.complete, completed.summary.cleanup, completed.summary.store],
+        ['lambdadb', { name: ledger.name, ledger: 'store.json' }, true, 'retained', { name: ledger.name, ledger: 'store.json' }]);
+    assert.equal((await live.connection.client.collection(ledger.name).get()).collection.tags['beam.owner'], ledger.labels['beam.owner']);
+
+    const failed = await run(1, { mode: 'model', instructions: 'none', askFactory: () => async () => { throw new Error('offline'); } });
+    assert.deepEqual([failed.summary.failed, failed.summary.cleanup], [1, 'retained']);
+    const failedLedger = await json(path.join(outputs[1], 'store.json'));
+    assert.equal(failedLedger.status, 'ready');
+    assert(live.fixture.collections.has(failedLedger.name), 'A failed run keeps its store');
+
+    // Cleanup refuses another endpoint or project and a store whose owner label differs.
+    await assert.rejects(cleanupStore({ output: outputs[0], ...live.connection, endpoint: 'https://other.example' }), /another endpoint\/project/);
+    await assert.rejects(cleanupStore({ output: outputs[0], ...live.connection, project: 'other' }), /another endpoint\/project/);
+    live.fixture.collections.get(failedLedger.name).metadata.tags['beam.owner'] = '00000000-0000-4000-8000-000000000000';
+    await assert.rejects(cleanupStore({ output: outputs[1], ...live.connection }), /owner differs/);
+    assert(live.fixture.collections.has(failedLedger.name));
+
+    const before = [...live.fixture.collections.keys()];
+    assert.deepEqual(await cleanupStore({ output: outputs[0], ...live.connection }), { status: 'cleaned', name: ledger.name });
+    assert.equal((await json(path.join(outputs[0], 'store.json'))).status, 'cleaned');
+    // The store and its owned journal are gone; the other run's store is untouched.
+    assert.equal(live.fixture.collections.has(ledger.name), false);
+    assert.deepEqual([...live.fixture.collections.keys()], [failedLedger.name]);
+    assert(before.length > 2, 'The completed run also owned a publication journal');
+    const deletes = live.fixture.calls.filter(call => call.kind === 'collection-delete').length;
+    assert.deepEqual(await cleanupStore({ output: outputs[0], ...live.connection }), { status: 'cleaned', name: ledger.name });
+    assert.equal(live.fixture.calls.filter(call => call.kind === 'collection-delete').length, deletes, 'Repeated cleanup deletes nothing');
+
+    // A lost create response leaves a pending ledger, which cleanup also handles.
+    const lost = liveFixture(async (request, fixture) => { await fixture.client.createCollection(request); throw new Error('response lost'); });
+    await assert.rejects(runReplay({ manifest: files.manifest, conversation: '7', output: outputs[2], backend: 'lambdadb', mode: 'scripted', connect: lost.connect }));
+    const pending = await json(path.join(outputs[2], 'store.json'));
+    assert.deepEqual([pending.status, (await json(path.join(outputs[2], 'summary.json'))).cleanup], ['pending', 'retained']);
+    assert(lost.fixture.collections.has(pending.name));
+    await cleanupStore({ output: outputs[2], ...lost.connection });
+    assert.deepEqual([lost.fixture.collections.size, (await json(path.join(outputs[2], 'store.json'))).status], [0, 'cleaned']);
+});
+
+test('per-session token and time limits reach the session budget and the manifest', async t => {
+    const files = await prepared(t);
+    const run = (name, options) => runReplay({ manifest: files.manifest, conversation: '7', output: path.join(files.root, name), mode: 'model',
+        instructions: 'none', sessions: 1, ...options });
+    const tokens = await run('tokens', { sessionTokens: 150000,
+        askFactory: () => async request => ({ ...reply(request), usage: { input_tokens: 90000, output_tokens: 20000 } }) });
+    assert.equal(tokens.results[0].error.code, 'TOKEN_BUDGET_EXHAUSTED');
+    assert.deepEqual(tokens.manifest.limits, { ...limits, sessionTokens: 150000 });
+    const seconds = await run('seconds', { sessionSeconds: 1, askFactory: () => (request, { signal }) => new Promise((resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    }) });
+    assert.equal(seconds.results[0].error.code, 'SESSION_TIMEOUT');
+    assert.deepEqual(seconds.manifest.limits, { ...limits, sessionSeconds: 1 });
+    for (const invalid of [{ sessionTokens: 0 }, { sessionSeconds: 1.5 }, { sessionTokens: Number('x') }])
+        await assert.rejects(run('invalid', { askFactory: () => reply, ...invalid }), /positive integers/);
+    assert.equal(await exists(path.join(files.root, 'invalid')), false);
+});
+
+test('the list check compares an unpaginated listing with a consistent read of every written path', async t => {
+    const { client } = fileClient();
+    const drive = await MemDrive.create({ client, name: 'list-check' });
+    const at = { kind: 'fork', name: 'work' };
+    await drive.fork({ name: 'work' });
+    const created = await drive.write({ at, operations: ['/a/x.md', '/a/y.md', '/b/z.md', '/b/gone.md']
+        .map(file => ({ op: 'create', path: file, content: file })) });
+    await drive.write({ at, op: 'delete', fileId: created[3].fileId });
+    // Unknown paths are omitted by the read; 120 of them also force a second read batch.
+    const written = new Set([...created.map(file => file.path), ...Array.from({ length: 120 }, (_, i) => `/never/${i}.md`)]);
+    const full = await drive.list({ at });
+    const check = (args, result) => checkList(drive, { turn: 1, round: 2, args, ok: true, delivered: true, result }, written);
+    const without = (result, omitted) => ({ ...result, files: result.files.filter(file => !omitted.includes(file.path)) });
+    const record = { turn: 1, round: 2, at, delivered: true };
+
+    assert.deepEqual(await check({ at }, full), { ...record, checked: true, existing: 3, listed: 3, missed: [] });
+    assert.deepEqual(await check({ at }, without(full, ['/a/y.md'])), { ...record, checked: true, existing: 3, listed: 2, missed: ['/a/y.md'] });
+    assert.deepEqual(await check({ at, prefix: '/a/' }, without(await drive.list({ at, prefix: '/a/' }), ['/a/x.md'])),
+        { ...record, checked: true, existing: 2, listed: 1, missed: ['/a/x.md'] });
+    assert.deepEqual(await check({ at, nameContains: 'z' }, await drive.list({ at, nameContains: 'z' })), { ...record, checked: true, existing: 1, listed: 1, missed: [] });
+    // Main has none of the fork's files yet.
+    assert.deepEqual(await check({}, await drive.list()), { ...record, at: { kind: 'main' }, checked: true, existing: 0, listed: 0, missed: [] });
+
+    const paged = await drive.list({ at, limit: 1 });
+    assert.deepEqual(await check({ at, limit: 1 }, paged), { ...record, checked: false, reason: 'next' });
+    assert.deepEqual(await check(paged.next, await drive.list(paged.next)), { ...record, checked: false, reason: 'cursor' });
+    assert.deepEqual(await check({ at, delimiter: '/' }, await drive.list({ at, delimiter: '/' })), { ...record, checked: false, reason: 'delimiter' });
+    assert.deepEqual(await check({ at: { kind: 'fork', name: 'removed' } }, full),
+        { ...record, at: { kind: 'fork', name: 'removed' }, checked: false, reason: 'read_failed', code: 'BRANCH_NOT_FOUND' });
+
+    const metrics = sessionMetrics({ userTurns: 1, requests: [], events: [], observation: null, listChecks: [
+        { checked: true, missed: [] }, { checked: true, missed: ['/a', '/b'] }, { checked: true, missed: ['/c'] },
+        { checked: false, reason: 'next' }, { checked: false, reason: 'read_failed' }, { checked: false, reason: 'next' }] });
+    assert.deepEqual(metrics.listCheck, { calls: 6, checked: 3, uncheckedByReason: { next: 2, read_failed: 1 }, missedCalls: 2, missedFiles: 3 });
+    assert.deepEqual(conversationMetrics([metrics, metrics]).listCheck, { calls: 12, checked: 6, uncheckedByReason: { next: 4, read_failed: 2 }, missedCalls: 4, missedFiles: 6 });
+
+    // In a run, a stale listing is counted as a miss without changing what the model received.
+    const files = await prepared(t);
+    const live = liveFixture();
+    live.fixture.listPage = () => ({ isDocsInline: true, total: 0, docs: [] });
+    const script = [['fork', { name: 'work' }], ['write', { at, op: 'create', path: '/kept.md', content: 'kept' }], ['list', { at }]];
+    const listed = [];
+    const run = await runReplay({ manifest: files.manifest, conversation: '7', output: files.output, backend: 'lambdadb', connect: live.connect,
+        mode: 'model', instructions: 'none', sessions: 1, turns: 1, askFactory: () => async (request, { round }) => {
+            const last = request.input.at(-1);
+            if (round === script.length) listed.push(JSON.parse(last.output));
+            return round < script.length ? toolCall(request, `call-${round}`, ...script[round]) : reply(request);
+        } });
+    assert.deepEqual(listed, [{ files: [], prefixes: [], consistency: 'eventual' }]);
+    assert.deepEqual([run.results[0].metrics.toolCalls, run.results[0].metrics.listCheck], [3, { calls: 1, checked: 1, uncheckedByReason: {}, missedCalls: 1, missedFiles: 1 }]);
+    assert.deepEqual((await jsonl(path.join(files.output, 'session-001-s000', 'list-checks.jsonl'))).map(entry => entry.missed), [['/kept.md']]);
 });

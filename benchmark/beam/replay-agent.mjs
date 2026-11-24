@@ -3,6 +3,7 @@
 // deployment could deliver: the utterances, the SDK tool definitions and results,
 // and optional server instructions. Nothing else is injected.
 import assert from 'node:assert/strict';
+import { performance } from 'node:perf_hooks';
 import { get_encoding } from 'tiktoken';
 import { createFileTools, fileToolError, getFileToolDefinitions } from '@functional-systems/memdrive';
 
@@ -73,9 +74,10 @@ export function createToolHost({ drive, resultBytes = limits.resultBytes }) {
  * Replay `turns` user utterances of one session in a fresh model conversation.
  * `state` is filled as the session runs so a failure keeps everything observed:
  * input items, request receipts, tool events and the number of utterances sent.
+ * Each settled receipt and each tool event carries `elapsedMs` measured with `clock`.
  */
 export async function runSession({ session, turns = session.turns.length, call, ask, model, instructions = null, definitions,
-    budget = limits, signal, state = { input: [], requests: [], events: [], userTurns: 0 }, hooks = {} }) {
+    budget = limits, signal, state = { input: [], requests: [], events: [], userTurns: 0 }, hooks = {}, clock = () => performance.now() }) {
     const encoder = get_encoding('cl100k_base');
     const tools = definitions.map(tool => ({ type: 'function', name: tool.name, description: tool.description,
         parameters: tool.inputSchema, strict: false }));
@@ -100,9 +102,11 @@ export async function runSession({ session, turns = session.turns.length, call, 
                 state.requests.push(receipt);
                 await hooks.receipt?.(receipt);
                 let response;
+                const started = clock();
                 try {
                     response = await ask(request, { session: session.index, turn, round, signal });
                 } catch (error) {
+                    receipt.elapsedMs = clock() - started;
                     receipt.status = 'failed_or_uncertain';
                     // Never record service error bodies, headers, credentials or stacks.
                     receipt.error = error?.code === 'MODEL_HTTP_ERROR' && Number.isInteger(error.status)
@@ -110,6 +114,7 @@ export async function runSession({ session, turns = session.turns.length, call, 
                     await hooks.receipt?.(receipt);
                     throw new ReplayFailure(signal?.aborted ? 'SESSION_TIMEOUT' : 'MODEL_REQUEST_FAILED');
                 }
+                receipt.elapsedMs = clock() - started;
                 receipt.status = 'completed';
                 receipt.response = response;
                 receipt.usage = response?.usage;
@@ -138,8 +143,9 @@ export async function runSession({ session, turns = session.turns.length, call, 
                     seen.add(item.call_id);
                     calls++;
                     requireReplay(typeof item.name === 'string' && typeof item.arguments === 'string', 'TOOL_CALL_INVALID');
+                    const started = clock();
                     const { event, output } = await call(item.name, item.arguments, { signal });
-                    const recorded = { turn, round, ...event };
+                    const recorded = { turn, round, ...event, elapsedMs: clock() - started };
                     state.events.push(recorded);
                     await hooks.event?.(recorded);
                     await push({ type: 'function_call_output', call_id: item.call_id, output });
@@ -173,9 +179,10 @@ export function openAI({ key, fetcher = fetch }) {
 
 /**
  * Deterministic transport and metrics smoke only; never evidence of model behavior.
- * `plan[i]` is the number of utterances replayed in session i. Session 0 publishes a
- * note and republishes it from the same fork, session 1 meets a fork-name conflict
- * and leaves an unpublished draft, session 3 publishes later and deletes its fork.
+ * `plan[i]` is the number of utterances replayed in session i. Session 0 lists its
+ * fork after a write, publishes a note and republishes it from the same fork,
+ * session 1 meets a fork-name conflict and leaves an unpublished draft, session 3
+ * publishes later and deletes its fork.
  * Every other session only replies.
  */
 export function scriptedTransport(plan) {
@@ -188,6 +195,7 @@ export function scriptedTransport(plan) {
             if (first) {
                 add('fork', { name: 'notes' });
                 add('write', { at, op: 'create', path: '/notes.md', content: 'Scripted note.\n' });
+                add('list', { at });
                 add('diff', { at });
                 add('merge', { at, requestId: 'scripted-notes-1', summary: 'Add the scripted note' });
             }
