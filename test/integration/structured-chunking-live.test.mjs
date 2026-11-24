@@ -25,6 +25,7 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
         tokenizer: new URL('../fixtures/docling-tokenizer.json', import.meta.url).pathname, maxTokens: 32,
     });
     let collision = false;
+    let failure;
     let phase = 'create store';
     try {
         const main = await MemDrive.create({ client, name, chunker }, options());
@@ -173,13 +174,19 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
         collision = error?.code === 'STORE_EXISTS';
         const detail = error instanceof assert.AssertionError ? ` ${error.message}` : '';
         const status = error?.status ?? error?.statusCode;
-        throw new Error(`Structured live ${phase} failed (${error?.code ?? error?.name ?? 'Error'}${status ? `, status ${status}` : ''}).${detail}`);
+        // A merge error wraps the database rejection; name its code and status too.
+        const cause = error?.cause;
+        const causeStatus = cause?.status ?? cause?.statusCode;
+        const wrapped = cause ? `, caused by ${cause.code ?? cause.name ?? 'Error'}${causeStatus ? ` status ${causeStatus}` : ''}` : '';
+        failure = new Error(`Structured live ${phase} failed (${error?.code ?? error?.name ?? 'Error'}${status ? `, status ${status}` : ''}${wrapped}).${detail}`);
+        throw failure;
     } finally {
         // Creation can fail after the native collection exists. Clean the
         // unique test name in that case too, but never touch a name collision.
         if (!collision) {
             try { await MemDrive.destroy({ client, name }, options()); }
-            catch (error) { throw new Error(`Structured live cleanup failed (${error?.code ?? error?.name ?? 'Error'}).`); }
+            // A cleanup failure must not hide the failure that preceded it.
+            catch (error) { throw new Error(`Structured live cleanup failed (${error?.code ?? error?.name ?? 'Error'}).${failure ? ` Earlier: ${failure.message}` : ''}`); }
             await assert.rejects(client.collection(name).get(options()), error => (error.status ?? error.statusCode) === 404);
         }
     }
