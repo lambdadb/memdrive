@@ -101,14 +101,18 @@ test('versioned forks preserve old merge baselines and can be copied through exp
 
 test('recreating a deleted file from a retained version preserves later main changes', async () => {
     const { drive, first } = await setup();
-    const { mainVersion } = await drive.status();
     const { at: changes } = await drive.fork({ name: 'later-changes' });
     await drive.write({ at: changes, op: 'delete', fileId: first.fileId });
     const other = await drive.write({ at: changes, op: 'create', path: '/other', content: 'Later content' });
-    await drive.merge({ at: changes, requestId: 'later-changes', summary: 'Remove the old file and publish later content' });
+    const deletion = await drive.merge({ at: changes, requestId: 'later-changes', summary: 'Remove the old file and publish later content' });
     assert.equal(await drive.read({ fileId: first.fileId }), null);
 
-    const { at: beforeDeletion } = await drive.checkpoint({ name: 'before-deletion', version: mainVersion });
+    const { entries } = await drive.history();
+    const deletionIndex = entries.findIndex(entry => entry.version === deletion.version);
+    assert(deletionIndex > 0);
+    assert(entries[deletionIndex].fileIds.includes(first.fileId));
+    const { version } = entries[deletionIndex - 1];
+    const { at: beforeDeletion } = await drive.checkpoint({ name: 'before-deletion', version });
     const original = await drive.read({ at: beforeDeletion, fileId: first.fileId });
     assert.equal(original.content, 'Revision 2');
     const { at: recovery } = await drive.fork({ name: 'recovery' });
