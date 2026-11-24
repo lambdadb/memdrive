@@ -341,7 +341,8 @@ test('metrics separate unchanged and failed merges, truncated history and unobse
         { turn: 3, name: 'write', args: fork('b'), ok: false, error: { code: 'EDIT_CONFLICT' } },
     ], observation: { publications: [{ version: 'v1', fileIds: ['x', 'y'], fileIdsTruncated: true }, { version: 'v3', fileIds: ['x'], fileIdsTruncated: false }],
         forks: [{ ...fork('a'), changes: 2 }, { ...fork('b'), changes: null }, { ...fork('c'), changes: 0 }] } });
-    assert.deepEqual(metrics.publicationLags, [3, null]);
+    // Fork a's only later merge returned unchanged, which publishes nothing.
+    assert.deepEqual(metrics.publicationLags, [null, null]);
     assert.deepEqual(metrics.merges, { published: 1, replayed: 0, unchanged: 1, failed: 1 });
     assert.deepEqual(metrics.toolErrorsByCode, { EDIT_CONFLICT: 1, MERGE_CONFLICT: 1 });
     assert.deepEqual([metrics.inputTokens, metrics.outputTokens, metrics.unknownUsageRequests], [5, 1, 1]);
@@ -375,6 +376,11 @@ test('a merge that replays an earlier published result is not a new publication'
         observation: { publications: [{ version: 'v2', fileIds: ['x'], fileIdsTruncated: false }], forks: [] } });
     assert.deepEqual(observed.merges, { published: 1, replayed: 2, unchanged: 0, failed: 0 });
     assert.deepEqual([observed.turnsWithPublication, observed.utteranceToPublicationLags, observed.publicationLags], [1, [0, null, null], [0, null]]);
+    // An unchanged outcome, first or repeated with its request ID, never publishes a write.
+    const empty = { turn: 1, name: 'merge', args: at, ok: true, result: { status: 'unchanged', version: 'v2' } };
+    const unchanged = sessionMetrics({ userTurns: 3, requests: [], events: [empty, { turn: 1, name: 'write', args: at, ok: true, result: {} }, { ...empty, turn: 2 }],
+        observation: { publications: [], forks: [] } });
+    assert.deepEqual([unchanged.publicationLags, unchanged.merges], [[null], { published: 0, replayed: 0, unchanged: 2, failed: 0 }]);
     // Without history, a version returned for the first time in the session still counts once.
     const unobserved = sessionMetrics({ userTurns: 3, requests: [], events, observation: { publications: null, forks: null } });
     assert.deepEqual(unobserved.merges, { published: 2, replayed: 1, unchanged: 0, failed: 0 });

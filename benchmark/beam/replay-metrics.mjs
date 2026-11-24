@@ -59,11 +59,10 @@ export function sessionMetrics({ userTurns, requests, events, observation, listC
         returned.add(version);
     }
     const replayed = merges.filter(event => event.ok && event.result?.status === 'published' && !publishing.has(event));
-    // A write call is published by the next merge of its fork that published or returned
-    // unchanged; a replayed result cannot include it. A batch write is one call. Lag counts user turns.
+    // A write call is published by the next merge of its fork that published a new version.
+    // An `unchanged` or replayed result publishes nothing. A batch write is one call. Lag counts user turns.
     const lags = named('write').map(write => {
-        const merge = events.slice(events.indexOf(write) + 1)
-            .find(event => event.name === 'merge' && event.ok && !replayed.includes(event) && forkOf(event) === forkOf(write));
+        const merge = events.slice(events.indexOf(write) + 1).find(event => publishing.has(event) && forkOf(event) === forkOf(write));
         return merge ? merge.turn - write.turn : null;
     });
     // A model can defer the write itself instead of holding edits on a fork, so also

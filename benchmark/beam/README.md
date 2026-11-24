@@ -258,8 +258,9 @@ conversation totals:
   repeated with a completed request ID returns its original `published`
   result without publishing again; it counts as replayed, not as a publication;
 - publication lag: for each successful `write` call, the number of utterances
-  until the next `merge` of the same fork that returned a result in that
-  session, or null when there was none. A batch write is one call;
+  until the next `merge` of the same fork that published a new version in
+  that session, or null when there was none. An `unchanged` or replayed
+  merge publishes nothing. A batch write is one call;
 - utterance-to-publication lag: for each utterance, the number of utterances
   until the next turn in which a merge published, or null when none followed
   in that session. A model can postpone the write itself instead of holding
