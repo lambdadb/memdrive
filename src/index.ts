@@ -105,8 +105,8 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
      * Keep this object registered while it holds state a reopened store would
      * lose: running or queued work, fences for unconfirmed configuration,
      * reference or write outcomes, unsettled merge state, invalidation and
-     * unexpired list cursors. It is re-evaluated whenever an operation or
-     * detached task ends or a cached list scan is dropped.
+     * unexpired list cursors. It is re-evaluated whenever an operation ends
+     * or a cached list scan is dropped.
      */
     function retain() {
         if (self.store) storesFor(client).hold(name, self.store, operations > 0 || invalid || pendingRetention !== undefined
@@ -137,13 +137,14 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
     function writerFor(branch: string) {
         const existing = writers.get(branch);
         if (existing) return existing;
-        const writer = workingWriter(handle, name, branch, metadataSchema, dimensions, chunker);
+        const writer = workingWriter(handle, name, branch, metadataSchema, dimensions, chunker,
+            (first, signal) => publishing.requireWritable(branch, first, signal));
         writers.set(branch, writer);
         return writer;
     }
     const publishing = publication(client, handle, identity, metadataSchema, writerFor, dimensions,
         () => gate.soleOperation() && !invalid && pendingRetention === undefined && pendingRefs.size === 0
-            && ![...refs.values()].some(view => view.uncertain), retain);
+            && ![...refs.values()].some(view => view.uncertain));
 
     async function assertDeleteSafe(signal?: AbortSignal, retry?: View) {
         if (pendingRetention !== undefined) throw new MemDriveError('CONFIGURATION_UNCONFIRMED', 'Settle the pending retention configuration before deleting resources.');
@@ -408,7 +409,7 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
                 refView(at);
                 return { at: { ...at } };
             };
-            // Captures of a working fork are ordered with its writes.
+            // A ref of a working fork is ordered with its writes and merges.
             return selected.writer ? selected.writer.enqueueRef(create, signal) : create();
         });
     }

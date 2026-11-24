@@ -201,16 +201,21 @@ test('live external vectors preserve private application text and frozen vector 
         const stale = { drive: published.drive, at: (await published.drive.fork({ name: 'stale-vector-draft' }, options())).at };
         await stale.drive.write({ at: stale.at, op: 'update', fileId: a.fileId, content: vector(0, 1, 1) }, options());
 
-        phase = 'Publish a captured vector while preserving a later working edit';
+        phase = 'Publish the fork vector while a later working edit waits for the merge';
         await main.write({ at: work.at, op: 'update', fileId: a.fileId, content: capturedVector }, options());
         assert.deepEqual(await main.diff({ at: work.at }, options()), [{ op: 'update', fileId: a.fileId, path: '/moved/a' }]);
         gate = { id: originalId(a.fileId), entered: deferred(), release: deferred(), reached: false };
-        const publication = merge(work, 'Publish the captured vector without later changes');
+        const publication = merge(work, 'Publish the fork vector without later changes');
         const unexpected = publication.then(() => { throw new Error('Publication skipped its expected original mutation.'); });
-        let second, interruption;
+        let second, interruption, laterWrite, written = false;
         try {
             await Promise.race([gate.entered.promise, unexpected]);
-            await main.write({ at: work.at, op: 'update', fileId: a.fileId, content: laterVector }, options());
+            // The write waits in the fork's queue until the running merge has settled.
+            laterWrite = main.write({ at: work.at, op: 'update', fileId: a.fileId, content: laterVector }, options())
+                .then(() => { written = true; });
+            laterWrite.catch(() => {});
+            // Reads of the fork do not wait for the merge.
+            assert.deepEqual((await records(sourceRef, [a.fileId])).get(a.fileId).map(Math.fround), capturedVector);
         } catch (error) {
             interruption = error;
         } finally {
@@ -220,6 +225,8 @@ test('live external vectors preserve private application text and frozen vector 
         finally { gate = undefined; }
         if (interruption) throw interruption;
         assert.equal(second.status, 'published');
+        assert.equal(written, false, 'A write to the fork finished before its running merge.');
+        await laterWrite;
         const current = await open();
         await nearest(current, [a.fileId], { probe: capturedVector });
         assert.deepEqual((await records(toTag(second), [a.fileId])).get(a.fileId).map(Math.fround), capturedVector);
@@ -229,7 +236,7 @@ test('live external vectors preserve private application text and frozen vector 
         await nearest(checkpoint, [a.fileId, b.fileId]);
         assert.deepEqual((await records(toTag(first), [a.fileId])).get(a.fileId).map(Math.fround), canonical);
         await assert.rejects(merge(stale, 'Reject an overlapping vector-only stale draft'), { code: 'MERGE_CONFLICT' });
-        t.diagnostic('Published and checkpoint vectors were frozen; the vector-only working edit remained in diff and a stale vector conflicted.');
+        t.diagnostic('Published and checkpoint vectors were frozen; the vector-only edit waited for the merge and remained in diff, and a stale vector conflicted.');
 
         phase = 'Delete a vector file and preserve its checkpoint';
         const remove = { drive: current.drive, at: (await current.drive.fork({ name: 'delete-vector' }, options())).at };

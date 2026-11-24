@@ -80,7 +80,7 @@ test('public merges publish to main and keep a started list, old checkpoints, an
     await assert.rejects(replay.merge({ ...request('first'), summary: 'Different input' }), { code: 'MERGE_REQUEST_CONFLICT' });
 });
 
-test('a partial physical merge preserves all public main views and replays frozen files while the fork keeps later edits', async () => {
+test('a partial physical merge preserves all public main views and replays the held fork, which takes edits again once it settles', async () => {
     const { fixture, main } = await setup();
     const work = await fork(main, { name: 'research' });
     const alternate = await fork(main, { name: 'alternate' });
@@ -119,16 +119,22 @@ test('a partial physical merge preserves all public main views and replays froze
     assert.equal(fixture.calls.filter(journalMutation).length, count);
 
     fixture.beforeUpsert = undefined;
-    await work.write({ op: 'update', fileId: one.fileId, content: 'postcapture edit' });
+    // The unfinished merge holds its fork still; the blocked fork is not held.
+    await assert.rejects(work.write({ op: 'update', fileId: one.fileId, content: 'edit during the merge' }),
+        { code: 'MERGE_BLOCKED', details: { requestId: 'second' } });
+    await alternate.write(file('/alternate-later'));
     assert.deepEqual(await work.merge(request('second')), status('second', 'v2'));
     assert.equal((await observer.read({ fileId: one.fileId })).content, 'draft one');
-    assert.equal((await work.read({ fileId: one.fileId })).content, 'postcapture edit');
+    assert.deepEqual(await work.diff(), []);
+    await work.write({ op: 'update', fileId: one.fileId, content: 'later edit' });
+    assert.equal((await observer.read({ fileId: one.fileId })).content, 'draft one');
+    assert.equal((await work.read({ fileId: one.fileId })).content, 'later edit');
     assert.deepEqual(await work.diff(), [{ op: 'update', fileId: one.fileId, path: one.path }]);
     assert.deepEqual(await alternate.merge(request('third')), status('third', 'v3'));
     assert.equal(await alternate.read({ fileId: one.fileId }), null);
 });
 
-test('healthy queued merges check current main and terminal conflict and empty captures replay unchanged', async () => {
+test('healthy queued merges check current main and terminal conflict and unchanged outcomes replay unchanged', async () => {
     const { fixture, main } = await setup();
     const left = await fork(main, { name: 'left' });
     const right = await fork(main, { name: 'right' });
@@ -146,7 +152,8 @@ test('healthy queued merges check current main and terminal conflict and empty c
     const updates = await Promise.all([
         left.merge(request('next')), left.merge(request('repeat')), independent.merge(request('independent')),
     ]);
-    assert.deepEqual(updates, [status('next', 'v4'), status('repeat', 'v4', 'unchanged'), status('independent', 'v6')]);
+    // A second merge of the same fork waits for the first, so the other fork's merge is reserved before it.
+    assert.deepEqual(updates, [status('next', 'v4'), status('repeat', 'v5', 'unchanged'), status('independent', 'v5')]);
 
     const reopened = scoped(await MemDrive.open(withClient(fixture)), right.at);
     await assert.rejects(reopened.merge(request('conflict')), { code: 'MERGE_CONFLICT',
@@ -157,7 +164,7 @@ test('healthy queued merges check current main and terminal conflict and empty c
 test('unknown mutable writes fence the runtime and an exclusive drained owner can resume from the journal', async () => {
     const { fixture, main } = await setup();
     const work = await fork(main, { name: 'research' });
-    const saved = await work.write(file('/captured'));
+    const saved = await work.write(file('/published'));
     const dispatched = gate(), complete = gate();
     let didLose = false;
     fixture.afterUpsert = async ({ branch, docs }) => {
@@ -177,6 +184,7 @@ test('unknown mutable writes fence the runtime and an exclusive drained owner ca
     await rejected;
     await assert.rejects(work.merge(request('uncertain')), { code: 'MERGE_BLOCKED' });
     await assert.rejects(MemDrive.open({ client: fixture.client, name, recover: true }), { code: 'MERGE_BLOCKED' });
+    await assert.rejects(work.write(file('/during')), { code: 'MERGE_BLOCKED', details: { requestId: 'uncertain' } });
     assert.equal(await observer.read({ fileId: saved.fileId }), null);
 
     const owner = { ...fixture.client };
@@ -189,6 +197,9 @@ test('unknown mutable writes fence the runtime and an exclusive drained owner ca
     assert.equal(await MemDrive.open({ client: owner, name }), recovered);
     const writer = scoped(recovered, work.at);
     assert.deepEqual(await writer.merge(request('uncertain')), status('uncertain', 'v1'));
+    // The replacement owner writes again. The fenced runtime never does: its mutation may still land.
+    await writer.write(file('/after'));
+    await assert.rejects(work.write(file('/during')), { code: 'MERGE_BLOCKED', details: { requestId: 'uncertain' } });
 });
 
 test('a reader of a store whose creation left v0 unpinned safely rechecks main if a publication races its read', async () => {
@@ -290,14 +301,8 @@ test('main history reports each publication\'s affected files, omits version gap
         clock.mock.restore();
     }
 
-    // History is recorded at publication and does not depend on a merge capture.
-    const complete = await reopened.history();
-    const tags = fixture.collections.get(name).tags;
-    const captures = [...tags.keys()].filter(tag => tag.startsWith('merge-capture-'));
-    assert.equal(captures.length, 3);
-    for (const tag of captures) tags.delete(tag);
-    assert.deepEqual(await reopened.history(), complete);
-    assert.deepEqual(await (await MemDrive.open(withClient(fixture))).history(), complete);
+    // Merges leave only main version tags beside the user's checkpoint.
+    assert.deepEqual([...fixture.collections.get(name).tags.keys()].sort(), ['checkpoint-original', 'md-main-v1', 'md-main-v3', 'md-main-v4']);
 });
 
 test('history caps affected IDs and reads a published completion while bookkeeping is running', async () => {
@@ -328,37 +333,37 @@ test('history caps affected IDs and reads a published completion while bookkeepi
     assert.deepEqual(await main.status(), { at: { kind: 'main' }, mainVersion: 'v1' });
 });
 
-test('known cold tag rejections retry inside the public call while preserving the captured working state', async () => {
+test('a known cold target tag rejection retries inside the public call while a queued write waits for the merge', async () => {
     const { fixture, main } = await setup();
     const work = await fork(main, { name: 'research' });
     const original = await work.write(file('/original'));
     const observed = gate();
-    let rejectedSource = false, rejectedTarget = false;
+    let rejectedTarget = false;
     fixture.beforeTagCreate = tag => {
-        if (tag.startsWith('merge-capture-') && !rejectedSource) {
-            rejectedSource = true;
-            observed.resolve();
-            throw dbRejection();
-        }
         if (tag === 'md-main-v1' && !rejectedTarget) {
             rejectedTarget = true;
+            observed.resolve();
             throw dbRejection();
         }
     };
     const publication = work.merge(request('cold'), { signal: AbortSignal.timeout(10_000) });
     await observed.promise;
-    const later = work.write(file('/later'));
+    let written = false;
+    const later = work.write(file('/later')).then(() => { written = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(written, false);
     assert.deepEqual(await publication, status('cold', 'v1'));
     await later;
-    assert(rejectedTarget);
     assert.deepEqual(await main.read({ fileId: original.fileId }), original);
     assert.equal(await main.read({ path: '/later' }), null);
     assert.deepEqual((await work.diff()).map(({ path }) => path), ['/later']);
     assert.equal(fixture.calls.filter(call => call.kind === 'upsert' && call.collection === name
         && call.request.branch === 'main').length, 1);
+    // The merge pins nothing but its target version.
+    assert.deepEqual(fixture.calls.filter(call => call.kind === 'tag-create').map(call => call.request.tagName), ['md-main-v1', 'md-main-v1']);
 });
 
-test('a same-fork merge captures after prior bookkeeping and before later queued user edits', async () => {
+test('a second merge of a fork and later edits wait for its running merge, each publishing what preceded it', async () => {
     const { fixture, main } = await setup();
     const work = await fork(main, { name: 'research' });
     const saved = await work.write(file('/versioned', 'first'));
@@ -371,15 +376,17 @@ test('a same-fork merge captures after prior bookkeeping and before later queued
     };
     const first = work.merge(request('first'));
     await applying.promise;
-    await work.write({ op: 'update', fileId: saved.fileId, content: 'second' });
+    const edit = work.write({ op: 'update', fileId: saved.fileId, content: 'second' });
     const second = work.merge(request('second'));
     const later = work.write({ op: 'update', fileId: saved.fileId, content: 'third' });
     resume.resolve();
     assert.deepEqual(await Promise.all([first, second]), [status('first', 'v1'), status('second', 'v2')]);
-    await later;
+    await Promise.all([edit, later]);
     assert.equal((await main.read({ fileId: saved.fileId })).content, 'second');
     assert.equal((await work.read({ fileId: saved.fileId })).content, 'third');
     assert.deepEqual(await work.diff(), [{ op: 'update', fileId: saved.fileId, path: saved.path }]);
+    const { at } = await main.fork({ name: 'first-version', version: 'v1' });
+    assert.equal((await main.read({ at, fileId: saved.fileId })).content, 'first');
 });
 
 test('a temporarily unconfirmed bookkeeping record can settle without blocking subsequent publication', async () => {

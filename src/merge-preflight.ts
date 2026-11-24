@@ -1,8 +1,7 @@
 import { changedFiles, netChange } from './diff.js';
 import { resolvedChunking } from './text-chunks.js';
-import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest } from './errors.js';
+import { checkAbort, databaseError, MemDriveError, nativeOptions, nativeRequest } from './errors.js';
 import { decodeStoredFile, fingerprintOf, originalId, resultDocs, validFileId } from './records.js';
-import { createRef } from './refs.js';
 import { fetchOriginals, pathQuery, viewRead, type Handle, type ViewRef } from './storage-reads.js';
 import type { MetadataSchema } from './types.js';
 
@@ -10,35 +9,14 @@ type TagRef = Extract<ViewRef, { kind: 'tag' }>;
 type BranchRef = Extract<ViewRef, { kind: 'branch' }>;
 export const initialMainRef = { kind: 'branch', name: 'md-main-v0' } as const;
 type PublishedMain = TagRef | typeof initialMainRef;
-type SourceQueue = <T>(operation: () => Promise<T>, signal?: AbortSignal) => Promise<T>;
 type Candidate = NonNullable<ReturnType<typeof netChange>>;
-const confirmedCapture = Symbol('confirmed merge capture');
-export type MergeSource = Readonly<TagRef & { [confirmedCapture]: string }>;
-
-// A durable caller can reconstruct the capability only after verifying the
-// operation's binding to a previously confirmed, retained capture.
-export function confirmedMergeSource(handle: Handle, name: string): MergeSource {
-    return Object.freeze({ kind: 'tag', name, [confirmedCapture]: handle.collectionName });
-}
 
 // Keep batches of full originals smaller than projected queries. The native
 // client can hydrate larger responses from its download URL.
-const originalBatchSize = 16;
+export const originalBatchSize = 16;
 const destinationBatchSize = 100;
 
-/** Use the working writer's enqueueRef and an operation-owned, retained tag name. */
-export function captureMergeSource(handle: Handle, source: BranchRef, tagName: string, enqueueRef: SourceQueue,
-    pendingRefs: Set<string>, signal?: AbortSignal): Promise<MergeSource> {
-    const branch: BranchRef = { kind: 'branch', name: source.name };
-    return enqueueRef(async () => {
-        await createRef(pendingRefs, { kind: 'merge source', name: tagName }, signal,
-            () => handle.tags.create({ tagName, source: branch }, mutationOptions(signal)),
-            response => response?.tag?.name === tagName);
-        return confirmedMergeSource(handle, tagName);
-    }, signal);
-}
-
-async function loadTargets(handle: Handle, name: string, source: TagRef, schema: MetadataSchema, dimensions: number | undefined, signal?: AbortSignal) {
+async function loadTargets(handle: Handle, name: string, source: BranchRef, schema: MetadataSchema, dimensions: number | undefined, signal?: AbortSignal) {
     const candidates: Candidate[] = [];
     for await (const candidate of changedFiles(handle, name, source, signal)) candidates.push(candidate);
 
@@ -49,10 +27,10 @@ async function loadTargets(handle: Handle, name: string, source: TagRef, schema:
         for (const candidate of batch) {
             const doc = originals.get(candidate.change.fileId);
             if (!doc || JSON.stringify(netChange(doc)) !== JSON.stringify(candidate))
-                throw new MemDriveError('INVALID_RESULT', 'The pinned source original disagrees with its change summary.');
+                throw new MemDriveError('INVALID_RESULT', 'The source original disagrees with its change summary.');
             const { revision, generation } = doc;
             if ((revision !== undefined && !validFileId(revision)) || (generation !== undefined && !validFileId(generation)))
-                throw new MemDriveError('INVALID_RESULT', 'The pinned source original has invalid file tracking.');
+                throw new MemDriveError('INVALID_RESULT', 'The source original has invalid file tracking.');
             // Only a deletion has no fingerprint; every live target carries one.
             if (candidate.fingerprint === undefined) {
                 targets.push({ ...candidate, file: undefined, revision, generation, chunking: undefined });
@@ -60,7 +38,7 @@ async function loadTargets(handle: Handle, name: string, source: TagRef, schema:
             }
             const file = decodeStoredFile(doc, schema, dimensions);
             if (await fingerprintOf(file) !== candidate.fingerprint)
-                throw new MemDriveError('INVALID_RESULT', 'The pinned source original disagrees with its fingerprint.');
+                throw new MemDriveError('INVALID_RESULT', 'The source original disagrees with its fingerprint.');
             const chunking = 'content' in file ? resolvedChunking(doc.chunking) : undefined;
             targets.push({ ...candidate, file, revision, generation, chunking });
         }
@@ -69,15 +47,16 @@ async function loadTargets(handle: Handle, name: string, source: TagRef, schema:
 }
 
 /**
- * Resolve publishedMain in the main publication queue and keep ownership
- * through application. For restart recovery, consume the
- * confirmed source returned by the durable capture journal.
+ * Plan a merge of the `working` fork against the published main
+ * version. Call it in the main publication queue while the fork is held still:
+ * its merge owns the fork's queue, or an unfinished reservation rejects writes
+ * to it. A resumed merge then reads the same source and rebuilds the same plan.
  */
-export async function prepareMerge(handle: Handle, name: string, capture: MergeSource, publishedMain: PublishedMain,
+export async function prepareMerge(handle: Handle, name: string, working: BranchRef, publishedMain: PublishedMain,
     schema: MetadataSchema, signal?: AbortSignal, dimensions?: number) {
-    if (capture[confirmedCapture] !== name || handle.collectionName !== name || publishedMain.kind !== 'tag' && publishedMain.name !== initialMainRef.name)
-        throw new MemDriveError('INVALID_INPUT', 'Preparing a merge requires a confirmed source capture and the published main version.');
-    const source: TagRef = { kind: 'tag', name: capture.name };
+    if (working.kind !== 'branch' || handle.collectionName !== name || publishedMain.kind !== 'tag' && publishedMain.name !== initialMainRef.name)
+        throw new MemDriveError('INVALID_INPUT', 'Preparing a merge requires the working fork and the published main version.');
+    const source: BranchRef = { kind: 'branch', name: working.name };
     const main: PublishedMain = { ...publishedMain };
     const targets = await loadTargets(handle, name, source, schema, dimensions, signal);
     const destinationClaims = new Map<string, string>();

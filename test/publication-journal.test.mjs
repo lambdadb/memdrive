@@ -12,7 +12,7 @@ const published = (requestId, version) => ({ requestId, status: 'published', ver
 const fresh = fixture => MemDrive.open({ client: { ...fixture.client }, name });
 const journalOf = fixture => [...fixture.collections.values()]
     .find(store => store.metadata.tags['memdrive.format'] === 'merge-publication-v1')?.branches.get('main').docs;
-const journalId = id => /^(?:reservation|completion|applied|bookkeeping|request|retention|merge-capture-v1):/.test(id);
+const journalId = id => /^(?:reservation|completion|applied|bookkeeping|request|retention):/.test(id);
 const journalFetches = (fixture, since = 0) => fixture.calls.slice(since)
     .filter(call => call.kind === 'fetch' && call.request.ids.some(journalId));
 const journalWrites = fixture => fixture.calls.filter(call => call.kind === 'upsert' && call.collection !== name).length;
@@ -98,7 +98,7 @@ test('the head search is exact at every probe boundary and stays logarithmic far
             const [kind, value] = id.split(':'), slot = BigInt(value);
             if (slot > head) return [];
             if (kind === 'reservation') return [{ id, driveId, kind: 'merge-reservation-v1', requestId: `r${slot}`, summary: 'Synthetic',
-                branch: 'fork-empty', sourceTag: null, startedAt: at, priorVersion: 'v0', version: `v${slot}` }];
+                branch: 'fork-empty', startedAt: at, priorVersion: 'v0', version: `v${slot}` }];
             return kind === 'completion' && slot < head
                 ? [{ id, driveId, kind: 'merge-result-v1', status: 'unchanged', version: 'v0', completedAt: at }] : [];
         });
@@ -195,9 +195,8 @@ test('a second client sees the same status, history pages, exact versions and re
 test('a history page at 200 merges costs a head lookup and one fetch of its slot records', async () => {
     const { fixture, versions } = await populate(200);
     assert.equal(versions.length, 137);
-    const captures = [...fixture.collections.get(name).tags.keys()].filter(tag => tag.startsWith('merge-capture-'));
-    // Publications and conflicts each keep a capture.
-    assert.equal(captures.length, 137 + 28);
+    // Each publication pins its version. No request leaves any other tag.
+    assert.deepEqual([...fixture.collections.get(name).tags.keys()].sort(), versions.map(version => `md-main-${version}`).sort());
     // Every native request of a history read, which must be a fetch of slot records by ID.
     const read = async operation => {
         const before = fixture.calls.length;
@@ -238,12 +237,6 @@ test('a history page at 200 merges costs a head lookup and one fetch of its slot
         assert.equal(all.fetches, 2 * pageCount, `all pages of ${limit}`);
         assert.deepEqual(all.page.map(entry => entry.version), versions);
     }
-    // No capture is needed: the same pages come back once they are all gone.
-    const expected = await pages(await fresh(fixture), 100);
-    for (const tag of captures) fixture.collections.get(name).tags.delete(tag);
-    const released = await fresh(fixture);
-    assert.equal((await read(() => released.history({ limit: 100 }))).fetches, 4);
-    assert.deepEqual(await pages(released, 100), expected);
 });
 
 test('per-merge records are read back from the journal instead of being kept in memory', async () => {
@@ -302,7 +295,7 @@ test('a crash after the reservation and before its request index resumes the sam
         assert.equal(indexOf(fixture, 'first').slot, '1');
         assert.deepEqual(await owner.merge({ at: other, ...request('second') }), published('second', 'v2'));
         assert.deepEqual(reservations(fixture).map(doc => [doc.id, doc.requestId]).sort(), [['reservation:1', 'first'], ['reservation:2', 'second']]);
-        assert.equal([...fixture.collections.get(name).tags.keys()].filter(tag => tag.startsWith('merge-capture-')).length, 2);
+        assert.deepEqual([...fixture.collections.get(name).tags.keys()].sort(), ['md-main-v1', 'md-main-v2']);
         assert.deepEqual(await (await fresh(fixture)).merge({ at: draft, ...request('first') }), published('first', 'v1'));
     }
 });

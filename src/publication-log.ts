@@ -7,7 +7,7 @@ import type { MergeRequest, MergeResult } from './types.js';
 export type BoundRequest = Omit<MergeRequest, 'at'> & { branch: string };
 type RecordBase = { id: string; driveId: string };
 export type Reservation = RecordBase & BoundRequest & {
-    kind: 'merge-reservation-v1'; sourceTag: string | null; startedAt: string; priorVersion: string; version: string;
+    kind: 'merge-reservation-v1'; startedAt: string; priorVersion: string; version: string;
 };
 /**
  * A publication records the files it affected: at most `publishedFileLimit`
@@ -65,19 +65,17 @@ export function parseReservation(doc: Record<string, unknown>, slot: bigint, exp
     if (doc.kind !== 'merge-reservation-v1' || doc.id !== reservationId(slot) || doc.version !== versionFor(slot)
         || !canonicalVersion(priorVersion) || slotOf(priorVersion) >= slot
         || (expectedPrior !== undefined && priorVersion !== expectedPrior)
-        || !validDate(doc.startedAt) || !requestId(doc.requestId) || !summary(doc.summary) || !branch(doc.branch)
-        || (doc.sourceTag !== null && (typeof doc.sourceTag !== 'string' || !doc.sourceTag.startsWith('merge-capture-')
-            || !validFileId(doc.sourceTag.slice('merge-capture-'.length)))))
+        || !validDate(doc.startedAt) || !requestId(doc.requestId) || !summary(doc.summary) || !branch(doc.branch))
         throw invalid();
-    const { kind, requestId: id, branch: sourceBranch, summary: message, sourceTag, startedAt, version } = doc;
+    const { kind, requestId: id, branch: sourceBranch, summary: message, startedAt, version } = doc;
     return { id: reservationId(slot), driveId: doc.driveId as string, kind, requestId: id, summary: message,
-        branch: sourceBranch, sourceTag, startedAt, priorVersion, version };
+        branch: sourceBranch, startedAt, priorVersion, version };
 }
 
 export function parseOutcome(doc: Record<string, unknown>, reservation: Reservation): Outcome & { completedAt: string } {
     if (doc.kind !== 'merge-result-v1' || !validDate(doc.completedAt)) throw invalid();
     const { fileIds, fileIdsTruncated } = doc;
-    if (doc.status === 'published' && doc.version === reservation.version && reservation.sourceTag !== null
+    if (doc.status === 'published' && doc.version === reservation.version
         && Array.isArray(fileIds) && fileIds.length >= 1 && fileIds.length <= publishedFileLimit
         && fileIds.every((id, index) => validFileId(id) && (index === 0 || fileIds[index - 1] < id))
         && typeof fileIdsTruncated === 'boolean' && (!fileIdsTruncated || fileIds.length === publishedFileLimit))
@@ -212,9 +210,14 @@ export function publicationLog(content: Handle, internal: Handle, driveId: strin
         return true;
     }
 
-    async function write(record: PublicationRecord, signal?: AbortSignal) {
+    /**
+     * Write a record unless it is already there. `dispatching` runs just before
+     * the mutation is sent: a failure before it left nothing in flight.
+     */
+    async function write(record: PublicationRecord, signal?: AbortSignal, dispatching?: () => void) {
         if (await confirmed(record, signal)) return;
         checkAbort(signal);
+        dispatching?.();
         let cause;
         try {
             await internal.docs.upsert({ branch: 'main', docs: [record] }, mutationOptions(signal));

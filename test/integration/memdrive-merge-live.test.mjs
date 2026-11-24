@@ -23,7 +23,7 @@ const newPath = '/published-created.txt';
 const mainRef = { kind: 'branch', name: 'main' };
 const sha = value => createHash('sha256').update(value).digest('hex');
 
-test('live public merge publishes immutable views and resumes one interrupted request', {
+test('live public merge publishes immutable views, holds its fork still and resumes one interrupted request', {
     skip: enabled ? false : 'Set MEMDRIVE_RUN_LIVE_TESTS=1 and MEMDRIVE_RUN_LIVE_MERGE_TESTS=1 for live resources.',
     timeout: 600_000,
 }, async t => {
@@ -201,13 +201,34 @@ test('live public merge publishes immutable views and resumes one interrupted re
         const blockedFork = await freshFork('unrelated-edit');
         const beforeBlocked = mutations;
         await assert.rejects(merge(blockedFork, unrelatedRequest), { code: 'MERGE_BLOCKED' });
-        // Drain this fork's source queue so a stray background capture is observable.
+        // Drain this fork's queue so a stray background mutation is observable.
         await blockedFork.drive.diff({ at: blockedFork.at }, options());
         assert.equal(mutations, beforeBlocked, 'A blocked request sent a mutation.');
         await read(await freshMain(), '/unrelated.txt', null);
 
-        phase = 'Resume the same request while preserving later working edits';
-        await main.write({ at: work.at, op: 'update', fileId: moved.fileId, content: later }, options());
+        phase = 'Hold the fork of the unfinished merge still';
+        // The writer that saw the interruption and a new client that reads the
+        // journal before its first write both reject writes without a mutation.
+        const edit = { op: 'update', fileId: moved.fileId, content: later };
+        const heldFork = await freshFork('source');
+        const beforeHeld = mutations;
+        for (const drive of [main, heldFork.drive]) {
+            await assert.rejects(drive.write({ at: work.at, ...edit }, options()),
+                error => error.code === 'MERGE_BLOCKED' && error.details.requestId === second.requestId);
+            await assert.rejects(drive.write({ at: work.at, op: 'create', path: '/during-merge.txt', content: '' }, options()),
+                { code: 'MERGE_BLOCKED' });
+        }
+        assert.equal(mutations, beforeHeld, 'A write to the held fork sent a mutation.');
+        // Reads, diff and references from the held fork still work.
+        await read(heldFork, '/moved.txt', changed);
+        const heldDiff = await heldFork.drive.diff({ at: heldFork.at }, options());
+        assert.deepEqual(heldDiff.map(change => change.op).sort(), ['create', 'delete', 'update']);
+        const heldChild = { drive: heldFork.drive, at: (await heldFork.drive.fork({ at: heldFork.at, name: 'during-merge' }, options())).at };
+        await read(heldChild, '/moved.txt', changed);
+        // A fork whose merge was only blocked reserved nothing and stays writable.
+        await blockedFork.drive.write({ at: blockedFork.at, op: 'create', path: '/unrelated-later.txt', content: '' }, options());
+
+        phase = 'Resume the same request from the held fork';
         const terminal = { kind: 'terminal', dropped: 0 };
         fault = terminal;
         let resumed;
@@ -239,9 +260,18 @@ test('live public merge publishes immutable views and resumes one interrupted re
         await read(retained, '/working.txt', original);
         await read(faultCheckpoint, '/delete.txt', deletion);
         await read(faultFork, '/working.txt', original);
+        phase = 'Edit the settled fork for its next merge';
         const reopened = await freshFork('source');
+        assert.deepEqual(await reopened.drive.diff({ at: reopened.at }, options()), []);
+        // The original writer observes the settlement by another client and writes again.
+        await main.write({ at: work.at, ...edit }, options());
         await read(reopened, '/moved.txt', later);
         assert.deepEqual(await reopened.drive.diff({ at: reopened.at }, options()), [{ op: 'update', fileId: moved.fileId, path: '/moved.txt' }]);
+        await read(await freshMain(), '/moved.txt', changed);
+        // Merges pinned main versions only; every other tag is a user checkpoint.
+        const tagNames = (await client.collection(name).tags.list(options())).tags.map(tag => tag.name);
+        assert(tagNames.length > 0 && tagNames.every(tag => /^md-main-v[1-9][0-9]*$/.test(tag) || tag.startsWith('checkpoint-')),
+            'A merge left a tag other than a main version.');
 
         phase = 'Reject a stale target and publish an unrelated fork';
         await assert.rejects(merge(await freshFork('conflicting-edit'), { requestId: randomUUID(), summary: 'Conflicting file' }),

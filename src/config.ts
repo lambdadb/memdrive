@@ -25,7 +25,7 @@ const fileIndexes = {
 } as const;
 const indexTypes = { string: 'keyword', number: 'double', boolean: 'boolean', datetime: 'datetime' } as const;
 const supportedAnalyzers: ReadonlySet<unknown> = new Set(Object.values(Analyzer));
-/** The SDK history window for internal main version tags and completed merge captures. */
+/** The SDK history window for superseded internal main version tags. */
 export const validRetention = (days: unknown): days is number => typeof days === 'number' && Number.isInteger(days) && days >= 1 && days <= 365;
 export const defaultRetentionInDays = 30;
 /** The SDK keeps LambdaDB's own snapshot retention at its minimum. */

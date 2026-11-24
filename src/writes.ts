@@ -117,32 +117,21 @@ export async function listChunkIds(handle: Handle, name: string, ref: ViewRef, f
     throw new MemDriveError('CHUNK_SCAN_LIMIT', 'Current chunk lookup exceeded the supported number of pages.');
 }
 
-export function workingWriter(handle: Handle, name: string, branch: string, schema: MetadataSchema, dimensions?: number, chunker?: TextChunker) {
+/**
+ * The single writer of one working fork. `requireWritable` rejects a write
+ * while an unsettled merge holds the fork still; `first` asks it to read that
+ * state before this writer's first write.
+ */
+export function workingWriter(handle: Handle, name: string, branch: string, schema: MetadataSchema, dimensions?: number, chunker?: TextChunker,
+    requireWritable?: (first: boolean, signal?: AbortSignal) => Promise<void>) {
     let queue = Promise.resolve();
-    let userBarrier: Promise<void> | undefined;
-
-    function deferUserOperations(until: Promise<unknown>) {
-        const barrier = until.then(() => undefined, () => undefined);
-        userBarrier = barrier;
-        void barrier.then(() => {
-            if (userBarrier === barrier) userBarrier = undefined;
-        });
-    }
-
-    function enqueueUser<T>(schedule: () => Promise<T>) {
-        return userBarrier ? userBarrier.then(schedule) : schedule();
-    }
+    let writable = false;
     function enqueue<T>(operation: () => Promise<T>): Promise<T> {
         const result = queue.then(operation);
         queue = result.then(() => undefined, () => undefined);
         return result;
     }
     const pending = new Set<Pending>();
-    let baselineUnconfirmed: MemDriveError | undefined;
-
-    function requireBaselineSettled() {
-        if (baselineUnconfirmed) throw baselineUnconfirmed;
-    }
     const branchSettings = branchRead(branch);
 
     async function confirm(expected: Expected, signal?: AbortSignal) {
@@ -184,9 +173,11 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
             ? { op: 'create' as const, records: await createRecords(operation, schema, dimensions, chunker, { signal }) }
             : editRequest(operation, schema, dimensions)));
         void prepared.catch(() => {});
-        return enqueueUser(() => enqueue(async () => {
+        return enqueue(async () => {
             checkAbort(signal);
-            requireBaselineSettled();
+            // A write queued behind a merge runs after it and proceeds only if that merge settled.
+            await requireWritable?.(!writable, signal);
+            writable = true;
             const inputs = await prepared;
             const targetIds = inputs.flatMap(input => input.op === 'create' ? [] : [input.fileId]);
             requireInput(new Set(targetIds).size === targetIds.length, 'Target file IDs must be distinct within one write.');
@@ -385,54 +376,48 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
                 }
             }
             return multi ? completed : completed[0]!;
-        }));
-    }
-    function enqueueCapture<T>(operation: (source: string, confirmSource: () => Promise<void>) => Promise<T>, signal?: AbortSignal) {
-        return enqueue(async () => {
-            checkAbort(signal);
-            requireBaselineSettled();
-            return operation(branch, async () => {
-                for (const unsettled of pending) {
-                    try { await confirm(unsettled.expected, signal); }
-                    catch (cause) {
-                        checkAbort(signal);
-                        throw new MemDriveError('WRITE_UNCONFIRMED', 'A source write is still unconfirmed. Inspect the fork before creating a reference.',
-                            { cause, details: { targets: unsettled.targets, stage: unsettled.stage } });
-                    }
-                    pending.delete(unsettled);
-                }
-            });
         });
+    }
+    /** Reject while a write to this fork has an unknown outcome. */
+    async function confirmSource(signal?: AbortSignal) {
+        for (const unsettled of pending) {
+            try { await confirm(unsettled.expected, signal); }
+            catch (cause) {
+                checkAbort(signal);
+                throw new MemDriveError('WRITE_UNCONFIRMED', 'A source write is still unconfirmed. Inspect the fork before creating a reference or publishing it.',
+                    { cause, details: { targets: unsettled.targets, stage: unsettled.stage } });
+            }
+            pending.delete(unsettled);
+        }
     }
 
     return {
         write,
-        enqueueCapture,
-        deferUserOperations,
-        /** Whether this queue holds a fence for a write whose outcome is unknown. */
-        fenced: () => pending.size > 0 || baselineUnconfirmed !== undefined,
-        enqueueRef<T>(operation: () => Promise<T>, signal?: AbortSignal) {
-            return enqueueUser(() => enqueueCapture(async (_source, confirmSource) => {
-                await confirmSource();
-                return operation();
-            }, signal));
+        /**
+         * Run a merge, or its recovery, as one operation of this queue. Writes,
+         * diffs, references and other merges of the fork wait until it ends,
+         * while the operation itself reads and advances the fork directly.
+         * Its `confirmSource` must pass before the merge reserves anything.
+         */
+        enqueueMerge<T>(operation: (confirmSource: () => Promise<void>) => Promise<T>, signal?: AbortSignal) {
+            return enqueue(async () => {
+                checkAbort(signal);
+                return operation(() => confirmSource(signal));
+            });
         },
-        enqueueBaseline(operation: (branch: string) => Promise<void>, signal?: AbortSignal) {
-            return enqueueCapture(async (source, confirmSource) => {
-                await confirmSource();
-                try {
-                    await operation(source);
-                } catch (error) {
-                    if (error instanceof MemDriveError && error.code === 'MERGE_MUTATION_UNCONFIRMED')
-                        baselineUnconfirmed = error;
-                    throw error;
-                }
-            }, signal);
+        /** Whether this queue holds a fence for a write whose outcome is unknown. */
+        fenced: () => pending.size > 0,
+        enqueueRef<T>(operation: () => Promise<T>, signal?: AbortSignal) {
+            return enqueue(async () => {
+                checkAbort(signal);
+                await confirmSource(signal);
+                return operation();
+            });
         },
         async diff(options?: RequestOptions) {
             const { signal } = operationOptions(options);
             checkAbort(signal);
-            return enqueueUser(() => enqueue(() => diffFiles(handle, name, branch, signal)));
+            return enqueue(() => diffFiles(handle, name, branch, signal));
         },
     };
 }
