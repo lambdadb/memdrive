@@ -124,8 +124,11 @@ preserves the upstream notice.
 
 `replay.mjs` is a separate runner. It replays one prepared conversation session
 by session and reports how a model used the MemDrive file tools while it
-talked to the user. It makes no retrieval, answer or judge request, and it
-never reads the evaluation annotations.
+talked to the user. The replay makes no retrieval, answer or judge request,
+and it never reads the evaluation annotations. The separate
+[question stage](#questions-is-what-was-saved-enough-to-answer) asks and judges
+BEAM's probing questions afterwards; it is the only part of the session replay
+that reads them.
 
 A session is one original BEAM batch: the messages that share a batch in the
 source, identified by the `s###` part of each prepared source ID. Only the
@@ -311,8 +314,9 @@ tool name, in milliseconds. Fixture timings show only local overhead.
 
 ### Limits of this measurement
 
-- These are process counts from recorded tool calls. There is no answer
-  generation, judging or score for what was saved.
+- These are process counts from recorded tool calls. The replay itself
+  generates no answer to a probing question and scores nothing; the question
+  stage below does, against a retained LambdaDB store.
 - A direct model request is not an agent application. Real agents add their
   own system prompt and memory features and decide whether server instructions
   reach the model. Results describe the model with this catalog only.
@@ -324,3 +328,96 @@ tool name, in milliseconds. Fixture timings show only local overhead.
 - Scripted mode and injected test transports report their totals under
   `smoke`, and `modelBehavior` stays null. The maintained tests use synthetic
   conversations and establish the harness, not model behavior.
+
+### Questions: is what was saved enough to answer?
+
+`--questions` asks one finished LambdaDB run's probing questions against the
+store it kept and judges the answers. It is the only reader of
+`evaluation/<id>.json`:
+
+```sh
+node benchmark/beam/replay.mjs --questions --run artifacts/beam-replay/live-1 \
+  --manifest artifacts/beam-original-100k/manifest.json \
+  --output artifacts/beam-replay/live-1-questions --env-file /path/to/evaluation.env
+```
+
+The run must use `--backend lambdadb`, have finished (`summary.json` reports
+`cleanup: "retained"`) and still hold its store (`store.json` status `ready`).
+A fixture run is rejected because its store is gone. The run does not record
+where its prepared data lives, so `--manifest` names it; the stage checks the
+SHA-256 of that manifest and of the runtime file against the run's manifest,
+and the evaluation file against the prepared manifest. It needs `LLM_API_KEY`
+and the same LambdaDB settings as the run. Missing settings, a ledger from
+another endpoint or project, a store whose ownership labels differ from the
+ledger and an existing `--output` all fail before any model request and
+before anything is written; the last two are checked after the store is read.
+The stage makes paid model requests (answers and judge) and paid database
+requests (reads and searches).
+
+Every question of the conversation is classified by the messages its
+annotation cites (`source_chat_ids`, matched to runtime turn IDs):
+
+- `user_replayed`: every cited message is a user utterance the run sent;
+- `no_sources`: it cites none, as for every abstention question;
+- `needs_assistant`: it cites a dataset assistant message. The replay never
+  sends those, because the model writes its own replies;
+- `not_replayed`: it cites only user utterances, but at least one was not
+  sent: outside the planned sessions, beyond `--turns`, or in a session that
+  failed;
+- `unresolved`: it cites an ID that matches no message, or more than one.
+  These are recorded and never asked.
+
+`--scope replayed` (default) asks `user_replayed` and `no_sources` questions.
+The other two classes depend on content the drive cannot hold, so their scores
+measure the replay's coverage rather than the model's saving. `--scope all`
+asks every class except `unresolved`. `--limit N` asks only the first N
+selected questions, in dataset order. The manifest records every question's
+class and cited messages, and the selected IDs.
+
+Each question is a fresh model conversation in dataset order with no memory of
+other questions: the run's exact instruction text as the developer message
+(none when the run had none), then the question text verbatim. There is no
+"answer only from the drive" instruction, so the model can also answer from
+its general knowledge. The tool catalog is read-only: `guide`, `status`,
+`history`, `list`, `read`, `search`, `findText`, `listForks` and
+`listCheckpoints`, from `getFileToolDefinitions` and executed through
+`createFileTools` with the same allowlist, so any other call returns
+`TOOL_NOT_ALLOWED`. The answer model defaults to the run's model (`--model`
+overrides it). Requests, budgets and failure handling are those of a replay
+session with one utterance; a failed question keeps its failure code, is not
+judged, and the stage continues. The answer is the final response's assistant
+text. The harness opens the store without recovery and only reads it: it
+compares the main version, forks and checkpoints before and after and reports
+them in `summary.json`.
+
+Judging follows upstream BEAM's `evaluate_*` functions: one Chat Completions
+request per rubric item with `unified_llm_judge_base_prompt`, replacing
+`<rubric_item>` and then `<llm_response>`. Upstream never substitutes the
+QUESTION the prompt mentions, and neither does this stage. The prompt is
+stored in [original-judge-prompt.json](original-judge-prompt.json) with the
+upstream revision and the pinned `src/prompts.py` hash, and its text hash is
+pinned in the runner. The judge is `gpt-4.1-mini-2025-04-14` at temperature 0
+(`--judge-model` overrides it), without retries. Its returned model and usage
+are validated. The reply is parsed as upstream's `parse_json_response` does
+(optional code fence, the whole text, then the first embedded JSON object),
+but upstream's `json_repair` fallback is not applied: anything that does not
+yield a score of exactly 1, 0.5 or 0 is a judge failure. A question's score is
+the mean over its rubric items, or null when any item failed. For
+`event_ordering`, upstream's headline metric is Kendall tau-b times F1 after
+an LLM alignment of events; it is not computed here, and only the rubric judge
+score is reported. This is not a reproduction of the BEAM paper's scores.
+
+`NEW_DIR/manifest.json` records the run directory and manifest hash, store
+name, source hashes, scope, limit, models, budgets, the instruction hash, the
+read-only tool definitions and their hash, the judge prompt hash and upstream
+revision, and the classification. Each asked question has a directory with
+`transcript.jsonl`, `requests.jsonl`, `events.jsonl` (with `elapsedMs`),
+`judge.jsonl` (one record per rubric item: score, reason, judge text, usage,
+`elapsedMs` or a failure code) and `result.json` (answer, tool calls by name,
+whether `search`, `read` or `findText` was called, tokens and timing).
+`summary.json` is rewritten after every question. It counts every question by
+class and by category, and reports judge scores for the asked questions
+overall, per class and per category. Each mean is over judged questions only
+and comes with its counts: asked, answered, failed (not answered), judged and
+unjudged (failed or with a failed judge request). Compare classes separately.
+Injected test transports report `measured: false`.

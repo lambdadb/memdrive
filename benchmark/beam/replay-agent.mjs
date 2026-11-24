@@ -48,9 +48,10 @@ export const toolDefinitions = () => getFileToolDefinitions({ embeddingMode: 'ma
  * Execute model tool calls against one drive. Every view of the store is authorized,
  * as for a personal drive. The model receives the SDK result unchanged, the SDK's
  * normalized error, or an explicit delivery-limit error; never a truncated result.
+ * `tools` is the SDK allowlist; a call outside it gets the SDK's `TOOL_NOT_ALLOWED`.
  */
-export function createToolHost({ drive, resultBytes = limits.resultBytes }) {
-    const tools = createFileTools({ drive, tools: toolNames });
+export function createToolHost({ drive, resultBytes = limits.resultBytes, tools: allowed = toolNames }) {
+    const tools = createFileTools({ drive, tools: allowed });
     return async function call(name, rawArguments, { signal } = {}) {
         let event;
         try {
@@ -160,10 +161,12 @@ export async function runSession({ session, turns = session.turns.length, call, 
     } finally { encoder.free(); }
 }
 
-export function openAI({ key, fetcher = fetch }) {
+/** One OpenAI request per call to `responses` or `chat/completions`; never retried. */
+export function openAI({ key, fetcher = fetch, endpoint = 'responses' }) {
     assert(typeof key === 'string' && key.trim(), 'Missing LLM_API_KEY');
+    assert(['responses', 'chat/completions'].includes(endpoint), 'Unsupported OpenAI endpoint');
     return async (request, { signal }) => {
-        const response = await fetcher('https://api.openai.com/v1/responses', {
+        const response = await fetcher(`https://api.openai.com/v1/${endpoint}`, {
             method: 'POST', headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
             body: JSON.stringify(request), redirect: 'error', signal: AbortSignal.any([
                 ...(signal ? [signal] : []), AbortSignal.timeout(limits.requestSeconds * 1000),

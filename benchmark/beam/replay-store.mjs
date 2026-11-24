@@ -49,6 +49,23 @@ export async function writeLedger(directory, ledger, { create = false } = {}) {
     finally { await rm(temporary, { force: true }); }
 }
 
+/** Read one run's ledger and check its format, endpoint, project and ownership receipt. */
+export async function readLedger(directory, { endpoint, project }) {
+    const ledger = JSON.parse(await readFile(path.join(directory, ledgerFile), 'utf8'));
+    assert.equal(ledger.protocol, storeProtocol, 'Unexpected replay store ledger format');
+    assert(ledger.endpoint === endpoint && ledger.project === project, 'Ledger belongs to another endpoint/project');
+    assert(storeName.test(ledger.name) && uuid.test(ledger.labels?.['beam.owner'] ?? '')
+        && JSON.stringify(ledger.labels) === JSON.stringify(storeLabels(ledger.labels['beam.owner'])), 'Invalid replay store ownership receipt');
+    assert(['pending', 'ready', 'cleaned'].includes(ledger.status), 'Unexpected replay store ledger state');
+    return ledger;
+}
+
+/** The store's labels must match the ledger's, so a ledger cannot point at a store it does not own. */
+export function assertOwner(collection, ledger) {
+    for (const [key, expected] of Object.entries(ledger.labels))
+        assert.equal(collection.tags?.[key], expected, 'Replay store owner differs');
+}
+
 /**
  * Delete the store recorded in one run's ledger, and nothing else. Requires the same
  * endpoint and project, checks the name and ownership labels, destroys the store with
@@ -56,12 +73,7 @@ export async function writeLedger(directory, ledger, { create = false } = {}) {
  */
 export async function cleanupStore({ output, client, endpoint, project }) {
     const directory = path.resolve(output);
-    const ledger = JSON.parse(await readFile(path.join(directory, ledgerFile), 'utf8'));
-    assert.equal(ledger.protocol, storeProtocol, 'Unexpected replay store ledger format');
-    assert(ledger.endpoint === endpoint && ledger.project === project, 'Ledger belongs to another endpoint/project');
-    assert(storeName.test(ledger.name) && uuid.test(ledger.labels?.['beam.owner'] ?? '')
-        && JSON.stringify(ledger.labels) === JSON.stringify(storeLabels(ledger.labels['beam.owner'])), 'Invalid replay store ownership receipt');
-    assert(['pending', 'ready', 'cleaned'].includes(ledger.status), 'Unexpected replay store ledger state');
+    const ledger = await readLedger(directory, { endpoint, project });
     if (ledger.status === 'cleaned') return { status: 'cleaned', name: ledger.name };
     const handle = client.collection(ledger.name);
     const inspect = async () => {
@@ -76,8 +88,7 @@ export async function cleanupStore({ output, client, endpoint, project }) {
     };
     const collection = await inspect();
     if (collection) {
-        for (const [key, expected] of Object.entries(ledger.labels))
-            assert.equal(collection.tags?.[key], expected, 'Replay store owner differs');
+        assertOwner(collection, ledger);
         await MemDrive.destroy({ client, name: ledger.name });
         for (let attempt = 0; await inspect(); attempt++) {
             assert(attempt < 8, 'Deletion is unconfirmed; retain the ledger and retry cleanup');

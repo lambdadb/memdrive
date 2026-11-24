@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { appendFile, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -14,7 +14,8 @@ import { MemDrive, fileToolError, fileToolInstructions } from '@functional-syste
 import { fileClient } from '../../test/helpers/file-client.mjs';
 import { createToolHost, failureCodes, limits, openAI, protocol, ReplayFailure, runSession, scriptedTransport, toolDefinitions, toolNames } from './replay-agent.mjs';
 import { conversationMetrics, sessionMetrics } from './replay-metrics.mjs';
-import { hash, loadSessions } from './replay-sessions.mjs';
+import { fingerprint, hash, loadSessions } from './replay-sessions.mjs';
+import { runQuestions } from './replay-questions.mjs';
 import { cleanupStore, lambdadbConnection, ledgerFile, newStoreName, storeLabels, storeProtocol, writeLedger } from './replay-store.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -23,16 +24,6 @@ const privateFile = { mode: 0o600 };
 const positive = value => value === undefined || (Number.isSafeInteger(value) && value >= 1);
 const backends = { fixture: 'native-client-fixture', lambdadb: 'lambdadb' };
 const sorted = map => Object.fromEntries(Object.entries(map).sort(([a], [b]) => a.localeCompare(b)));
-
-async function fingerprint(directory) {
-    const result = {};
-    for (const entry of await readdir(directory, { withFileTypes: true })) {
-        const file = path.join(directory, entry.name);
-        if (entry.isDirectory()) Object.assign(result, await fingerprint(file));
-        else result[path.relative(root, file)] = hash(await readFile(file));
-    }
-    return result;
-}
 
 /** Read-only harness observations after a session. A failed read is recorded and left null. */
 export async function observe(drive, mainVersionBefore) {
@@ -141,7 +132,7 @@ export async function runReplay({ manifest: manifestFile, conversation, output, 
     const definitions = toolDefinitions();
     const sources = { ...Object.fromEntries(await Promise.all(['replay.mjs', 'replay-agent.mjs', 'replay-metrics.mjs', 'replay-sessions.mjs', 'replay-store.mjs', 'original-config.json']
         .map(async name => [`benchmark/beam/${name}`, hash(await readFile(path.join(root, 'benchmark/beam', name)))]))),
-    ...await fingerprint(path.join(root, 'dist/esm')),
+    ...await fingerprint(path.join(root, 'dist/esm'), root),
     'test/helpers/file-client.mjs': hash(await readFile(path.join(root, 'test/helpers/file-client.mjs'))),
     'package-lock.json': hash(await readFile(path.join(root, 'package-lock.json'))) };
     const manifest = { protocol, mode, transport: askFactory ? 'injected-test' : mode === 'model' ? 'openai-responses' : 'scripted',
@@ -225,18 +216,23 @@ const help = `Replay one prepared original-BEAM conversation against the MemDriv
   [--mode model|scripted] [--model ID] [--instructions sdk|none] [--policy-file FILE]
   [--sessions COUNT] [--turns COUNT] [--session-tokens N] [--session-seconds N]
   [--backend fixture|lambdadb] [--env-file FILE]
+Ask and judge the BEAM questions against the store a LambdaDB run retained:
+  --questions --run RUN_DIR --manifest FILE --output NEW_DIR [--scope replayed|all]
+  [--model ID] [--judge-model ID] [--limit N] [--env-file FILE]
 Delete the LambdaDB store a run retained:
   --cleanup --output RUN_DIR [--env-file FILE]
 Model mode needs LLM_API_KEY and makes paid requests. Scripted mode makes none.
 The lambdadb backend needs LAMBDADB_BASE_URL, LAMBDADB_PROJECT_NAME and
 LAMBDADB_PROJECT_API_KEY, makes paid requests and keeps its store.
+Questions need LLM_API_KEY and the LambdaDB settings, make paid model and
+database requests, and leave the store unchanged.
 `;
 
 async function main() {
     const { values } = parseArgs({ options: Object.fromEntries([
         ...['manifest', 'conversation', 'output', 'mode', 'model', 'instructions', 'policy-file', 'sessions', 'turns', 'env-file',
-            'backend', 'session-tokens', 'session-seconds'].map(option => [option, { type: 'string' }]),
-        ['help', { type: 'boolean' }], ['cleanup', { type: 'boolean' }],
+            'backend', 'session-tokens', 'session-seconds', 'run', 'scope', 'judge-model', 'limit'].map(option => [option, { type: 'string' }]),
+        ['help', { type: 'boolean' }], ['cleanup', { type: 'boolean' }], ['questions', { type: 'boolean' }],
     ]) });
     if (values.help) { console.log(help); return; }
     const env = { ...process.env, ...(values['env-file'] ? parseEnv(await readFile(values['env-file'], 'utf8')) : {}) };
@@ -246,8 +242,18 @@ async function main() {
         console.log(json(await cleanupStore({ output: values.output, ...lambdadbConnection(env) })));
         return;
     }
-    assert(values.manifest && values.conversation && values.output, help);
     const count = value => value === undefined ? undefined : Number(value);
+    const questionOptions = ['questions', 'run', 'manifest', 'output', 'scope', 'model', 'judge-model', 'limit', 'env-file'];
+    if (values.questions) {
+        assert(values.run && values.manifest && values.output && Object.keys(values).every(option => questionOptions.includes(option)),
+            'Questions take --run RUN_DIR --manifest FILE --output NEW_DIR and optionally --scope, --model, --judge-model, --limit and --env-file');
+        const { summary } = await runQuestions({ run: values.run, manifest: values.manifest, output: values.output, scope: values.scope,
+            model: values.model, judgeModel: values['judge-model'], limit: count(values.limit), env, key: env.LLM_API_KEY });
+        console.log(json(summary));
+        if (!summary.questions.complete) process.exitCode = 1;
+        return;
+    }
+    assert(values.manifest && values.conversation && values.output && !['run', 'scope', 'judge-model', 'limit'].some(option => option in values), help);
     const { summary } = await runReplay({ manifest: values.manifest, conversation: values.conversation, output: values.output,
         mode: values.mode, model: values.model, instructions: values.instructions, policyFile: values['policy-file'],
         sessions: count(values.sessions), turns: count(values.turns), sessionTokens: count(values['session-tokens']),

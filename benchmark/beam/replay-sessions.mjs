@@ -2,11 +2,23 @@
 // Only user utterances are replayed; evaluation annotations are never read here.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 
 const config = JSON.parse(await readFile(new URL('./original-config.json', import.meta.url), 'utf8'));
 export const hash = value => createHash('sha256').update(value).digest('hex');
+
+/** SHA-256 of every file below `directory`, keyed by its path relative to `base`. */
+export async function fingerprint(directory, base) {
+    const result = {};
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+        const file = path.join(directory, entry.name);
+        if (entry.isDirectory()) Object.assign(result, await fingerprint(file, base));
+        else result[path.relative(base, file)] = hash(await readFile(file));
+    }
+    return result;
+}
+
 const nonblank = text => typeof text === 'string' && Boolean(text.trim()) && !/\p{Surrogate}/u.test(text);
 
 /**
