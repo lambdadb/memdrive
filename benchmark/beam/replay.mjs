@@ -15,7 +15,7 @@ import { fileClient } from '../../test/helpers/file-client.mjs';
 import { createToolHost, failureCodes, limits, openAI, protocol, ReplayFailure, runSession, scriptedTransport, toolDefinitions, toolNames } from './replay-agent.mjs';
 import { conversationMetrics, sessionMetrics } from './replay-metrics.mjs';
 import { fingerprint, hash, loadSessions } from './replay-sessions.mjs';
-import { runQuestions } from './replay-questions.mjs';
+import { runQuestions, runRejudge } from './replay-questions.mjs';
 import { cleanupStore, lambdadbConnection, ledgerFile, newStoreName, storeLabels, storeProtocol, writeLedger } from './replay-store.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -228,13 +228,17 @@ The lambdadb backend needs LAMBDADB_BASE_URL, LAMBDADB_PROJECT_NAME and
 LAMBDADB_PROJECT_API_KEY, makes paid requests and keeps its store.
 Questions need LLM_API_KEY and the LambdaDB settings, make paid model and
 database requests, and leave the store unchanged.
+Judge the stored answers of a question stage again:
+  --rejudge --answers QUESTIONS_DIR --manifest FILE --output NEW_DIR
+  [--judge-model ID] [--repeats N] [--env-file FILE]
+Rejudge needs only LLM_API_KEY and makes paid judge requests.
 `;
 
 async function main() {
     const { values } = parseArgs({ options: Object.fromEntries([
         ...['manifest', 'conversation', 'output', 'mode', 'model', 'instructions', 'policy-file', 'sessions', 'turns', 'env-file',
-            'backend', 'session-tokens', 'session-seconds', 'context-tokens', 'run', 'scope', 'judge-model', 'limit'].map(option => [option, { type: 'string' }]),
-        ['help', { type: 'boolean' }], ['cleanup', { type: 'boolean' }], ['questions', { type: 'boolean' }],
+            'backend', 'session-tokens', 'session-seconds', 'context-tokens', 'run', 'scope', 'judge-model', 'limit', 'answers', 'repeats'].map(option => [option, { type: 'string' }]),
+        ['help', { type: 'boolean' }], ['cleanup', { type: 'boolean' }], ['questions', { type: 'boolean' }], ['rejudge', { type: 'boolean' }],
     ]) });
     if (values.help) { console.log(help); return; }
     const env = { ...process.env, ...(values['env-file'] ? parseEnv(await readFile(values['env-file'], 'utf8')) : {}) };
@@ -255,7 +259,17 @@ async function main() {
         if (!summary.questions.complete) process.exitCode = 1;
         return;
     }
-    assert(values.manifest && values.conversation && values.output && !['run', 'scope', 'judge-model', 'limit'].some(option => option in values), help);
+    if (values.rejudge) {
+        assert(values.answers && values.manifest && values.output
+            && Object.keys(values).every(option => ['rejudge', 'answers', 'manifest', 'output', 'judge-model', 'repeats', 'env-file'].includes(option)),
+        'Rejudge takes --answers QUESTIONS_DIR --manifest FILE --output NEW_DIR and optionally --judge-model, --repeats and --env-file');
+        const { summary } = await runRejudge({ answers: values.answers, manifest: values.manifest, output: values.output,
+            judgeModel: values['judge-model'], repeats: count(values.repeats), key: env.LLM_API_KEY });
+        console.log(json(summary));
+        if (!summary.questions.complete || summary.tokens.failedRequests) process.exitCode = 1;
+        return;
+    }
+    assert(values.manifest && values.conversation && values.output && !['run', 'scope', 'judge-model', 'limit', 'answers', 'repeats'].some(option => option in values), help);
     const { summary } = await runReplay({ manifest: values.manifest, conversation: values.conversation, output: values.output,
         mode: values.mode, model: values.model, instructions: values.instructions, policyFile: values['policy-file'],
         sessions: count(values.sessions), turns: count(values.turns), sessionTokens: count(values['session-tokens']),

@@ -4,7 +4,7 @@
 // harness itself only reads: nothing writes, merges, forks or deletes in the store.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
@@ -14,6 +14,7 @@ import { fingerprint, groupSessions, hash } from './replay-sessions.mjs';
 import { assertOwner, lambdadbConnection, ledgerFile, readLedger } from './replay-store.mjs';
 
 export const questionsProtocol = 'memdrive-beam-replay-questions-v1';
+export const rejudgeProtocol = 'memdrive-beam-replay-rejudge-v1';
 export const readToolNames = Object.freeze(['guide', 'status', 'history', 'list', 'read', 'search', 'findText', 'listForks', 'listCheckpoints']);
 export const defaultJudgeModel = 'gpt-4.1-mini-2025-04-14';
 // `unresolved` questions cite a message ID the conversation lacks and are never asked.
@@ -351,4 +352,116 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
     const store = { before, after, unchanged: JSON.stringify(before) === JSON.stringify(after) };
     await writeSummary(store);
     return { manifest, results, summary: summarizeQuestions(manifest, results, store) };
+}
+
+/**
+ * How repeated judgments of the same answers agree with each other and with the original
+ * ones. `items`: { original, scores } per rubric item, one score per repeat; null is a
+ * failed judgment. An item is `stable` when every repeat scored and gave the same score,
+ * and `sameAsOriginal` when the original also scored and equals all of them.
+ */
+export function judgeAgreement(items) {
+    const scored = items.filter(item => item.scores.every(score => score !== null));
+    const stable = scored.filter(item => new Set(item.scores).size === 1);
+    const comparable = stable.filter(item => item.original !== null);
+    return { items: items.length, scored: scored.length, stable: stable.length, unstable: scored.length - stable.length,
+        comparable: comparable.length, sameAsOriginal: comparable.filter(item => item.scores[0] === item.original).length };
+}
+
+const meanOf = values => { const known = values.filter(value => value !== null); return { questions: known.length, mean: known.length ? sum(known, value => value) / known.length : null }; };
+
+/**
+ * Judge the stored answers of one question-stage output again, `repeats` times per rubric
+ * item, with any judge model. Nothing is asked again and no store is used; the answers and
+ * the original judgments are read from `answers`, the rubric from the prepared evaluation
+ * file the original stage recorded.
+ */
+export async function runRejudge({ answers, manifest: manifestFile, output, judgeModel = defaultJudgeModel, repeats = 1, key, judge,
+    clock = () => performance.now() }) {
+    assert(typeof answers === 'string' && answers && typeof manifestFile === 'string' && manifestFile, 'Provide --answers QUESTIONS_DIR and --manifest FILE');
+    assert(typeof output === 'string' && output, 'Provide a new output directory');
+    assert(typeof judgeModel === 'string' && judgeModel.length > 0 && judgeModel.length <= 100, 'Invalid model');
+    assert(Number.isSafeInteger(repeats) && repeats >= 1 && repeats <= 10, 'repeats must be an integer from 1 to 10');
+    const judgeTransport = judge ?? openAI({ key, endpoint: 'chat/completions' });
+
+    const directory = path.resolve(answers);
+    const stageBytes = await readFile(path.join(directory, 'manifest.json'));
+    const stage = JSON.parse(stageBytes);
+    assert.equal(stage.protocol, questionsProtocol, 'Use a question-stage output directory');
+    const source = stage.source, id = source.conversationId;
+    const manifestBytes = await readFile(manifestFile);
+    assert.equal(hash(manifestBytes), source.manifestSha256, 'Prepared manifest differs from the question stage');
+    const entries = JSON.parse(manifestBytes).conversations.filter(entry => entry.id === id);
+    assert(entries.length === 1 && entries[0].evaluation === `evaluation/${id}.json`, 'Unexpected prepared conversation entry');
+    const evaluationBytes = await readFile(path.join(path.dirname(manifestFile), entries[0].evaluation));
+    assert.equal(hash(evaluationBytes), source.evaluationSha256, 'Prepared evaluation differs from the question stage');
+    const rubrics = new Map(JSON.parse(evaluationBytes).map(item => [item.id, item.rubric]));
+
+    // Only answered questions have an answer to judge; a question that was never reached has no directory.
+    const names = new Set(await readdir(directory)), stored = [];
+    for (const [ordinal, question] of stage.selected.entries()) {
+        const name = `question-${String(ordinal + 1).padStart(3, '0')}-${question}`;
+        if (!names.has(name)) continue;
+        const result = await readJSON(path.join(directory, name, 'result.json'));
+        assert(result.id === question && rubrics.has(question), 'Stored answer differs from the selected question');
+        if (result.status !== 'answered') continue;
+        assert(typeof result.answer === 'string' && result.judge?.items.length === rubrics.get(question).length, 'Stored judgment differs from the rubric');
+        stored.push({ name, result });
+    }
+
+    const manifest = { protocol: rejudgeProtocol, judgeTransport: judge ? 'injected-test' : 'openai-chat-completions',
+        startedAt: new Date().toISOString(), node: process.version,
+        sourceCommit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
+        answers: { directory: path.relative(root, directory) || '.', manifestSha256: hash(stageBytes), judgeModel: stage.judgeModel, measured: stage.transport === 'openai-responses' },
+        source, judgeModel, repeats, judgeRequest: { temperature: 0, perRubricItem: true, retries: 0 },
+        judgePrompt: { file: 'benchmark/beam/original-judge-prompt.json', sha256: hash(judgePrompt), sameAsAnswers: stage.judgePrompt.sha256 === hash(judgePrompt) },
+        questions: stored.map(({ result }) => result.id) };
+    output = path.resolve(output);
+    await mkdir(path.dirname(output), { recursive: true });
+    await mkdir(output); // Existing results cannot be overwritten.
+    await writeFile(path.join(output, 'manifest.json'), json(manifest), privateFile);
+
+    const results = [];
+    const summarize = () => {
+        const items = results.flatMap(result => result.items);
+        const outcomes = results.flatMap(result => result.outcomes);
+        const usage = outcomes.filter(outcome => ['prompt_tokens', 'completion_tokens'].every(key => Number.isSafeInteger(outcome.usage?.[key])));
+        return { protocol: rejudgeProtocol, judgeTransport: manifest.judgeTransport, measured: manifest.judgeTransport === 'openai-chat-completions',
+            conversationId: id, answers: manifest.answers.directory, originalJudgeModel: stage.judgeModel, judgeModel, repeats,
+            questions: { stored: stored.length, judged: results.length, complete: results.length === stored.length },
+            agreement: judgeAgreement(items),
+            scores: { original: meanOf(results.map(result => result.originalScore)),
+                repeats: Array.from({ length: repeats }, (_, repeat) => meanOf(results.map(result => result.scores[repeat]))) },
+            // Every rubric item whose repeats disagree with each other or with the original judgment.
+            differing: results.flatMap(result => result.items.filter(item => new Set([item.original, ...item.scores]).size > 1)
+                .map(item => ({ id: result.id, index: item.index, rubricItem: item.rubricItem, original: item.original, scores: item.scores }))),
+            tokens: { requests: outcomes.length, failedRequests: outcomes.filter(outcome => outcome.status === 'failed').length,
+                prompt: sum(usage, outcome => outcome.usage.prompt_tokens), completion: sum(usage, outcome => outcome.usage.completion_tokens) },
+            questionResults: results.map(({ id: question, category, class: kind, originalScore, scores }) => ({ id: question, category, class: kind, originalScore, scores })) };
+    };
+    const writeSummary = () => writeFile(path.join(output, 'summary.json'), json(summarize()), privateFile);
+    await writeSummary();
+    for (const { name, result } of stored) {
+        await mkdir(path.join(output, name));
+        const rubric = rubrics.get(result.id), rounds = [], outcomes = [];
+        for (let repeat = 0; repeat < repeats; repeat++) {
+            const round = [];
+            for (const [index, item] of rubric.entries()) {
+                const outcome = { repeat, index, rubricItem: item, ...await judgeItem({ judge: judgeTransport, model: judgeModel, item, answer: result.answer, clock }) };
+                round.push(outcome);
+                await appendFile(path.join(output, name, 'judge.jsonl'), JSON.stringify(outcome) + '\n', privateFile);
+            }
+            rounds.push(round);
+            outcomes.push(...round);
+        }
+        const original = result.judge.items.map(item => item.status === 'scored' ? item.score : null);
+        const record = { id: result.id, category: result.category, class: result.class, originalScore: result.score, scores: rounds.map(questionScore),
+            items: rubric.map((item, index) => ({ index, rubricItem: item, original: original[index],
+                scores: rounds.map(round => round[index].status === 'scored' ? round[index].score : null) })),
+            outcomes: outcomes.map(({ repeat, index, status, code, usage }) => ({ repeat, index, status, ...(code ? { code } : {}), usage: usage ?? null })) };
+        await writeFile(path.join(output, name, 'result.json'), json(record), privateFile);
+        results.push(record);
+        await writeSummary();
+    }
+    return { manifest, results, summary: summarize() };
 }

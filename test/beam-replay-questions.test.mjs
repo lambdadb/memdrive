@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileToolInstructions, getFileToolDefinitions, MemDrive } from '@functional-systems/memdrive';
-import { classCounts, defaultJudgeModel, flattenSourceIds, judgeItem, judgePrompt, judgePromptSha256, parseJudgeOutput, questionScore, readToolNames,
-    runQuestions, scoreSummary } from '../benchmark/beam/replay-questions.mjs';
+import { classCounts, defaultJudgeModel, flattenSourceIds, judgeAgreement, judgeItem, judgePrompt, judgePromptSha256, parseJudgeOutput, questionScore,
+    readToolNames, runQuestions, runRejudge, scoreSummary } from '../benchmark/beam/replay-questions.mjs';
 import { runReplay } from '../benchmark/beam/replay.mjs';
 import { hash } from '../benchmark/beam/replay-sessions.mjs';
 import { fileClient } from './helpers/file-client.mjs';
@@ -296,6 +296,56 @@ test('the judge parser follows upstream without repairing JSON, and scores need 
     assert.deepEqual(await judge(scored(0.5)), { status: 'scored', score: 0.5, reason: 'scored 0.5', model: defaultJudgeModel,
         usage: { prompt_tokens: 10, completion_tokens: 5 }, content: '{"score":0.5,"reason":"scored 0.5"}', elapsedMs: 0 });
     assert.equal(calls, 4);
+});
+
+test('stored answers are judged again without asking, and agreement is counted per rubric item', async t => {
+    const files = await replayed(t);
+    // The original stage: question 0 scores [1, 0.5, 0], every other item 1; question 7 is never answered.
+    const original = { 0: [1, 0.5, 0] };
+    const marker = request => /RUBRIC-MARKER (\d+)\.(\d+)/.exec(request.messages[0].content).slice(1).map(Number);
+    const first = await files.stage('first', {
+        ask: async (request, { session }) => { if (session === 3) throw new Error('offline'); return message(request, `Stored answer ${session}`); },
+        judge: async request => { const [question, item] = marker(request); return scored(original[question]?.[item] ?? 1)(request); } });
+    const asked = files.counts.ask;
+    assert.deepEqual(first.results.map(result => result.status), ['answered', 'answered', 'answered', 'failed', 'answered']);
+
+    // Repeat 0 agrees with the original; repeat 1 changes item 0.1 and fails on item 1.0.
+    const calls = new Map(), requests = [];
+    const again = await runRejudge({ answers: path.join(files.root, 'first'), manifest: files.manifest, output: path.join(files.root, 'again'),
+        judgeModel: 'stronger-judge', repeats: 2, judge: async request => {
+            requests.push(request);
+            const [question, item] = marker(request), key = `${question}.${item}`, repeat = calls.get(key) ?? 0;
+            calls.set(key, repeat + 1);
+            if (repeat === 1 && key === '1.0') return verdict(request, 'not json');
+            return scored(repeat === 1 && key === '0.1' ? 1 : original[question]?.[item] ?? 1)(request);
+        } });
+    assert.equal(files.counts.ask, asked, 'Rejudging asks nothing');
+    assert(requests.every(request => request.model === 'stronger-judge' && request.temperature === 0 && /Stored answer \d/.test(request.messages[0].content)));
+    assert.deepEqual(again.results.map(result => [result.id, result.originalScore, result.scores]), [
+        [ids[0], 0.5, [0.5, 2 / 3]], [ids[1], 1, [1, null]], [ids[6], 1, [1, 1]], [ids[9], 1, [1, 1]]]);
+    const summary = await json(path.join(files.root, 'again', 'summary.json'));
+    assert.deepEqual(summary, JSON.parse(JSON.stringify(again.summary)));
+    // Seven rubric items: one failed in a repeat, one changed between repeats, five stable and equal to the original.
+    assert.deepEqual(summary.agreement, { items: 7, scored: 6, stable: 5, unstable: 1, comparable: 5, sameAsOriginal: 5 });
+    assert.deepEqual([summary.measured, summary.originalJudgeModel, summary.judgeModel, summary.repeats, summary.questions],
+        [false, defaultJudgeModel, 'stronger-judge', 2, { stored: 4, judged: 4, complete: true }]);
+    assert.deepEqual(summary.scores, { original: { questions: 4, mean: 0.875 },
+        repeats: [{ questions: 4, mean: 0.875 }, { questions: 3, mean: (2 / 3 + 2) / 3 }] });
+    assert.deepEqual(summary.differing.map(item => [item.id, item.index, item.original, item.scores]), [[ids[0], 1, 0.5, [0.5, 1]], [ids[1], 0, 1, [1, null]]]);
+    assert.deepEqual([summary.tokens.requests, summary.tokens.failedRequests], [14, 1]);
+    assert.deepEqual((await jsonl(path.join(files.root, 'again', `question-001-${ids[0]}`, 'judge.jsonl'))).map(item => [item.repeat, item.index, item.score]),
+        [[0, 0, 1], [0, 1, 0.5], [0, 2, 0], [1, 0, 1], [1, 1, 1], [1, 2, 0]]);
+
+    assert.deepEqual(judgeAgreement([{ original: null, scores: [1, 1] }, { original: 0, scores: [1, 1] }, { original: 1, scores: [null] }]),
+        { items: 3, scored: 2, stable: 2, unstable: 0, comparable: 1, sameAsOriginal: 0 });
+    const reject = (options, message) => assert.rejects(runRejudge({ answers: path.join(files.root, 'first'), manifest: files.manifest,
+        output: path.join(files.root, 'rejected'), judge: scored(1), ...options }), message);
+    await reject({ answers: files.run }, /question-stage output/);
+    await reject({ repeats: 0 }, /repeats/);
+    await reject({ output: path.join(files.root, 'again') }, { code: 'EEXIST' });
+    await writeFile(path.join(files.root, 'evaluation', '7.json'), '[]');
+    await reject({}, /Prepared evaluation differs/);
+    assert.equal(await exists(path.join(files.root, 'rejected')), false);
 });
 
 test('the stored judge prompt is the pinned upstream text with two placeholders', async () => {

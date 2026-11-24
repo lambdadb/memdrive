@@ -426,3 +426,21 @@ overall, per class and per category. Each mean is over judged questions only
 and comes with its counts: asked, answered, failed (not answered), judged and
 unjudged (failed or with a failed judge request). Compare classes separately.
 Injected test transports report `measured: false`.
+
+### Judging stored answers again
+
+`--rejudge --answers QUESTIONS_DIR --manifest FILE --output NEW_DIR
+[--judge-model ID] [--repeats N]` judges the answers a question stage already
+stored, without asking anything and without a store. It needs only
+`LLM_API_KEY`. Each rubric item of each answered question is judged
+`--repeats` times (1 to 10, default 1) with the same upstream prompt and
+request as the stage, and any judge model. Use it to see whether the judge
+repeats its own scores and whether another judge model agrees.
+
+`summary.json` reports, per rubric item, how many were scored in every repeat,
+how many of those got the same score in every repeat (`stable`), and how many
+stable items equal the original judgment (`sameAsOriginal`); the mean question
+score of the original stage and of each repeat with the number of questions
+behind it; and every item whose scores differ, with its rubric text. Judge
+reasons are in each question's `judge.jsonl`. A different model changes the
+judge, so its scores are not comparable with upstream BEAM's `gpt-4.1-mini`.
