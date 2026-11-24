@@ -19,7 +19,9 @@ test('browser bundle writes and reads exact file originals without Node globals'
                 const saved = await reopened.read({ at, fileId: created.fileId });
                 return JSON.stringify({ created, saved, main: await drive.read({ path: '/note.md' }) });
             }; ` }, bundle: true, platform: 'browser', format: 'iife', write: false });
-    const context = createContext({ crypto: webcrypto, TextEncoder, TextDecoder, AbortController, AbortSignal });
+    // Browser globals only. The Fetch API classes are present in every browser;
+    // the re-exported LambdaDB client references them when its module loads.
+    const context = createContext({ crypto: webcrypto, TextEncoder, TextDecoder, AbortController, AbortSignal, Request, Response, Headers });
     runInContext('globalThis.structuredClone = value => value === undefined ? undefined : JSON.parse(JSON.stringify(value));', context);
     runInContext(result.outputFiles[0].text, context);
     const { created, saved, main } = JSON.parse(await context.smoke());

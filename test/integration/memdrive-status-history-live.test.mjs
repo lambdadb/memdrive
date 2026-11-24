@@ -2,8 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import test from 'node:test';
-import { HTTPClient, LambdaDBClient } from '@functional-systems/lambdadb';
-import { MemDrive } from '@functional-systems/memdrive';
+import { HTTPClient, LambdaDBClient, MemDrive } from '@functional-systems/memdrive';
 
 const enabled = process.env.MEMDRIVE_RUN_LIVE_TESTS === '1' && process.env.MEMDRIVE_RUN_LIVE_STATUS_HISTORY_TESTS === '1';
 const options = () => ({ signal: AbortSignal.timeout(240_000) });

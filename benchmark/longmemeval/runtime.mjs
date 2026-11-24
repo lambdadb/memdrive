@@ -1,8 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile, writeFile, rename, mkdir } from 'node:fs/promises';
 import path from 'node:path';
-import { LambdaDBClient, HTTPClient } from '@functional-systems/lambdadb';
-import { MemDrive } from '@functional-systems/memdrive';
+import { HTTPClient, LambdaDBClient, MemDrive } from '@functional-systems/memdrive';
 import { get_encoding } from 'tiktoken';
 import { jsonHash, metadataSchema, integer, sourceFiles } from './protocol.mjs';
 
