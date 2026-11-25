@@ -22,7 +22,7 @@ const newPath = '/published-created.txt';
 const mainRef = { kind: 'branch', name: 'main' };
 const sha = value => createHash('sha256').update(value).digest('hex');
 
-test('live public merge publishes immutable views, holds its fork still and resumes one interrupted request', {
+test('live public merge publishes immutable views, rolls main back after failures and publishes the same fork again', {
     skip: enabled ? false : 'Set MEMDRIVE_RUN_LIVE_TESTS=1 and MEMDRIVE_RUN_LIVE_MERGE_TESTS=1 for live resources.',
     timeout: 600_000,
 }, async t => {
@@ -37,6 +37,7 @@ test('live public merge publishes immutable views, holds its fork still and resu
     const root = `/projects/${encodeURIComponent(project)}/collections`;
     let fault, failure, driveId;
     let mutations = 0;
+    const rollbacks = [], tagDeletes = [];
     let phase = 'Create an empty store';
 
     function native() {
@@ -53,6 +54,14 @@ test('live public merge publishes immutable views, holds its fork still and resu
             if (url.pathname === root && request.method === 'POST') assert(names.has(body.collectionName), 'Unknown collection create.');
             const contentMutation = request.method === 'POST' && collection === name && body?.branch === 'main'
                 && /\/docs\/(upsert|update|delete)$/.test(url.pathname);
+            const journalRecord = request.method === 'POST' && collection !== name && /\/docs\/upsert$/.test(url.pathname)
+                && body?.docs?.some(doc => doc.kind === 'publication-v1');
+            if (fault?.kind === 'record' && journalRecord) {
+                fault.rejected++;
+                return new Response(JSON.stringify({ message: 'Synthetic rejection of the publication record' }), {
+                    status: 400, headers: { 'content-type': 'application/json' },
+                });
+            }
             if (fault?.kind === 'partial' && contentMutation && fault.applied > 0) {
                 fault.rejected++;
                 // This synthetic rejection is returned before dispatch. Writes through the first
@@ -65,6 +74,9 @@ test('live public merge publishes immutable views, holds its fork still and resu
             if (request.method === 'DELETE' || request.method === 'PATCH' || request.method === 'PUT'
                 || (request.method === 'POST' && !/\/(docs\/(fetch|list)|query)$/.test(url.pathname))) mutations++;
             const response = await fetch(request, { redirect: 'error' });
+            if (collection === name && request.method === 'POST' && url.pathname.endsWith('/branches/main/rollback'))
+                rollbacks.push(response.status);
+            if (collection === name && request.method === 'DELETE' && parts[1] === 'tags') tagDeletes.push(decodeURIComponent(parts[2]));
             if (url.pathname === root && request.method === 'POST' && response.status === 201) {
                 created.add(body.collectionName);
                 if (body.collectionName === name) {
@@ -80,10 +92,9 @@ test('live public merge publishes immutable views, holds its fork still and resu
                 if (body.docs?.some(doc => doc.id?.startsWith('file:')) || body.ids?.some(id => id.startsWith('file:')))
                     fault.applied++;
             }
-            if (fault?.kind === 'terminal' && collection !== name && response.status === 202
-                && body?.docs?.some(doc => doc.kind === 'merge-result-v1' && doc.status === 'published') && !fault.dropped) {
+            if (fault?.kind === 'terminal' && journalRecord && response.status === 202 && !fault.dropped) {
                 fault.dropped++;
-                // The server accepted the terminal record. Only the reply is lost.
+                // The server accepted the publication record. Only the reply is lost.
                 throw new Error('Synthetic transport loss after an actual HTTP 202');
             }
             if (!response.ok && response.status !== 404)
@@ -134,18 +145,17 @@ test('live public merge publishes immutable views, holds its fork still and resu
         await read(await freshMain(), '/working.txt', null);
 
         phase = 'Publish the first merge from a new store';
-        const first = { requestId: randomUUID(), summary: 'Publish synthetic originals' };
+        const first = { summary: 'Publish synthetic originals' };
         const firstStarted = Date.now();
         const firstResult = await merge(work, first);
         t.diagnostic(`First cold publication completed in one public call after ${Date.now() - firstStarted} ms.`);
-        assert.equal(firstResult.requestId, first.requestId);
-        assert.equal(firstResult.status, 'published');
-        assert(typeof firstResult.version === 'string' && firstResult.version);
+        assert.deepEqual(firstResult, { status: 'published', version: 'v1' });
         // merge publishes only; the source fork remains.
         assert.deepEqual(await main.listForks({}, options()), { forks: [{ at: work.at }] });
+        // Merging the published fork again, from a new client, is unchanged and sends no mutation.
         const beforeFirstReplay = mutations;
-        assert.deepEqual(await merge(await freshFork('source'), first), firstResult);
-        assert.equal(mutations, beforeFirstReplay, 'Terminal replay sent a mutation.');
+        assert.deepEqual(await merge(await freshFork('source'), first), { status: 'unchanged', version: 'v1' });
+        assert.equal(mutations, beforeFirstReplay, 'A repeated merge sent a mutation.');
         const initial = await freshMain();
         await read(initial, '/working.txt', original);
         await read(initial, '/delete.txt', deletion);
@@ -159,8 +169,8 @@ test('live public merge publishes immutable views, holds its fork still and resu
         await stale.drive.write({ at: stale.at, op: 'update', fileId: moved.fileId, content: 'Conflicting synthetic edit.' }, options());
         await unrelated.drive.write({ at: unrelated.at, op: 'create', path: '/unrelated.txt', content: '' }, options());
 
-        phase = 'Stop after one real physical mutation';
-        const second = { requestId: randomUUID(), summary: 'Publish the moved, removed, and new files' };
+        phase = 'Fail after one real main mutation and roll main back';
+        const second = { summary: 'Publish the moved, removed, and new files' };
         const edits = await main.write({ at: work.at, operations: [
             { op: 'update', fileId: moved.fileId, newPath: '/moved.txt', content: changed },
             { op: 'delete', fileId: removed.fileId },
@@ -168,87 +178,76 @@ test('live public merge publishes immutable views, holds its fork still and resu
         ] }, options());
         const partial = { kind: 'partial', accepted: 0, applied: 0, rejected: 0 };
         fault = partial;
-        await assert.rejects(merge(work, second), { code: 'MERGE_RESUMABLE' });
+        const failedAt = Date.now();
+        await assert.rejects(merge(work, second), error => error instanceof MemDriveError && error.code === 'DATABASE_ERROR' && error.status === 400);
         fault = undefined;
         assert.equal(partial.applied, 1);
         assert(partial.rejected >= 1);
-        const physical = await client.collection(name).docs.fetch({
-            ids: [moved.fileId, removed.fileId, edits[2].fileId].map(id => `file:${id}`),
-            ref: mainRef, consistentRead: true, includeVectors: false,
-        }, options());
-        const originals = new Map(physical.docs.map(({ doc }) => [doc.fileId, doc]));
-        const movedNow = originals.get(moved.fileId)?.path === '/moved.txt';
-        const removedNow = !originals.has(removed.fileId) || originals.get(removed.fileId).kind !== 'file';
-        const createdNow = originals.has(edits[2].fileId);
-        assert([movedNow, removedNow, createdNow].some(Boolean), 'No applied change was visible on physical main.');
-        assert(![movedNow, removedNow, createdNow].every(Boolean), 'The fault did not interrupt a partial apply.');
-        t.diagnostic(`Partial apply: native accepts=${partial.accepted}; original mutations=${partial.applied}; injected pre-dispatch rejections=${partial.rejected}.`);
+        // The fresh v1 tag can need its snapshot published before it is a rollback target.
+        assert(rollbacks.length >= 1 && rollbacks.at(-1) < 300, `Rollback statuses: ${rollbacks.join(',')}`);
+        t.diagnostic(`Partial apply: native accepts=${partial.accepted}; original mutations=${partial.applied}; injected pre-dispatch rejections=${partial.rejected}; rollback attempts=${rollbacks.join(',')} within ${Date.now() - failedAt} ms.`);
+        const physical = async () => {
+            const response = await client.collection(name).docs.fetch({
+                ids: [moved.fileId, removed.fileId, edits[2].fileId].map(id => `file:${id}`),
+                ref: mainRef, consistentRead: true, includeVectors: false,
+            }, options());
+            return new Map(response.docs.map(({ doc }) => [doc.fileId, doc]));
+        };
+        // The writable main branch holds v1 again.
+        const restored = await physical();
+        assert.equal(restored.get(moved.fileId)?.path, '/working.txt');
+        assert.equal(restored.get(moved.fileId)?.body, original);
+        assert.equal(restored.get(removed.fileId)?.kind, 'file');
+        assert.equal(restored.has(edits[2].fileId), false);
 
-        phase = 'Read the previous published view and block a different request';
+        phase = 'Read the published view and keep the failed fork';
         const oldMain = await freshMain();
+        assert.deepEqual(await oldMain.drive.status({}, options()), { at: { kind: 'main' }, mainVersion: 'v1' });
         await read(oldMain, '/working.txt', original);
         await read(oldMain, '/moved.txt', null);
         await read(oldMain, '/delete.txt', deletion);
         await read(oldMain, newPath, null);
         await search(oldMain, 'Alpine compass', moved.fileId, original);
         await verifyList(oldMain, [{ fileId: moved.fileId, path: '/working.txt' }, { fileId: removed.fileId, path: '/delete.txt' }]);
-        const faultCheckpoint = { drive: oldMain.drive, at: (await oldMain.drive.checkpoint({ name: 'during-failure' }, options())).at };
-        const faultFork = { drive: oldMain.drive, at: (await oldMain.drive.fork({ name: 'during-failure' }, options())).at };
+        const faultCheckpoint = { drive: oldMain.drive, at: (await oldMain.drive.checkpoint({ name: 'after-failure' }, options())).at };
+        const faultFork = { drive: oldMain.drive, at: (await oldMain.drive.fork({ name: 'after-failure' }, options())).at };
         await read(faultFork, '/working.txt', original);
         await read(faultFork, '/moved.txt', null);
-        const unrelatedRequest = { requestId: randomUUID(), summary: 'Publish an unrelated file' };
-        const blockedFork = await freshFork('unrelated-edit');
-        const beforeBlocked = mutations;
-        await assert.rejects(merge(blockedFork, unrelatedRequest), { code: 'MERGE_BLOCKED' });
-        // Drain this fork's queue so a stray background mutation is observable.
-        await blockedFork.drive.diff({ at: blockedFork.at }, options());
-        assert.equal(mutations, beforeBlocked, 'A blocked request sent a mutation.');
-        await read(await freshMain(), '/unrelated.txt', null);
+        const failedFork = await freshFork('source');
+        await read(failedFork, '/moved.txt', changed);
+        const failedDiff = await failedFork.drive.diff({ at: failedFork.at }, options());
+        assert.deepEqual(failedDiff.map(change => change.op).sort(), ['create', 'delete', 'update']);
 
-        phase = 'Hold the fork of the unfinished merge still';
-        // The writer that saw the interruption and a new client that reads the
-        // journal before its first write both reject writes without a mutation.
-        const edit = { op: 'update', fileId: moved.fileId, content: later };
-        const heldFork = await freshFork('source');
-        const beforeHeld = mutations;
-        for (const drive of [main, heldFork.drive]) {
-            await assert.rejects(drive.write({ at: work.at, ...edit }, options()),
-                error => error.code === 'MERGE_BLOCKED' && error.details.requestId === second.requestId);
-            await assert.rejects(drive.write({ at: work.at, op: 'create', path: '/during-merge.txt', content: '' }, options()),
-                { code: 'MERGE_BLOCKED' });
-        }
-        assert.equal(mutations, beforeHeld, 'A write to the held fork sent a mutation.');
-        // Reads, diff and references from the held fork still work.
-        await read(heldFork, '/moved.txt', changed);
-        const heldDiff = await heldFork.drive.diff({ at: heldFork.at }, options());
-        assert.deepEqual(heldDiff.map(change => change.op).sort(), ['create', 'delete', 'update']);
-        const heldChild = { drive: heldFork.drive, at: (await heldFork.drive.fork({ at: heldFork.at, name: 'during-merge' }, options())).at };
-        await read(heldChild, '/moved.txt', changed);
-        // A fork whose merge was only blocked reserved nothing and stays writable.
-        await blockedFork.drive.write({ at: blockedFork.at, op: 'create', path: '/unrelated-later.txt', content: '' }, options());
+        phase = 'Fail at the publication record and leave an unrecorded tag';
+        const record = { kind: 'record', rejected: 0 };
+        fault = record;
+        const rollbacksBefore = rollbacks.length;
+        await assert.rejects(merge(work, second), error => error instanceof MemDriveError && error.status === 400);
+        fault = undefined;
+        assert.equal(record.rejected, 1);
+        assert.equal((await client.collection(name).tags.get('md-main-v2', options())).tag.name, 'md-main-v2');
+        assert(rollbacks.length > rollbacksBefore && rollbacks.at(-1) < 300, `Rollback statuses: ${rollbacks.join(',')}`);
+        const afterRecord = await freshMain();
+        assert.deepEqual(await afterRecord.drive.status({}, options()), { at: { kind: 'main' }, mainVersion: 'v1' });
+        await assert.rejects(afterRecord.drive.checkpoint({ name: 'unrecorded', version: 'v2' }, options()),
+            { code: 'HISTORICAL_VIEW_UNAVAILABLE' });
+        await read(afterRecord, '/moved.txt', null);
 
-        phase = 'Resume the same request from the held fork';
+        phase = 'Publish the same fork from a new client with a lost record reply';
         const terminal = { kind: 'terminal', dropped: 0 };
         fault = terminal;
-        let resumed;
-        try { resumed = await merge(await freshFork('source'), second); }
-        catch (error) {
-            assert(error instanceof MemDriveError && terminal.dropped === 1, 'The recovery did not reach the terminal write.');
-            t.diagnostic(`The native reply loss surfaced as ${error.code} before terminal replay.`);
-        }
+        const deletesBefore = tagDeletes.length;
+        const published = await merge(await freshFork('source'), second);
         fault = undefined;
         assert.equal(terminal.dropped, 1);
+        // The record was read back, so the lost reply did not fail the merge.
+        assert.deepEqual(published, { status: 'published', version: 'v2' });
+        // The unrecorded tag was removed before its version was reused.
+        assert.deepEqual(tagDeletes.slice(deletesBefore), ['md-main-v2']);
         const beforeReplay = mutations;
-        const replay = await merge(await freshFork('source'), second);
-        assert.equal(replay.requestId, second.requestId);
-        assert.equal(replay.status, 'published');
-        assert.notEqual(replay.version, firstResult.version);
-        if (resumed !== undefined) assert.deepEqual(replay, resumed);
-        assert.deepEqual(await merge(await freshFork('source'), second), replay);
-        await assert.rejects(merge(await freshFork('source'), { ...second, summary: 'Different summary' }),
-            { code: 'MERGE_REQUEST_CONFLICT' });
-        assert.equal(mutations, beforeReplay, 'Terminal replay sent a mutation.');
-        t.diagnostic('Terminal reply dropped after a real HTTP 202; the same request replayed from two fresh clients.');
+        assert.deepEqual(await merge(await freshFork('source'), second), { status: 'unchanged', version: 'v2' });
+        assert.equal(mutations, beforeReplay, 'A repeated merge sent a mutation.');
+        t.diagnostic('A failed record left an unrecorded tag that the next merge replaced; a lost record reply after HTTP 202 still published.');
         const final = await freshMain();
         await read(final, '/working.txt', null);
         await read(final, '/moved.txt', changed);
@@ -259,10 +258,15 @@ test('live public merge publishes immutable views, holds its fork still and resu
         await read(retained, '/working.txt', original);
         await read(faultCheckpoint, '/delete.txt', deletion);
         await read(faultFork, '/working.txt', original);
-        phase = 'Edit the settled fork for its next merge';
+        const afterPublication = await physical();
+        assert.equal(afterPublication.get(moved.fileId)?.path, '/moved.txt');
+        assert.equal(afterPublication.has(removed.fileId), false);
+        assert.equal(afterPublication.has(edits[2].fileId), true);
+
+        phase = 'Edit the published fork for its next merge';
         const reopened = await freshFork('source');
         assert.deepEqual(await reopened.drive.diff({ at: reopened.at }, options()), []);
-        // The original writer observes the settlement by another client and writes again.
+        const edit = { op: 'update', fileId: moved.fileId, content: later };
         await main.write({ at: work.at, ...edit }, options());
         await read(reopened, '/moved.txt', later);
         assert.deepEqual(await reopened.drive.diff({ at: reopened.at }, options()), [{ op: 'update', fileId: moved.fileId, path: '/moved.txt' }]);
@@ -273,10 +277,11 @@ test('live public merge publishes immutable views, holds its fork still and resu
             'A merge left a tag other than a main version.');
 
         phase = 'Reject a stale target and publish an unrelated fork';
-        await assert.rejects(merge(await freshFork('conflicting-edit'), { requestId: randomUUID(), summary: 'Conflicting file' }),
+        await assert.rejects(merge(await freshFork('conflicting-edit'), { summary: 'Conflicting file' }),
             { code: 'MERGE_CONFLICT' });
         await read(await freshMain(), '/moved.txt', changed);
-        await merge(await freshFork('unrelated-edit'), unrelatedRequest);
+        assert.deepEqual(await merge(await freshFork('unrelated-edit'), { summary: 'Publish an unrelated file' }),
+            { status: 'published', version: 'v3' });
         await read(await freshMain(), '/unrelated.txt', '');
         await read(retained, '/unrelated.txt', null);
 

@@ -6,7 +6,7 @@ import { fileClient } from './helpers/file-client.mjs';
 const all = ['guide', 'status', 'history', 'list', 'read', 'search', 'findText', 'fork', 'checkpoint',
     'listForks', 'listCheckpoints', 'deleteFork', 'deleteCheckpoint', 'diff', 'write', 'merge'];
 const draft = { kind: 'fork', name: 'draft' };
-const publication = requestId => ({ at: draft, requestId, summary: `Publish ${requestId}` });
+const publication = name => ({ at: draft, summary: `Publish ${name}` });
 async function setup(options = {}) {
     const fixture = fileClient();
     const drive = await MemDrive.create({ client: fixture.client, name: 'tools-fixture', ...options });
@@ -76,7 +76,7 @@ test('drive-bound execution can target any authorized view; edits need an explic
             const scope = at === undefined ? {} : { at };
             await assert.rejects(tools.execute('write', { ...scope, op: 'create', path: '/note.txt', content }), { code: 'INVALID_INPUT' });
             await assert.rejects(tools.execute('diff', scope), { code: 'INVALID_INPUT' });
-            await assert.rejects(tools.execute('merge', { ...scope, requestId: 'one', summary: 'One.' }), { code: 'INVALID_INPUT' });
+            await assert.rejects(tools.execute('merge', { ...scope, summary: 'One.' }), { code: 'INVALID_INPUT' });
         }
         assert.equal(fixture.calls.length, before);
         const reader = createFileTools({ drive, tools: ['read'] });
@@ -105,7 +105,7 @@ test('tool execution follows explicit fork targets through retrieval, exact edit
     assert.deepEqual(await tools.execute('diff', { at: draft }), await drive.diff({ at: draft }));
     const published = await tools.execute('merge', publication('first'));
     assert.equal(published.version, 'v1');
-    assert.deepEqual(await tools.execute('merge', publication('first')), published);
+    assert.deepEqual(await tools.execute('merge', publication('first')), { status: 'unchanged', version: 'v1' });
     assert.deepEqual(await tools.execute('listForks', {}), { forks: [{ at: draft }] });
     assert.equal((await tools.execute('read', { fileId: file.fileId })).content, edited.content);
     assert.deepEqual(await tools.execute('status', { at: draft }), { at: draft, mainVersion: 'v1' });
@@ -178,10 +178,10 @@ test('write wrapper validates its envelope, forwards cancellation and preserves 
         await assert.rejects(tools.execute(name, { at: draft }, { signal: AbortSignal.abort() }), { code: 'ABORTED' });
     await assert.rejects(tools.execute('status', {}, { recover: true }), { code: 'INVALID_INPUT' });
     assert.equal(fixture.calls.length, before);
-    const failure = new MemDriveError('MERGE_RESUMABLE', 'Resume after exclusive ownership.',
-        { details: { requestId: 'request', publishedVersion: 'v1' }, cause: new Error('private transport detail') });
+    const failure = new MemDriveError('MERGE_CONFLICT', 'Published main changed a targeted file.',
+        { details: { fileIds: [], paths: ['/note'] }, cause: new Error('private transport detail') });
     failure.status = 503;
-    assert.deepEqual(fileToolError(failure), { ok: false, error: { code: 'MERGE_RESUMABLE',
+    assert.deepEqual(fileToolError(failure), { ok: false, error: { code: 'MERGE_CONFLICT',
         message: failure.message, status: 503, details: failure.details } });
     assert(!JSON.stringify(fileToolError(failure)).includes('private transport detail'));
     assert.deepEqual(fileToolError(new Error('private detail')), { ok: false,

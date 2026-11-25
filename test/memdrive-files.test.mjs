@@ -72,7 +72,7 @@ test('omitted at reads main and explicit main returns the same published view', 
     await drive.fork({ name: 'research' });
     const file = await drive.write({ at: research, ...request('/published.txt', 'published') });
     await drive.write({ at: research, ...request('/draft.txt', 'draft') });
-    await drive.merge({ at: research, requestId: 'publish', summary: 'Publish one file' });
+    await drive.merge({ at: research, summary: 'Publish one file' });
     await drive.write({ at: research, op: 'update', fileId: file.fileId, content: 'unpublished edit' });
     assert.equal((await drive.read({ fileId: file.fileId })).content, 'published');
     assert.deepEqual(await drive.read({ at: { kind: 'main' }, fileId: file.fileId }), await drive.read({ fileId: file.fileId }));
@@ -93,7 +93,7 @@ test('write, diff and merge require an explicit working fork without storage cal
         await assert.rejects(drive.write({ ...target, ...request('/x.txt') }), { code: 'INVALID_INPUT' });
         await assert.rejects(drive.write({ ...target, operations: [request('/x.txt')] }), { code: 'INVALID_INPUT' });
         await assert.rejects(drive.diff(target), { code: 'INVALID_INPUT' });
-        await assert.rejects(drive.merge({ ...target, requestId: 'publish', summary: 'Publish' }), { code: 'INVALID_INPUT' });
+        await assert.rejects(drive.merge({ ...target, summary: 'Publish' }), { code: 'INVALID_INPUT' });
     }
     await assert.rejects(drive.diff(), { code: 'INVALID_INPUT' });
     await assert.rejects(drive.diff({ at: research, limit: 1 }), { code: 'INVALID_INPUT' });

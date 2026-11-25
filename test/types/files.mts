@@ -65,12 +65,16 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     await drive.diff({});
     // @ts-expect-error Diff is available only on working forks.
     await drive.diff({ at: { kind: 'main' } });
-    const merged: MergeResult = await reopened.merge({ at, requestId: 'batch-1', summary: 'Save the research' });
+    const merged: MergeResult = await reopened.merge({ at, summary: 'Save the research' });
     const mainVersion: string = merged.version;
-    void mainVersion;
+    const outcome: 'published' | 'unchanged' = merged.status;
+    void mainVersion; void outcome;
+    // @ts-expect-error A merge has no request identity; it is idempotent by content.
+    await reopened.merge({ at, requestId: 'batch-1', summary: 'Save the research' });
+    // @ts-expect-error Recovery is automatic; open has no recover option.
     await open({ client, name: 'workspace', recover: true });
     // @ts-expect-error Publication requires an explicit fork.
-    await drive.merge({ requestId: 'batch-1', summary: 'Save the research' });
+    await drive.merge({ summary: 'Save the research' });
     // @ts-expect-error Views are selected per request, not when opening.
     await open({ client, name: 'workspace', at: { kind: 'fork', name: 'research' } });
     const checkpoint: FileRef<CheckpointAt> = await reopened.checkpoint({ at, name: 'saved' });
@@ -82,7 +86,7 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     // @ts-expect-error A view is identified by one kind.
     await drive.read({ at: { kind: 'fork', fork: 'research' }, fileId: created.fileId });
     // @ts-expect-error Merge requires a fork target, not a checkpoint.
-    await drive.merge({ at: checkpoint.at, requestId: 'batch-1', summary: 'Save the research' });
+    await drive.merge({ at: checkpoint.at, summary: 'Save the research' });
     const selected: FileDrive = await open(options);
     const state: FileStoreStatus = await selected.status();
     const forkState: FileStoreStatus = await selected.status({ at });
@@ -111,7 +115,7 @@ export async function externalFileConsumer(client: LambdaDBClient, options: Open
     const reopened: FileDrive<'external'> = await open({ client, name: 'workspace', mode: 'external' });
     const reference = await reopened.read({ at, fileId: file!.fileId });
     await reopened.write({ at, op: 'update', fileId: file!.fileId, content: vector, newPath: '/updated' });
-    await reopened.merge({ at, requestId: 'publish-1', summary: 'Save the vector files' });
+    await reopened.merge({ at, summary: 'Save the vector files' });
     const hits = await drive.search({ query: vector, filter: topicFilter });
     const results: false = hits.reranked;
     const saved = await reopened.checkpoint({ at, name: 'saved' });

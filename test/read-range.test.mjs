@@ -61,7 +61,7 @@ test('range next carries its view and continues there rather than on main', asyn
 
 test('continuation rejects a changed original while a checkpoint remains readable', async () => {
     const { drive, file } = await setup('abcdef');
-    await drive.merge({ at: draft, requestId: 'publish', summary: 'Publish original' });
+    await drive.merge({ at: draft, summary: 'Publish original' });
     const { at: before } = await drive.checkpoint({ name: 'before' });
     const page = await drive.read({ at: draft, fileId: file.fileId, maxChars: 2 });
     const pinned = await drive.read({ at: before, fileId: file.fileId, maxChars: 2 });

@@ -1,8 +1,8 @@
 import { managedEmbedding } from './config.js';
-import { changedFiles, netChange } from './diff.js';
-import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, requireInput } from './errors.js';
+import { netChange } from './diff.js';
+import { databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, requireInput } from './errors.js';
 import { originalBatchSize, type prepareMerge } from './merge-preflight.js';
-import { bytes, contentHash, decodeStoredFile, fileOriginal, fingerprintOf, originalId, resultDocs, validFileId } from './records.js';
+import { bytes, contentHash, decodeStoredFile, fileOriginal, originalId, resultDocs, validFileId } from './records.js';
 import { branchRef, fetchOriginals, pathQuery, viewRead, type Handle, type ViewRef } from './storage-reads.js';
 import type { MetadataSchema } from './types.js';
 import { listChunkIds, writeBatches } from './writes.js';
@@ -10,22 +10,10 @@ import { listChunkIds, writeBatches } from './writes.js';
 export type PreparedMerge = Awaited<ReturnType<typeof prepareMerge>>;
 type Target = PreparedMerge['targets'][number];
 type NativeDoc = Record<string, unknown>;
-const rejectedStatuses = new Set([400, 401, 403, 404, 413, 422, 429]);
 
 async function mutate(operation: () => Promise<unknown>, signal?: AbortSignal) {
-    checkAbort(signal);
-    try {
-        await operation();
-    } catch (cause) {
-        const error = databaseError(cause, 'The merge content mutation was rejected.');
-        if (rejectedStatuses.has(error.status ?? 0)) throw error;
-        throw mutationUnconfirmed(cause);
-    }
-}
-
-function mutationUnconfirmed(cause: unknown) {
-    return new MemDriveError('MERGE_MUTATION_UNCONFIRMED',
-        'A merge content mutation may still be in flight. Settle outstanding writes before resuming.', { cause });
+    try { await nativeRequest(operation, signal); }
+    catch (cause) { throw databaseError(cause, 'A merge write was rejected or its outcome is unknown.'); }
 }
 
 async function mergeRevision(version: string) {
@@ -58,8 +46,8 @@ async function publishedRecords(handle: Handle, name: string, prepared: Prepared
     if (target.baseline && !(await fetchOriginals(handle, name, prepared.publishedMain, [fileId], signal)).has(fileId))
         throw new MemDriveError('INVALID_RESULT', 'The retained main tag is missing the merge baseline.');
 
-    // Copy the fork's stored representation and vectors. Publication and
-    // recovery never invoke a parser or depend on its current segmentation.
+    // Copy the fork's stored representation and vectors. Publication never
+    // invokes a parser or depends on its current segmentation.
     const { source } = prepared;
     const { generation } = target;
     if (generation !== undefined && !validFileId(generation))
@@ -95,7 +83,7 @@ async function publishedRecords(handle: Handle, name: string, prepared: Prepared
     return { docs, chunkIds: chunks.map(({ doc }) => doc.id) };
 }
 
-/** Apply only after durable reservation under exclusive main writer ownership. */
+/** Write the plan's targets to the main branch. Only the publication queue writes to main. */
 export async function applyMerge(handle: Handle, name: string, prepared: PreparedMerge, version: string, signal?: AbortSignal) {
     const revision = await mergeRevision(version);
     for (const target of prepared.targets) {
@@ -189,86 +177,38 @@ export async function verifyMerge(handle: Handle, name: string, prepared: Prepar
     }
 }
 
-/**
- * What a publication is known to contain: the plan that this run applied and
- * verified, or the tag that pins the version when the plan is no longer in
- * memory.
- */
-export type PublishedContent = { plan: PreparedMerge } | { tag: ViewRef };
+/** The main state a changed fork file now matches: its fingerprint, none for a deletion, and the version that holds it. */
+export type HeldFile = { fileId: string; fingerprint?: string | undefined; version?: string | undefined };
 
 /**
- * Advance the baselines of a published fork to `version`. The fork is held
- * still from its merge's reservation until this bookkeeping is confirmed, so
- * its changed originals should be exactly the files that version published.
- * That is not taken on trust: an original is advanced only if the version
- * holds exactly its current state. Anything else that reached the fork past
- * the hold stays an unpublished change with its old baseline, for the next
- * diff and merge.
- *
- * A merge that reaches bookkeeping in the run that built its plan compares
- * with that plan and sends no extra request. A resumed merge has no plan and
- * reads the version's tag once per batch of changed originals. A repeated
- * pass finds only the originals still to advance. Call it while holding the
- * fork's queue.
+ * Advance the baselines of fork files that main now holds exactly, so they
+ * are no longer changes. Call it while holding the fork's queue. It stops
+ * at the first failure; a repeated pass advances only what is left, and the
+ * next merge settles a file left with its old baseline without a conflict.
  */
-export async function advanceMergeSource(handle: Handle, name: string, branch: string, version: string, published: PublishedContent,
+export async function advanceMergeSource(handle: Handle, name: string, branch: string, held: HeldFile[],
     schema: MetadataSchema, dimensions?: number, signal?: AbortSignal) {
     const source = branchRef(branch);
-    const publishedRevision = await mergeRevision(version);
-    const read = (ref: ViewRef, ids: string[]) => fetchOriginals(handle, name, ref, ids, signal, dimensions !== undefined);
-    const targets = 'plan' in published ? new Map(published.plan.targets.map(target => [target.change.fileId, target])) : undefined;
-    const fileIds: string[] = [];
-    for await (const { change } of changedFiles(handle, name, source, signal)) fileIds.push(change.fileId);
-    for (let start = 0; start < fileIds.length; start += originalBatchSize) {
-        const batch = fileIds.slice(start, start + originalBatchSize);
-        const originals = await read(source, batch);
-        // The exact read decides: an original an earlier pass advanced has no change left.
-        const changes = batch.flatMap(fileId => {
+    for (let start = 0; start < held.length; start += originalBatchSize) {
+        const batch = held.slice(start, start + originalBatchSize);
+        const originals = await fetchOriginals(handle, name, source, batch.map(({ fileId }) => fileId), signal, dimensions !== undefined);
+        for (const { fileId, fingerprint, version } of batch) {
             const current = originals.get(fileId);
             const change = current?.changed === true ? netChange(current) : undefined;
-            return current && change ? [{ fileId, current, change }] : [];
-        });
-        if (!changes.length) continue;
-        const contained = 'tag' in published ? await read(published.tag, changes.map(({ fileId }) => fileId)) : undefined;
-        /** Whether the version holds the file with this fingerprint, or does not hold it when there is none. */
-        async function holds(fileId: string, fingerprint?: string) {
-            if (targets) {
-                // Only a file that the plan published can be advanced.
-                const target = targets.get(fileId);
-                return target !== undefined && target.fingerprint === fingerprint;
-            }
-            const main = contained?.get(fileId);
-            return (main?.kind === 'file' ? await fingerprintOf(decodeStoredFile(main, schema, dimensions)) : undefined) === fingerprint;
-        }
-        for (const { fileId, current, change } of changes) {
-            const id = originalId(fileId);
-            async function confirm(expected?: NativeDoc) {
-                try {
-                    const actual = (await read(source, [fileId])).get(fileId);
-                    if (expected ? !actual || !matchesFields(actual, expected) : actual !== undefined)
-                        throw new MemDriveError('INVALID_RESULT', 'The source fork did not confirm the advanced baseline.');
-                } catch (cause) {
-                    throw mutationUnconfirmed(cause);
-                }
-            }
+            if (!current || !change || change.fingerprint !== fingerprint) continue;
             // A published deletion leaves nothing on the fork.
-            if (change.fingerprint === undefined) {
-                if (!await holds(fileId)) continue;
-                await mutate(() => handle.docs.delete({ branch, ids: [id] }, mutationOptions(signal)), signal);
-                await confirm();
+            if (fingerprint === undefined) {
+                await mutate(() => handle.docs.delete({ branch, ids: [originalId(fileId)] }, mutationOptions(signal)), signal);
                 continue;
             }
-            // The fingerprint covers path, metadata and content or vector, and nothing that differs between views.
+            if (version === undefined) throw new MemDriveError('INVALID_RESULT', 'A published file has no version.');
             const file = decodeStoredFile(current, schema, dimensions);
-            const fingerprint = await fingerprintOf(file);
-            if (!await holds(fileId, fingerprint)) continue;
-            const { revision = publishedRevision, generation } = current;
+            const { revision = await mergeRevision(version), generation } = current;
             if (!validFileId(revision) || (generation !== undefined && !validFileId(generation)))
                 throw new MemDriveError('INVALID_RESULT', 'The working original has invalid revision or generation data.');
             const next = { ...fileOriginal(file, { revision, generation, baseline: { version, path: file.path, fingerprint }, version, fingerprint }),
                 ...(current.chunking === undefined ? {} : { chunking: current.chunking }) };
             await mutate(() => handle.docs.upsert({ branch, docs: [next] }, mutationOptions(signal)), signal);
-            await confirm(next);
         }
     }
 }

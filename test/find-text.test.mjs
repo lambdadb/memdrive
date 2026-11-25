@@ -311,13 +311,13 @@ test('findText reads a maximum-sized original and escapes literal syntax', async
 test('findText keeps a published continuation pinned across a later merge', async () => {
     const { drive } = await setup();
     const file = await drive.write({ at, op: 'create', path: '/note', content: 'Old old' });
-    await drive.merge({ at, requestId: 'first', summary: 'Publish the first original' });
+    await drive.merge({ at, summary: 'Publish the first original' });
     const first = await drive.findText({ query: 'old', limit: 1 });
     assert.equal(first.consistency, 'snapshot');
     assert.equal(first.hits[0].content, 'Old');
     assert.deepEqual(first.next.at, { kind: 'main' });
     await drive.write({ at, op: 'update', fileId: file.fileId, content: 'New' });
-    await drive.merge({ at, requestId: 'second', summary: 'Publish the second original' });
+    await drive.merge({ at, summary: 'Publish the second original' });
     assert.deepEqual((await drive.findText({ query: 'old' })).hits, []);
     // Omitted at is main, so the main cursor continues with or without explicit at.
     assert.equal((await drive.findText({ cursor: first.next.cursor })).hits[0].content, 'old');
@@ -355,7 +355,7 @@ test('findText cursors are stateless: they continue on another client and never 
 test('main findText cursors verify their pinned publication on every page', async () => {
     const { fixture, name, drive } = await setup();
     await drive.write({ at, op: 'create', path: '/note', content: 'old old' });
-    await drive.merge({ at, requestId: 'first', summary: 'Publish' });
+    await drive.merge({ at, summary: 'Publish' });
     const page = await drive.findText({ query: 'old', limit: 1 });
     const state = decoded(page.next.cursor);
     assert.equal(state.v, 'v1');

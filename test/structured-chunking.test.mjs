@@ -67,7 +67,7 @@ test('structured chunks retain exact originals and distinguish preview bodies fr
     await assert.rejects(fresh.write(createFile('new content')), { code: 'CHUNKER_UNAVAILABLE' });
 });
 
-test('publication and recovery use frozen rendered chunks without invoking the parser again', async () => {
+test('publication and a repeated merge use frozen rendered chunks without invoking the parser again', async () => {
     const fixture = fileClient();
     let parses = 0;
     const chunker = { id: 'table-fixture-v1', async chunk() {
@@ -79,16 +79,17 @@ test('publication and recovery use frozen rendered chunks without invoking the p
     await main.fork({ name: 'draft' });
     const file = await main.write(createFile('# Data\n\n| Name | Age |\n| --- | --- |\n| Mira | 30 |'));
     fixture.beforeTagCreate = tag => { if (tag === 'md-main-v1') throw Object.assign(new Error('Pause publication'), { statusCode: 403 }); };
-    await assert.rejects(main.merge({ at, requestId: 'publish-table', summary: 'Publish table' }), { code: 'MERGE_RESUMABLE' });
+    await assert.rejects(main.merge({ at, summary: 'Publish table' }), { code: 'DATABASE_ERROR', status: 403 });
     fixture.beforeTagCreate = undefined;
-    const recovered = await open({ client: { ...fixture.client }, name: 'table-store', recover: true });
+    const recovered = await open({ client: { ...fixture.client }, name: 'table-store' });
+    await recovered.merge({ at, summary: 'Publish table' });
     const hit = (await recovered.search({ query: 'Mira', rerank: false })).hits[0];
     assert.equal(hit.content, 'Mira, Age = 30');
     assert.equal(hit.range, undefined);
     assert.equal((await recovered.read({ fileId: file.fileId })).content, file.content);
     assert.equal(parses, 1);
     await main.write({ at, op: 'update', fileId: file.fileId, newPath: '/moved.md' });
-    await main.merge({ at, requestId: 'move-table', summary: 'Move table' });
+    await main.merge({ at, summary: 'Move table' });
     assert.equal((await main.search({ query: 'Mira', rerank: false })).hits[0].path, '/moved.md');
     assert.equal(parses, 1);
     await destroy({ client: { ...fixture.client }, name: 'table-store' });

@@ -31,7 +31,7 @@ export function scriptedAgent(scenario, guide) {
             add('write', previous => ({ at, op: 'update', fileId: previous.fileId,
                 edits: [{ oldText: 'Retention is 30 days.', newText: 'Retention is 42 days.' }] }));
             add('diff', { at });
-            if (scenario.id !== 'draft-checkpoint') add('merge', { at, requestId: 'task', summary: 'Update current retention guidance' });
+            if (scenario.id !== 'draft-checkpoint') add('merge', { at, summary: 'Update current retention guidance' });
         }
     }
     let index = 0;

@@ -313,7 +313,7 @@ test('a convincing text answer cannot replace required SDK publication and instr
 test('conflict scoring rejects a destroyed draft even when main is unchanged and the blocker is reported', async () => {
     await usingScenario('conflict', 'none', async (context, host) => {
         await host.toolsCall('write', { at: context.at, op: 'delete', fileId: context.ids['/faq.md'] });
-        assert.equal((await host.toolsCall('merge', { at: context.at, requestId: 'wrong-edit', summary: 'Publish FAQ edit' })).error.code, 'MERGE_CONFLICT');
+        assert.equal((await host.toolsCall('merge', { at: context.at, summary: 'Publish FAQ edit' })).error.code, 'MERGE_CONFLICT');
         const scored = await evaluate(context, host, 'Concurrent conflict blocked publication; not published.');
         assert.equal(scored.checks.conflictObserved, true);
         assert.equal(scored.checks.mainUnchanged, true);
@@ -397,7 +397,7 @@ test('retrieval scoring requires the stored fact, complete literal enumeration a
     const published = await scored('paraphrase', '21 days; renewals@example.test', async ({ main }) => {
         const { at } = await main.fork({ name: 'late' });
         await main.write({ at, op: 'create', path: '/late.md', content: 'late' });
-        await main.merge({ at, requestId: 'late', summary: 'Publish a late synthetic file' });
+        await main.merge({ at, summary: 'Publish a late synthetic file' });
         await main.deleteFork({ at });
     });
     assert.deepEqual([published.checks.correctAnswer, published.checks.mainUnchanged, published.passed], [true, false, false]);

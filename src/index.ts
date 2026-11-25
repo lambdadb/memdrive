@@ -108,14 +108,13 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
     /**
      * Keep this object registered while it holds state a reopened store would
      * lose: running or queued work, fences for unconfirmed configuration,
-     * reference or write outcomes, unsettled merge state, invalidation and
-     * unexpired list cursors. It is re-evaluated whenever an operation ends
-     * or a cached list scan is dropped.
+     * reference or write outcomes, invalidation and unexpired list cursors. It
+     * is re-evaluated whenever an operation ends or a cached list scan is dropped.
      */
     function retain() {
         if (self.store) storesFor(client).hold(name, self.store, operations > 0 || invalid || pendingRetention !== undefined
             || pendingRefs.size > 0 || [mainView, ...refs.values()].some(view => view.uncertain || view.lister.holds())
-            || [...writers.values()].some(writer => writer.fenced()) || publishing.held());
+            || [...writers.values()].some(writer => writer.fenced()));
     }
     async function tracked<T>(operation: () => Promise<T>): Promise<T> {
         operations++;
@@ -141,12 +140,11 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
     function writerFor(branch: string) {
         const existing = writers.get(branch);
         if (existing) return existing;
-        const writer = workingWriter(handle, name, branch, metadataSchema, dimensions, chunker,
-            (first, signal) => publishing.requireWritable(branch, first, signal));
+        const writer = workingWriter(handle, name, branch, metadataSchema, dimensions, chunker);
         writers.set(branch, writer);
         return writer;
     }
-    const publishing = publication(client, handle, identity, metadataSchema, writerFor, dimensions,
+    const publishing = publication(client, handle, identity, metadataSchema, dimensions,
         () => gate.soleOperation() && !invalid && pendingRetention === undefined && pendingRefs.size === 0
             && ![...refs.values()].some(view => view.uncertain));
 
@@ -155,7 +153,6 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         if (pendingRefs.size) throw new MemDriveError('REF_CREATION_UNCONFIRMED', 'Resolve unconfirmed reference creation before deleting.');
         if ([...refs.values()].some(view => view !== retry && view.uncertain))
             throw new MemDriveError('REF_DELETION_UNCONFIRMED', 'Settle unconfirmed reference deletion before deleting other resources.');
-        await publishing.assertIdle(signal);
         for (const writer of writers.values()) await writer.enqueueRef(async () => undefined, signal);
     }
 
@@ -519,7 +516,7 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
             rest => requireInput(Object.keys(rest).length === 0, 'diff accepts only at.')),
         merge: (request: unknown, options?: RequestOptions) => onFork('merge', request, options, (writer, rest, signal) => {
             const { at } = request as { at: ForkAt };
-            return publishing.merge({ requestId: rest.requestId as string, summary: rest.summary as string, branch: forkPrefix + at.name }, writer, signal);
+            return publishing.merge({ summary: rest.summary as string, branch: forkPrefix + at.name }, writer, signal);
         }, rest => validateMergeRequest(rest)),
         async configure(request: { retentionInDays: number }, options?: RequestOptions) {
             const { signal } = operationOptions(options);
@@ -576,7 +573,6 @@ function store(client: Client, handle: Handle, description: FileStoreDescription
         assertDeleteSafe: (signal?: AbortSignal) => tracked(() => assertDeleteSafe(signal)),
         invalidate() { invalid = true; retain(); },
         mode: embedding.mode,
-        recover: (signal?: AbortSignal) => tracked(() => publishing.recover(signal)),
         initialize: (signal?: AbortSignal) => tracked(() => publishing.initialize(signal)),
     };
     self.store = created;
@@ -624,10 +620,9 @@ export function open(options: OpenFileStoreOptions<EmbeddingMode>, requestOption
 export async function open(options: OpenFileStoreOptions<EmbeddingMode>, requestOptions?: RequestOptions) {
     const { signal } = operationOptions(requestOptions);
     checkAbort(signal);
-    validateConnection(options, ['client', 'name', 'recover', 'mode', 'chunker']);
-    const { client, name, recover, mode = 'managed' } = options;
+    validateConnection(options, ['client', 'name', 'mode', 'chunker']);
+    const { client, name, mode = 'managed' } = options;
     requireInput(mode === 'managed' || mode === 'external', 'Select managed or external embedding mode.');
-    requireInput(recover === undefined || typeof recover === 'boolean', 'recover must be a boolean.');
     return lifecycle(options).run(async () => {
         const stores = storesFor(client);
         let selected = stores.get(name);
@@ -648,7 +643,6 @@ export async function open(options: OpenFileStoreOptions<EmbeddingMode>, request
             throw new MemDriveError('CHUNKER_MISMATCH', 'The cached store is bound to another chunker. Use a separate client instance.');
         if (mode !== selected.mode)
             throw new MemDriveError('INCOMPATIBLE_STORE', `The file store uses ${selected.mode} embedding mode.`);
-        if (recover) await selected.recover(signal);
         return selected.drive;
     });
 }

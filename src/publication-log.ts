@@ -1,42 +1,23 @@
 import { keysOnly, validDate } from './config.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, requireInput } from './errors.js';
-import { contentHash, resultDocs, validFileId, validPath, validText } from './records.js';
+import { contentHash, resultDocs, validFileId, validText } from './records.js';
 import { branchRead, type Handle } from './storage-reads.js';
-import type { MergeRequest, MergeResult } from './types.js';
+import type { FileHistoryEntry, MergeRequest } from './types.js';
 
-export type BoundRequest = Omit<MergeRequest, 'at'> & { branch: string };
 type RecordBase = { id: string; driveId: string };
-export type Reservation = RecordBase & BoundRequest & {
-    kind: 'merge-reservation-v1'; startedAt: string; priorVersion: string; version: string;
-};
 /**
- * A publication records the files it affected: at most `publishedFileLimit`
- * IDs in ascending order, and whether it affected more.
+ * The record of one published main version, written once after its tag is
+ * confirmed. Its existence is the publication point. It lists at most
+ * `publishedFileLimit` affected file IDs in ascending order, and whether
+ * the publication affected more.
  */
-export type Outcome = { status: 'published'; version: string; fileIds: string[]; fileIdsTruncated: boolean }
-    | { status: 'unchanged'; version: string }
-    | { status: 'conflict'; fileIds: string[]; paths: string[] };
-export type Completion = RecordBase & Outcome & { kind: 'merge-result-v1'; completedAt: string };
-export type Applied = RecordBase & { kind: 'merge-applied-v1' };
-export type Bookkeeping = RecordBase & { kind: 'merge-bookkeeping-v1' };
-/**
- * Locates a request's reservation by a document ID derived from the request ID.
- * It is written once, after the reservation it names, and never changes.
- */
-export type RequestIndex = RecordBase & { kind: 'merge-request-v1'; requestId: string; slot: string };
-/** Every slot below `slot` has no remaining internal tag to release. */
+export type PublicationRecord = RecordBase & FileHistoryEntry & { kind: 'publication-v1' };
+/** Every version below `slot` has no superseded main tag left to release. */
 export type RetentionWatermark = RecordBase & { kind: 'retention-watermark-v1'; slot: string };
-/** One slot as read from the journal: its reservation and, once terminal, its outcome. */
-export type SlotState = { reservation: Reservation; outcome?: Outcome & { completedAt: string } };
-export type PublicationRecord = Reservation | Completion | Applied | Bookkeeping | RequestIndex;
 
 export const versionFor = (slot: bigint) => `v${slot}`;
 export const tagFor = (version: string) => `md-main-${version}`;
-export const reservationId = (slot: bigint) => `reservation:${slot}`;
-export const completionId = (slot: bigint) => `completion:${slot}`;
-export const appliedId = (slot: bigint) => `applied:${slot}`;
-export const bookkeepingId = (slot: bigint) => `bookkeeping:${slot}`;
-export const requestIndexId = async (requestId: string) => `request:${await contentHash(requestId)}`;
+export const publicationId = (slot: bigint) => `publication:${slot}`;
 export const watermarkId = 'retention:watermark';
 /** LambdaDB accepts 1–1,000 IDs per fetch. */
 export const fetchLimit = 1000;
@@ -47,64 +28,28 @@ export const canonicalVersion = (value: unknown): value is string => typeof valu
     && value.length <= 52 - 'md-main-'.length && /^v(?:0|[1-9][0-9]*)$/.test(value);
 export const slotOf = (version: string) => BigInt(version.slice(1));
 
-const requestId = (value: unknown): value is string => validText(value) && value.length > 0 && value.length <= 128;
 const summary = (value: unknown): value is string => validText(value) && value.trim().length > 0 && value.length <= 1024;
-const branch = (value: unknown): value is string => typeof value === 'string' && /^fork-[A-Za-z0-9_-]{3,47}$/.test(value);
 
 export function validateMergeRequest(request: unknown): asserts request is Omit<MergeRequest, 'at'> {
-    requireInput(keysOnly(request, ['requestId', 'summary']) && requestId(request.requestId) && summary(request.summary),
-        'Provide a merge request ID and a nonempty summary.');
+    requireInput(keysOnly(request, ['summary']) && summary(request.summary), 'Provide a nonempty merge summary.');
 }
 
-/**
- * Validate one reservation. Pass the prior version when the preceding slots
- * were observed; a record read on demand must still name an earlier version.
- */
-export function parseReservation(doc: Record<string, unknown>, slot: bigint, expectedPrior?: string): Reservation {
-    const { priorVersion } = doc;
-    if (doc.kind !== 'merge-reservation-v1' || doc.id !== reservationId(slot) || doc.version !== versionFor(slot)
-        || !canonicalVersion(priorVersion) || slotOf(priorVersion) >= slot
-        || (expectedPrior !== undefined && priorVersion !== expectedPrior)
-        || !validDate(doc.startedAt) || !requestId(doc.requestId) || !summary(doc.summary) || !branch(doc.branch))
+/** The history entry that the publication record of `slot` states. */
+export function parsePublication(doc: Record<string, unknown>, slot: bigint): FileHistoryEntry {
+    const { fileIds, fileIdsTruncated, publishedAt } = doc;
+    if (doc.kind !== 'publication-v1' || doc.id !== publicationId(slot) || doc.version !== versionFor(slot)
+        || !validDate(publishedAt) || !summary(doc.summary)
+        || !Array.isArray(fileIds) || fileIds.length < 1 || fileIds.length > publishedFileLimit
+        || !fileIds.every((id, index) => validFileId(id) && (index === 0 || fileIds[index - 1] < id))
+        || typeof fileIdsTruncated !== 'boolean' || (fileIdsTruncated && fileIds.length !== publishedFileLimit))
         throw invalid();
-    const { kind, requestId: id, branch: sourceBranch, summary: message, startedAt, version } = doc;
-    return { id: reservationId(slot), driveId: doc.driveId as string, kind, requestId: id, summary: message,
-        branch: sourceBranch, startedAt, priorVersion, version };
-}
-
-export function parseOutcome(doc: Record<string, unknown>, reservation: Reservation): Outcome & { completedAt: string } {
-    if (doc.kind !== 'merge-result-v1' || !validDate(doc.completedAt)) throw invalid();
-    const { fileIds, fileIdsTruncated } = doc;
-    if (doc.status === 'published' && doc.version === reservation.version
-        && Array.isArray(fileIds) && fileIds.length >= 1 && fileIds.length <= publishedFileLimit
-        && fileIds.every((id, index) => validFileId(id) && (index === 0 || fileIds[index - 1] < id))
-        && typeof fileIdsTruncated === 'boolean' && (!fileIdsTruncated || fileIds.length === publishedFileLimit))
-        return { status: 'published', version: doc.version, fileIds: fileIds as string[], fileIdsTruncated, completedAt: doc.completedAt };
-    if (doc.status === 'unchanged' && doc.version === reservation.priorVersion)
-        return { status: 'unchanged', version: doc.version, completedAt: doc.completedAt };
-    if (doc.status === 'conflict' && Array.isArray(doc.fileIds) && doc.fileIds.every(validFileId)
-        && Array.isArray(doc.paths) && doc.paths.every(validPath) && doc.fileIds.length + doc.paths.length > 0)
-        return { status: 'conflict', fileIds: doc.fileIds as string[], paths: doc.paths as string[], completedAt: doc.completedAt };
-    throw invalid();
-}
-
-/** The slot a request index record names for the expected request. */
-export function parseRequestIndex(doc: Record<string, unknown>, expected: string): bigint {
-    if (doc.kind !== 'merge-request-v1' || doc.requestId !== expected || !canonicalSlot(doc.slot)) throw invalid();
-    return BigInt(doc.slot);
+    return { version: doc.version, publishedAt, summary: doc.summary, fileIds: [...fileIds] as string[], fileIdsTruncated };
 }
 
 export function parseWatermark(doc: Record<string, unknown> | undefined): bigint {
     if (!doc) return 1n;
     if (doc.kind !== 'retention-watermark-v1' || !canonicalSlot(doc.slot)) throw invalid();
     return BigInt(doc.slot);
-}
-
-export function returnOutcome(value: Outcome, requestId: string): MergeResult {
-    if (value.status === 'conflict')
-        throw new MemDriveError('MERGE_CONFLICT', 'Published main changed a targeted file or occupies a requested destination.',
-            { details: { requestId, fileIds: [...value.fileIds], paths: [...value.paths] } });
-    return { requestId, status: value.status, version: value.version };
 }
 
 const invalid = () => new MemDriveError('INVALID_RESULT', 'The merge publication journal contains an invalid record.');
@@ -182,55 +127,38 @@ export function publicationLog(content: Handle, internal: Handle, driveId: strin
         return (await readMany([id], signal)).get(id);
     }
 
-    /** Read the reservations and outcomes of slots `from` through `to`, plus any `extra` slots, in one fetch. */
-    async function readSlots(from: bigint, to: bigint, signal?: AbortSignal, extra: readonly bigint[] = []) {
-        const slots = [...extra];
+    /** Read the publications of versions `from` through `to` in one fetch. Every one must exist. */
+    async function readSlots(from: bigint, to: bigint, signal?: AbortSignal) {
+        const states = new Map<bigint, FileHistoryEntry>();
+        if (from > to) return states;
+        const slots: bigint[] = [];
         for (let slot = from; slot <= to; slot++) slots.push(slot);
-        const states = new Map<bigint, SlotState>();
-        if (!slots.length) return states;
-        const records = await readMany(slots.flatMap(slot => [reservationId(slot), completionId(slot)]), signal);
+        const records = await readMany(slots.map(publicationId), signal);
         for (const slot of slots) {
-            const reservation = records.get(reservationId(slot)), completion = records.get(completionId(slot));
-            if (!reservation) {
-                if (completion) throw invalid();
-                continue;
-            }
-            const state: SlotState = { reservation: parseReservation(reservation, slot) };
-            if (completion) state.outcome = parseOutcome(completion, state.reservation);
-            states.set(slot, state);
+            const record = records.get(publicationId(slot));
+            if (!record) throw new MemDriveError('INVALID_RESULT', 'A published version is missing from the publication journal.');
+            states.set(slot, parsePublication(record, slot));
         }
         return states;
     }
 
-    async function confirmed(record: PublicationRecord, signal?: AbortSignal) {
+    /** Whether the journal holds exactly this record, rather than none or another publication of its version. */
+    async function recorded(record: PublicationRecord, signal?: AbortSignal) {
         const observed = await read(record.id, signal);
-        if (!observed) return false;
-        if (!Object.entries(record).every(([field, value]) => JSON.stringify(value) === JSON.stringify(observed[field])))
-            throw invalid();
-        return true;
+        return observed !== undefined && Object.entries(record).every(([field, value]) => JSON.stringify(value) === JSON.stringify(observed[field]));
     }
 
-    /**
-     * Write a record unless it is already there. `dispatching` runs just before
-     * the mutation is sent: a failure before it left nothing in flight.
-     */
-    async function write(record: PublicationRecord, signal?: AbortSignal, dispatching?: () => void) {
-        if (await confirmed(record, signal)) return;
-        checkAbort(signal);
-        dispatching?.();
+    /** Write a publication record and confirm it by reading it back. */
+    async function write(record: PublicationRecord, signal?: AbortSignal) {
         let cause;
         try {
-            await internal.docs.upsert({ branch: 'main', docs: [record] }, mutationOptions(signal));
+            await nativeRequest(() => internal.docs.upsert({ branch: 'main', docs: [record] }, mutationOptions(signal)), signal);
         } catch (error) {
             cause = error;
         }
-        try {
-            if (await confirmed(record, signal)) return;
-        } catch (error) {
-            cause ??= error;
-        }
-        throw new MemDriveError('MERGE_JOURNAL_UNCONFIRMED', 'Could not confirm the durable merge record. Retry the same request.',
-            { cause, details: { record: record.id } });
+        if (await recorded(record, signal)) return;
+        throw cause === undefined ? new MemDriveError('INVALID_RESULT', 'The publication record was not confirmed.')
+            : databaseError(cause, 'Could not record the publication.');
     }
 
     /** Store the retention watermark. A lost or stale write only repeats idempotent cleanup. */
@@ -243,5 +171,5 @@ export function publicationLog(content: Handle, internal: Handle, driveId: strin
         }
     }
 
-    return { exists, ensure, read, readMany, readSlots, confirmed, write, saveWatermark };
+    return { exists, ensure, read, readMany, readSlots, recorded, write, saveWatermark };
 }

@@ -14,9 +14,9 @@ async function setup(external = false) {
     await drive.fork({ name: 'draft' });
     const content = n => external ? new Array(64).fill(n) : `Revision ${n}`;
     const first = await drive.write({ at: draftAt, op: 'create', path: '/first', content: content(1) });
-    await drive.merge({ at: draftAt, requestId: 'first', summary: 'First publication' });
+    await drive.merge({ at: draftAt, summary: 'First publication' });
     await drive.write({ at: draftAt, op: 'update', fileId: first.fileId, newPath: '/second', content: content(2) });
-    await drive.merge({ at: draftAt, requestId: 'second', summary: 'Second publication' });
+    await drive.merge({ at: draftAt, summary: 'Second publication' });
     const journal = [...fixture.collections.values()].find(store => store.metadata.tags['memdrive.format'] === 'merge-publication-v1');
     const records = journal.branches.get('main').docs;
     const client = { ...fixture.client };
@@ -42,19 +42,23 @@ test('main sources select exact publication versions and retained v0; omission s
     assert(!fixture.calls.some(call => call.request?.source && 'asOf' in call.request.source));
 });
 
-test('an unfinished publication cannot be selected even after its target tag is created', async () => {
+test('an unrecorded publication cannot be selected even after its target tag is created', async () => {
     const { drive, fixture, state, first } = await setup();
     await drive.write({ at: draftAt, op: 'update', fileId: first.fileId, content: 'Unpublished third revision' });
     fixture.beforeUpsert = request => {
-        if (request.docs.some(doc => doc.id === 'completion:3')) throw new Error('Pause publication');
+        if (request.docs.some(doc => doc.id === 'publication:3')) throw new Error('Interrupt publication');
     };
-    await assert.rejects(drive.merge({ at: draftAt, requestId: 'third', summary: 'Third publication' }), { code: 'MERGE_RESUMABLE' });
+    await assert.rejects(drive.merge({ at: draftAt, summary: 'Third publication' }), { code: 'DATABASE_ERROR' });
     assert(state.tags.has('md-main-v3'));
     await assert.rejects(drive.checkpoint({ name: 'unpublished', version: 'v3' }),
         error => error.code === 'HISTORICAL_VIEW_UNAVAILABLE' && error.details.version === 'v3');
-    const { at } = await drive.checkpoint({ name: 'during-merge', version: 'v2' });
+    const { at } = await drive.checkpoint({ name: 'after-failure', version: 'v2' });
     assert.equal((await drive.read({ at, fileId: first.fileId })).content, 'Revision 2');
-    assert.equal((await drive.status()).merge.phase, 'publication');
+    assert.equal((await drive.status()).mainVersion, 'v2');
+    fixture.beforeUpsert = undefined;
+    assert.deepEqual(await drive.merge({ at: draftAt, summary: 'Third publication' }), { status: 'published', version: 'v3' });
+    const { at: third } = await drive.checkpoint({ name: 'third', version: 'v3' });
+    assert.equal((await drive.read({ at: third, fileId: first.fileId })).content, 'Unpublished third revision');
 });
 
 test('missing or expired versions fail without fallback while explicitly preserved refs survive', async () => {
@@ -92,7 +96,7 @@ test('versioned forks preserve old merge baselines and can be copied through exp
     const { at: old } = await drive.fork({ name: 'past-work', version: 'v1' });
     const { at: saved } = await drive.checkpoint({ at: old, name: 'past-save' });
     await drive.write({ at: old, op: 'update', fileId: first.fileId, content: 'Historical edit' });
-    await assert.rejects(drive.merge({ at: old, requestId: 'historical-edit', summary: 'Edit from an old baseline' }), { code: 'MERGE_CONFLICT' });
+    await assert.rejects(drive.merge({ at: old, summary: 'Edit from an old baseline' }), { code: 'MERGE_CONFLICT' });
     await drive.deleteFork({ at: old });
     assert.equal((await drive.read({ at: saved, fileId: first.fileId })).content, 'Revision 1');
     const { at: copy } = await drive.fork({ at: saved, name: 'copy-saved' });
@@ -104,7 +108,7 @@ test('recreating a deleted file from a retained version preserves later main cha
     const { at: changes } = await drive.fork({ name: 'later-changes' });
     await drive.write({ at: changes, op: 'delete', fileId: first.fileId });
     const other = await drive.write({ at: changes, op: 'create', path: '/other', content: 'Later content' });
-    const deletion = await drive.merge({ at: changes, requestId: 'later-changes', summary: 'Remove the old file and publish later content' });
+    const deletion = await drive.merge({ at: changes, summary: 'Remove the old file and publish later content' });
     assert.equal(await drive.read({ fileId: first.fileId }), null);
 
     const { entries } = await drive.history();
@@ -120,7 +124,7 @@ test('recreating a deleted file from a retained version preserves later main cha
     const restored = await drive.write({ at: recovery, op: 'create', path: original.path, content: original.content });
     assert.notEqual(restored.fileId, first.fileId);
     assert.deepEqual(await drive.diff({ at: recovery }), [{ op: 'create', fileId: restored.fileId, path: '/second' }]);
-    const outcome = await drive.merge({ at: recovery, requestId: 'recover-file', summary: 'Recreate the deleted file from its retained version' });
+    const outcome = await drive.merge({ at: recovery, summary: 'Recreate the deleted file from its retained version' });
     assert.equal(outcome.status, 'published');
     assert.deepEqual(await drive.read({ path: '/second' }), restored);
     assert.equal(await drive.read({ fileId: first.fileId }), null);
@@ -193,7 +197,7 @@ test('versioned tools return serializable at values and reject version from non-
 
 test('version selection is independent of publication timestamps', async () => {
     const { drive, records, first } = await setup();
-    records.get('completion:2').completedAt = records.get('completion:1').completedAt;
+    records.get('publication:2').publishedAt = records.get('publication:1').publishedAt;
     const { at } = await drive.checkpoint({ name: 'same-time', version: 'v1' });
     assert.equal((await drive.read({ at, fileId: first.fileId })).content, 'Revision 1');
 });

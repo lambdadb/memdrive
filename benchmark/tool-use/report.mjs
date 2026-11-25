@@ -8,8 +8,8 @@ import { retrievalMetrics } from './scenarios.mjs';
 const toolNames = ['guide', 'status', 'history', 'list', 'read', 'search', 'findText',
     'fork', 'checkpoint', 'listForks', 'listCheckpoints', 'deleteFork', 'deleteCheckpoint', 'diff', 'write', 'merge'];
 // BINDING_CHANGED and REF_DELETED identify errors in protocol-v1 run directories. HISTORY_UNAVAILABLE,
-// MERGE_CAPTURE_UNCONFIRMED, MERGE_SOURCE_CONFLICT and MERGE_SOURCE_NOT_READY are no longer raised; earlier
-// run directories can hold them.
+// MERGE_BLOCKED, MERGE_CAPTURE_UNCONFIRMED, MERGE_REQUEST_CONFLICT, MERGE_SOURCE_CONFLICT and
+// MERGE_SOURCE_NOT_READY are no longer raised; earlier run directories can hold them.
 const toolErrorCodes = [
     'ABORTED', 'BINDING_CHANGED', 'BRANCH_CONFLICT', 'BRANCH_NOT_FOUND', 'CHECKPOINT_CONFLICT', 'CHECKPOINT_NOT_FOUND',
     'CURSOR_VIEW_MISMATCH', 'DATABASE_ERROR', 'EDIT_CONFLICT', 'FILE_NOT_FOUND',

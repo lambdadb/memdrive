@@ -5,7 +5,7 @@ import { fileClient } from './helpers/file-client.mjs';
 
 const name = 'lifecycle-store';
 const edit = { op: 'create', path: '/note.md', content: 'Remember this.' };
-const merge = { requestId: 'publish', summary: 'Publish note' };
+const merge = { summary: 'Publish note' };
 const forkAt = refName => ({ kind: 'fork', name: refName });
 const checkpointAt = refName => ({ kind: 'checkpoint', name: refName });
 async function setup(published = false) {
@@ -156,19 +156,17 @@ test('definite ref rejection leaves the at usable and unconfirmed writes block d
     assert.equal(deletes(calls).length, before);
 });
 
-test('an unfinished durable merge blocks ref and store deletion on fresh clients', async () => {
-    const { fixture, drive, fork, connection, calls } = await setup();
+test('a failed merge leaves nothing that blocks ref or store deletion', async () => {
+    const { fixture, drive, fork, connection, calls, collections } = await setup();
     await drive.write({ at: fork, ...edit });
     fixture.beforeTagCreate = tag => { if (tag === 'md-main-v1') throw Object.assign(new Error('Forbidden'), { statusCode: 403 }); };
-    await assert.rejects(drive.merge({ at: fork, ...merge }), { code: 'MERGE_RESUMABLE' });
-    const remote = fresh(connection);
-    const reopened = await open(remote);
-    await assert.rejects(reopened.deleteFork({ at: fork }), { code: 'MERGE_BLOCKED' });
-    await assert.rejects(destroy(fresh(connection)), { code: 'MERGE_BLOCKED' });
-    assert.equal(deletes(calls).length, 0);
-    fixture.beforeTagCreate = undefined;
-    assert.equal(await open({ ...remote, recover: true }), reopened);
+    await assert.rejects(drive.merge({ at: fork, ...merge }), { code: 'DATABASE_ERROR', status: 403 });
+    // Main held nothing at v0, so the failed merge's writes were removed.
+    assert.equal(collections.get(name).branches.get('main').docs.size, 0);
+    const reopened = await open(fresh(connection));
     await reopened.deleteFork({ at: fork });
+    await destroy(fresh(connection));
+    assert.deepEqual(deletes(calls).map(call => call.kind), ['branch-delete', 'collection-delete', 'collection-delete']);
 });
 
 test('destroy removes only owned resources, invalidates the drive, and permits a fresh store generation', async () => {

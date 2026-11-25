@@ -33,8 +33,6 @@ export interface FileAtRequest {
 export type EmbeddingMode = 'managed' | 'external';
 
 export type OpenFileStoreOptions<Mode extends EmbeddingMode = 'managed'> = ConnectionOptions & ModeOption<Mode> & {
-    /** Resume an unfinished main merge as the exclusive host-owned writer. */
-    recover?: boolean | undefined;
     chunker?: DoclingChunker | undefined;
 };
 
@@ -205,12 +203,11 @@ export type FileChange =
     | { op: 'delete'; fileId: string; previousPath: string };
 
 export interface MergeRequest extends ForkRequest {
-    requestId: string;
     summary: string;
 }
 
+/** `published` creates the next main version; `unchanged` reports the current one when main already holds the fork's changes. */
 export interface MergeResult {
-    requestId: string;
     status: 'published' | 'unchanged';
     version: string;
 }
@@ -218,8 +215,6 @@ export interface MergeResult {
 export interface FileStoreStatus {
     at: FileAt;
     mainVersion: string;
-    /** An observed unfinished main merge. Its writer may still be running. */
-    merge?: { requestId: string; phase: 'publication' | 'bookkeeping' } | undefined;
 }
 
 /** List store-wide main publications after a version, or continue a previous page. */
