@@ -82,32 +82,23 @@ export async function createRecords(request: CreateFileRequest | CreateExternalF
     const metadata = metadataValues(request.metadata, schema);
     const file: StoredFile = { fileId: globalThis.crypto.randomUUID(), path, modifiedAt: new Date().toISOString(), ...payload,
         ...(metadata === undefined ? {} : { metadata }) };
-    if ('embedding' in file)
-        return fileRecords(file, { revision: globalThis.crypto.randomUUID(), fingerprint: await fingerprintOf(file) });
     return fileRecords(file, undefined, chunker, options);
-}
-
-export type FileBaseline = { version: string; path: string; fingerprint: string };
-
-export function baselineOf(doc: Record<string, unknown>): FileBaseline | undefined {
-    if (doc.baseline === undefined) return undefined;
-    if (!isObject(doc.baseline) || typeof doc.baseline.version !== 'string' || !doc.baseline.version
-        || !validPath(doc.baseline.path) || typeof doc.baseline.fingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(doc.baseline.fingerprint))
-        throw new MemDriveError('INVALID_RESULT', 'Read returned invalid file baseline data.');
-    return { version: doc.baseline.version, path: doc.baseline.path, fingerprint: doc.baseline.fingerprint };
 }
 
 export const metadataKey = (metadata: DriveFile['metadata']) => metadata === undefined ? null : Object.entries(metadata).sort();
 export const fingerprintOf = (file: StoredFile) =>
     contentHash(JSON.stringify([file.path, metadataKey(file.metadata), 'embedding' in file ? file.embedding : file.content]));
 
+/**
+ * Stored with each original. `revision` is new for every write of the original
+ * and copied to its chunks, so search drops chunks of another revision.
+ * `generation` suffixes the chunk IDs of a replaced text, so cleanup of one
+ * generation never deletes a later one.
+ */
 type FileTracking = {
     chunking?: ResolvedChunking | undefined;
     revision: string;
     generation?: string | undefined;
-    baseline?: FileBaseline | undefined;
-    fingerprint: string;
-    version?: string | undefined;
 };
 
 export function fileOriginal(file: StoredFile, tracking?: FileTracking) {
@@ -124,8 +115,7 @@ export function fileOriginal(file: StoredFile, tracking?: FileTracking) {
     const shared = { fileId, path, fileName, ancestorPaths, modifiedAt, ...(metadata === undefined ? {} : { metadata }),
         ...(revision === undefined ? {} : { revision }) };
     const payload = 'embedding' in file ? { embedding: file.embedding } : { body: file.content };
-    return { id: originalId(fileId), kind: 'file' as const, ...shared, ...payload,
-        changed: !tracking?.baseline || tracking.fingerprint !== tracking.baseline.fingerprint, ...tracking };
+    return { id: originalId(fileId), kind: 'file' as const, ...shared, ...payload, ...tracking };
 }
 
 export async function fileRecords(file: StoredFile, tracking?: FileTracking, chunker?: TextChunker, options?: { signal?: AbortSignal | undefined }) {
@@ -137,13 +127,13 @@ export async function fileRecords(file: StoredFile, tracking?: FileTracking, chu
     };
     if ('embedding' in file) {
         const { embedding: _embedding, ...reference } = file;
-        return { file: reference, docs: [toRecord(fileOriginal(file, tracking))] };
+        return { file: reference, docs: [toRecord(fileOriginal(file, tracking ?? { revision: globalThis.crypto.randomUUID() }))] };
     }
     // Reject an oversized original before running the chunker.
     toRecord(fileOriginal(file, tracking));
     requireInput(chunker !== undefined, 'Text files require the store chunker.');
     const rendered = await chunker(file, options);
-    const originalRecord = toRecord(fileOriginal(file, { revision: globalThis.crypto.randomUUID(), fingerprint: await fingerprintOf(file), ...tracking, chunking: rendered.resolved }));
+    const originalRecord = toRecord(fileOriginal(file, { revision: globalThis.crypto.randomUUID(), ...tracking, chunking: rendered.resolved }));
     const { path, fileName, ancestorPaths, modifiedAt, metadata, revision } = originalRecord.doc;
     const generation = tracking?.generation;
     const shared = { fileId, path, fileName, ancestorPaths, modifiedAt, ...(metadata === undefined ? {} : { metadata }), revision };

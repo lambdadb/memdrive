@@ -16,12 +16,14 @@ export interface DoclingChunker {
     chunk(file: { path: string; content: string; format: string }, options?: RequestOptions): Promise<Array<{ text: string; contextualized: string }>>;
 }
 
-/** Main, the published view. Omitting `at` selects it. */
+/** The store's main branch. Omitting `at` selects it. */
 export type MainAt = { kind: 'main' };
-/** A named working fork; the only writable target. */
+/** A named fork: a writable branch created from another view. */
 export type ForkAt = { kind: 'fork'; name: string };
-/** A named read-only checkpoint. */
+/** A named read-only checkpoint: a tag of a view at the time it was created. */
 export type CheckpointAt = { kind: 'checkpoint'; name: string };
+/** A writable view: main or a fork. */
+export type WritableAt = MainAt | ForkAt;
 /** One serializable view identity shared by requests, results and continuations. */
 export type FileAt = MainAt | ForkAt | CheckpointAt;
 
@@ -69,6 +71,12 @@ export interface FileCursorRequest {
     cursor: string;
 }
 
+/**
+ * One native listing page in native order, not sorted by path. A page can hold
+ * fewer than `limit` entries, or none, while `next` is present; common prefixes
+ * are computed per page and can repeat on later pages. The listing is complete
+ * only when a page has no `next`, and concurrent writes can be missed or seen twice.
+ */
 export interface ListFilesResult {
     files: FileListEntry[];
     prefixes: string[];
@@ -94,8 +102,6 @@ export interface FileReadPage extends DriveFile {
     at: FileAt;
     /** Fingerprint of the original path, content and metadata, checked on continuation. */
     revision: string;
-    /** Main publication last assigned to this original, when present. */
-    version?: string | undefined;
     totalLines: number;
     /** One-based inclusive line numbers and half-open UTF-16 offsets in the original. */
     range: { startLine: number; endLine: number; start: number; end: number };
@@ -157,17 +163,11 @@ type ViewFile<Mode extends EmbeddingMode> = Mode extends 'external' ? FileListEn
 type ViewSearch<Mode extends EmbeddingMode> = Mode extends 'external' ? SearchExternalFilesRequest : SearchFilesRequest;
 type ViewSearchResult<Mode extends EmbeddingMode> = Mode extends 'external' ? SearchExternalFilesResult : SearchFilesResult;
 
-/** Create a named ref from a source view; omission selects main. */
-export type CreateFileRefRequest = {
-    at?: MainAt | undefined;
+/** Create a named fork or checkpoint from a source view; omission selects main. */
+export interface CreateFileRefRequest {
+    at?: FileAt | undefined;
     name: string;
-    /** A main version such as v3, or the retained initial v0. Only supported from main. */
-    version?: string | undefined;
-} | {
-    at: ForkAt | CheckpointAt;
-    name: string;
-    version?: never;
-};
+}
 
 /** Serializable identity of an existing fork or checkpoint. */
 export interface FileRef<At extends ForkAt | CheckpointAt = ForkAt | CheckpointAt> {
@@ -187,70 +187,34 @@ export interface CheckpointList {
 /** Fork and checkpoint listings take no options. */
 export type ListFileRefsRequest = Record<string, never>;
 
-/** Requests that act on one existing working fork. */
-export interface ForkRequest {
-    at: ForkAt;
+/** Select a writable view; omission selects main. */
+export interface WriteTargetRequest {
+    at?: WritableAt | undefined;
 }
 
 export type WriteFileOperation<Mode extends EmbeddingMode = 'managed'> = FileMutation<Mode> | DeleteFileRequest;
-export interface WriteFilesRequest<Operation> extends ForkRequest {
+export interface WriteFilesRequest<Operation> extends WriteTargetRequest {
     operations: Operation[];
 }
 
-export type FileChange =
-    | { op: 'create'; fileId: string; path: string }
-    | { op: 'update'; fileId: string; path: string; previousPath?: string | undefined }
-    | { op: 'delete'; fileId: string; previousPath: string };
-
-export interface MergeRequest extends ForkRequest {
-    summary: string;
+/** Restore main or a fork to the contents of a checkpoint. */
+export interface RollbackRequest {
+    at: WritableAt;
+    to: CheckpointAt;
 }
 
-/** `published` creates the next main version; `unchanged` reports the current one when main already holds the fork's changes. */
-export interface MergeResult {
-    status: 'published' | 'unchanged';
-    version: string;
+export interface RollbackResult {
+    at: WritableAt;
 }
 
-export interface FileStoreStatus {
-    at: FileAt;
-    mainVersion: string;
-}
-
-/** List store-wide main publications after a version, or continue a previous page. */
-export type FileHistoryRequest = {
-    sinceVersion?: string | undefined;
-    limit?: number | undefined;
-    cursor?: never;
-} | {
-    cursor: string;
-    sinceVersion?: never;
-    limit?: never;
-};
-
-export interface FileHistoryEntry {
-    version: string;
-    publishedAt: string;
-    summary: string;
-    fileIds: string[];
-    fileIdsTruncated: boolean;
-}
-
-export interface FileHistoryResult {
-    entries: FileHistoryEntry[];
-    /** The latest published main version observed when the first page was requested. */
-    throughVersion: string;
-    /** Store-wide continuation; forward unchanged. */
-    next?: { cursor: string } | undefined;
-}
-
-/** One store object. Each request selects its view with `at`; omission selects main. */
+/**
+ * One store object. Each request selects its view with `at`; omission selects main.
+ * The object holds no state between calls: ordering, concurrency and ownership
+ * across calls, processes and clients belong to the caller.
+ */
 export interface FileDrive<Mode extends EmbeddingMode = 'managed'> {
     readonly name: string;
     describe(options?: RequestOptions): Promise<FileStoreDescription<Mode>>;
-    configure(request: { retentionInDays: number }, options?: RequestOptions): Promise<FileStoreDescription<Mode>>;
-    status(request?: FileAtRequest, options?: RequestOptions): Promise<FileStoreStatus>;
-    history(request?: FileHistoryRequest, options?: RequestOptions): Promise<FileHistoryResult>;
     list(request?: ListFilesRequest, options?: RequestOptions): Promise<ListFilesResult>;
     read(request: Mode extends 'external' ? never : ReadFileRangeRequest, options?: RequestOptions): Promise<FileReadPage | null>;
     read(request: ReadFileRequest, options?: RequestOptions): Promise<ViewFile<Mode> | null>;
@@ -264,13 +228,12 @@ export interface FileDrive<Mode extends EmbeddingMode = 'managed'> {
     listCheckpoints(request?: ListFileRefsRequest, options?: RequestOptions): Promise<CheckpointList>;
     deleteFork(request: { at: ForkAt }, options?: RequestOptions): Promise<FileRef<ForkAt>>;
     deleteCheckpoint(request: { at: CheckpointAt }, options?: RequestOptions): Promise<FileRef<CheckpointAt>>;
-    write(request: ForkRequest & FileMutation<Mode>, options?: RequestOptions): Promise<ViewFile<Mode>>;
-    write(request: ForkRequest & DeleteFileRequest, options?: RequestOptions): Promise<DeleteFileResult>;
-    write(request: ForkRequest & WriteFileOperation<Mode>, options?: RequestOptions): Promise<ViewFile<Mode> | DeleteFileResult>;
+    write(request: WriteTargetRequest & FileMutation<Mode>, options?: RequestOptions): Promise<ViewFile<Mode>>;
+    write(request: WriteTargetRequest & DeleteFileRequest, options?: RequestOptions): Promise<DeleteFileResult>;
+    write(request: WriteTargetRequest & WriteFileOperation<Mode>, options?: RequestOptions): Promise<ViewFile<Mode> | DeleteFileResult>;
     write(request: WriteFilesRequest<FileMutation<Mode>>, options?: RequestOptions): Promise<ViewFile<Mode>[]>;
     write(request: WriteFilesRequest<WriteFileOperation<Mode>>, options?: RequestOptions): Promise<(ViewFile<Mode> | DeleteFileResult)[]>;
-    diff(request: ForkRequest, options?: RequestOptions): Promise<FileChange[]>;
-    merge(request: MergeRequest, options?: RequestOptions): Promise<MergeResult>;
+    rollback(request: RollbackRequest, options?: RequestOptions): Promise<RollbackResult>;
 }
 
 export type MetadataType = 'string' | 'number' | 'boolean' | 'datetime';
@@ -287,11 +250,6 @@ export interface ExternalEmbedding {
 type StoreOptions = ConnectionOptions & {
     labels?: Record<string, string> | undefined;
     metadataSchema?: MetadataSchema | undefined;
-    /**
-     * SDK history window, 1–365 days (default 30), for superseded internal main version
-     * tags. Native snapshot retention stays at its one-day minimum.
-     */
-    retentionInDays?: number | undefined;
 };
 
 export type CreateFileStoreOptions = StoreOptions & {
@@ -312,11 +270,6 @@ interface StoreDescription {
     name: string;
     labels: Record<string, string>;
     metadataSchema: MetadataSchema;
-    /**
-     * SDK history window for automatic cleanup of superseded internal versions.
-     * Explicit forks, checkpoints and history summaries do not expire.
-     */
-    retentionInDays: number;
 }
 
 export type FileStoreDescription<Mode extends EmbeddingMode = 'managed'> = StoreDescription & (

@@ -17,7 +17,7 @@ test('external file reads and vector searches return references from the selecte
     assert.equal(indexConfigs.body, undefined);
     assert.equal(indexConfigs.content, undefined);
     assert.equal(tags['memdrive.embedding'], embedding.identity);
-    assert.deepEqual(await (await open()).describe(), { name, labels: { app: 'fixture' }, metadataSchema, retentionInDays: 30, embedding });
+    assert.deepEqual(await (await open()).describe(), { name, labels: { app: 'fixture' }, metadataSchema, embedding });
     await assert.rejects(MemDrive.open({ client, name }), { code: 'INCOMPATIBLE_STORE' });
 
     const { at: work } = await main.fork({ name: 'vector-draft' });

@@ -1,6 +1,6 @@
-import type { FileHistoryResult, FileStoreStatus, LambdaDBClient } from '@functional-systems/memdrive';
-import { create, open, type DriveFile, type FileAt, type ForkAt, type CheckpointAt, type FileChange, type FileFilter, type FindTextResult, type DeleteFileResult,
-    type SearchFilesResult, type ListFilesResult, type FileDrive, type EmbeddingMode, type MergeResult, type OpenFileStoreOptions, type FileRef } from '@functional-systems/memdrive';
+import type { LambdaDBClient, RollbackResult, WritableAt } from '@functional-systems/memdrive';
+import { create, open, type DriveFile, type FileAt, type ForkAt, type CheckpointAt, type FileFilter, type FindTextResult, type DeleteFileResult,
+    type SearchFilesResult, type ListFilesResult, type FileDrive, type EmbeddingMode, type OpenFileStoreOptions, type FileRef } from '@functional-systems/memdrive';
 
 export async function fileConsumer(client: LambdaDBClient, options: OpenFileStoreOptions) {
     const drive: FileDrive = await create({ client, name: 'workspace', metadataSchema: { topic: { type: 'string' } } });
@@ -17,10 +17,9 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     await reopened.write({ at, operations: [{ op: 'update', fileId: deleted.fileId, content: '' }, { op: 'delete', fileId: deleted.fileId }] });
     // @ts-expect-error Choose a full replacement or exact edits.
     await reopened.write({ at, op: 'update', fileId: update.fileId, content: '', edits: [] });
-    // @ts-expect-error Writes require an explicit fork target.
-    await reopened.write({ op: 'create', path: '/main.md', content: '' });
-    // @ts-expect-error Main is read-only.
-    await reopened.write({ at: { kind: 'main' }, op: 'create', path: '/main.md', content: '' });
+    // Omitted at writes to main.
+    const onMain: DriveFile = await reopened.write({ op: 'create', path: '/main.md', content: '' });
+    await reopened.write({ at: { kind: 'main' }, operations: [{ op: 'delete', fileId: onMain.fileId }] });
     // @ts-expect-error Checkpoints are read-only.
     await reopened.write({ at: { kind: 'checkpoint', name: 'saved' }, op: 'delete', fileId: created.fileId });
     // @ts-expect-error Batches are an operations array with at, not a bare array.
@@ -59,22 +58,20 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     if (exact.next) await reopened.findText(exact.next);
     // @ts-expect-error A continuation inherits its original options.
     await reopened.findText({ cursor: 'opaque', filter: topicFilter });
-    const changes: FileChange[] = await reopened.diff({ at }, { signal: new AbortController().signal });
-    for (const change of changes) if (change.op === 'update' || change.op === 'delete') change.previousPath;
-    // @ts-expect-error Diff requires an explicit fork.
-    await drive.diff({});
-    // @ts-expect-error Diff is available only on working forks.
-    await drive.diff({ at: { kind: 'main' } });
-    const merged: MergeResult = await reopened.merge({ at, summary: 'Save the research' });
-    const mainVersion: string = merged.version;
-    const outcome: 'published' | 'unchanged' = merged.status;
-    void mainVersion; void outcome;
-    // @ts-expect-error A merge has no request identity; it is idempotent by content.
-    await reopened.merge({ at, requestId: 'batch-1', summary: 'Save the research' });
-    // @ts-expect-error Recovery is automatic; open has no recover option.
-    await open({ client, name: 'workspace', recover: true });
-    // @ts-expect-error Publication requires an explicit fork.
-    await drive.merge({ summary: 'Save the research' });
+    // @ts-expect-error Merge, diff, status, history and configure are removed.
+    await reopened.merge({ at, summary: 'Save the research' });
+    // @ts-expect-error Merge, diff, status, history and configure are removed.
+    await reopened.diff({ at });
+    // @ts-expect-error Merge, diff, status, history and configure are removed.
+    await reopened.status();
+    // @ts-expect-error Merge, diff, status, history and configure are removed.
+    await reopened.history();
+    // @ts-expect-error Merge, diff, status, history and configure are removed.
+    await reopened.configure({ retentionInDays: 7 });
+    // @ts-expect-error Retention is not an SDK option.
+    await create({ client, name: 'workspace', retentionInDays: 7 });
+    // @ts-expect-error Refs are created from the current state of a view; there is no version.
+    await drive.fork({ name: 'past', version: 'v1' });
     // @ts-expect-error Views are selected per request, not when opening.
     await open({ client, name: 'workspace', at: { kind: 'fork', name: 'research' } });
     const checkpoint: FileRef<CheckpointAt> = await reopened.checkpoint({ at, name: 'saved' });
@@ -85,23 +82,21 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     await drive.fork({ at, name: 'nested' });
     // @ts-expect-error A view is identified by one kind.
     await drive.read({ at: { kind: 'fork', fork: 'research' }, fileId: created.fileId });
-    // @ts-expect-error Merge requires a fork target, not a checkpoint.
-    await drive.merge({ at: checkpoint.at, summary: 'Save the research' });
+    const restored: RollbackResult = await drive.rollback({ at, to: checkpoint.at }, { signal: new AbortController().signal });
+    const restoredAt: WritableAt = restored.at;
+    await drive.rollback({ at: { kind: 'main' }, to: checkpoint.at });
+    // @ts-expect-error Rollback requires an explicit target.
+    await drive.rollback({ to: checkpoint.at });
+    // @ts-expect-error A checkpoint cannot be rolled back.
+    await drive.rollback({ at: checkpoint.at, to: checkpoint.at });
+    // @ts-expect-error Rollback restores from a checkpoint only.
+    await drive.rollback({ at, to: { kind: 'main' } });
     const selected: FileDrive = await open(options);
-    const state: FileStoreStatus = await selected.status();
-    const forkState: FileStoreStatus = await selected.status({ at });
-    const stateAt: FileAt = state.at;
-    const history: FileHistoryResult = await selected.history({ sinceVersion: state.mainVersion, limit: 1 });
-    if (history.next) await selected.history(history.next);
-    // @ts-expect-error Continuation is scoped to the original history request.
-    await selected.history({ cursor: 'cursor', sinceVersion: 'v1' });
-    // @ts-expect-error History is store-wide.
-    await selected.history({ at, limit: 1 });
     // @ts-expect-error Path and ID selectors are mutually exclusive.
     await selected.read({ fileId: created.fileId, path: created.path });
     // @ts-expect-error View handles are removed.
     selected.at;
-    return { file, published, forkState, stateAt };
+    return { file, published, restoredAt };
 }
 
 const topicFilter: FileFilter = { field: 'metadata.topic', op: 'eq', value: 'local' };
@@ -115,12 +110,10 @@ export async function externalFileConsumer(client: LambdaDBClient, options: Open
     const reopened: FileDrive<'external'> = await open({ client, name: 'workspace', mode: 'external' });
     const reference = await reopened.read({ at, fileId: file!.fileId });
     await reopened.write({ at, op: 'update', fileId: file!.fileId, content: vector, newPath: '/updated' });
-    await reopened.merge({ at, summary: 'Save the vector files' });
     const hits = await drive.search({ query: vector, filter: topicFilter });
     const results: false = hits.reranked;
     const saved = await reopened.checkpoint({ at, name: 'saved' });
-    const state: FileStoreStatus = await reopened.status({ at: saved.at });
-    const history: FileHistoryResult = await drive.history({ sinceVersion: state.mainVersion });
+    await reopened.rollback({ at, to: saved.at });
     await drive.search({ at: saved.at, query: vector });
     const modelIdentity: string = (await drive.describe()).embedding.identity;
 
@@ -151,5 +144,5 @@ export async function externalFileConsumer(client: LambdaDBClient, options: Open
     await drive.write({ at: saved.at, op: 'delete', fileId: file!.fileId });
     // @ts-expect-error External stores do not configure text indexes.
     await create({ client, name: 'workspace', embedding, textSearch: { analyzers: ['standard'] } });
-    return { results, modelIdentity, reference, history };
+    return { results, modelIdentity, reference };
 }

@@ -1,4 +1,5 @@
 import { isObject } from './config.js';
+import { MemDriveError } from './errors.js';
 import { contentHash } from './records.js';
 
 // Opaque, versioned continuation tokens. They carry position only: callers can
@@ -30,7 +31,13 @@ export function decodeToken(prefix: string, token: unknown): Record<string, unkn
     }
 }
 
-/** A short store-generation tag, so a token cannot continue on a replaced or different store. */
-export async function storeTag(driveId: string) {
-    return (await contentHash(`memdrive-cursor:${driveId}`)).slice(0, 16);
+/**
+ * A short store-generation tag, so a token cannot continue on a replaced or
+ * different store. A recreated collection with the same name has a new creation time.
+ */
+export async function storeTag(name: string, collection: { projectName?: unknown; createdAt?: unknown }) {
+    const { projectName, createdAt } = collection ?? {};
+    if (typeof projectName !== 'string' || !(createdAt instanceof Date) || !Number.isFinite(createdAt.getTime()))
+        throw new MemDriveError('INVALID_RESULT', 'Collection lookup did not identify the file store generation.');
+    return (await contentHash(`memdrive-cursor:${JSON.stringify([name, projectName, createdAt.toISOString()])}`)).slice(0, 16);
 }

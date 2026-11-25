@@ -2,8 +2,11 @@ import { createFileTools, getFileToolDefinitions, fileToolError, fileToolInstruc
 import type { FileToolGuideTopic, FileDrive, FileToolDefinition, FileToolErrorResult, FileToolName, FileTools } from '@functional-systems/memdrive';
 
 export async function toolConsumer(drive: FileDrive, external: FileDrive<'external'>, name: string, input: unknown) {
-    const names: readonly FileToolName[] = ['guide', 'status', 'history', 'read', 'fork', 'checkpoint', 'listForks', 'listCheckpoints',
-        'deleteFork', 'deleteCheckpoint', 'write', 'diff', 'merge'];
+    const names: readonly FileToolName[] = ['guide', 'list', 'read', 'fork', 'checkpoint', 'listForks', 'listCheckpoints',
+        'deleteFork', 'deleteCheckpoint', 'write', 'rollback'];
+    // @ts-expect-error Publication tools are removed.
+    const removed: FileToolName = 'merge';
+    void removed;
     const tools: FileTools = createFileTools({ drive, tools: names });
     const definitions: readonly FileToolDefinition[] = tools.definitions;
     const fixedDefinitions: readonly FileToolDefinition[] = getFileToolDefinitions({ embeddingMode: 'managed', tools: names });
