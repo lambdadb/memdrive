@@ -457,3 +457,26 @@ test('failed source bookkeeping keeps the publication, and the fork settles it b
     assert.deepEqual(await work.diff(), [{ op: 'update', fileId: kept.fileId, path: '/kept' }]);
     assert.deepEqual(await work.merge(request('sixth')), status('v7'));
 });
+
+test('a failed publication record never settles a fork against another fork\'s publication of the same version', async () => {
+    const { fixture, main } = await setup();
+    const left = await fork(main, { name: 'left' });
+    const right = await fork(main, { name: 'right' });
+    const created = await left.write(file('/left'));
+    let rejected = false;
+    fixture.beforeUpsert = ({ docs }) => {
+        if (!rejected && docs[0].kind === 'publication-v1') {
+            rejected = true;
+            throw new Error('Lost publication record');
+        }
+    };
+    await assert.rejects(left.merge(request('left')), { code: 'DATABASE_ERROR' });
+    fixture.beforeUpsert = undefined;
+    // Another fork publishes the version number the failed merge used.
+    await right.write(file('/right'));
+    assert.deepEqual(await right.merge(request('right')), status('v1'));
+    // The left fork's pending bookkeeping finds another record at v1 and changes nothing.
+    assert.deepEqual(await left.diff(), [{ op: 'create', fileId: created.fileId, path: '/left' }]);
+    assert.deepEqual(await left.merge(request('left')), status('v2'));
+    assert.equal((await main.read({ fileId: created.fileId })).content, '/left');
+});

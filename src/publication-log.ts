@@ -142,6 +142,12 @@ export function publicationLog(content: Handle, internal: Handle, driveId: strin
         return states;
     }
 
+    /** Whether the journal holds exactly this record, rather than none or another publication of its version. */
+    async function recorded(record: PublicationRecord, signal?: AbortSignal) {
+        const observed = await read(record.id, signal);
+        return observed !== undefined && Object.entries(record).every(([field, value]) => JSON.stringify(value) === JSON.stringify(observed[field]));
+    }
+
     /** Write a publication record and confirm it by reading it back. */
     async function write(record: PublicationRecord, signal?: AbortSignal) {
         let cause;
@@ -150,9 +156,7 @@ export function publicationLog(content: Handle, internal: Handle, driveId: strin
         } catch (error) {
             cause = error;
         }
-        const observed = await read(record.id, signal);
-        if (observed && Object.entries(record).every(([field, value]) => JSON.stringify(value) === JSON.stringify(observed[field]))) return;
-        if (observed) throw invalid();
+        if (await recorded(record, signal)) return;
         throw cause === undefined ? new MemDriveError('INVALID_RESULT', 'The publication record was not confirmed.')
             : databaseError(cause, 'Could not record the publication.');
     }
@@ -167,5 +171,5 @@ export function publicationLog(content: Handle, internal: Handle, driveId: strin
         }
     }
 
-    return { exists, ensure, read, readMany, readSlots, write, saveWatermark };
+    return { exists, ensure, read, readMany, readSlots, recorded, write, saveWatermark };
 }

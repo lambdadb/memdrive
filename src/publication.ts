@@ -340,12 +340,12 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         const advanceTo = (version: string, next?: AbortSignal) => advanceMergeSource(content, content.collectionName, branch,
             [...plan.targets.map(({ change: { fileId }, fingerprint }) => ({ fileId, fingerprint, version })), ...plan.settled],
             schema, dimensions, next);
-        // Source bookkeeping that failed, or whose publication is uncertain, is
-        // completed by the fork's next operation before it runs, once the
-        // journal shows `version` published.
-        const defer = (version: string) => writer.defer(async next => {
-            await refresh(next);
-            if (slotOf(published) >= slotOf(version)) await advanceTo(version, next);
+        // Source bookkeeping that failed is completed by the fork's next
+        // operation before it runs. When the publication itself is uncertain,
+        // only once the journal holds this merge's own record: a later merge
+        // can publish another change set under the same version.
+        const defer = (version: string, record?: PublicationRecord) => writer.defer(async next => {
+            if (!record || await journal.recorded(record, next)) await advanceTo(version, next);
         });
         const settle = (version: string) => advanceTo(version, signal).catch(() => defer(version));
         if (!plan.targets.length) {
@@ -358,7 +358,7 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         // A tag left by an interrupted merge never becomes this version's content.
         await removeUnpublishedTag(target.name, signal);
         mainBranch.holds = undefined;
-        let recording = false;
+        let record: PublicationRecord | undefined;
         try {
             await applyMerge(content, content.collectionName, plan, version, signal);
             await createTag(target.name, signal);
@@ -373,18 +373,17 @@ export function publication(client: ConnectionOptions['client'], content: Handle
                 }
             }
             // The affected files are the plan's targets: the fork's net changes in ascending ID order.
-            const record: PublicationRecord = { id: publicationId(slotOf(version)), driveId, kind: 'publication-v1', version,
+            record = { id: publicationId(slotOf(version)), driveId, kind: 'publication-v1', version,
                 publishedAt: new Date().toISOString(), summary,
                 fileIds: plan.targets.slice(0, publishedFileLimit).map(({ change }) => change.fileId),
                 fileIdsTruncated: plan.targets.length > publishedFileLimit };
-            recording = true;
             await journal.write(record, signal);
         } catch (cause) {
             // A record whose reply and confirmation were lost may still have
             // landed: it is the publication point, and main holds its content.
-            const landed = recording && await refresh(signal).then(() => published === version, () => false);
+            const landed = record !== undefined && await journal.recorded(record, signal).catch(() => false);
             if (!landed) {
-                if (recording) defer(version);
+                if (record) defer(version, record);
                 // Main may hold part of this merge. Restore the latest recorded
                 // version now if possible; the next merge does otherwise.
                 await refresh(signal).then(() => restoreMain(published, signal)).catch(() => {});
