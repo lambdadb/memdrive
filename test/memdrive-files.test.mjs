@@ -7,6 +7,8 @@ import { fileClient } from './helpers/file-client.mjs';
 // The CommonJS build is a separate SDK copy with its own branch queues, so it
 // races this module's writers the way another process would.
 const separateCopy = createRequire(import.meta.url)('@functional-systems/memdrive');
+// If both imports ever shared one module instance, the race tests below would wait forever.
+assert.notEqual(separateCopy.open, open, 'the CommonJS build must be a separate module instance');
 
 const request = (path, content = '') => ({ op: 'create', path, content });
 const fork = name => ({ kind: 'fork', name });

@@ -114,8 +114,9 @@ has pending calls. Calls on different branches run concurrently. Reads (`read`,
 call that fails or is aborted does not hold up the next one; aborting a waiting
 call rejects it with `ABORTED` before it sends anything. `MemDrive.destroy` waits
 for the store's pending state-changing calls in the process before deleting the
-collection, and such calls made while it waits run after the deletion and fail
-with `STORE_NOT_FOUND`.
+collection. It first reads the collection to identify the store; calls made after
+that read run after the deletion and fail with `STORE_NOT_FOUND`, while a call made
+during the read can still run, succeed and then be deleted with the store.
 
 Separate processes, and separate copies of the SDK in one process (for example
 its ESM and CommonJS builds loaded side by side), are not coordinated. Ordering
@@ -146,8 +147,10 @@ LambdaDB lacks; callers build them when they need them.
   processes are the caller's responsibility.
 - **Path uniqueness within one process.** `create` and path changes check the
   destination with a read before writing (`PATH_EXISTS`). Writes on one branch
-  in one process run one at a time, so the check holds there; writers in
-  separate processes can both pass it and create two files at the same path.
+  in one process run one at a time, so the check holds there, except right after
+  a write that was aborted or failed with an unknown outcome: a request it already
+  sent can still be applied after the next write's check. Writers in separate
+  processes can both pass it and create two files at the same path.
 - **No hidden retries of unknown outcomes.** A write whose outcome is unknown
   fails with `WRITE_UNCONFIRMED`; it may or may not have been applied, and the
   caller inspects the files before retrying. Fork, checkpoint, deletion and

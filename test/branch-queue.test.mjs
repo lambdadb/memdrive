@@ -172,7 +172,18 @@ test('destroy waits for a running write and later state-changing calls fail clea
     assert.equal(count(calls, 'collection-delete'), 1);
     await assert.rejects(late, { code: 'STORE_NOT_FOUND' });
     await assert.rejects(lateFork, { code: 'STORE_NOT_FOUND' });
-    // A store recreated under the same name is a new generation with its own queues.
+});
+
+test('a store recreated under the same name has its own queues even while the old one has a pending write', async () => {
+    const { collections, connection, drive, hold } = await setup();
+    const held = hold('main');
+    const writing = drive.write(fileCreate('/old.txt', 'old'));
+    await held.arrived;
+    // Another process replaces the collection under the same name.
+    collections.delete(name);
     const replacement = await create(connection);
+    // The old store's write is still holding its queue, yet the new generation is not blocked.
     assert.equal((await replacement.write(fileCreate('/new.txt', 'new'))).path, '/new.txt');
+    held.release();
+    await writing.catch(() => {});
 });
