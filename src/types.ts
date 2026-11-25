@@ -174,22 +174,49 @@ export interface FileRef<At extends ForkAt | CheckpointAt = ForkAt | CheckpointA
     at: At;
 }
 
-/** User forks sorted by name. */
+/** A listed fork or checkpoint with its native creation time (ISO 8601). */
+export interface FileRefEntry<At extends ForkAt | CheckpointAt = ForkAt | CheckpointAt> extends FileRef<At> {
+    createdAt: string;
+}
+
+/**
+ * One page of forks or checkpoints in LambdaDB's name order. A page can hold
+ * fewer than `limit` entries while `next` is present. The listing is complete
+ * only when a page has no `next`.
+ */
 export interface ForkList {
-    forks: FileRef<ForkAt>[];
+    forks: FileRefEntry<ForkAt>[];
+    next?: { cursor: string } | undefined;
 }
 
-/** User checkpoints sorted by name. */
+/** One page of checkpoints in name order; see {@link ForkList}. */
 export interface CheckpointList {
-    checkpoints: FileRef<CheckpointAt>[];
+    checkpoints: FileRefEntry<CheckpointAt>[];
+    next?: { cursor: string } | undefined;
 }
 
-/** Fork and checkpoint listings take no options. */
-export type ListFileRefsRequest = Record<string, never>;
+/** Start a fork or checkpoint listing with an optional page size (1–100, default 100), or continue one with its cursor. */
+export type ListFileRefsRequest = { limit?: number | undefined; cursor?: never } | { cursor: string; limit?: never };
 
 /** Select a writable view; omission selects main. */
 export interface WriteTargetRequest {
     at?: WritableAt | undefined;
+}
+
+/** Make a write a checkpointed write: the call also creates `checkpoint-<name>` and makes it the branch's latest checkpoint. */
+export interface CheckpointedWriteRequest {
+    checkpoint: { name: string };
+}
+
+/** A plain write: no checkpoint is created. */
+interface PlainWriteRequest {
+    checkpoint?: undefined;
+}
+
+/** The ordinary write result plus the checkpoint that now holds it. */
+export interface CheckpointedWriteResult<Result> {
+    result: Result;
+    checkpoint: FileRef<CheckpointAt>;
 }
 
 export type WriteFileOperation<Mode extends EmbeddingMode = 'managed'> = FileMutation<Mode> | DeleteFileRequest;
@@ -207,6 +234,16 @@ export interface RollbackResult {
     at: WritableAt;
 }
 
+/** Select the branch whose latest checkpoint `describe` reports; omission selects main. */
+export interface DescribeRequest {
+    at?: WritableAt | undefined;
+}
+
+/** The store's configuration and the selected branch's latest checkpoint, or null when it has none. */
+export type FileDriveDescription<Mode extends EmbeddingMode = 'managed'> = FileStoreDescription<Mode> & {
+    latestCheckpoint: FileRef<CheckpointAt> | null;
+};
+
 /**
  * One store object. Each request selects its view with `at`; omission selects main.
  * State-changing calls on one branch run one at a time within this process (see
@@ -215,7 +252,7 @@ export interface RollbackResult {
  */
 export interface FileDrive<Mode extends EmbeddingMode = 'managed'> {
     readonly name: string;
-    describe(options?: RequestOptions): Promise<FileStoreDescription<Mode>>;
+    describe(request?: DescribeRequest, options?: RequestOptions): Promise<FileDriveDescription<Mode>>;
     list(request?: ListFilesRequest, options?: RequestOptions): Promise<ListFilesResult>;
     read(request: Mode extends 'external' ? never : ReadFileRangeRequest, options?: RequestOptions): Promise<FileReadPage | null>;
     read(request: ReadFileRequest, options?: RequestOptions): Promise<ViewFile<Mode> | null>;
@@ -229,11 +266,16 @@ export interface FileDrive<Mode extends EmbeddingMode = 'managed'> {
     listCheckpoints(request?: ListFileRefsRequest, options?: RequestOptions): Promise<CheckpointList>;
     deleteFork(request: { at: ForkAt }, options?: RequestOptions): Promise<FileRef<ForkAt>>;
     deleteCheckpoint(request: { at: CheckpointAt }, options?: RequestOptions): Promise<FileRef<CheckpointAt>>;
-    write(request: WriteTargetRequest & FileMutation<Mode>, options?: RequestOptions): Promise<ViewFile<Mode>>;
-    write(request: WriteTargetRequest & DeleteFileRequest, options?: RequestOptions): Promise<DeleteFileResult>;
-    write(request: WriteTargetRequest & WriteFileOperation<Mode>, options?: RequestOptions): Promise<ViewFile<Mode> | DeleteFileResult>;
-    write(request: WriteFilesRequest<FileMutation<Mode>>, options?: RequestOptions): Promise<ViewFile<Mode>[]>;
-    write(request: WriteFilesRequest<WriteFileOperation<Mode>>, options?: RequestOptions): Promise<(ViewFile<Mode> | DeleteFileResult)[]>;
+    write(request: WriteTargetRequest & FileMutation<Mode> & CheckpointedWriteRequest, options?: RequestOptions): Promise<CheckpointedWriteResult<ViewFile<Mode>>>;
+    write(request: WriteTargetRequest & DeleteFileRequest & CheckpointedWriteRequest, options?: RequestOptions): Promise<CheckpointedWriteResult<DeleteFileResult>>;
+    write(request: WriteTargetRequest & WriteFileOperation<Mode> & CheckpointedWriteRequest, options?: RequestOptions): Promise<CheckpointedWriteResult<ViewFile<Mode> | DeleteFileResult>>;
+    write(request: WriteFilesRequest<FileMutation<Mode>> & CheckpointedWriteRequest, options?: RequestOptions): Promise<CheckpointedWriteResult<ViewFile<Mode>[]>>;
+    write(request: WriteFilesRequest<WriteFileOperation<Mode>> & CheckpointedWriteRequest, options?: RequestOptions): Promise<CheckpointedWriteResult<(ViewFile<Mode> | DeleteFileResult)[]>>;
+    write(request: WriteTargetRequest & FileMutation<Mode> & PlainWriteRequest, options?: RequestOptions): Promise<ViewFile<Mode>>;
+    write(request: WriteTargetRequest & DeleteFileRequest & PlainWriteRequest, options?: RequestOptions): Promise<DeleteFileResult>;
+    write(request: WriteTargetRequest & WriteFileOperation<Mode> & PlainWriteRequest, options?: RequestOptions): Promise<ViewFile<Mode> | DeleteFileResult>;
+    write(request: WriteFilesRequest<FileMutation<Mode>> & PlainWriteRequest, options?: RequestOptions): Promise<ViewFile<Mode>[]>;
+    write(request: WriteFilesRequest<WriteFileOperation<Mode>> & PlainWriteRequest, options?: RequestOptions): Promise<(ViewFile<Mode> | DeleteFileResult)[]>;
     rollback(request: RollbackRequest, options?: RequestOptions): Promise<RollbackResult>;
 }
 

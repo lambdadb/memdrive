@@ -86,11 +86,17 @@ test('empty files and invalid bounds have explicit behavior', async () => {
     await assert.rejects(drive.read({ at: draft, fileId: file.fileId, startLine: 2 }), { code: 'INVALID_INPUT' });
 });
 
-test('the common tool returns SDK range pages and external mode rejects range fields', async () => {
-    const { drive, file, client } = await setup('one\ntwo\nthree');
+test('the common tool returns SDK range pages on main without view selectors and external mode rejects range fields', async () => {
+    const { drive, client } = await setup('one\ntwo\nthree');
+    const file = await drive.write({ op: 'create', path: '/main.txt', content: 'one\ntwo\nthree' });
     const tools = createFileTools({ drive, tools: ['read'] });
-    const request = { at: draft, fileId: file.fileId, startLine: 2, maxChars: 3 };
-    assert.deepEqual(await tools.execute('read', request), await drive.read(request));
+    const request = { fileId: file.fileId, startLine: 2, maxChars: 3 };
+    const { at, next: { at: nextAt, ...next }, ...page } = await drive.read(request);
+    assert.deepEqual([at, nextAt], [{ kind: 'main' }, { kind: 'main' }]);
+    const delivered = await tools.execute('read', request);
+    assert.deepEqual(delivered, { ...page, next });
+    assert.equal((await tools.execute('read', delivered.next)).content, (await drive.read({ ...delivered.next, at: { kind: 'main' } })).content);
+    await assert.rejects(tools.execute('read', { ...request, at: { kind: 'main' } }), { code: 'INVALID_INPUT' });
     const external = await MemDrive.create({ client, name: 'external-range',
         embedding: { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'fixture' } });
     await assert.rejects(external.read({ path: '/file', maxChars: 20 }), { code: 'INVALID_INPUT' });

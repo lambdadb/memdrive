@@ -1,4 +1,4 @@
-import type { LambdaDBClient, RollbackResult, WritableAt } from '@functional-systems/memdrive';
+import type { CheckpointedWriteResult, LambdaDBClient, RollbackResult, WritableAt } from '@functional-systems/memdrive';
 import { create, open, type DriveFile, type FileAt, type ForkAt, type CheckpointAt, type FileFilter, type FindTextResult, type DeleteFileResult,
     type SearchFilesResult, type ListFilesResult, type FileDrive, type EmbeddingMode, type OpenFileStoreOptions, type FileRef } from '@functional-systems/memdrive';
 
@@ -22,6 +22,14 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     await reopened.write({ at: { kind: 'main' }, operations: [{ op: 'delete', fileId: onMain.fileId }] });
     // @ts-expect-error Checkpoints are read-only.
     await reopened.write({ at: { kind: 'checkpoint', name: 'saved' }, op: 'delete', fileId: created.fileId });
+    // A checkpointed write returns the ordinary result and its checkpoint.
+    const saved: CheckpointedWriteResult<DriveFile> = await reopened.write({ op: 'create', path: '/turn.md', content: '', checkpoint: { name: 'turn-1' } });
+    const savedAt: CheckpointAt = saved.checkpoint.at;
+    const savedBatch: CheckpointedWriteResult<(DriveFile | DeleteFileResult)[]> = await reopened.write({ at,
+        operations: [{ op: 'delete', fileId: saved.result.fileId }], checkpoint: { name: 'turn-2' } });
+    void savedAt; void savedBatch;
+    // @ts-expect-error A checkpoint is named by an object.
+    await reopened.write({ op: 'create', path: '/turn.md', content: '', checkpoint: 'turn-3' });
     // @ts-expect-error Batches are an operations array with at, not a bare array.
     await reopened.write([{ op: 'create', path: '/batch.txt', content: 'Batch' }]);
     const listed: ListFilesResult = await reopened.list({ at, prefix: '/notes/', delimiter: '/', limit: 2 });

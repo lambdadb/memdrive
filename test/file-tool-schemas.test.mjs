@@ -4,13 +4,10 @@ import Ajv from 'ajv';
 import { MemDrive, createFileTools, getFileToolDefinitions } from '@functional-systems/memdrive';
 import { fileClient } from './helpers/file-client.mjs';
 
-const names = ['guide', 'list', 'read', 'search', 'findText', 'fork', 'checkpoint',
-    'listForks', 'listCheckpoints', 'deleteFork', 'deleteCheckpoint', 'write', 'rollback'];
-const main = { kind: 'main' };
+const names = ['guide', 'read', 'list', 'search', 'findText', 'write'];
 const fork = { kind: 'fork', name: 'draft' };
-const saved = { kind: 'checkpoint', name: 'saved' };
 
-test('advertised tool schemas accept SDK inputs and reject ambiguous selectors, invalid targets and mode mismatches', () => {
+test('advertised tool schemas accept main-only SDK inputs and reject view selectors, checkpoints and mode mismatches', () => {
     const ajv = new Ajv({ strict: true, strictRequired: false, allowUnionTypes: true });
     for (const external of [false, true]) {
         const definitions = getFileToolDefinitions({ embeddingMode: external ? 'external' : 'managed',
@@ -18,114 +15,88 @@ test('advertised tool schemas accept SDK inputs and reject ambiguous selectors, 
         const validators = Object.fromEntries(definitions.map(tool => [tool.name, ajv.compile(tool.inputSchema)]));
         const content = external ? [1, ...Array(63).fill(0)] : 'Original';
         const valid = [
-            ['guide', {}], ['guide', { topic: 'editing' }], ['listForks', {}], ['listCheckpoints', {}],
-            ...[undefined, main, fork, saved].map(at => ['list', at === undefined ? {} : { at }]),
-            ['deleteFork', { at: fork }], ['deleteCheckpoint', { at: saved }],
-            ['fork', { name: 'new-fork' }], ['fork', { name: 'x'.repeat(47) }], ['fork', { at: saved, name: 'child' }],
-            ['fork', { at: fork, name: 'child' }], ['fork', { at: main, name: 'child' }],
-            ['checkpoint', { name: 'main' }], ['checkpoint', { name: 'x'.repeat(41) }], ['checkpoint', { at: fork, name: 'before-edit' }],
-            ['rollback', { at: main, to: saved }], ['rollback', { at: fork, to: saved }],
-            ['list', { prefix: '/notes/', nameContains: 'plan', delimiter: '/', limit: 1000 }], ['list', { at: fork, prefix: '/' }],
-            ['list', { cursor: 'opaque' }], ['list', { at: saved, cursor: 'opaque' }],
-            ['read', { path: '/plan' }], ['read', { at: fork, fileId: 'returned-id' }], ['read', { at: saved, paths: ['/one', '/two'] }],
-            ['search', { at: fork, query: content, limit: 10, filter: { and: [
+            ['guide', {}], ['guide', { topic: 'editing' }], ['guide', { topic: 'retrieval' }], ['list', {}],
+            ['list', { prefix: '/notes/', nameContains: 'plan', delimiter: '/', limit: 1000 }], ['list', { cursor: 'opaque' }],
+            ['read', { path: '/plan' }], ['read', { fileId: 'returned-id' }], ['read', { paths: ['/one', '/two'] }],
+            ['search', { query: content, limit: 10, filter: { and: [
                 { field: 'metadata.topic', op: 'in', value: ['plan', 'travel'] },
                 { or: [{ field: 'metadata.year', op: 'gte', value: 2026 }, { field: 'metadata.enabled', op: 'exists', value: true }] },
             ] } }],
-            ['write', { at: fork, op: 'create', path: '/plan', content, metadata: { topic: 'plan' } }],
-            ['write', { at: fork, op: 'update', fileId: 'returned-id', content }],
-            ['write', { at: fork, op: 'update', fileId: 'returned-id', newPath: '/moved', metadata: {} }],
-            ['write', { at: fork, op: 'delete', fileId: 'returned-id' }],
-            ['write', { at: fork, operations: [{ op: 'create', path: '/plan', content }, { op: 'delete', fileId: 'returned-id' }] }],
-            ['write', { op: 'create', path: '/plan', content }], ['write', { at: main, op: 'delete', fileId: 'returned-id' }],
-            ['write', { operations: [{ op: 'create', path: '/plan', content }] }],
+            ['write', { op: 'create', path: '/plan', content, metadata: { topic: 'plan' } }],
+            ['write', { op: 'update', fileId: 'returned-id', content }],
+            ['write', { op: 'update', fileId: 'returned-id', newPath: '/moved', metadata: {} }],
+            ['write', { op: 'delete', fileId: 'returned-id' }],
+            ['write', { operations: [{ op: 'create', path: '/plan', content }, { op: 'delete', fileId: 'returned-id' }] }],
             ...(external ? [] : [
                 ['read', { path: '/plan', startLine: 2, endLine: 4, maxChars: 200 }],
-                ['read', { at: fork, fileId: 'id', offset: 200, revision: 'a'.repeat(64), maxChars: 200 }],
+                ['read', { fileId: 'id', offset: 200, revision: 'a'.repeat(64), maxChars: 200 }],
                 ...['semantic', 'keyword', 'hybrid'].flatMap(mode => [
-                    ['search', { query: 'checkpoint', mode }],
-                    ['search', { query: 'checkpoint', mode, rerank: true, embeddingQuery: 'preserve work' }],
+                    ['search', { query: 'handoff', mode }],
+                    ['search', { query: 'handoff', mode, rerank: true, embeddingQuery: 'preserve work' }],
                 ]),
                 ['search', { query: 'plan', embeddingQuery: 'travel plan', rerank: { fields: ['content'], onFailure: 'returnOriginal' } }],
-                ['write', { at: fork, op: 'update', fileId: 'returned-id', edits: [{ oldText: 'Original', newText: '' }] }],
-                ['findText', { at: saved, query: 'a.b', prefix: '/notes/', filter: { field: 'metadata.topic', op: 'eq', value: 'plan' } }],
-                ['findText', { cursor: 'opaque' }], ['findText', { at: fork, cursor: 'opaque' }],
+                ['write', { op: 'update', fileId: 'returned-id', edits: [{ oldText: 'Original', newText: '' }] }],
+                ['findText', { query: 'a.b', prefix: '/notes/', filter: { field: 'metadata.topic', op: 'eq', value: 'plan' } }],
+                ['findText', { cursor: 'opaque' }],
             ]),
         ];
         for (const [name, input] of valid)
             assert(validators[name](input), `${external ? 'vector' : 'text'} ${name}: ${JSON.stringify(validators[name].errors)}`);
         const invalid = [
-            ['guide', { topic: 'unknown' }], ['guide', { topic: null }], ['guide', { topic: 'editing', version: '6' }],
-            ['fork', {}], ['fork', { name: 'main' }], ['fork', { name: 'xy' }],
-            ['fork', { name: 'x'.repeat(48) }], ['checkpoint', { name: 'x'.repeat(42) }],
-            ['checkpoint', { name: 'invalid/path' }], ['checkpoint', { name: 'valid', at: { fork: 'other' } }],
-            ['fork', { at: fork, name: 'child', version: 'v1' }], ['checkpoint', { at: saved, name: 'child', version: 'v1' }],
-            ['fork', { name: 'copy', version: 'v0' }], ['fork', { name: 'copy', asOf: '2026-01-01T00:00:00.000Z' }],
-            ['list', { recover: true }], ['list', { at: { kind: 'main', name: 'main' } }], ['list', { at: { kind: 'fork' } }],
-            ['list', { at: { kind: 'fork', name: 'main' } }], ['list', { at: { kind: 'branch', name: 'draft' } }],
-            ['list', { at: { kind: 'checkpoint', name: 'x'.repeat(42) } }], ['list', { at: fork, extra: true }],
-            ['rollback', {}], ['rollback', { at: fork }], ['rollback', { to: saved }], ['rollback', { at: saved, to: saved }],
-            ['rollback', { at: fork, to: fork }], ['rollback', { at: fork, to: main }], ['rollback', { at: fork, to: saved, extra: true }],
-            ['listForks', { at: fork }], ['listCheckpoints', { prefix: '/' }],
-            ['deleteFork', {}], ['deleteFork', { at: saved }], ['deleteFork', { at: main }], ['deleteFork', { at: fork, name: 'draft' }],
-            ['deleteCheckpoint', { at: fork }], ['deleteCheckpoint', { name: 'saved' }],
-            ['read', { path: '/one', fileId: 'id' }], ['read', {}], ['read', { at: fork }],
+            ['guide', { topic: 'unknown' }], ['guide', { topic: 'references' }], ['guide', { topic: null }], ['guide', { topic: 'editing', version: '6' }],
+            ['list', { recover: true }], ['list', { at: { kind: 'main' } }], ['list', { at: fork }], ['list', { at: fork, cursor: 'opaque' }],
+            ['read', { path: '/one', fileId: 'id' }], ['read', {}], ['read', { at: fork, path: '/one' }], ['read', { at: { kind: 'main' }, path: '/one' }],
             ['read', { paths: ['/one'], maxChars: 20 }], ['read', { path: '/one', offset: 0 }],
             ['read', { paths: [] }], ['read', { paths: ['/one', '/one'] }],
             ['list', { cursor: 'opaque', prefix: '/' }], ['list', { cursor: 'opaque', limit: 1 }], ['list', { delimiter: '-' }],
+            ['search', { query: content, at: fork }],
             ['search', { query: content, filter: { and: [] } }],
             ['search', { query: content, filter: { field: 'metadata.topic', op: 'exists', value: 'yes' } }],
-            ['write', { at: saved, op: 'delete', fileId: 'id' }], ['write', { at: saved, operations: [{ op: 'delete', fileId: 'id' }] }],
-            ['write', { at: fork, op: 'update', fileId: 'id' }], ['write', { at: fork, op: 'delete', fileId: 'id', content }],
-            ['write', { at: fork, operations: [] }], ['write', { at: fork, operations: [{ op: 'create', path: '/one' }] }],
-            ['write', { at: fork, operations: [], op: 'delete', fileId: 'id' }],
-            ['write', { at: fork, operations: [{ at: fork, op: 'delete', fileId: 'id' }] }],
-            ['write', { at: fork, op: 'create', path: '/one', content: external ? 'text' : [1] }],
+            ['write', { at: fork, op: 'delete', fileId: 'id' }], ['write', { at: { kind: 'main' }, operations: [{ op: 'delete', fileId: 'id' }] }],
+            ['write', { op: 'delete', fileId: 'id', checkpoint: { name: 'turn-1' } }],
+            ['write', { operations: [{ op: 'delete', fileId: 'id' }], checkpoint: { name: 'turn-1' } }],
+            ['write', { op: 'update', fileId: 'id' }], ['write', { op: 'delete', fileId: 'id', content }],
+            ['write', { operations: [] }], ['write', { operations: [{ op: 'create', path: '/one' }] }],
+            ['write', { operations: [], op: 'delete', fileId: 'id' }],
+            ['write', { operations: [{ at: fork, op: 'delete', fileId: 'id' }] }],
+            ['write', { op: 'create', path: '/one', content: external ? 'text' : [1] }],
             ...(external ? [
                 ['read', { path: '/one', startLine: 1 }],
                 ['search', { query: 'text' }], ['search', { query: content, rerank: false }],
                 ['search', { query: content, mode: 'semantic' }],
-                ['write', { at: fork, op: 'update', fileId: 'id', edits: [{ oldText: 'a', newText: 'b' }] }],
+                ['write', { op: 'update', fileId: 'id', edits: [{ oldText: 'a', newText: 'b' }] }],
             ] : [
                 ['search', { query: 'plan', mode: 'auto' }],
                 ['search', { query: 'plan', mode: 'keyword', embeddingQuery: 'unused' }],
                 ['search', { query: 'plan', mode: 'keyword', rerank: false, embeddingQuery: 'unused' }],
-                ['findText', { query: '' }], ['findText', { cursor: 'opaque', query: 'a' }],
-                ['write', { at: fork, op: 'update', fileId: 'id', content: '', edits: [{ oldText: 'a', newText: 'b' }] }],
+                ['findText', { query: '' }], ['findText', { cursor: 'opaque', query: 'a' }], ['findText', { query: 'a', at: fork }],
+                ['write', { op: 'update', fileId: 'id', content: '', edits: [{ oldText: 'a', newText: 'b' }] }],
             ]),
         ];
         for (const [name, input] of invalid) assert.equal(validators[name](input), false, `${name}: ${JSON.stringify(input)}`);
         for (const definition of definitions) {
-            assert.equal(validators[definition.name]({ at: { fork: 'other' } }), false);
             assert.equal(validators[definition.name]({ drive: 'other' }), false);
+            assert(!JSON.stringify(definition.inputSchema).includes('"at"'), `${definition.name} has no view selector`);
+            assert(!JSON.stringify(definition.inputSchema).includes('checkpoint'), `${definition.name} has no checkpoint option`);
         }
     }
 });
 
-test('every catalog schema compiles under strict Ajv and shares one view identity definition', () => {
+test('every catalog schema compiles under strict Ajv', () => {
     const ajv = new Ajv({ strict: true, strictRequired: false, allowUnionTypes: true });
-    for (const embeddingMode of ['managed', 'external']) {
-        const definitions = getFileToolDefinitions({ embeddingMode, tools: names.filter(name => embeddingMode === 'managed' || name !== 'findText') });
-        let shared;
-        for (const { name, inputSchema } of definitions) {
+    for (const embeddingMode of ['managed', 'external'])
+        for (const { inputSchema } of getFileToolDefinitions({ embeddingMode, tools: names.filter(name => embeddingMode === 'managed' || name !== 'findText') }))
             ajv.compile(inputSchema);
-            if (!inputSchema.$defs?.at) continue;
-            shared ??= inputSchema.$defs;
-            for (const key of ['at', 'mainAt', 'forkAt', 'checkpointAt'])
-                assert.deepEqual(inputSchema.$defs[key], shared[key], `${name} ${key}`);
-        }
-        assert(shared);
-    }
 });
 
-test('static and drive-bound definitions are identical for every view-independent selection', async () => {
+test('static and drive-bound definitions are identical for every selection', async () => {
     for (const external of [false, true]) {
         const fixture = fileClient();
         const drive = await MemDrive.create({ client: fixture.client, name: 'schema-fixture',
             ...(external ? { embedding: { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'fixture-v1' } } : {}) });
         const embeddingMode = external ? 'external' : 'managed';
         const tools = names.filter(name => !external || name !== 'findText');
-        for (const selection of [tools, ['write', 'read'], ['fork', 'checkpoint'], []])
+        for (const selection of [tools, ['write', 'read'], ['guide'], []])
             assert.deepEqual(createFileTools({ drive, tools: selection }).definitions, getFileToolDefinitions({ embeddingMode, tools: selection }));
     }
 });

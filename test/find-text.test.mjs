@@ -378,6 +378,8 @@ test('findText cursors never continue on a fork or checkpoint recreated under th
     // The original incarnation still continues, including on another client.
     const other = await MemDrive.open({ client: { ...fixture.client }, name });
     assert.equal((await other.findText(page.next)).hits[0].range.start, 6);
+    // A newer checkpoint of the fork becomes its latest, so saved can be deleted.
+    await drive.checkpoint({ at, name: 'newer' });
     await drive.deleteCheckpoint({ at: saved });
     await assert.rejects(other.findText(page.next), { code: 'FIND_TEXT_CURSOR_UNAVAILABLE' });
     await drive.write({ at, op: 'update', fileId: file.fileId, content: 'saved but replaced' });

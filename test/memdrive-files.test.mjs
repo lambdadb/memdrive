@@ -980,7 +980,9 @@ test('rollback sends one native rollback of main or a fork to a checkpoint tag a
     assert.equal(calls.length, before);
 
     assert.deepEqual(await drive.rollback({ at: { kind: 'main' }, to: saved }), { at: { kind: 'main' } });
-    assert.deepEqual(calls.slice(before), [{ kind: 'branch-rollback', name: 'main', tag: 'checkpoint-saved', retries: { strategy: 'none' } }]);
+    // The rollback, then a move of the branch's latest-checkpoint alias, absent here.
+    assert.deepEqual(calls.slice(before), [{ kind: 'branch-rollback', name: 'main', tag: 'checkpoint-saved', retries: { strategy: 'none' } },
+        { kind: 'alias-retarget', name: 'latest-main', target: { kind: 'tag', name: 'checkpoint-saved' }, retries: { strategy: 'none' } }]);
     assert.equal((await drive.read({ fileId: kept.fileId })).content, 'kept');
     assert.equal(await drive.read({ fileId: later.fileId }), null);
     // The fork is a separate branch: rolling back main leaves it alone, and the fork can roll back too.
@@ -1009,6 +1011,8 @@ test('deleted refs and stores report not found on later use', async () => {
     const drive = await create({ client, name: 'workspace' });
     await drive.fork({ name: 'research' });
     await drive.checkpoint({ name: 'saved' });
+    // The newer checkpoint becomes main's latest, so saved can be deleted.
+    await drive.checkpoint({ name: 'newer' });
     assert.deepEqual(await drive.deleteFork({ at: research }), { at: research });
     assert.deepEqual(await drive.deleteCheckpoint({ at: checkpoint('saved') }), { at: checkpoint('saved') });
     await assert.rejects(drive.read({ at: research, path: '/a' }), { code: 'BRANCH_NOT_FOUND' });

@@ -59,7 +59,8 @@ checkpoints and continuations, always carry an explicit `at`, including
 `{ kind: 'main' }`.
 
 The drive object keeps only the store's configuration, read once by `create` or
-`open` and returned by `describe()`. Every call resolves its `at` and goes to
+`open` and returned by `describe()` together with the latest checkpoint of main
+or a fork (see [Checkpointed writes](#checkpointed-writes)). Every call resolves its `at` and goes to
 LambdaDB, so any number of drive objects, clients and processes can use the same
 store, and a continuation from one works on another. Apart from the per-branch
 queues that order state-changing calls within one process (see
@@ -100,10 +101,13 @@ has no multi-document transaction or conditional write. Within one process the
 SDK therefore runs state-changing calls on one branch one at a time, in call
 order:
 
-- `write`, as one operation or a batch, on main or that fork;
+- `write`, as one operation or a batch, on main or that fork; a checkpointed
+  write also creates its checkpoint, moves the branch's latest checkpoint and, on
+  failure, restores the branch in the same turn;
 - `rollback` of that branch;
 - `fork` and `checkpoint` whose source is that branch, so a new fork or
-  checkpoint never captures a half-applied write;
+  checkpoint never captures a half-applied write; a checkpoint also becomes the
+  branch's latest checkpoint in the same turn;
 - `deleteFork` of that fork.
 
 The queues are shared by every drive object of the same store in the process; a
@@ -376,6 +380,104 @@ whose details list `{ path, fileIds }`; move or delete the extra files by
 `fileId`. A create or move to a path that another file holds fails with
 `PATH_EXISTS`.
 
+## Checkpointed writes
+
+A checkpointed write applies a write and records the result as the branch's
+latest checkpoint, or leaves the branch at its previous latest checkpoint. It is
+meant for a host that saves an agent's work once per turn: every such write goes
+through it, so the latest checkpoint is always the last good state.
+
+```ts
+const { result, checkpoint } = await drive.write({
+    operations: [
+        { op: 'create', path: '/notes/handoff.md', content: 'On-call handoff happens at 09:30 KST every Monday.' },
+        { op: 'update', fileId: file.fileId, edits: [{ oldText: 'Tuesday', newText: 'Monday' }] },
+    ],
+    checkpoint: { name: 'turn-0042' }, // host-chosen, unique per write
+});
+// result: the ordinary write result; checkpoint: { at: { kind: 'checkpoint', name: 'turn-0042' } }
+const { latestCheckpoint } = await drive.describe(); // { at: { kind: 'checkpoint', name: 'turn-0042' } }
+```
+
+Add `checkpoint: { name }` to any single-operation or batch `write` on main or a
+fork. The result is `{ result, checkpoint: { at } }`, where `result` is what the
+same write without `checkpoint` returns. Checkpoint names follow the rules in
+[Save a checkpoint](#save-a-checkpoint).
+
+Each branch has one SDK-reserved LambdaDB alias naming its latest checkpoint:
+`latest-main` for main and `latest-fork-<name>` for a fork. The alias names the
+most recent checkpoint taken of the branch, whether by a checkpointed write or by
+`checkpoint({ at, name })` with that branch as source, or the checkpoint the
+branch was last rolled back to. The SDK has no alias API, so callers cannot
+create, move or delete it through the SDK, and `listCheckpoints` never lists it.
+`describe({ at? })` reports it as `latestCheckpoint: { at } | null` for main
+(default) or a fork with one alias read; a checkpoint `at` fails with
+`INVALID_INPUT`. `describe` does not check that the fork exists: a missing fork,
+like a fork without checkpoints, reports `null`. `deleteCheckpoint` refuses a
+checkpoint that is some branch's latest with `CHECKPOINT_IN_USE`, whose details
+list `latestOf` (the branches), so retention can never leave the alias dangling;
+delete older checkpoints instead. `deleteFork` deletes the fork's alias before
+the branch, so a recreated fork starts without a latest checkpoint.
+
+One turn of the branch's queue (see [Concurrent calls](#concurrent-calls)) runs
+the whole sequence:
+
+1. Apply the write exactly as `write` without `checkpoint` does.
+2. Create the tag `checkpoint-<name>` from the branch (`tags.create`).
+3. Move the alias to it (`aliases.retarget`). The branch's first checkpoint gets
+   a 404 there and creates the alias instead (`aliases.create`).
+4. Return the write result and the checkpoint.
+
+On success this adds exactly two requests to the write's own requests: one tag
+creation and one alias retarget (plus one alias creation the first time). The
+alias is not read beforehand. A plain `write` sends no tag, alias or rollback
+requests.
+
+Errors raised before the write changes anything, such as `INVALID_INPUT`,
+`PATH_EXISTS`, `EDIT_CONFLICT` or `FILE_NOT_FOUND`, are thrown unchanged and the
+branch is untouched. Any later failure (a rejected or partial write,
+`WRITE_UNCONFIRMED`, a failed tag creation including `CHECKPOINT_CONFLICT`, or a
+failed alias move) restores the branch, then throws:
+
+- The SDK reads the alias. If the alias move's response was lost but the alias
+  now names the new checkpoint, the call succeeded and returns normally.
+- Otherwise it rolls the branch back to the checkpoint the alias names with one
+  `branches.rollback`, never retried, and deletes the new tag if the call
+  created it or may have created it (a pre-existing checkpoint with that name is
+  never deleted).
+- Without an alias, on the branch's first checkpointed write, there is nothing to
+  roll back to: the SDK deletes the files this call created, with their chunks.
+  Updates and deletions of files that existed before cannot be undone this way.
+
+The restore runs even when the caller's signal aborted the call. The error is one
+of:
+
+| Code | Meaning | Details |
+| --- | --- | --- |
+| `CHECKPOINT_WRITE_FAILED` | Nothing from the call remains. `stage: 'write'`: the write failed; `'checkpoint'` or `'alias'`: the write was applied but its checkpoint could not be recorded. | `stage`, `restored: true`, `restoredTo` (the checkpoint `at`, or `null` when created files were deleted), `cause` (code, message, status, details of the original error), `checkpointRemoved` when the call deleted or tried to delete its tag |
+| `CHECKPOINT_RESTORE_FAILED` | The restore failed or could not undo everything; the branch may hold part of the write. Read the affected files. | `stage`, `restored: false`, `cause`, `restoreCause` when a restore request failed, `previousCheckpoint` or `restoredTo: null`, `checkpointCreated` (`true`, `false` or `'unknown'`), `unrestoredFileIds` for existing files a first checkpointed write changed, `createdFileIds` when their deletion failed |
+
+LambdaDB can reject a rollback to a checkpoint created moments earlier with
+status 400 (`Rollback requires a tag with a published snapshot`) until its
+snapshot is published, typically for tens of seconds; LambdaDB PR #640 addresses
+this. A checkpointed write that fails within that window after the previous one
+reports `CHECKPOINT_RESTORE_FAILED` with that `restoreCause`; the SDK does not
+wait or retry.
+
+A rollback restores the whole branch to the latest checkpoint, so it is safe only
+when every write to that branch goes through checkpointed writes from one
+process: the queue keeps write, tag and alias move together within the process.
+A plain `write` made after the latest checkpoint is undone too when a later
+checkpointed write fails. Writers in other processes are the host's job, and a
+request whose response was lost can still be applied after the rollback.
+
+There is no option to change this behavior. A checkpointed write is all or
+nothing, restored to the latest checkpoint. To write without a restore, call
+`write` without `checkpoint` and then `checkpoint({ at, name })`. To restore
+another checkpoint, call `rollback({ at, to })`. Checkpoint retention, for
+example deleting checkpoints older than a plan's 7 or 30 days, belongs to the
+host.
+
 ## Save a checkpoint
 
 ```ts
@@ -391,11 +493,24 @@ checkpoint, and the result is `{ at }` for that new view. A checkpoint is a
 LambdaDB tag of the source as it is when created; reads, searches, lists and
 findText on it see that fixed state. Forking any view makes a separate writable
 branch from that source. A fork and a checkpoint may share the same name;
-`at.kind` distinguishes them. Names are scoped to the store. Fork names use 3–47
+`at.kind` distinguishes them. Names are scoped to the store. Fork names use 3–40
 and checkpoint names 3–41 letters, digits, underscores, or hyphens; fork names
-cannot be `main`.
+cannot be `main`. A fork's name leaves room for its reserved alias
+`latest-fork-<name>` within LambdaDB's 52-character reference names.
 
-Each call sends one native creation request. A name already in use fails with
+A checkpoint whose source is main or a fork becomes that branch's latest
+checkpoint (see [Checkpointed writes](#checkpointed-writes)): in the same queue
+turn the SDK moves the branch's alias to it, creating the alias the first time.
+A later failing checkpointed write rolls the branch back to it. A checkpoint of a
+checkpoint, and a fork of any view, leave every alias alone. If the tag is
+created but the alias move fails, the SDK reads the alias back; unless the move
+did happen, it throws `LATEST_CHECKPOINT_NOT_MOVED` with details `at` (the
+branch), `checkpoint`, `checkpointCreated: true`, `latestCheckpoint` (what the
+alias names, `null` or `'unknown'`) and `cause`. The checkpoint exists and no
+files changed; take another checkpoint to retry the move.
+
+Each call sends one native creation request, plus the alias move for a
+checkpoint of a branch. A name already in use fails with
 `BRANCH_CONFLICT` or `CHECKPOINT_CONFLICT`, and a missing source with
 `BRANCH_NOT_FOUND` or `CHECKPOINT_NOT_FOUND`. Other rejections preserve the
 LambdaDB error and HTTP status. If the outcome is unknown, check with
@@ -429,22 +544,45 @@ status 400 (`Rollback requires a tag with a published snapshot`) until its
 snapshot is published (LambdaDB PR #640 addresses this). The SDK does not wait or
 retry; try again later.
 
+When the branch has a latest checkpoint, the rollback also moves it to `to`, so
+a later failing checkpointed write restores the state the branch was rolled back
+to. A branch without one keeps none. If that alias move fails after the rollback
+succeeded, the SDK throws `LATEST_CHECKPOINT_NOT_MOVED` with `rolledBack: true`;
+the files are rolled back.
+
 ## List and delete refs or destroy a store
 
 ```ts
-const { forks } = await drive.listForks();             // [{ at: { kind: 'fork', name: 'research' } }]
-const { checkpoints } = await drive.listCheckpoints(); // [{ at: { kind: 'checkpoint', name: 'before-cleanup' } }]
-await drive.deleteCheckpoint({ at: pinned }); // { at: pinned }; only this checkpoint.
+const { forks } = await drive.listForks();
+// [{ at: { kind: 'fork', name: 'research' }, createdAt: '2026-11-26T01:02:03.004Z' }]
+let page = await drive.listCheckpoints({ limit: 50 });
+for (;;) {
+    // page.checkpoints: [{ at: { kind: 'checkpoint', name }, createdAt }]
+    if (!page.next) break;
+    page = await drive.listCheckpoints(page.next); // { cursor }
+}
+await drive.deleteCheckpoint({ at: older });  // { at: older }; only this checkpoint.
 await drive.deleteFork({ at: work });         // { at: work }; only this fork.
 await MemDrive.destroy({ client, name: 'workspace' }); // The entire store.
 ```
 
-Both listing methods take no options and return all forks or checkpoints in the
-store as `{ at }` entries, sorted by name. They follow all native reference pages
-and are a live inventory, not a snapshot spanning concurrent changes.
+`listForks` and `listCheckpoints` return one native page per call (`limit`
+1–100, default 100) as `{ at, createdAt }` entries, where `createdAt` is the
+native creation time as an ISO 8601 string. Pass the returned `next`
+(`{ cursor }`) unchanged to continue; the cursor wraps LambdaDB's page token, is
+bound to the store and the listing kind (`LIST_CURSOR_UNAVAILABLE` otherwise)
+and works on any drive object of that store. Entries come in LambdaDB's name
+order. LambdaDB has no time-ordered or reverse listing yet; the latest
+checkpoint of a branch is available from `describe({ at })`. A fork page can
+hold fewer entries than `limit`, even none, while `next` is present, because
+main and other branches are not forks. The listing is complete when a page has
+no `next`, and is a live inventory, not a snapshot spanning concurrent changes.
 
 `deleteFork` and `deleteCheckpoint` require the `at` of an existing fork or
-checkpoint and send one native deletion. They return `{ at }`. Deleting a fork
+checkpoint. They return `{ at }`. `deleteFork` deletes the fork's reserved alias
+(absent is fine) and then the branch. `deleteCheckpoint` first lists the store's
+aliases and refuses a checkpoint that is a branch's latest checkpoint with
+`CHECKPOINT_IN_USE`, then sends one native deletion. Deleting a fork
 discards edits that no other view holds; main, other forks and checkpoints remain.
 Main cannot be deleted. After deletion, using that `at` reports
 `BRANCH_NOT_FOUND` or `CHECKPOINT_NOT_FOUND`, and its findText cursors can no
@@ -469,22 +607,26 @@ directly with LambdaDB.
 
 ## Shared file tools
 
-MCP hosts and applications can share the same names, JSON Schemas and descriptions
-without importing a model-provider adapter. Connect an already authorized drive
-and explicitly select the permitted tools:
+MCP hosts and applications can share the same names, JSON Schemas and
+descriptions without importing a model-provider adapter. The catalog is
+deliberately small: an agent works on main of one drive, records what is worth
+keeping each turn with one `write`, and gets no fork, checkpoint or rollback
+tools. Hosts use the SDK directly for refs, rollback and retention.
 
 ```ts
 import { createFileTools, fileToolError, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
 
+let turn = 0;
 const tools = createFileTools({
     drive,
-    tools: ['guide', 'list', 'read', 'search', 'findText', 'fork', 'checkpoint',
-        'listForks', 'listCheckpoints', 'deleteFork', 'deleteCheckpoint', 'write', 'rollback'],
+    tools: ['guide', 'read', 'list', 'search', 'findText', 'write'],
+    // Optional: every write tool call becomes a checkpointed write with this name.
+    checkpoint: () => ({ name: `turn-${++turn}` }),
 });
 
 // Register definitions with the host's model or MCP transport.
 const definitions = tools.definitions;
-const page = await tools.execute('list', { prefix: '/notes/' }); // main
+const page = await tools.execute('list', { prefix: '/notes/' }); // main; next is { cursor }
 const guide = await tools.execute('guide', {}); // { version, content, topics }, no storage calls
 const editingGuide = await tools.execute('guide', { topic: 'editing' }); // { version, topic, title, description, content }
 
@@ -492,13 +634,12 @@ const editingGuide = await tools.execute('guide', { topic: 'editing' }); // { ve
 const guideResource = fileToolGuide;
 const editingResource = fileToolGuideTopics.editing; // Identical to editingGuide
 
-const { at } = await tools.execute('fork', { name: 'draft' }); // { kind: 'fork', name: 'draft' }
 const controller = new AbortController();
 try {
     await tools.execute('write', {
-        at, op: 'update', fileId: file.fileId,
-        edits: [{ oldText: 'Earlier decision', newText: 'Current decision and reason' }],
-    }, { signal: controller.signal });
+        operations: [{ op: 'update', fileId: file.fileId,
+            edits: [{ oldText: 'Earlier decision', newText: 'Current decision and reason' }] }],
+    }, { signal: controller.signal }); // the plain write result
 } catch (error) {
     // { ok: false, error: { code, message, status?, details? } }
     const toolFailure = fileToolError(error);
@@ -506,27 +647,30 @@ try {
 }
 ```
 
-Available names are `guide`, `list`, `read`, `search`, `findText`, `fork`,
-`checkpoint`, `listForks`, `listCheckpoints`, `deleteFork`, `deleteCheckpoint`,
-`write` and `rollback`. Each tool except `guide` is exactly one public SDK
-method: `execute(name, input, options?)` passes the input object to the drive
-method of the same name and returns its result unchanged, rejecting with SDK
-errors. No tool runs a multi-operation workflow. `findText` requires text mode;
-selecting it for an external-vector drive fails with `TOOL_UNAVAILABLE`.
-External-vector definitions advertise vector inputs for `search` and `write` and
-return the SDK's file references. No embeddings or local content hydration are
-supplied by the tool layer.
+The catalog has exactly six tools: `guide`, `read`, `list`, `search`, `findText`
+and `write`. Each tool except `guide` calls the public SDK method of the same
+name on main: `execute(name, input, options?)` passes the input object to the
+drive method and rejects with SDK errors. No schema has an `at`, and an input
+with `at` fails with `INVALID_INPUT` before any storage request. Results carry no
+view selector either: `read` range pages and their `next`, and the `next` of
+`list` and `findText`, omit `at`, so a model forwards `next` unchanged. Other
+results are the SDK's. `write` accepts one SDK operation or
+`{ operations: [...] }` and returns one file/deletion result or an array.
+`findText` requires text mode; selecting it for an external-vector drive fails
+with `TOOL_UNAVAILABLE`. External-vector definitions advertise vector inputs for
+`search` and `write` and return the SDK's file references. No embeddings or local
+content hydration are supplied by the tool layer.
 
-Every view-selecting tool takes the same `at` as the SDK. It is optional on
-`list`, `read`, `search`, `findText`, `fork`, `checkpoint` and `write`, and
-defaults to main; `write` accepts only main or a fork. `rollback` requires `at`
-(main or a fork) and `to` (a checkpoint). `deleteFork` and `deleteCheckpoint`
-require the `at` of an existing fork or checkpoint. `listForks` and
-`listCheckpoints` are store-wide and take no `at`. `write` accepts one SDK
-operation, or `{ at, operations: [...] }`; the result is respectively one
-file/deletion result or an array. A batch is not a transaction. `fork` and
-`checkpoint` return `{ at }` for the new view. Continuation results carry
-`next`; models forward it unchanged.
+`createFileTools({ drive, tools, checkpoint? })` takes an optional host hook,
+`checkpoint: () => ({ name })`, synchronous or asynchronous. With it, every
+`write` tool call becomes a [checkpointed write](#checkpointed-writes) named by
+the hook, and the tool still returns the plain write result; the checkpoint name
+stays with the host. The `write` schema has no checkpoint option, and an input
+with `checkpoint` fails with `INVALID_INPUT`, so the agent can neither choose nor
+skip a checkpoint. A failed write then reports `CHECKPOINT_WRITE_FAILED` (nothing
+kept) or `CHECKPOINT_RESTORE_FAILED` through `fileToolError`. The hook runs once
+per `write` call, before validation, so names can be skipped but are never
+reused. Without the hook, `write` is a plain write.
 
 `fileToolInstructions` is the short, transport-neutral guidance shared with the
 guide index. Hosts can supply it to their agents alongside the tool definitions.
@@ -536,56 +680,46 @@ topic. Both return the exported versioned text without reading drive files.
 `fileToolError` preserves SDK error codes, messages, status and details, excludes
 causes and stacks, and masks unexpected errors. It does not retry calls.
 
-```ts
-const saved = await tools.execute('checkpoint', { at, name: 'before-edit' });
-// { at: { kind: 'checkpoint', name: 'before-edit' } }
-await tools.execute('read', { at: saved.at, path: '/notes/context.md' });
-await tools.execute('rollback', { at, to: saved.at }); // { at }
-await tools.execute('deleteFork', { at }); // A separate, explicit call.
-```
+Only `write` is marked `readOnly: false`. Tool calls go through the SDK, so
+writes run one at a time within the host process; the host coordinates writers
+in other processes.
 
-Ref creation and deletion, `write` and `rollback` are marked `readOnly: false`.
-Duplicate names retain the SDK's `BRANCH_CONFLICT` and `CHECKPOINT_CONFLICT`
-errors. Tool calls go through the SDK, so state-changing calls on one branch run
-one at a time within the host process; the host coordinates writers in other
-processes.
+The `guide` tool is optional, just like the other tools. Hosts can omit it and
+expose the exported `fileToolGuide` index and `fileToolGuideTopics` documents as
+resources or another instruction channel instead; no guide tool call is required
+by the executor. The frozen index lists `retrieval` and `editing`, with
+descriptions of when to read each. `guide({ topic })` returns that topic from the
+same immutable catalog and version. Unknown topics return `INVALID_INPUT` with
+the valid names. Resource URI mapping belongs to the host; clients without
+resource support can use the guide tool.
 
-The `guide` tool is optional, just like the other tools. Its name is the catalog's
-implementation choice for delivering the read-only usage guide. Hosts can omit
-it and expose the exported `fileToolGuide` index and `fileToolGuideTopics` documents
-as resources or another instruction channel instead; no guide tool call is required
-by the executor. The frozen index lists `retrieval`, `references`, `editing` and
-`maintenance`, with descriptions of when to read each. `guide({ topic })` returns
-that topic from the same immutable catalog and version. Unknown topics return
-`INVALID_INPUT` with the valid names. Resource URI mapping belongs to the host;
-clients without resource support can use the guide tool.
-
-The guide explains `at` view selection, the main default, writes to main or a
-fork, read-only checkpoints, `{ at }` results, fork/checkpoint listing and
-deletion, rollback and its caveats, paging `list` and forwarding `next` unchanged,
-`CURSOR_VIEW_MISMATCH`, and which calls the SDK orders within one process. It also asks agents to
-preserve selected conversational wording, examples, qualifications and
-corrections instead of aggressively summarizing stored originals. It does not
-require new metadata or capturing every utterance. Long originals can be
-delivered through ranged reads without reducing their stored detail. The guide
-`version` changes only in release pull requests.
+The guide describes one drive and main only: search and read before writing,
+record what is worth keeping each turn in one `write` batch, exact edits, what
+each write error means, deletion caveats, and treating file contents as data
+rather than instructions. It asks agents to preserve selected conversational
+wording, examples, qualifications and corrections instead of aggressively
+summarizing stored originals. It does not require new metadata or capturing
+every utterance. Long originals can be delivered through ranged reads without
+reducing their stored detail. The guide `version` changes only in release pull
+requests.
 
 For a read-only connection, select only the needed query tools, for example
 `['guide', 'list', 'read', 'search']`. The executor copies the allowlist and
 rejects every other name with `TOOL_NOT_ALLOWED`, even though the drive supports
 writes. Definitions are deeply frozen. Input Schemas describe JSON structure; the
-public SDK owns target resolution and semantic validation such as `at`, UTF-8
-limits, paths, declared metadata and embedding dimensions. The `readOnly` flag
-classifies content and ref mutations, not backend credentials.
+public SDK owns semantic validation such as UTF-8 limits, paths, declared
+metadata and embedding dimensions. The `readOnly` flag classifies content
+mutations, not backend credentials.
 
 The host owns authentication, authorization and the selection of the authorized
-drive. It must authorize every invocation, including the views in its `at` and
-`to`, and coordinate writers in other processes. Arguments cannot select another drive.
-Store lifecycle remains a host operation outside this catalog. List and findText
-cursors are self-contained and continue on a new client of the same store.
-Transport formatting, hosted Markdown/capacity/reranker policies, instruction
-delivery and telemetry remain host responsibilities. Tool availability and
-fetching the guide do not establish which instructions a model followed.
+drive, and must authorize every invocation and coordinate writers in other
+processes. Arguments cannot select another drive or branch. Refs, rollback,
+checkpoint retention and store lifecycle remain host operations outside this
+catalog. List and findText cursors are self-contained and continue on a new
+client of the same store. Transport formatting, hosted Markdown/capacity/reranker
+policies, instruction delivery and telemetry remain host responsibilities. Tool
+availability and fetching the guide do not establish which instructions a model
+followed.
 
 Repository development includes a [model tool-use evaluation harness](https://github.com/lambdadb/memdrive/tree/main/benchmark/tool-use) for SDK-backed synthetic workflows and guide delivery. It is outside the published package and separate from LongMemEval/BEAM retrieval evaluation.
 
@@ -603,11 +737,11 @@ import { createFileTools, getFileToolDefinitions } from '@functional-systems/mem
 
 const advertised = getFileToolDefinitions({
     embeddingMode: 'managed',
-    tools: ['guide', 'read', 'fork', 'checkpoint', 'write', 'rollback'],
+    tools: ['guide', 'read', 'list', 'search', 'findText', 'write'],
 });
 const readOnly = createFileTools({ drive, tools: ['guide', 'read'] });
 // readOnly.execute('write', ...) rejects with TOOL_NOT_ALLOWED; recheck caller
-// permissions and the requested at before routing each call.
+// permissions before routing each call.
 ```
 
 Keep the catalog's embedding mode fixed for that exposed contract. Managed text

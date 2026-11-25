@@ -127,7 +127,7 @@ test('live external vectors preserve private application text, checkpoints and r
     try {
         const main = await MemDrive.create({ client: native, name, embedding: model, labels: { 'eval.owner': owner },
             metadataSchema: { topic: { type: 'string' }, rank: { type: 'number' } } }, options());
-        assert.deepEqual((await main.describe(options())).embedding, model);
+        assert.deepEqual((await main.describe({}, options())).embedding, model);
         // The store is a single collection: the fetcher rejects any other collection creation.
         assert.deepEqual([...created], [name]);
         assert.deepEqual((await (await open()).drive.list({}, options())).files, []);
@@ -222,12 +222,14 @@ test('live external vectors preserve private application text, checkpoints and r
             noPayloadText(file);
             assert(!Object.hasOwn(file, 'embedding'), 'A public list exposed the stored vector.');
         }
-        assert.deepEqual(await main.listForks({}, options()), { forks: [{ at: work.at }] });
-        assert.deepEqual(await main.listCheckpoints({}, options()), { checkpoints: [{ at: checkpointAt }] });
-        assert.deepEqual(await main.deleteCheckpoint({ at: checkpointAt }, options()), { at: checkpointAt });
-        await assert.rejects(main.read({ at: checkpointAt, fileId: a.fileId }, options()), { code: 'CHECKPOINT_NOT_FOUND' });
+        assert.deepEqual((await main.listForks({}, options())).forks.map(entry => entry.at), [work.at]);
+        assert.deepEqual((await main.listCheckpoints({}, options())).checkpoints.map(entry => entry.at), [checkpointAt]);
+        // The fork's latest checkpoint cannot be deleted until the fork, and its alias, are gone.
+        await assert.rejects(main.deleteCheckpoint({ at: checkpointAt }, options()), { code: 'CHECKPOINT_IN_USE' });
         assert.deepEqual(await main.deleteFork({ at: work.at }, options()), { at: work.at });
         await assert.rejects(main.read({ at: work.at, fileId: a.fileId }, options()), { code: 'BRANCH_NOT_FOUND' });
+        assert.deepEqual(await main.deleteCheckpoint({ at: checkpointAt }, options()), { at: checkpointAt });
+        await assert.rejects(main.read({ at: checkpointAt, fileId: a.fileId }, options()), { code: 'CHECKPOINT_NOT_FOUND' });
         assert.deepEqual(await main.listForks({}, options()), { forks: [] });
         assert.deepEqual(await main.listCheckpoints({}, options()), { checkpoints: [] });
     } catch (error) {

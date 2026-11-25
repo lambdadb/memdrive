@@ -46,44 +46,85 @@ test('create makes one collection with one-day native snapshot retention and no 
     await assert.rejects(open({ client, name, mode: 'external' }), { code: 'INCOMPATIBLE_STORE' });
 });
 
-test('lists all user forks and checkpoints as sorted at values, hides other refs and rejects malformed lists', async () => {
+const ats = list => (list.forks ?? list.checkpoints).map(entry => entry.at);
+
+test('lists one name-ordered page of user forks or checkpoints with creation times, hides other refs and rejects malformed lists', async () => {
     const { fixture, drive, checkpoint, collections } = await setup();
     await drive.fork({ at: checkpoint, name: 'another' });
     await drive.checkpoint({ name: 'alpha' });
     await fixture.client.collection(name).branches.create({ branchName: 'unrelated', source: { kind: 'branch', name: 'main' } });
     assert(collections.get(name).branches.has('unrelated'));
-    assert.deepEqual(await drive.listForks(), { forks: [{ at: forkAt('another') }, { at: forkAt('draft') }] });
-    assert.deepEqual(await drive.listCheckpoints({}), { checkpoints: [{ at: checkpointAt('alpha') }, { at: checkpointAt('saved') }] });
-    await assert.rejects(drive.listForks({ at: forkAt('draft') }), { code: 'INVALID_INPUT' });
-    fixture.listBranches = () => ({ branches: [{ name: 'fork-draft' }, { name: 'fork-draft' }] });
+    const forks = await drive.listForks();
+    assert.deepEqual(ats(forks), [forkAt('another'), forkAt('draft')]);
+    assert.equal(forks.next, undefined);
+    const checkpoints = await drive.listCheckpoints({});
+    assert.deepEqual(ats(checkpoints), [checkpointAt('alpha'), checkpointAt('saved')]);
+    const tag = collections.get(name).tags.get('checkpoint-alpha').tag;
+    assert.equal(checkpoints.checkpoints[0].createdAt, tag.createdAt.toISOString());
+    for (const request of [{ at: forkAt('draft') }, { limit: 0 }, { limit: 101 }, { limit: 1.5 }, { cursor: 'x', limit: 1 }])
+        await assert.rejects(drive.listForks(request), { code: 'INVALID_INPUT' });
+    fixture.listBranches = () => ({ branches: [{ name: 'fork-draft', createdAt: new Date() }, { name: 'fork-draft', createdAt: new Date() }] });
+    await assert.rejects(drive.listForks(), { code: 'INVALID_RESULT' });
+    fixture.listBranches = () => ({ branches: [{ name: 'fork-draft', createdAt: 'yesterday' }] });
     await assert.rejects(drive.listForks(), { code: 'INVALID_RESULT' });
     fixture.listTags = () => ({ tags: [null] });
     await assert.rejects(drive.listCheckpoints(), { code: 'INVALID_RESULT' });
+    fixture.listTags = params => ({ tags: [], nextPageToken: params.pageToken ?? 'same' });
+    const { next } = await drive.listCheckpoints();
+    await assert.rejects(drive.listCheckpoints(next), { code: 'INVALID_RESULT' });
+});
+
+test('ref listings page with stateless cursors bound to the store and listing kind', async () => {
+    const { drive, calls, connection } = await setup();
+    for (const label of ['b-one', 'c-two', 'd-three']) await drive.checkpoint({ name: label });
+    const seen = [];
+    let page = await drive.listCheckpoints({ limit: 2 });
+    for (;;) {
+        seen.push(...ats(page));
+        if (!page.next) break;
+        assert.deepEqual(Object.keys(page.next), ['cursor']);
+        page = await (await open(connection)).listCheckpoints(page.next);
+    }
+    // Name order across pages, as LambdaDB lists tags.
+    assert.deepEqual(seen.map(at => at.name), ['b-one', 'c-two', 'd-three', 'saved']);
+    assert.deepEqual(calls.filter(call => call.kind === 'tag-list').map(call => call.params), [{ size: 2 }, { size: 2, pageToken: '2' }]);
+    const { next } = await drive.listCheckpoints({ limit: 1 });
+    await assert.rejects(drive.listForks(next), { code: 'LIST_CURSOR_UNAVAILABLE' });
+    await assert.rejects(drive.listCheckpoints({ cursor: 'r1.e30' }), { code: 'LIST_CURSOR_UNAVAILABLE' });
+    const other = await create({ client: connection.client, name: 'other-store' });
+    await other.checkpoint({ name: 'one' });
+    await assert.rejects(other.listCheckpoints(next), { code: 'LIST_CURSOR_UNAVAILABLE' });
+    // Main is not a fork: a page can hold fewer forks than its native size, even none.
+    await drive.fork({ name: 'zeta' });
+    const first = await drive.listForks({ limit: 2 });
+    assert.deepEqual(ats(first), [forkAt('draft'), forkAt('zeta')]);
+    assert.deepEqual(await drive.listForks(first.next), { forks: [] });
 });
 
 test('ref deletion returns at, keeps independent snapshots, and later uses report absence', async () => {
     const { connection, drive, fork, checkpoint, calls } = await setup();
     const { at: child } = await drive.fork({ at: checkpoint, name: 'child' });
-    const tools = createFileTools({ drive, tools: ['read', 'write', 'deleteFork'] });
+    const tools = createFileTools({ drive, tools: ['read', 'write'] });
     assert.deepEqual(await drive.deleteFork({ at: fork }), { at: fork });
     assert.deepEqual(await drive.deleteCheckpoint({ at: checkpoint }), { at: checkpoint });
-    assert.deepEqual(await drive.listForks(), { forks: [{ at: child }] });
-    assert.deepEqual(await drive.listCheckpoints(), { checkpoints: [] });
+    assert.deepEqual(ats(await drive.listForks()), [child]);
+    assert.deepEqual(ats(await drive.listCheckpoints()), []);
     assert.equal((await drive.read({ at: child, path: edit.path })).content, edit.content);
     await assert.rejects(drive.write({ at: fork, ...edit }), { code: 'BRANCH_NOT_FOUND' });
     await assert.rejects(drive.read({ at: checkpoint, path: edit.path }), { code: 'CHECKPOINT_NOT_FOUND' });
-    await assert.rejects(tools.execute('read', { at: fork, path: edit.path }), { code: 'BRANCH_NOT_FOUND' });
     await assert.rejects(drive.deleteFork({ at: fork }), { code: 'BRANCH_NOT_FOUND' });
     await assert.rejects(drive.deleteCheckpoint({ at: checkpoint }), { code: 'CHECKPOINT_NOT_FOUND' });
     // A recreated name is a new view without the deleted fork's state.
     await drive.fork({ name: 'draft' });
     assert.equal(await drive.read({ at: fork, path: edit.path }), null);
+    assert.equal(await tools.execute('read', { path: edit.path }), null);
     const reopened = await open(connection);
     assert.notEqual(reopened, drive);
-    assert.deepEqual(await tools.execute('deleteFork', { at: fork }), { at: fork });
+    assert.deepEqual(await reopened.deleteFork({ at: fork }), { at: fork });
     assert(deletes(calls).every(call => call.retries.strategy === 'none'));
-    // One native call per deletion request, including the two that found nothing; no confirmation reads or fences.
-    assert.equal(deletes(calls).length, 5);
+    // A fork deletion removes its reserved alias first (absent here), then the branch; no confirmation reads.
+    assert.deepEqual(deletes(calls).map(call => call.kind), ['alias-delete', 'branch-delete', 'tag-delete',
+        'alias-delete', 'branch-delete', 'tag-delete', 'alias-delete', 'branch-delete']);
 });
 
 test('delete requests require an existing at of the matching kind and main cannot be deleted', async () => {

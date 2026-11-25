@@ -1,13 +1,20 @@
 import { createFileTools, getFileToolDefinitions, fileToolError, fileToolInstructions, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
-import type { FileToolGuideTopic, FileDrive, FileToolDefinition, FileToolErrorResult, FileToolName, FileTools } from '@functional-systems/memdrive';
+import type { FileToolCheckpoint, FileToolGuideTopic, FileDrive, FileToolDefinition, FileToolErrorResult, FileToolName, FileTools } from '@functional-systems/memdrive';
 
 export async function toolConsumer(drive: FileDrive, external: FileDrive<'external'>, name: string, input: unknown) {
-    const names: readonly FileToolName[] = ['guide', 'list', 'read', 'fork', 'checkpoint', 'listForks', 'listCheckpoints',
-        'deleteFork', 'deleteCheckpoint', 'write', 'rollback'];
+    const names: readonly FileToolName[] = ['guide', 'read', 'list', 'search', 'findText', 'write'];
     // @ts-expect-error Publication tools are removed.
     const removed: FileToolName = 'merge';
-    void removed;
+    // @ts-expect-error Ref and rollback tools are removed; hosts use the SDK directly.
+    const removedRef: FileToolName = 'rollback';
+    void removed; void removedRef;
     const tools: FileTools = createFileTools({ drive, tools: names });
+    let turn = 0;
+    const checkpoint: FileToolCheckpoint = () => ({ name: `turn-${++turn}` });
+    createFileTools({ drive, tools: ['write'], checkpoint });
+    createFileTools({ drive, tools: ['write'], checkpoint: async () => ({ name: 'turn-async' }) });
+    // @ts-expect-error The hook returns a checkpoint name object.
+    createFileTools({ drive, tools: ['write'], checkpoint: () => 'turn' });
     const definitions: readonly FileToolDefinition[] = tools.definitions;
     const fixedDefinitions: readonly FileToolDefinition[] = getFileToolDefinitions({ embeddingMode: 'managed', tools: names });
     getFileToolDefinitions({ embeddingMode: 'external', tools: ['search', 'write'] });

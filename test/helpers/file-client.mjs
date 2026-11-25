@@ -21,7 +21,7 @@ export function fileClient() {
             collections.set(request.collectionName, {
                 metadata: structuredClone({ ...request, defaultBranchName: 'main', projectName: 'fixture',
                     createdAt: new Date(++generation) }),
-                branches: new Map([['main', { docs: new Map() }]]), tags: new Map(),
+                branches: new Map([['main', { docs: new Map() }]]), tags: new Map(), aliases: new Map(),
             });
             return collectionResult(collections.get(request.collectionName));
         },
@@ -31,6 +31,19 @@ export function fileClient() {
             const sourceDocs = ref => ref.kind === 'tag'
                 ? (state().tags.get(ref.name) ?? fail(404, 'Checkpoint missing')).docs : docsAt(ref.name);
             const copyView = ref => new Map(structuredClone([...sourceDocs(ref)]));
+            // One native page of sorted ref details, with numeric page tokens.
+            const refPage = (entries, { size = 10, pageToken } = {}) => {
+                const sorted = [...entries].sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+                const start = Number(pageToken ?? 0), end = Math.min(sorted.length, start + size);
+                return { page: sorted.slice(start, end), ...(end < sorted.length ? { nextPageToken: String(end) } : {}) };
+            };
+            const aliasResult = alias => ({ alias: { ...structuredClone(alias), createdAt: new Date(alias.createdAt),
+                dangling: alias.targetKind === 'TAG' && !state().tags.has(alias.targetName) } });
+            const aliasTarget = target => {
+                if (target?.kind !== 'tag' && target?.kind !== 'branch') fail(400, 'Invalid alias target');
+                if (!(target.kind === 'tag' ? state().tags : state().branches).has(target.name)) fail(404, `Reference not found: ${target.name}`);
+                return { targetKind: target.kind.toUpperCase(), targetName: target.name };
+            };
             const response = (docs, fields) => ({ isDocsInline: true, total: docs.length, docs: docs.map(doc => ({
                 collection: name, score: 0.8, doc: structuredClone(fields?.include
                     ? Object.fromEntries(fields.include.filter(key => Object.hasOwn(doc, key)).map(key => [key, doc[key]]))
@@ -69,6 +82,13 @@ export function fileClient() {
                     async list() {
                         return fixture.listBranches?.() ?? { branches: [...state().branches.keys()].map(name => ({ name })) };
                     },
+                    async listPage(params, options) {
+                        calls.push({ kind: 'branch-list', params: structuredClone(params), signal: options?.signal });
+                        const override = await fixture.listBranches?.(params);
+                        if (override) return override;
+                        const { page, ...next } = refPage([...state().branches].map(([name, branch]) => ({ name, createdAt: branch.createdAt })), params);
+                        return { branches: page, ...next };
+                    },
                     // Restores the branch to the tag's documents. `fixture.beforeRollback` may throw, for
                     // example the definite 400 of a tag whose snapshot is not yet published.
                     // Like the native client, rollback is never retried.
@@ -93,6 +113,13 @@ export function fileClient() {
                     async list() {
                         return fixture.listTags?.() ?? { tags: [...state().tags.keys()].map(name => ({ name })) };
                     },
+                    async listPage(params, options) {
+                        calls.push({ kind: 'tag-list', params: structuredClone(params), signal: options?.signal });
+                        const override = await fixture.listTags?.(params);
+                        if (override) return override;
+                        const { page, ...next } = refPage([...state().tags.values()].map(({ tag }) => ({ ...tag })), params);
+                        return { tags: page, ...next };
+                    },
                     async delete(tagName, options) {
                         calls.push({ kind: 'tag-delete', name: tagName, retries: options?.retries });
                         await fixture.beforeRefDelete?.('checkpoint', tagName);
@@ -113,6 +140,42 @@ export function fileClient() {
                         calls.push({ kind: 'tag-get', tagName });
                         const override = await fixture.getTag?.(tagName);
                         return override ?? { tag: (state().tags.get(tagName) ?? fail(404, 'Checkpoint missing')).tag };
+                    },
+                },
+                // Aliases name a tag or branch; `fixture.before*`/`after*` hooks may throw
+                // to inject failures before or after the native change.
+                aliases: {
+                    async create({ aliasName, target }, options) {
+                        calls.push({ kind: 'alias-create', request: { aliasName, target }, retries: options?.retries });
+                        await fixture.beforeAliasCreate?.(aliasName, target);
+                        if (state().aliases.has(aliasName)) fail(409, 'Alias already exists');
+                        const alias = { aliasId: globalThis.crypto.randomUUID(), aliasName, ...aliasTarget(target), aliasRevision: 1, createdAt: Date.now() };
+                        state().aliases.set(aliasName, alias);
+                        await fixture.afterAliasCreate?.(aliasName, target);
+                        return aliasResult(alias);
+                    },
+                    async retarget(aliasName, { target }, options) {
+                        calls.push({ kind: 'alias-retarget', name: aliasName, target, retries: options?.retries });
+                        await fixture.beforeAliasRetarget?.(aliasName, target);
+                        const alias = state().aliases.get(aliasName) ?? fail(404, 'Alias missing');
+                        Object.assign(alias, aliasTarget(target), { aliasRevision: alias.aliasRevision + 1 });
+                        await fixture.afterAliasRetarget?.(aliasName, target);
+                        return aliasResult(alias);
+                    },
+                    async get(aliasName) {
+                        calls.push({ kind: 'alias-get', name: aliasName });
+                        await fixture.beforeAliasGet?.(aliasName);
+                        return aliasResult(state().aliases.get(aliasName) ?? fail(404, 'Alias missing'));
+                    },
+                    async delete(aliasName, options) {
+                        calls.push({ kind: 'alias-delete', name: aliasName, retries: options?.retries });
+                        if (!state().aliases.delete(aliasName)) fail(404, 'Alias missing');
+                        return { message: 'Deleted' };
+                    },
+                    async listPage(params) {
+                        calls.push({ kind: 'alias-list', params: structuredClone(params) });
+                        const { page, ...next } = refPage([...state().aliases.values()].map(alias => ({ ...alias, name: alias.aliasName })), params);
+                        return { aliases: page.map(({ name: _name, ...alias }) => aliasResult(alias).alias), ...next };
                     },
                 },
                 async query(request, options) {
