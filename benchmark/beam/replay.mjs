@@ -216,6 +216,18 @@ export async function runReplay({ manifest: manifestFile, conversation, output, 
     return { manifest, results, summary: summarize(manifest, results, cleanup) };
 }
 
+/**
+ * What the CLI prints for a failure: the error's name, its code and HTTP status when it has
+ * them (an SDK, Node or argument-parser code names the cause), and a fixed message. Only an
+ * assertion's own first line is shown; other messages, causes and stacks can carry service text.
+ */
+export function describeFailure(error) {
+    return { error: error?.name ?? 'Error', ...(typeof error?.code === 'string' ? { code: error.code } : {}),
+        ...(Number.isInteger(error?.status) ? { status: error.status } : {}),
+        message: error?.name === 'AssertionError' ? error.message.split('\n')[0]
+            : 'BEAM replay could not complete. Check arguments, LLM_API_KEY, LambdaDB configuration and run receipts; a LambdaDB run keeps store.json for --cleanup. Use a new output directory.' };
+}
+
 const help = `Replay one prepared original-BEAM conversation against the MemDrive file tools.
   --manifest FILE --conversation ID --output NEW_DIR
   [--mode model|scripted] [--model ID] [--instructions sdk|none] [--policy-file FILE]
@@ -286,8 +298,7 @@ async function main() {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
     main().catch(error => {
-        console.error(json({ error: error.name, message: error.name === 'AssertionError' ? error.message.split('\n')[0]
-            : 'BEAM replay could not complete. Check arguments, LLM_API_KEY, LambdaDB configuration and run receipts; a LambdaDB run keeps store.json for --cleanup. Use a new output directory.' }));
+        console.error(json(describeFailure(error)));
         process.exitCode = 1;
     });
 }

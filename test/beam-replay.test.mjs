@@ -6,7 +6,7 @@ import test from 'node:test';
 import { fileToolInstructions, getFileToolDefinitions, MemDrive } from '@functional-systems/memdrive';
 import { limits, openAI, toolNames } from '../benchmark/beam/replay-agent.mjs';
 import { conversationMetrics, sessionMetrics } from '../benchmark/beam/replay-metrics.mjs';
-import { checkList, runReplay } from '../benchmark/beam/replay.mjs';
+import { describeFailure, checkList, runReplay } from '../benchmark/beam/replay.mjs';
 import { dateOf, groupSessions, hash, loadSessions, stripMarker } from '../benchmark/beam/replay-sessions.mjs';
 import { cleanupStore, lambdadbConnection } from '../benchmark/beam/replay-store.mjs';
 import { fileClient } from './helpers/file-client.mjs';
@@ -407,6 +407,17 @@ test('a merge that replays an earlier published result is not a new publication'
     assert.equal(conversationMetrics([session([['x']]), session([['x']])]).republishedWithinSessions, 0);
     assert.equal(conversationMetrics([session([['x'], ['x']]), session([['x'], ['x']])]).republishedWithinSessions, 2);
     assert.equal('republishedFiles' in conversationMetrics([session([['x']])]), false);
+});
+
+test('a CLI failure names the error code and status without its message, cause or stack', () => {
+    const fixed = /^BEAM replay could not complete/;
+    const sdk = describeFailure(Object.assign(new Error('secret service text'), { name: 'MemDriveError', code: 'DATABASE_ERROR', status: 503, cause: new Error('body') }));
+    assert.deepEqual([sdk.error, sdk.code, sdk.status, fixed.test(sdk.message), JSON.stringify(sdk).includes('secret')], ['MemDriveError', 'DATABASE_ERROR', 503, true, false]);
+    const parser = describeFailure(Object.assign(new TypeError('Unknown option'), { code: 'ERR_PARSE_ARGS_UNKNOWN_OPTION' }));
+    assert.deepEqual([parser.error, parser.code, 'status' in parser, fixed.test(parser.message)], ['TypeError', 'ERR_PARSE_ARGS_UNKNOWN_OPTION', false, true]);
+    assert.deepEqual(describeFailure(Object.assign(new Error('Use --backend fixture or lambdadb\n\n1 !== 2'), { name: 'AssertionError', code: 'ERR_ASSERTION' })),
+        { error: 'AssertionError', code: 'ERR_ASSERTION', message: 'Use --backend fixture or lambdadb' });
+    assert.deepEqual(describeFailure(undefined).error, 'Error');
 });
 
 test('the Responses transport sends one bounded request and reports only an HTTP status on failure', async () => {
