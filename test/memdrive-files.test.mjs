@@ -52,7 +52,8 @@ test('file stores round-trip exact text and empty originals by path and stable I
     assert.equal(calls.filter(call => call.kind === 'fetch').every(call => call.request.consistentRead), true);
     const lookup = calls.find(call => call.kind === 'query').request;
     assert.deepEqual(lookup, {
-        size: 2, ref: { kind: 'branch', name: 'fork-research' }, consistentRead: true, includeVectors: false,
+        // Large enough to see every file at a destination, including ones that share it.
+        size: 1000, ref: { kind: 'branch', name: 'fork-research' }, consistentRead: true, includeVectors: false,
         fields: { include: ['id', 'kind', 'fileId', 'path'] },
         query: { bool: [
             { queryString: { query: '"file"', defaultField: 'kind' }, occur: 'filter' },
@@ -629,7 +630,9 @@ test('an applied update or deletion resumes chunk cleanup after reopening', asyn
     const reject = () => { throw Object.assign(new Error('Rejected'), { statusCode: 400 }); };
     fixture.beforeDelete = reject;
     await assert.rejects(drive.write({ at: research, op: 'update', fileId: file.fileId, content: 'second' }), error =>
-        error.status === 400 && error.details.stage === 'cleanup-chunks' && error.details.targets[0].fileId === file.fileId);
+        error.status === 400 && error.details.stage === 'cleanup-chunks' && error.details.targets[0].fileId === file.fileId
+        // The original is written, so the update is reported as applied.
+        && error.details.completedFileIds.includes(file.fileId));
     assert.equal((await drive.read({ at: research, fileId: file.fileId })).content, 'second');
     assert(oldChunks.every(id => orig.has(id)));
     assert.deepEqual((await drive.search({ at: research, query: 'first', rerank: false })).hits.map(hit => hit.content), ['second']);
@@ -642,7 +645,8 @@ test('an applied update or deletion resumes chunk cleanup after reopening', asyn
     // The original goes first; a rejected chunk cleanup leaves invisible orphans that a repeated delete removes.
     fixture.beforeDelete = request => request.ids.some(id => id.startsWith('chunk:')) && reject();
     await assert.rejects(reopened.write({ at: research, op: 'delete', fileId: file.fileId }), error =>
-        error.status === 400 && error.details.stage === 'cleanup-chunks' && error.details.targets[0].fileId === file.fileId);
+        error.status === 400 && error.details.stage === 'cleanup-chunks' && error.details.targets[0].fileId === file.fileId
+        && error.details.completedFileIds.includes(file.fileId));
     assert.equal(await reopened.read({ at: research, fileId: file.fileId }), null);
     assert.equal((await reopened.search({ at: research, query: 'second', rerank: false })).hits.length, 0);
     fixture.beforeDelete = undefined;
@@ -681,6 +685,84 @@ test('reintroducing identical text uses new chunk IDs even if an earlier delete 
     const hits = (await drive.search({ at: research, query: 'first', rerank: false })).hits;
     assert.equal(hits.length, 1);
     assert.equal(hits[0].content, 'first');
+});
+
+test('chunk cleanup keeps the generation of the original it reads back, so a concurrent update keeps its chunks', async () => {
+    const fixture = fileClient();
+    const drive = await create({ client: fixture.client, name: 'workspace' });
+    const file = await drive.write(request('/a.txt', 'zero'));
+    const other = await open({ client: { ...fixture.client }, name: 'workspace' });
+    let originalFetches = 0;
+    fixture.beforeFetch = async request => {
+        if (request.fields || request.ids.length !== 1 || request.ids[0] !== `file:${file.fileId}`) return;
+        // The second plain original fetch of the first update is its pre-cleanup read:
+        // let another writer replace the file completely at that moment.
+        if (++originalFetches === 2) await other.write({ op: 'update', fileId: file.fileId, content: 'second writer' });
+    };
+    await drive.write({ op: 'update', fileId: file.fileId, content: 'first writer' });
+    fixture.beforeFetch = undefined;
+    assert.equal((await drive.read({ fileId: file.fileId })).content, 'second writer');
+    assert.deepEqual((await drive.search({ query: 'second writer', rerank: false })).hits.map(hit => hit.content), ['second writer']);
+});
+
+test('racing updates that remove each other\'s chunks are repaired by resending an update', async () => {
+    const fixture = fileClient();
+    const { collections } = fixture;
+    const drive = await create({ client: fixture.client, name: 'workspace' });
+    const file = await drive.write(request('/a.txt', 'zero'));
+    const other = await open({ client: { ...fixture.client }, name: 'workspace' });
+    const docs = collections.get('workspace').branches.get('main').docs;
+    // The first update reads its own original back before cleanup; the second
+    // update then completes entirely before the first deletes stale chunks.
+    let originalFetches = 0;
+    fixture.beforeFetch = async (request, current) => {
+        if (request.fields || request.ids.length !== 1 || request.ids[0] !== `file:${file.fileId}` || ++originalFetches !== 2) return;
+        const observed = { isDocsInline: true, total: 1, docs: [{ collection: 'workspace', doc: structuredClone(current.get(request.ids[0])) }] };
+        await other.write({ op: 'update', fileId: file.fileId, content: 'second' });
+        return observed;
+    };
+    await drive.write({ op: 'update', fileId: file.fileId, content: 'first' });
+    fixture.beforeFetch = undefined;
+    assert.equal((await drive.read({ fileId: file.fileId })).content, 'second');
+    const chunks = () => [...docs.values()].filter(doc => doc.kind === 'chunk' && doc.fileId === file.fileId);
+    // The first writer's cleanup read its own original and removed the second writer's chunks.
+    assert.deepEqual(chunks(), []);
+    assert.deepEqual((await drive.search({ query: 'second', rerank: false })).hits, []);
+    // Resending the same content, or moving the file, chunks it again instead of failing.
+    const repaired = await drive.write({ op: 'update', fileId: file.fileId, content: 'second' });
+    assert.equal(repaired.content, 'second');
+    assert.equal(chunks().length, 1);
+    assert.deepEqual((await drive.search({ query: 'second', rerank: false })).hits.map(hit => hit.content), ['second']);
+    for (const doc of chunks()) docs.delete(doc.id);
+    assert.equal((await drive.write({ op: 'update', fileId: file.fileId, newPath: '/moved.txt' })).path, '/moved.txt');
+    assert.deepEqual((await drive.search({ query: 'second', rerank: false })).hits.map(hit => hit.path), ['/moved.txt']);
+});
+
+test('files sharing a path after racing creates stay readable and writable by fileId', async () => {
+    const fixture = fileClient();
+    const { client } = fixture;
+    const drive = await create({ client, name: 'workspace' });
+    const other = await open({ client: { ...client }, name: 'workspace' });
+    let arrived = 0, release;
+    const bothChecked = new Promise(resolve => { release = resolve; });
+    fixture.beforeUpsert = async () => { if (++arrived === 2) release(); await bothChecked; };
+    const [one, two] = await Promise.all([drive.write(request('/same.txt', 'one')), other.write(request('/same.txt', 'two'))]);
+    fixture.beforeUpsert = undefined;
+    const fileIds = [one.fileId, two.fileId].sort();
+    const ambiguous = { code: 'PATH_AMBIGUOUS', details: { paths: [{ path: '/same.txt', fileIds }] } };
+    await assert.rejects(drive.read({ path: '/same.txt' }), ambiguous);
+    await assert.rejects(drive.read({ paths: ['/same.txt', '/missing.txt'] }), ambiguous);
+    await assert.rejects(drive.read({ path: '/same.txt', maxChars: 10 }), ambiguous);
+    assert.equal((await drive.read({ fileId: one.fileId })).content, 'one');
+    // Updates that keep the path, moves and deletes by fileId keep working.
+    assert.equal((await drive.write({ op: 'update', fileId: one.fileId, content: 'one, edited' })).content, 'one, edited');
+    assert.equal((await drive.write({ op: 'update', fileId: two.fileId, metadata: {} })).path, '/same.txt');
+    await assert.rejects(drive.write(request('/same.txt', 'three')), { code: 'PATH_EXISTS', details: { paths: ['/same.txt'] } });
+    assert.equal((await drive.write({ op: 'update', fileId: two.fileId, newPath: '/two.txt' })).path, '/two.txt');
+    assert.equal((await drive.read({ path: '/same.txt' })).fileId, one.fileId);
+    await assert.rejects(drive.write({ op: 'update', fileId: two.fileId, newPath: '/same.txt' }), { code: 'PATH_EXISTS' });
+    assert.deepEqual(await drive.write({ op: 'delete', fileId: one.fileId }), { fileId: one.fileId });
+    assert.equal(await drive.read({ path: '/same.txt' }), null);
 });
 
 test('delete removes the original before its chunks and leaves no tombstone', async () => {

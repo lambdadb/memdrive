@@ -35,7 +35,9 @@ test('live findText enumerates original occurrences and resumes on main, forks a
         const mainFirst = await main.findText({ query: 'needle', limit: 1 }, options());
         assert.equal(mainFirst.consistency, 'live');
         assert.deepEqual(mainFirst.next?.at, { kind: 'main' });
-        const mainSecond = await main.findText(mainFirst.next, options());
+        // The create drive's cursor continues on a freshly opened drive of the same store.
+        const opened = await MemDrive.open({ client, name }, options());
+        const mainSecond = await opened.findText(mainFirst.next, options());
         assert.equal(mainSecond.next, undefined);
         assert.deepEqual([...mainFirst.hits, ...mainSecond.hits].map(({ fileId, content, range }) => ({ fileId, content, range })), [
             { fileId: mainFile.fileId, content: 'Needle', range: { startLine: 1, endLine: 1, start: 0, end: 6 } },

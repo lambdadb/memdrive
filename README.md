@@ -51,9 +51,10 @@ const { hits, reranked } = await reopened.search({ at: work, query: 'Task contex
 `MemDrive.create` and `MemDrive.open` return a drive object for the store. Each
 request selects its view with `at`: `{ kind: 'main' }`, `{ kind: 'fork', name }`
 or `{ kind: 'checkpoint', name }`. Omitting `at` selects main. Main and forks are
-writable LambdaDB branches; a checkpoint is a read-only LambdaDB tag. Reads of
-main and forks use consistent branch reads, so they see a write as soon as it
-succeeds. Results that identify a view, such as range pages, created forks and
+writable LambdaDB branches; a checkpoint is a read-only LambdaDB tag. `read`,
+`search` and `findText` on main and forks use consistent branch reads, so they
+see a write as soon as it succeeds; `list` is eventual and can lag behind
+writes (see [List files](#list-files)). Results that identify a view, such as range pages, created forks and
 checkpoints and continuations, always carry an explicit `at`, including
 `{ kind: 'main' }`.
 
@@ -99,10 +100,14 @@ LambdaDB lacks; callers build them when they need them.
   version log. A fork's changes reach main only when you write them to main, or
   when you roll main back to a checkpoint of the fork. Keep versions you need as
   checkpoints, and build diffs, merges or change logs in the application.
-- **No serialization or locking.** Calls are independent. Concurrent writes to
-  the same view interleave, and the last native write to a file wins. Exact
-  `edits` apply to the original read at the start of that write call, so a
-  concurrent replacement in between is overwritten.
+- **No serialization or locking.** Calls are independent and concurrent writes
+  to the same view interleave. The original written last decides a file's path,
+  content and metadata, and exact `edits` apply to the original read at the
+  start of that write call, so a concurrent replacement in between is
+  overwritten. Racing writers to one file can remove each other's chunks: the
+  file stays readable but search may miss it until another update of that file
+  (even with unchanged content or only a new path) chunks it again. Racing
+  creates can leave two files at one path; see below.
 - **No cross-call or process state.** The SDK keeps no caches, fences or
   registries. Ordering, concurrency, retries and multi-process ownership of a
   store or view are the caller's responsibility.
@@ -316,8 +321,23 @@ has another revision. A batch is not a transaction and can apply in parts; error
 details identify the stage, the attempted files, the completed file IDs and any
 files whose chunks were written without their original. If a request may have
 been accepted but the SDK cannot confirm it, the error code is
-`WRITE_UNCONFIRMED`. Read the affected files before retrying. Reissuing an update
-with the current path and content, or a delete, finishes stale-chunk cleanup.
+`WRITE_UNCONFIRMED`. Read the affected files before retrying.
+
+A file counts as completed as soon as its original is written or deleted. After
+that, the SDK reads the original back and removes chunks of other generations; if
+that cleanup fails, the error has stage `cleanup-chunks` and lists the file in
+`completedFileIds`: the change is applied, and only leftover chunks remain, which
+search ignores. Repeating a delete, or any update of the file, removes them
+again. An update that finds no chunks for a nonempty original, for example after
+racing writers removed each other's chunks, chunks the file again instead of
+failing, so resending an update repairs search for it.
+
+Racing creates can leave several files at one path. Updates and deletes by
+`fileId` keep working for each of them, and an update that keeps its path is not
+checked against other files. Reading that path fails with `PATH_AMBIGUOUS`,
+whose details list `{ path, fileIds }`; move or delete the extra files by
+`fileId`. A create or move to a path that another file holds fails with
+`PATH_EXISTS`.
 
 ## Save a checkpoint
 
@@ -400,6 +420,11 @@ as already destroyed, and a collection that is not a compatible file store fails
 with `INCOMPATIBLE_STORE` without deletion. View requests through drive objects
 of a destroyed store then fail with `STORE_NOT_FOUND`. The host must stop other users of the store
 before destroying it or reusing its name; the SDK does not coordinate them.
+
+Stores created by earlier development builds (format `files-v0`) cannot be
+opened or destroyed by this SDK and fail with `INCOMPATIBLE_STORE`. Delete such
+a collection, and the `md-journal-*` collection those builds created for it,
+directly with LambdaDB.
 
 ## Shared file tools
 
@@ -555,7 +580,7 @@ or establish compatibility with a particular client or marketplace.
 const files = new Map();
 let page = await reopened.list({ at: work, prefix: '/notes/', limit: 100 });
 for (;;) {
-    for (const file of page.files) files.set(file.path, file); // deduplicate by path
+    for (const file of page.files) files.set(file.fileId, file); // deduplicate by fileId
     if (!page.next) break;
     page = await reopened.list(page.next); // { at, cursor }
 }
@@ -581,14 +606,19 @@ entries scanned rather than guaranteeing that many results:
   a traversal can be missed or seen twice, including on main and forks.
 
 The listing is complete only when a page has no `next`. Follow every `next`,
-then merge prefixes and deduplicate and sort files by path when order or
-uniqueness matters. Forward the returned `next` (`{ at, cursor }`) unchanged. The
+then merge prefixes, deduplicate files by `fileId` (racing creates can leave two
+files at one path) and sort by path when order matters. Forward the returned `next` (`{ at, cursor }`) unchanged. The
 cursor is an opaque token carrying the listing criteria and the native page
 token, so it continues on any drive object or client of the same store and does
 not expire in the SDK. Passing it with another `at` (omitted means main) fails
 with `CURSOR_VIEW_MISMATCH`, and a malformed cursor or one from another store
 fails with `LIST_CURSOR_UNAVAILABLE`. A rejection of the native page token
-passes through as a LambdaDB error; start again without a cursor.
+passes through as a LambdaDB error; start again without a cursor. Unlike a
+findText cursor, a list cursor is not bound to the identity of its fork or
+checkpoint, which would cost an extra request per page: if the ref is deleted
+and recreated under the same name, a continuation reads the new ref with the old
+native page token or fails with a LambdaDB error. Restart a listing after
+recreating a ref.
 
 These ordering and duplication limits come from LambdaDB's current listing. When
 LambdaDB ships consistent ordered listing (LambdaDB PR #619), the SDK can adopt

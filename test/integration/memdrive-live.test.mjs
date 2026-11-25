@@ -52,12 +52,12 @@ test('live file store writes main and forks, searches, lists, checkpoints and ro
     const client = new LambdaDBClient(connection);
     const name = `memdrive-smoke-files-${randomUUID().replaceAll('-', '').slice(0, 16)}`;
     let failure, collision = false;
-    // Follow every next and deduplicate by path: pages come in native order and can repeat entries.
+    // Follow every next and deduplicate by fileId: pages come in native order and can repeat entries.
     const listAll = async (drive, request) => {
         const files = new Map(), prefixes = new Set();
         for (let page = await drive.list(request, options()); ; page = await drive.list(page.next, options())) {
             assert.equal(page.consistency, 'eventual');
-            for (const file of page.files) files.set(file.path, file);
+            for (const file of page.files) files.set(file.fileId, file);
             for (const prefix of page.prefixes) prefixes.add(prefix);
             if (!page.next) break;
         }
@@ -113,6 +113,17 @@ test('live file store writes main and forks, searches, lists, checkpoints and ro
         assert.deepEqual(listed.files, expected.filter(file => listed.files.some(row => row.fileId === file.fileId)));
         assert.deepEqual(listed.prefixes, []);
         assert.equal((await listAll(main, { prefix: '/notes/' })).files.length, 0);
+        // A cursor from the drive returned by create continues on a drive returned by
+        // open: both derive the store identity from the same collection creation time.
+        for (const deadline = Date.now() + 120_000; ;) {
+            const page = await main.list({ at, limit: 1 }, options());
+            if (page.next) {
+                await reopened.list(page.next, options());
+                break;
+            }
+            assert(Date.now() < deadline, 'The fork listing never returned a second page.');
+            await sleep(5_000);
+        }
 
         // The release smoke checks the eventual contract without a freshness
         // deadline. The opt-in diagnostic observes convergence in this run.
@@ -131,9 +142,9 @@ test('live file store writes main and forks, searches, lists, checkpoints and ro
             await assert.rejects(reopened.list({ cursor: first.next.cursor }, options()), { code: 'CURSOR_VIEW_MISMATCH' });
             // The cursor is self-contained and continues on a fresh drive object.
             const fresh = await MemDrive.open({ client: new LambdaDBClient(connection), name }, options());
-            const files = new Map(first.files.map(file => [file.path, file])), prefixes = new Set(first.prefixes);
+            const files = new Map(first.files.map(file => [file.fileId, file])), prefixes = new Set(first.prefixes);
             for (let page = await fresh.list(first.next, options()); ; page = await fresh.list(page.next, options())) {
-                for (const file of page.files) files.set(file.path, file);
+                for (const file of page.files) files.set(file.fileId, file);
                 for (const prefix of page.prefixes) prefixes.add(prefix);
                 if (!page.next) break;
             }

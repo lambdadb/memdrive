@@ -1,7 +1,7 @@
 import type { TextChunker } from './text-chunks.js';
 import { editRequest, planEdit } from './edits.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
-import { bytes, createRecords, fileOriginal, originalId, resultDocs, validFileId } from './records.js';
+import { bytes, createRecords, fileOriginal, fileRecords, originalId, resultDocs, validFileId } from './records.js';
 import { afterId, branchRead, branchRef, fetchOriginals, pathQuery, viewRead, type Handle, type ViewRef } from './storage-reads.js';
 import type { CreateExternalFileRequest, FileListEntry, MetadataSchema, RequestOptions, UpdateExternalFileRequest,
     WriteFileRequest } from './types.js';
@@ -159,9 +159,11 @@ export function fileWriter(handle: Handle, name: string, schema: MetadataSchema,
         const originals = await fetchOriginals(handle, name, branchRef(branch), targetIds, signal, dimensions !== undefined);
         const plans: Plan[] = await Promise.all(inputs.map(input =>
             input.op === 'create' ? input : planEdit(input, originals.get(input.fileId), schema, dimensions, chunker, { signal })));
+        // Only new paths are checked: creates and moves. An update that keeps its
+        // path never fails on it, even when a concurrent create shares that path.
         const destinations = new Map<string, string>();
         for (const plan of plans) {
-            if (plan.op === 'delete') continue;
+            if (plan.op === 'delete' || (plan.op === 'update' && plan.file.path === originals.get(plan.file.fileId)?.path)) continue;
             const file = plan.op === 'create' ? plan.records.file : plan.file;
             requireInput(!destinations.has(file.path), 'Destination paths must be distinct within one write.');
             destinations.set(file.path, file.fileId);
@@ -172,25 +174,24 @@ export function fileWriter(handle: Handle, name: string, schema: MetadataSchema,
             const paths = [...destinations.keys()];
             let response;
             try {
-                response = await nativeRequest(() => handle.query({ size: 2 * paths.length, ...branchSettings,
+                response = await nativeRequest(() => handle.query({ size: maximumRequestDocuments, ...branchSettings,
                     query: pathQuery(paths), fields: { include: ['id', 'kind', 'fileId', 'path'] } }, nativeOptions(signal)), signal);
             } catch (cause) { throw databaseError(cause, 'Could not check write destinations.'); }
             checkAbort(signal);
-            const occupied = new Set<string>(), conflicts: string[] = [];
-            for (const doc of resultDocs(response, name, 2 * paths.length)) {
+            const conflicts = new Set<string>();
+            for (const doc of resultDocs(response, name, maximumRequestDocuments)) {
                 if (doc.kind !== 'file' || !validFileId(doc.fileId) || doc.id !== originalId(doc.fileId)
-                    || typeof doc.path !== 'string' || !destinations.has(doc.path) || occupied.has(doc.path))
-                    throw new MemDriveError('INVALID_RESULT', 'Destination lookup returned an unexpected or duplicate file.');
-                occupied.add(doc.path);
-                if (destinations.get(doc.path) !== doc.fileId) conflicts.push(doc.path);
+                    || typeof doc.path !== 'string' || !destinations.has(doc.path))
+                    throw new MemDriveError('INVALID_RESULT', 'Destination lookup returned an unexpected file.');
+                if (destinations.get(doc.path) !== doc.fileId) conflicts.add(doc.path);
             }
-            if (conflicts.length) throw new MemDriveError('PATH_EXISTS', 'A file already exists at a requested path.',
-                { details: { paths: conflicts } });
+            if (conflicts.size) throw new MemDriveError('PATH_EXISTS', 'A file already exists at a requested path.',
+                { details: { paths: [...conflicts] } });
         }
 
         // Plan all native request boundaries before mutating the first file.
         const steps: Array<{ creates: FileRecords[]; batches: WriteRecord[][] }
-            | { edit: Exclude<Plan, { op: 'create' }>; batches: WriteRecord[][] }> = [];
+            | { edit: Exclude<Plan, { op: 'create' }>; batches: WriteRecord[][]; patch: boolean }> = [];
         let creates: FileRecords[] = [];
         const queueCreates = () => {
             if (creates.length) steps.push({ creates, batches: writeBatches(creates, branch) });
@@ -200,18 +201,24 @@ export function fileWriter(handle: Handle, name: string, schema: MetadataSchema,
             if (plan.op === 'create') creates.push(plan.records);
             else {
                 queueCreates();
-                let batches: WriteRecord[][] = [];
+                let batches: WriteRecord[][] = [], patch = false;
                 if (plan.op === 'update') {
-                    if (plan.moveOnly) {
-                        const ids = await listChunkIds(handle, name, branchRef(branch), plan.file.fileId, { generation: plan.generation }, signal);
-                        if (!ids.length && plan.file.content.trim())
-                            throw new MemDriveError('INVALID_RESULT', 'The nonempty file has no visible chunks in its current generation.');
+                    const ids = plan.moveOnly
+                        ? await listChunkIds(handle, name, branchRef(branch), plan.file.fileId, { generation: plan.generation }, signal) : [];
+                    if (plan.moveOnly && (ids.length || !plan.file.content.trim())) {
                         batches = writeBatches([moveRecords(plan.original, ids)], branch);
+                        patch = true;
                     } else {
-                        batches = writeBatches([plan.records], branch);
+                        // A nonempty original without chunks in its generation, for
+                        // example after concurrent writers removed each other's
+                        // chunks, is chunked again under a new generation.
+                        const revision = globalThis.crypto.randomUUID();
+                        const records = plan.moveOnly
+                            ? await fileRecords(plan.file, { revision, generation: revision }, chunker, { signal }) : plan.records;
+                        batches = writeBatches([records], branch);
                     }
                 }
-                steps.push({ edit: plan, batches });
+                steps.push({ edit: plan, batches, patch });
             }
         }
         queueCreates();
@@ -260,15 +267,24 @@ export function fileWriter(handle: Handle, name: string, schema: MetadataSchema,
             await dispatch(stage, [target], { absent: ids }, () => handle.docs.delete({ ids, branch }, mutationOptions(signal)));
         }
 
-        /** Delete a file's chunks, or only those outside the generation to keep. */
-        async function cleanup(target: Identity, keepOld?: { generation?: string | undefined }) {
+        /**
+         * Delete the chunks that the file's current original does not use. The
+         * original is read again first, so a concurrent writer's newer generation
+         * is kept; when no original exists, every chunk of the file is removed.
+         */
+        async function cleanup(target: Identity) {
             const root = chunkIdBase(target.fileId);
             const matches = { queryString: { query: `/${root}.*/`, defaultField: 'id' }, occur: 'filter' };
-            const pattern = generationPattern(target.fileId, keepOld?.generation);
-            const keep = { queryString: { query: `/${pattern}/`, defaultField: 'id' }, occur: 'must_not' };
-            const active = new RegExp(`^${pattern}$`);
             const cleaned = new Set<string>();
             try {
+                const current = (await fetchOriginals(handle, name, branchRef(branch), [target.fileId], signal)).get(target.fileId);
+                const generation = current?.generation;
+                if (generation !== undefined && !validFileId(generation))
+                    throw new MemDriveError('INVALID_RESULT', 'Read returned invalid file generation data.');
+                const keepOld = current ? { generation } : undefined;
+                const pattern = generationPattern(target.fileId, keepOld?.generation);
+                const keep = { queryString: { query: `/${pattern}/`, defaultField: 'id' }, occur: 'must_not' };
+                const active = new RegExp(`^${pattern}$`);
                 for (let attempt = 0; attempt <= maximumCleanupBatches; attempt++) {
                     const response = await nativeRequest(() => handle.query({ ...branchSettings, size: maximumRequestDocuments,
                         fields: chunkFields, query: { bool: keepOld ? [chunkKind, matches, keep] : [chunkKind, matches] },
@@ -295,7 +311,9 @@ export function fileWriter(handle: Handle, name: string, schema: MetadataSchema,
         }
 
         // Chunks are written before the original that makes a file visible, and
-        // a deleted original disappears before its chunks are removed.
+        // a deleted original disappears before its chunks are removed. A file
+        // counts as completed once its original is written or deleted, so a
+        // failed chunk cleanup still reports the change as applied.
         for (const step of steps) {
             if ('creates' in step) {
                 const files = new Map(step.creates.map(({ file }) => [file.fileId, file]));
@@ -308,15 +326,14 @@ export function fileWriter(handle: Handle, name: string, schema: MetadataSchema,
             }
             const edit = step.edit;
             if (edit.op === 'update') {
-                for (const batch of step.batches) await put(batch.map(record => record.doc), edit.moveOnly);
-                if (dimensions === undefined)
-                    await cleanup({ fileId: edit.file.fileId, path: edit.file.path }, { generation: edit.generation });
+                for (const batch of step.batches) await put(batch.map(record => record.doc), step.patch);
                 completed.push(edit.file);
+                if (dimensions === undefined) await cleanup({ fileId: edit.file.fileId, path: edit.file.path });
             } else {
                 const { fileId, path, removeOriginal } = edit;
                 if (removeOriginal) await remove([originalId(fileId)], { fileId, path }, 'delete-original');
-                if (dimensions === undefined) await cleanup({ fileId, path });
                 completed.push({ fileId });
+                if (dimensions === undefined) await cleanup({ fileId, path });
             }
         }
         return multi ? completed : completed[0]!;

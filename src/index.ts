@@ -33,6 +33,8 @@ const validName = (name: unknown, maxLength = 52): name is string =>
     typeof name === 'string' && name.length >= 3 && name.length <= maxLength && /^[A-Za-z0-9_-]+$/.test(name);
 const validForkName = (name: unknown): name is string => validName(name, 52 - forkPrefix.length) && name !== 'main';
 const validCheckpointName = (name: unknown): name is string => validName(name, 52 - checkpointPrefix.length);
+/** Rows fetched by a path read: enough to expose files that share a path. */
+const pathReadSize = 1000;
 const atShape = 'at must be { kind: "main" }, { kind: "fork", name } or { kind: "checkpoint", name }';
 
 /** Normalize a request's view. Omission selects main. */
@@ -190,16 +192,22 @@ function store(handle: Handle, description: FileStoreDescription<EmbeddingMode>,
         requireInput(Array.isArray(value) && value.length >= 1 && value.length <= writeBatchLimit && [...value].every(validPath)
             && new Set(value).size === value.length, 'Provide 1–100 distinct valid absolute file paths.');
         const paths: string[] = [...value];
-        const response = await remote(() => handle.query({ size: paths.length * 2, ...viewRead(ref), query: pathQuery(paths) },
+        // Concurrent creates can leave several files at one path; fetch enough
+        // rows to see them and report the ambiguity instead of picking one.
+        const response = await remote(() => handle.query({ size: pathReadSize, ...viewRead(ref), query: pathQuery(paths) },
             nativeOptions(signal)), 'Could not read files by path.', signal);
         checkAbort(signal);
-        const expected = new Set(paths), files = new Map<string, FileListEntry>();
-        for (const doc of resultDocs(response, name, paths.length)) {
+        const expected = new Set(paths), files = new Map<string, FileListEntry>(), ambiguous = new Map<string, string[]>();
+        for (const doc of resultDocs(response, name, pathReadSize)) {
             const file = await decode(doc);
-            if (!expected.has(file.path) || files.has(file.path))
-                throw new MemDriveError('INVALID_RESULT', 'Read returned unexpected or duplicate paths.');
+            if (!expected.has(file.path))
+                throw new MemDriveError('INVALID_RESULT', 'Read returned an unexpected path.');
+            const other = files.get(file.path);
+            if (other) ambiguous.set(file.path, [...(ambiguous.get(file.path) ?? [other.fileId]), file.fileId]);
             files.set(file.path, file);
         }
+        if (ambiguous.size) throw new MemDriveError('PATH_AMBIGUOUS', 'Several files share a requested path. Read or change them by fileId.',
+            { details: { paths: [...ambiguous].map(([path, fileIds]) => ({ path, fileIds: fileIds.sort() })) } });
         return multi ? paths.flatMap(path => files.has(path) ? [files.get(path)!] : []) : files.get(paths[0]!) ?? null;
     }
 
