@@ -111,45 +111,52 @@ test('a publication records the affected file IDs that its fork held when the me
     assert.deepEqual(await (await MemDrive.open({ client: { ...fixture.client }, name })).history(), history);
 });
 
-test('a lost publication record write fails the merge, and repeating the merge settles it either way', async () => {
-    for (const applied of [false, true]) {
-        const label = `applied ${applied}`;
+test('a lost publication record reply is settled by reading the journal again', async () => {
+    // Lost: the write never landed. Hidden once: it landed, but its confirmation read was lost.
+    // Hidden twice: the journal reread after the failure was lost too.
+    for (const loss of ['lost', 'hidden once', 'hidden twice']) {
+        const label = loss;
         const { fixture, main, write, merge, create, assertRecorded } = await setup();
         const files = await create(3, 'note');
         await merge('first');
         await write([{ op: 'update', fileId: files[0].fileId, content: 'changed' }, { op: 'delete', fileId: files[1].fileId }]);
         const added = await write({ op: 'create', path: '/added', content: 'added' });
-        // Lose the response. When the write was applied, also lose the read that would confirm it.
-        let failed = false, hidden = false;
-        fixture[applied ? 'afterUpsert' : 'beforeUpsert'] = ({ docs }) => {
+        let failed = false, hidden = { lost: 0, 'hidden once': 1, 'hidden twice': 2 }[loss];
+        fixture[loss === 'lost' ? 'beforeUpsert' : 'afterUpsert'] = ({ docs }) => {
             if (docs[0].kind === 'publication-v1' && !failed) {
-                failed = hidden = true;
+                failed = true;
                 throw lost();
             }
         };
         fixture.beforeFetch = ({ ids }) => {
-            if (applied && hidden && ids.length === 1 && ids[0] === 'publication:2') {
-                hidden = false;
+            if (failed && hidden > 0 && ids.includes('publication:2')) {
+                hidden--;
                 return { isDocsInline: true, total: 0, docs: [] };
             }
         };
         const forkBefore = structuredClone([...forkDocs(fixture)]);
-        await assert.rejects(merge('second'), { code: 'DATABASE_ERROR' }, label);
+        const attempt = merge('second');
+        if (loss === 'hidden once') assert.deepEqual(await attempt, published('v2'), label);
+        else await assert.rejects(attempt, { code: 'DATABASE_ERROR' }, label);
         fixture.afterUpsert = fixture.beforeUpsert = fixture.beforeFetch = undefined;
         const [submitted] = recordWrites(fixture).slice(1);
         assert.deepEqual(submitted.fileIds, sorted([files[0], files[1], added]), label);
-        // Main is restored to the latest recorded version; the fork is untouched.
-        assert.deepEqual(fixture.calls.filter(call => call.kind === 'branch-rollback').map(call => call.tag), [applied ? 'md-main-v2' : 'md-main-v1'], label);
-        assert.deepEqual([...forkDocs(fixture)], forkBefore, label);
-        assert.equal((await main.status()).mainVersion, applied ? 'v2' : 'v1', label);
-        // A record that landed is a publication: repeating the merge finds main
-        // already holding the fork's changes. Otherwise it publishes them.
-        assert.deepEqual(await merge('second'), applied ? { status: 'unchanged', version: 'v2' } : published('v2'), label);
-        assert.deepEqual(await main.diff({ at: draft }), [], label);
+        // A failed merge restores main to the latest recorded version.
+        assert.deepEqual(fixture.calls.filter(call => call.kind === 'branch-rollback').map(call => call.tag),
+            { lost: ['md-main-v1'], 'hidden once': [], 'hidden twice': ['md-main-v2'] }[loss], label);
+        assert.equal((await main.status()).mainVersion, loss === 'lost' ? 'v1' : 'v2', label);
+        if (loss === 'lost') {
+            assert.deepEqual([...forkDocs(fixture)], forkBefore, label);
+            assert.deepEqual(await merge('second'), published('v2'), label);
+        }
+        // The fork's next operation settles a recorded publication first, so deleting the
+        // file it created is a published deletion, not a discarded draft.
+        await write({ op: 'delete', fileId: added.fileId });
+        assert.deepEqual(await main.diff({ at: draft }), [{ op: 'delete', fileId: added.fileId, previousPath: '/added' }], label);
         const [, entry] = (await main.history()).entries;
         assertRecorded(entry, 2, 'second', label);
-        assert.deepEqual({ ...entry, publishedAt: submitted.publishedAt }, { version: 'v2', publishedAt: submitted.publishedAt,
-            summary: submitted.summary, fileIds: submitted.fileIds, fileIdsTruncated: false }, label);
+        assert.deepEqual(await merge('third'), published('v3'), label);
+        assert.equal(await main.read({ fileId: added.fileId }), null, label);
     }
 });
 
