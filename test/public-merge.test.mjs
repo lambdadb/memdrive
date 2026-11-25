@@ -404,27 +404,56 @@ test('a second merge of a fork and later edits wait for its running merge, each 
     assert.equal((await main.read({ at, fileId: saved.fileId })).content, 'first');
 });
 
-test('failed source bookkeeping keeps the publication, and the next merge settles the published files without a conflict', async () => {
+test('failed source bookkeeping keeps the publication, and the fork settles it before any later operation', async () => {
     const { fixture, main } = await setup();
     const work = await fork(main, { name: 'research' });
     const [kept, removed] = await work.write([file('/kept'), file('/removed')]);
     await work.merge(request('first'));
     await work.write([{ op: 'update', fileId: kept.fileId, content: 'second' }, { op: 'delete', fileId: removed.fileId }]);
-    fixture.beforeUpsert = fixture.beforeDelete = ({ branch }) => {
-        if (branch === 'fork-research') throw new Error('Lost bookkeeping response');
+    const created = await work.write(file('/created'));
+    const rejectBookkeeping = () => {
+        fixture.beforeUpsert = fixture.beforeDelete = ({ branch }) => {
+            if (branch === 'fork-research') throw new Error('Lost bookkeeping response');
+        };
     };
+    rejectBookkeeping();
     assert.deepEqual(await work.merge(request('second')), status('v2'));
     fixture.beforeUpsert = fixture.beforeDelete = undefined;
     assert.equal((await main.read({ fileId: kept.fileId })).content, 'second');
-    // The baselines were not advanced, so the fork still states both changes.
-    assert.deepEqual((await work.diff()).map(change => change.op).sort(), ['delete', 'update']);
+    const docs = fixture.collections.get(name).branches.get('fork-research').docs;
+    // The baselines were not advanced, so the fork still states all three changes.
+    assert.deepEqual([kept, removed, created].map(({ fileId }) => docs.get(`file:${fileId}`)?.changed), [true, true, true]);
+    // A new client does not know about the failed pass; merging again settles it without a conflict.
+    const other = scoped(await MemDrive.open(withClient(fixture)), work.at);
+    assert.equal((await other.diff()).length, 3);
     const before = fixture.calls.length;
-    assert.deepEqual(await work.merge(request('again')), status('v2', 'unchanged'));
+    assert.deepEqual(await other.merge(request('again')), status('v2', 'unchanged'));
     assert.deepEqual(fixture.calls.slice(before).filter(mainMutation), []);
-    assert.deepEqual(await work.diff(), []);
-    const doc = fixture.collections.get(name).branches.get('fork-research').docs.get(`file:${kept.fileId}`);
+    assert.deepEqual(await other.diff(), []);
+    const doc = docs.get(`file:${kept.fileId}`);
     assert.deepEqual([doc.changed, doc.version, doc.baseline.version], [false, 'v2', 'v2']);
-    // The fork continues from the settled baseline.
+
+    // In the publishing client, the next operation of the fork completes the failed pass first:
+    // deleting a just-published creation is a published deletion, not a discarded draft.
+    const extra = await work.write(file('/extra'));
+    await work.merge(request('third'));
     await work.write({ op: 'update', fileId: kept.fileId, content: 'third' });
-    assert.deepEqual(await work.merge(request('third')), status('v3'));
+    rejectBookkeeping();
+    assert.deepEqual(await work.merge(request('fourth')), status('v4'));
+    fixture.beforeUpsert = fixture.beforeDelete = undefined;
+    assert.equal(docs.get(`file:${kept.fileId}`).baseline.version, 'v2');
+    await work.write({ op: 'delete', fileId: extra.fileId });
+    assert.equal(docs.get(`file:${kept.fileId}`).baseline.version, 'v4');
+    assert.deepEqual(await work.diff(), [{ op: 'delete', fileId: extra.fileId, previousPath: '/extra' }]);
+    assert.deepEqual(await work.merge(request('delete')), status('v5'));
+    assert.equal(await main.read({ fileId: extra.fileId }), null);
+    // A pass that fails again fails the operation and stays pending.
+    await work.write({ op: 'update', fileId: kept.fileId, content: 'fifth' });
+    rejectBookkeeping();
+    assert.deepEqual(await work.merge(request('fifth')), status('v6'));
+    await assert.rejects(work.write(file('/blocked')), error => error.code === 'DATABASE_ERROR' && error.cause.message === 'Lost bookkeeping response');
+    fixture.beforeUpsert = fixture.beforeDelete = undefined;
+    await work.write({ op: 'update', fileId: kept.fileId, content: 'sixth' });
+    assert.deepEqual(await work.diff(), [{ op: 'update', fileId: kept.fileId, path: '/kept' }]);
+    assert.deepEqual(await work.merge(request('sixth')), status('v7'));
 });

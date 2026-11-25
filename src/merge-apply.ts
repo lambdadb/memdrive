@@ -13,7 +13,7 @@ type NativeDoc = Record<string, unknown>;
 
 async function mutate(operation: () => Promise<unknown>, signal?: AbortSignal) {
     try { await nativeRequest(operation, signal); }
-    catch (cause) { throw databaseError(cause, 'The merge content mutation failed.'); }
+    catch (cause) { throw databaseError(cause, 'A merge write was rejected or its outcome is unknown.'); }
 }
 
 async function mergeRevision(version: string) {
@@ -182,9 +182,9 @@ export type HeldFile = { fileId: string; fingerprint?: string | undefined; versi
 
 /**
  * Advance the baselines of fork files that main now holds exactly, so they
- * are no longer changes. Call it while holding the fork's queue. This is
- * best effort: it stops at the first failure, and a file left with its old
- * baseline is settled by the next merge without a conflict.
+ * are no longer changes. Call it while holding the fork's queue. It stops
+ * at the first failure; a repeated pass advances only what is left, and the
+ * next merge settles a file left with its old baseline without a conflict.
  */
 export async function advanceMergeSource(handle: Handle, name: string, branch: string, held: HeldFile[],
     schema: MetadataSchema, dimensions?: number, signal?: AbortSignal) {

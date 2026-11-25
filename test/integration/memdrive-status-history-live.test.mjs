@@ -84,7 +84,9 @@ test('live status and history read retained main publications without mutating t
         assert.deepEqual(await merge(work, 'second'), { status: 'published', version: 'v2' });
         assert.equal(interrupted, 1);
         rejectBookkeeping = false;
-        assert.deepEqual((await main.diff({ at: work }, options())).map(({ fileId }) => fileId), [second.fileId]);
+        // Another client still sees the published file as a change; this drive settles it before its next fork operation.
+        assert.deepEqual((await (await fresh()).diff({ at: work }, options())).map(({ fileId }) => fileId), [second.fileId]);
+        assert.deepEqual(await main.diff({ at: work }, options()), []);
 
         phase = 'Read status and history';
         const reader = await fresh();
@@ -102,10 +104,8 @@ test('live status and history read retained main publications without mutating t
         assert.deepEqual((await reader.history({ sinceVersion: 'v1' }, options())).entries.map(({ fileIds }) => fileIds), [[second.fileId]]);
         assert.equal(mutations, beforePendingReads);
 
-        phase = 'Settle the published file and publish after the pagination cutoff';
-        // Main already holds the file whose baseline was not advanced.
+        phase = 'Merge the settled fork again and publish after the pagination cutoff';
         assert.deepEqual(await merge(work, 'second again'), { status: 'unchanged', version: 'v2' });
-        assert.deepEqual(await main.diff({ at: work }, options()), []);
         await main.write({ at: work, op: 'delete', fileId: first.fileId }, options());
         assert.equal((await merge(work, 'third')).version, 'v3');
         const beforeContinuedReads = mutations;

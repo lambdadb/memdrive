@@ -86,8 +86,8 @@ the main branch. A merge either records its publication or rolls main back to
 the latest published tag (or clears main before the first publication); a merge
 that cannot roll back leaves that to the next merge that writes to main. Keep
 merges idempotent by content: a changed file that main already holds is settled,
-not published again or reported as a conflict, which makes best-effort source
-bookkeeping safe to lose. The publication regressions in
+not published again or reported as a conflict. Failed source bookkeeping is
+completed by the fork's next queued operation before it runs. The publication regressions in
 `test/public-merge.test.mjs` and `test/publication-file-ids.test.mjs` interrupt a
 merge after main writes, at its tag and at its record, in process and across a
 new client, and assert the native rollback, tag and journal calls.

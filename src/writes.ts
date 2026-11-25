@@ -120,8 +120,19 @@ export async function listChunkIds(handle: Handle, name: string, ref: ViewRef, f
 /** The single writer of one working fork. Its queue also orders the fork's diffs, references and merges. */
 export function workingWriter(handle: Handle, name: string, branch: string, schema: MetadataSchema, dimensions?: number, chunker?: TextChunker) {
     let queue = Promise.resolve();
-    function enqueue<T>(operation: () => Promise<T>): Promise<T> {
-        const result = queue.then(operation);
+    // Source bookkeeping of a publication that failed. Every later operation
+    // of this queue completes it first, so no write sees a published file
+    // with its old baseline.
+    let unsettled: ((signal?: AbortSignal) => Promise<void>) | undefined;
+    function enqueue<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+        const result = queue.then(async () => {
+            if (unsettled) {
+                checkAbort(signal);
+                await unsettled(signal);
+                unsettled = undefined;
+            }
+            return operation();
+        });
         queue = result.then(() => undefined, () => undefined);
         return result;
     }
@@ -367,7 +378,7 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
                 }
             }
             return multi ? completed : completed[0]!;
-        });
+        }, signal);
     }
     /** Reject while a write to this fork has an unknown outcome. */
     async function confirmSource(signal?: AbortSignal) {
@@ -394,21 +405,25 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
             return enqueue(async () => {
                 checkAbort(signal);
                 return operation(() => confirmSource(signal));
-            });
+            }, signal);
         },
-        /** Whether this queue holds a fence for a write whose outcome is unknown. */
-        fenced: () => pending.size > 0,
+        /** Defer source bookkeeping that failed to the next operation of this queue. Call it from within the queue. */
+        defer(bookkeeping: (signal?: AbortSignal) => Promise<void>) {
+            unsettled = bookkeeping;
+        },
+        /** Whether this queue holds a fence for a write whose outcome is unknown, or deferred bookkeeping. */
+        fenced: () => pending.size > 0 || unsettled !== undefined,
         enqueueRef<T>(operation: () => Promise<T>, signal?: AbortSignal) {
             return enqueue(async () => {
                 checkAbort(signal);
                 await confirmSource(signal);
                 return operation();
-            });
+            }, signal);
         },
         async diff(options?: RequestOptions) {
             const { signal } = operationOptions(options);
             checkAbort(signal);
-            return enqueue(() => diffFiles(handle, name, branch, signal));
+            return enqueue(() => diffFiles(handle, name, branch, signal), signal);
         },
     };
 }

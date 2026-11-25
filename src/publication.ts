@@ -330,15 +330,17 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         return task;
     }
 
-    async function publish({ summary, branch }: { summary: string; branch: string }, signal?: AbortSignal): Promise<MergeResult> {
+    async function publish({ summary, branch }: { summary: string; branch: string }, writer: Writer, signal?: AbortSignal): Promise<MergeResult> {
         checkAbort(signal);
         await ensureJournal(signal);
         await ensureBootstrap(signal);
         await refresh(signal);
         const prior = published;
         const plan = await prepareMerge(content, content.collectionName, branchRef(branch), refFor(prior), schema, signal, dimensions);
+        // A failed pass is completed by the fork's next operation before it runs.
         const advance = (held: Parameters<typeof advanceMergeSource>[3]) =>
-            advanceMergeSource(content, content.collectionName, branch, held, schema, dimensions, signal).catch(() => {});
+            advanceMergeSource(content, content.collectionName, branch, held, schema, dimensions, signal).catch(() =>
+                writer.defer(next => advanceMergeSource(content, content.collectionName, branch, held, schema, dimensions, next)));
         if (!plan.targets.length) {
             await advance(plan.settled);
             return { status: 'unchanged', version: prior };
@@ -387,7 +389,7 @@ export function publication(client: ConnectionOptions['client'], content: Handle
         const result = await writer.enqueueMerge(confirmSource => enqueue(async () => {
             // A fork write of unknown outcome must settle before the fork is published.
             await confirmSource();
-            return publish(request, signal);
+            return publish(request, writer, signal);
         }), signal);
         // Retention stays in the merge queue but no longer needs the fork, whose queue is free again.
         await enqueue(() => maintainHistory(signal));
