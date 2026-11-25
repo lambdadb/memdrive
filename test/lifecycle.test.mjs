@@ -96,19 +96,20 @@ test('delete requests require an existing at of the matching kind and main canno
     assert.equal('delete' in drive, false);
 });
 
-test('the SDK does not serialize operations: a ref deletion runs while a write to it is in flight', async () => {
-    const { fixture, connection, drive, fork } = await setup();
+test('a fork deletion waits for a write to that fork in flight in this process', async () => {
+    const { fixture, drive, fork, calls } = await setup();
     let release, entered;
     const pending = new Promise(resolve => { entered = resolve; });
     fixture.beforeUpsert = async () => { entered(); await new Promise(resolve => { release = resolve; }); };
     const writing = drive.write({ at: fork, op: 'create', path: '/late.md', content: 'late' });
     await pending;
-    assert.deepEqual(await drive.deleteFork({ at: fork }), { at: fork });
-    assert.equal((await open(connection)).name, name);
+    const deleting = drive.deleteFork({ at: fork });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(deletes(calls).length, 0);
     fixture.beforeUpsert = undefined;
     release();
-    // The in-flight write now targets a missing branch; the caller owns this ordering.
-    await assert.rejects(writing, { code: 'BRANCH_NOT_FOUND' });
+    assert.equal((await writing).path, '/late.md');
+    assert.deepEqual(await deleting, { at: fork });
 });
 
 test('destroy deletes only the content collection, is idempotent, and refuses foreign collections', async () => {

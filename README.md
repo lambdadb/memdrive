@@ -59,10 +59,12 @@ checkpoints and continuations, always carry an explicit `at`, including
 `{ kind: 'main' }`.
 
 The drive object keeps only the store's configuration, read once by `create` or
-`open` and returned by `describe()`. It holds no other state between calls: no
-caches, queues, locks or registries. Every call resolves its `at` and goes to
+`open` and returned by `describe()`. Every call resolves its `at` and goes to
 LambdaDB, so any number of drive objects, clients and processes can use the same
-store, and a continuation from one works on another. When a request on a view
+store, and a continuation from one works on another. Apart from the per-branch
+queues that order state-changing calls within one process (see
+[Concurrent calls](#concurrent-calls)), the SDK keeps no state between calls: no
+caches, locks or registries. When a request on a view
 fails with a native 404, the SDK checks what is missing and reports
 `STORE_NOT_FOUND`, `BRANCH_NOT_FOUND` or `CHECKPOINT_NOT_FOUND` (status 404).
 
@@ -91,6 +93,35 @@ An optional `embeddingQuery` supplies separate embedding and enabled reranking i
 Earlier SDK versions defaulted to hybrid retrieval with reranking. Pass `mode: 'hybrid', rerank: true` to request that behavior explicitly. The LongMemEval and BEAM benchmarks explicitly select hybrid and retain their configured reranking policy; their historical scores do not measure the new defaults.
 
 
+## Concurrent calls
+
+A file is several LambdaDB documents, an original and its chunks, and LambdaDB
+has no multi-document transaction or conditional write. Within one process the
+SDK therefore runs state-changing calls on one branch one at a time, in call
+order:
+
+- `write`, as one operation or a batch, on main or that fork;
+- `rollback` of that branch;
+- `fork` and `checkpoint` whose source is that branch, so a new fork or
+  checkpoint never captures a half-applied write;
+- `deleteFork` of that fork.
+
+The queues are shared by every drive object of the same store in the process; a
+store recreated under the same name gets new ones. A queue exists only while it
+has pending calls. Calls on different branches run concurrently. Reads (`read`,
+`list`, `search`, `findText`, `listForks`, `listCheckpoints`, `describe`),
+`deleteCheckpoint` and forks or checkpoints taken from a checkpoint never wait. A
+call that fails or is aborted does not hold up the next one; aborting a waiting
+call rejects it with `ABORTED` before it sends anything. `MemDrive.destroy` waits
+for the store's pending state-changing calls in the process before deleting the
+collection, and such calls made while it waits run after the deletion and fail
+with `STORE_NOT_FOUND`.
+
+Separate processes, and separate copies of the SDK in one process (for example
+its ESM and CommonJS builds loaded side by side), are not coordinated. Ordering
+their writers is the caller's job until LambdaDB offers conditional writes; the
+repair paths in [Edit files](#edit-files) cover what racing writers leave behind.
+
 ## What the SDK does not do
 
 MemDrive exposes what LambdaDB supports, as files. It does not add features
@@ -100,20 +131,23 @@ LambdaDB lacks; callers build them when they need them.
   version log. A fork's changes reach main only when you write them to main, or
   when you roll main back to a checkpoint of the fork. Keep versions you need as
   checkpoints, and build diffs, merges or change logs in the application.
-- **No serialization or locking.** Calls are independent and concurrent writes
-  to the same view interleave. The original written last decides a file's path,
-  content and metadata, and exact `edits` apply to the original read at the
-  start of that write call, so a concurrent replacement in between is
-  overwritten. Racing writers to one file can remove each other's chunks: the
-  file stays readable but search may miss it until another update of that file
-  (even with unchanged content or only a new path) chunks it again. Racing
-  creates can leave two files at one path; see below.
-- **No cross-call or process state.** The SDK keeps no caches, fences or
-  registries. Ordering, concurrency, retries and multi-process ownership of a
-  store or view are the caller's responsibility.
-- **Best-effort path uniqueness.** `create` and path changes check the
-  destination with a read before writing (`PATH_EXISTS`). Two concurrent
-  writers can both pass that check and create two files at the same path.
+- **No coordination across processes or locks.** Only state-changing calls
+  in one process are ordered (see [Concurrent calls](#concurrent-calls)).
+  Writes from separate processes or SDK copies to the same view interleave. The
+  original written last decides a file's path, content and metadata, and exact
+  `edits` apply to the original read at the start of that write call, so a
+  concurrent replacement in between is overwritten. Racing writers to one file
+  can remove each other's chunks: the file stays readable but search may miss it
+  until another update of that file (even with unchanged content or only a new
+  path) chunks it again. Racing creates can leave two files at one path; see
+  below.
+- **No other cross-call state.** The SDK keeps no caches, fences or
+  registries. Retries and the ordering and ownership of a store or view across
+  processes are the caller's responsibility.
+- **Path uniqueness within one process.** `create` and path changes check the
+  destination with a read before writing (`PATH_EXISTS`). Writes on one branch
+  in one process run one at a time, so the check holds there; writers in
+  separate processes can both pass it and create two files at the same path.
 - **No hidden retries of unknown outcomes.** A write whose outcome is unknown
   fails with `WRITE_UNCONFIRMED`; it may or may not have been applied, and the
   caller inspects the files before retrying. Fork, checkpoint, deletion and
@@ -329,10 +363,10 @@ that cleanup fails, the error has stage `cleanup-chunks` and lists the file in
 `completedFileIds`: the change is applied, and only leftover chunks remain, which
 search ignores. Repeating a delete, or any update of the file, removes them
 again. An update that finds no chunks for a nonempty original, for example after
-racing writers removed each other's chunks, chunks the file again instead of
-failing, so resending an update repairs search for it.
+racing writers in separate processes removed each other's chunks, chunks the
+file again instead of failing, so resending an update repairs search for it.
 
-Racing creates can leave several files at one path. Updates and deletes by
+Racing creates from separate processes can leave several files at one path. Updates and deletes by
 `fileId` keep working for each of them, and an update that keeps its path is not
 checked against other files. Reading that path fails with `PATH_AMBIGUOUS`,
 whose details list `{ path, fileIds }`; move or delete the extra files by
@@ -363,8 +397,9 @@ Each call sends one native creation request. A name already in use fails with
 `BRANCH_NOT_FOUND` or `CHECKPOINT_NOT_FOUND`. Other rejections preserve the
 LambdaDB error and HTTP status. If the outcome is unknown, check with
 `listForks`/`listCheckpoints` before retrying. A checkpoint captures whatever its
-source holds when LambdaDB creates it; with concurrent writers, compare its
-contents with the state you expect.
+source holds when LambdaDB creates it. A fork or checkpoint of
+main or a fork waits for that branch's pending writes in this process; with
+writers in other processes, compare its contents with the state you expect.
 
 ## Roll back to a checkpoint
 
@@ -418,8 +453,11 @@ store's collection, which removes all its forks and checkpoints. A store has no
 other collections. It inspects the collection first: a missing store is treated
 as already destroyed, and a collection that is not a compatible file store fails
 with `INCOMPATIBLE_STORE` without deletion. View requests through drive objects
-of a destroyed store then fail with `STORE_NOT_FOUND`. The host must stop other users of the store
-before destroying it or reusing its name; the SDK does not coordinate them.
+of a destroyed store then fail with `STORE_NOT_FOUND`. In one process, `destroy`
+first waits for the store's pending state-changing calls (see
+[Concurrent calls](#concurrent-calls)). The host must stop users of the store in
+other processes before destroying it or reusing its name; the SDK does not
+coordinate them.
 
 Stores created by earlier development builds (format `files-v0`) cannot be
 opened or destroyed by this SDK and fail with `INCOMPATIBLE_STORE`. Delete such
@@ -505,8 +543,9 @@ await tools.execute('deleteFork', { at }); // A separate, explicit call.
 
 Ref creation and deletion, `write` and `rollback` are marked `readOnly: false`.
 Duplicate names retain the SDK's `BRANCH_CONFLICT` and `CHECKPOINT_CONFLICT`
-errors. Tool calls are not serialized or coordinated; the host orders concurrent
-work.
+errors. Tool calls go through the SDK, so state-changing calls on one branch run
+one at a time within the host process; the host coordinates writers in other
+processes.
 
 The `guide` tool is optional, just like the other tools. Its name is the catalog's
 implementation choice for delivering the read-only usage guide. Hosts can omit
@@ -521,7 +560,7 @@ clients without resource support can use the guide tool.
 The guide explains `at` view selection, the main default, writes to main or a
 fork, read-only checkpoints, `{ at }` results, fork/checkpoint listing and
 deletion, rollback and its caveats, paging `list` and forwarding `next` unchanged,
-`CURSOR_VIEW_MISMATCH`, and that calls are not serialized. It also asks agents to
+`CURSOR_VIEW_MISMATCH`, and which calls the SDK orders within one process. It also asks agents to
 preserve selected conversational wording, examples, qualifications and
 corrections instead of aggressively summarizing stored originals. It does not
 require new metadata or capturing every utterance. Long originals can be
@@ -538,7 +577,7 @@ classifies content and ref mutations, not backend credentials.
 
 The host owns authentication, authorization and the selection of the authorized
 drive. It must authorize every invocation, including the views in its `at` and
-`to`, and coordinate concurrent writers. Arguments cannot select another drive.
+`to`, and coordinate writers in other processes. Arguments cannot select another drive.
 Store lifecycle remains a host operation outside this catalog. List and findText
 cursors are self-contained and continue on a new client of the same store.
 Transport formatting, hosted Markdown/capacity/reranker policies, instruction
@@ -606,8 +645,8 @@ entries scanned rather than guaranteeing that many results:
   a traversal can be missed or seen twice, including on main and forks.
 
 The listing is complete only when a page has no `next`. Follow every `next`,
-then merge prefixes, deduplicate files by `fileId` (racing creates can leave two
-files at one path) and sort by path when order matters. Forward the returned `next` (`{ at, cursor }`) unchanged. The
+then merge prefixes, deduplicate files by `fileId` (racing creates from separate
+processes can leave two files at one path) and sort by path when order matters. Forward the returned `next` (`{ at, cursor }`) unchanged. The
 cursor is an opaque token carrying the listing criteria and the native page
 token, so it continues on any drive object or client of the same store and does
 not expire in the SDK. Passing it with another `at` (omitted means main) fails

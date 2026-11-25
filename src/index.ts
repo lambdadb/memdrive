@@ -14,6 +14,7 @@ import type { DoclingChunker } from './types.js';
 import { rangeKeys, readRange, validateReadRange } from './read-range.js';
 import type { DriveFile, FileReadPage, ReadFileRangeRequest } from './types.js';
 import { storeTag } from './cursor-tokens.js';
+import { afterStoreQueues, onBranch } from './branch-queue.js';
 export type * from './types.js';
 // The LambdaDB client classes at the exact version this SDK pins, so a host
 // constructs its client without depending on @functional-systems/lambdadb itself.
@@ -89,8 +90,10 @@ function begin(options?: RequestOptions) {
 }
 
 /**
- * One drive object of a store. It keeps the store's configuration and holds
- * no other state: every call resolves its view from `at` and goes to LambdaDB.
+ * One drive object of a store. It keeps the store's configuration; every call
+ * resolves its view from `at` and goes to LambdaDB. State-changing calls share
+ * per-branch queues with every drive object of the same store generation in
+ * this process, keyed by the store tag.
  */
 function store(handle: Handle, description: FileStoreDescription<EmbeddingMode>, cursorStore: string, backend?: DoclingChunker) {
     const { name, metadataSchema, embedding } = description;
@@ -289,11 +292,13 @@ function store(handle: Handle, description: FileStoreDescription<EmbeddingMode>,
             : 'Checkpoint name must be 3–41 letters, digits, underscores or hyphens.');
         const at = { kind, name: request.name } as RefAt;
         const nativeName = (kind === 'fork' ? forkPrefix : checkpointPrefix) + at.name;
-        const created = await onViews([source], () => kind === 'fork'
+        const createNative = () => onViews([source], () => kind === 'fork'
             ? remote(() => handle.branches.create({ branchName: nativeName, source: refOf(source) }, mutationOptions(signal)),
                 'Could not create the fork.', signal, { 409: 'BRANCH_CONFLICT' }).then(response => response?.branch?.name)
             : remote(() => handle.tags.create({ tagName: nativeName, source: refOf(source) }, mutationOptions(signal)),
                 'Could not create the checkpoint.', signal, { 409: 'CHECKPOINT_CONFLICT' }).then(response => response?.tag?.name), signal);
+        // A ref taken from a branch waits for that branch's pending writes; a checkpoint source cannot change.
+        const created = source.kind === 'checkpoint' ? await createNative() : await onBranch(cursorStore, branchOf(source), signal, createNative);
         if (created !== nativeName) throw new MemDriveError('INVALID_RESULT', `${kind} creation returned another reference.`);
         return { at: { ...at } };
     }
@@ -305,9 +310,10 @@ function store(handle: Handle, description: FileStoreDescription<EmbeddingMode>,
             `${operation} requires only at, selecting an existing ${kind}: { kind: "${kind}", name }.`);
         const at = parseAt(request.at) as RefAt;
         const nativeName = (kind === 'fork' ? forkPrefix : checkpointPrefix) + at.name;
-        await onViews([at], () => remote(() => kind === 'fork'
+        const remove = () => onViews([at], () => remote(() => kind === 'fork'
             ? handle.branches.delete(nativeName, mutationOptions(signal))
             : handle.tags.delete(nativeName, mutationOptions(signal)), `Could not delete the ${kind}.`, signal), signal);
+        await (kind === 'fork' ? onBranch(cursorStore, nativeName, signal, remove) : remove());
         return { at: { ...at } };
     }
 
@@ -344,7 +350,9 @@ function store(handle: Handle, description: FileStoreDescription<EmbeddingMode>,
             requireInput(at.kind !== 'checkpoint', 'Checkpoints are read-only. Write to main or a fork.');
             requireInput(!('operations' in rest) || keysOnly(rest, ['operations']) && Array.isArray(rest.operations),
                 'A batch write accepts only at and an operations array.');
-            return writer.write(branchOf(at), 'operations' in rest ? rest.operations as WriteOperation[] : rest as unknown as WriteOperation, { signal });
+            const branch = branchOf(at);
+            return onBranch(cursorStore, branch, signal, () =>
+                writer.write(branch, 'operations' in rest ? rest.operations as WriteOperation[] : rest as unknown as WriteOperation, { signal }));
         }),
         /** Restore main or a fork to a checkpoint with one native rollback, never retried. */
         async rollback(request: unknown, options?: RequestOptions) {
@@ -353,8 +361,9 @@ function store(handle: Handle, description: FileStoreDescription<EmbeddingMode>,
             requireInput(keysOnly(request, ['at', 'to']) && isObject(request.at) && isObject(request.to), message);
             const at = parseAt(request.at), to = parseAt(request.to);
             requireInput(at.kind !== 'checkpoint' && to.kind === 'checkpoint', message);
-            await onViews([at, to], () => remote(() => handle.branches.rollback(branchOf(at), { tag: checkpointPrefix + to.name },
-                mutationOptions(signal)), `Could not roll back to the checkpoint ${to.name}.`, signal), signal);
+            await onBranch(cursorStore, branchOf(at), signal, () => onViews([at, to], () => remote(() =>
+                handle.branches.rollback(branchOf(at), { tag: checkpointPrefix + to.name }, mutationOptions(signal)),
+            `Could not roll back to the checkpoint ${to.name}.`, signal), signal));
             return { at: { ...at } };
         },
     }) as unknown as FileDrive<EmbeddingMode>;
@@ -397,6 +406,8 @@ export async function open(options: OpenFileStoreOptions<EmbeddingMode>, request
 /**
  * Delete the store's collection, including every fork and checkpoint. A missing
  * store is already destroyed; a collection that is not a file store is refused.
+ * Deletion waits for the store's pending state-changing calls in this process;
+ * calls queued after it fail against the deleted collection.
  */
 export async function destroy(options: ConnectionOptions, requestOptions?: RequestOptions): Promise<void> {
     const signal = begin(requestOptions);
@@ -411,12 +422,14 @@ export async function destroy(options: ConnectionOptions, requestOptions?: Reque
         throw error;
     }
     parseStore(collection, options.name);
-    try {
-        await nativeRequest(() => handle.delete(mutationOptions(signal)), signal);
-    } catch (cause) {
-        const error = databaseError(cause, 'Could not delete the file store.');
-        if (error.status !== 404) throw error;
-    }
+    await afterStoreQueues(await storeTag(options.name, collection), signal, async () => {
+        try {
+            await nativeRequest(() => handle.delete(mutationOptions(signal)), signal);
+        } catch (cause) {
+            const error = databaseError(cause, 'Could not delete the file store.');
+            if (error.status !== 404) throw error;
+        }
+    });
 }
 
 export const MemDrive = Object.freeze({ create, open, destroy });
