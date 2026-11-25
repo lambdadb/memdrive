@@ -1,17 +1,17 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { MemDrive } from '@functional-systems/memdrive';
-import { parseOutcome } from '../dist/esm/publication-log.js';
+import { parsePublication } from '../dist/esm/publication-log.js';
 import { fileClient } from './helpers/file-client.mjs';
 
 const name = 'file-id-store';
 const draft = { kind: 'fork', name: 'draft' };
-const request = requestId => ({ requestId, summary: `Publish ${requestId}` });
-const published = (requestId, version) => ({ requestId, status: 'published', version });
+const request = label => ({ summary: `Publish ${label}` });
+const published = version => ({ status: 'published', version });
 const journalOf = fixture => [...fixture.collections.values()]
     .find(store => store.metadata.tags['memdrive.format'] === 'merge-publication-v1').branches.get('main').docs;
-const completionWrites = fixture => fixture.calls
-    .filter(call => call.kind === 'upsert' && call.request.docs[0].kind === 'merge-result-v1').map(call => call.request.docs[0]);
+const recordWrites = fixture => fixture.calls
+    .filter(call => call.kind === 'upsert' && call.request.docs[0].kind === 'publication-v1').map(call => call.request.docs[0]);
 const lost = () => new Error('Response lost');
 const sorted = files => files.map(({ fileId }) => fileId).sort();
 
@@ -33,13 +33,13 @@ async function setup() {
     const write = input => main.write(Array.isArray(input) ? { at: draft, operations: input } : { at: draft, ...input });
     // What the fork holds when a merge is first requested is what that merge may publish.
     const sources = new Map();
-    const merge = async requestId => {
-        if (!sources.has(requestId)) {
+    const merge = async label => {
+        if (!sources.has(label)) {
             const changes = await main.diff({ at: draft });
-            sources.set(requestId, { diff: { fileIds: changes.slice(0, 100).map(change => change.fileId), fileIdsTruncated: changes.length > 100 },
+            sources.set(label, { diff: { fileIds: changes.slice(0, 100).map(change => change.fileId), fileIdsTruncated: changes.length > 100 },
                 records: fromRecords(fixture) });
         }
-        return main.merge({ at: draft, ...request(requestId) });
+        return main.merge({ at: draft, ...request(label) });
     };
     // One write accepts at most 100 operations.
     const create = async (count, prefix) => {
@@ -49,15 +49,15 @@ async function setup() {
         return files;
     };
     /** Check one publication's history entry and stored record against the fork as its merge found it. */
-    function assertRecorded(entry, slot, requestId, label = entry.version) {
-        const completion = journalOf(fixture).get(`completion:${slot}`);
+    function assertRecorded(entry, slot, source, label = entry.version) {
+        const record = journalOf(fixture).get(`publication:${slot}`);
         const { fileIds, fileIdsTruncated } = entry;
-        assert.deepEqual({ fileIds, fileIdsTruncated }, sources.get(requestId).diff, label);
-        assert.deepEqual({ fileIds, fileIdsTruncated }, sources.get(requestId).records, label);
-        assert.deepEqual(Object.keys(completion).sort(),
-            ['completedAt', 'driveId', 'fileIds', 'fileIdsTruncated', 'id', 'kind', 'status', 'version'], label);
-        assert.deepEqual([completion.status, completion.version, completion.fileIds, completion.fileIdsTruncated, completion.completedAt],
-            ['published', entry.version, fileIds, fileIdsTruncated, entry.publishedAt], label);
+        assert.deepEqual({ fileIds, fileIdsTruncated }, sources.get(source).diff, label);
+        assert.deepEqual({ fileIds, fileIdsTruncated }, sources.get(source).records, label);
+        assert.deepEqual(Object.keys(record).sort(),
+            ['driveId', 'fileIds', 'fileIdsTruncated', 'id', 'kind', 'publishedAt', 'summary', 'version'], label);
+        assert.deepEqual([record.version, record.summary, record.fileIds, record.fileIdsTruncated, record.publishedAt],
+            [entry.version, entry.summary, fileIds, fileIdsTruncated, entry.publishedAt], label);
     }
     return { fixture, main, write, merge, create, assertRecorded };
 }
@@ -65,11 +65,11 @@ async function setup() {
 test('a publication records the affected file IDs that its fork held when the merge started', async () => {
     const { fixture, main, write, merge, create, assertRecorded } = await setup();
     const expected = [], requests = [];
-    const publish = async (requestId, files, truncated = false) => {
+    const publish = async (label, files, truncated = false) => {
         const slot = expected.length + 1;
-        requests.push(requestId);
-        assert.deepEqual(await merge(requestId), published(requestId, `v${slot}`));
-        expected.push({ version: `v${slot}`, summary: `Publish ${requestId}`, fileIds: sorted(files).slice(0, 100), fileIdsTruncated: truncated });
+        requests.push(label);
+        assert.deepEqual(await merge(label), published(`v${slot}`));
+        expected.push({ version: `v${slot}`, summary: `Publish ${label}`, fileIds: sorted(files).slice(0, 100), fileIdsTruncated: truncated });
     };
 
     // Creates.
@@ -111,8 +111,9 @@ test('a publication records the affected file IDs that its fork held when the me
     assert.deepEqual(await (await MemDrive.open({ client: { ...fixture.client }, name })).history(), history);
 });
 
-test('a lost completion write is retried with the identical record', async () => {
+test('a lost publication record write fails the merge, and repeating the merge settles it either way', async () => {
     for (const applied of [false, true]) {
+        const label = `applied ${applied}`;
         const { fixture, main, write, merge, create, assertRecorded } = await setup();
         const files = await create(3, 'note');
         await merge('first');
@@ -121,42 +122,40 @@ test('a lost completion write is retried with the identical record', async () =>
         // Lose the response. When the write was applied, also lose the read that would confirm it.
         let failed = false, hidden = false;
         fixture[applied ? 'afterUpsert' : 'beforeUpsert'] = ({ docs }) => {
-            if (docs[0].kind === 'merge-result-v1' && !failed) {
+            if (docs[0].kind === 'publication-v1' && !failed) {
                 failed = hidden = true;
                 throw lost();
             }
         };
         fixture.beforeFetch = ({ ids }) => {
-            if (applied && hidden && ids.length === 1 && ids[0] === 'completion:2') {
+            if (applied && hidden && ids.length === 1 && ids[0] === 'publication:2') {
                 hidden = false;
                 return { isDocsInline: true, total: 0, docs: [] };
             }
         };
-        await assert.rejects(merge('second'), { code: 'MERGE_RESUMABLE', details: { requestId: 'second' } });
-        assert(failed && (!applied || !hidden));
-        const [submitted] = completionWrites(fixture).slice(1);
-        assert.deepEqual(submitted.fileIds, sorted([files[0], files[1], added]));
-        assert.equal(submitted.fileIdsTruncated, false);
-        // The fork cannot move on before the retry, so the retry derives the same record.
-        const held = structuredClone([...forkDocs(fixture)]);
-        for (const operation of [{ op: 'create', path: '/later', content: 'later' }, { op: 'update', fileId: files[2].fileId, content: 'later' }])
-            await assert.rejects(write(operation), { code: 'MERGE_BLOCKED', details: { requestId: 'second' } });
-        assert.deepEqual([...forkDocs(fixture)], held);
-        assert.deepEqual(await merge('second'), published('second', 'v2'));
-        // An unapplied write is submitted again unchanged; an applied one is only confirmed.
-        const writes = completionWrites(fixture).slice(1);
-        assert.equal(writes.length, applied ? 1 : 2);
-        for (const record of writes) assert.deepEqual(record, submitted);
-        assert.deepEqual(journalOf(fixture).get('completion:2'), submitted);
+        const forkBefore = structuredClone([...forkDocs(fixture)]);
+        await assert.rejects(merge('second'), { code: 'DATABASE_ERROR' }, label);
+        fixture.afterUpsert = fixture.beforeUpsert = fixture.beforeFetch = undefined;
+        const [submitted] = recordWrites(fixture).slice(1);
+        assert.deepEqual(submitted.fileIds, sorted([files[0], files[1], added]), label);
+        // Main is restored to the latest recorded version; the fork is untouched.
+        assert.deepEqual(fixture.calls.filter(call => call.kind === 'branch-rollback').map(call => call.tag), [applied ? 'md-main-v2' : 'md-main-v1'], label);
+        assert.deepEqual([...forkDocs(fixture)], forkBefore, label);
+        assert.equal((await main.status()).mainVersion, applied ? 'v2' : 'v1', label);
+        // A record that landed is a publication: repeating the merge finds main
+        // already holding the fork's changes. Otherwise it publishes them.
+        assert.deepEqual(await merge('second'), applied ? { status: 'unchanged', version: 'v2' } : published('v2'), label);
+        assert.deepEqual(await main.diff({ at: draft }), [], label);
         const [, entry] = (await main.history()).entries;
-        assert.equal(entry.publishedAt, submitted.completedAt);
-        assertRecorded(entry, 2, 'second', `applied ${applied}`);
+        assertRecorded(entry, 2, 'second', label);
+        assert.deepEqual({ ...entry, publishedAt: submitted.publishedAt }, { version: 'v2', publishedAt: submitted.publishedAt,
+            summary: submitted.summary, fileIds: submitted.fileIds, fileIdsTruncated: false }, label);
     }
 });
 
-test('a merge resumed by a new process records the same affected files from its held fork', async () => {
-    for (const stage of ['content', 'applied', 'completion']) for (const resume of ['recover', 'replay']) {
-        const label = `${stage} ${resume}`;
+test('a merge interrupted after main writes is rolled back by the next process, which publishes the same affected files', async () => {
+    for (const stage of ['content', 'record']) {
+        const label = stage;
         const { fixture, write, merge, create, assertRecorded } = await setup();
         const files = (await create(104, 'note')).sort((x, y) => x.fileId < y.fileId ? -1 : 1);
         await merge('first');
@@ -167,63 +166,60 @@ test('a merge resumed by a new process records the same affected files from its 
         const created = await create(3, 'created');
         const affected = sorted([...files.slice(0, 102), ...created]);
 
-        // Stop the first process after part of main was written, after all of it
-        // was written, or at the terminal record.
+        // Stop the first process after part of main was written, or at the publication record,
+        // and lose its rollback as if the process had stopped.
         let mainWrites = 0, failed = false;
         const fail = () => { failed = true; throw Object.assign(lost(), { statusCode: 400 }); };
         fixture.beforeUpsert = ({ branch, docs }) => {
             if (stage === 'content' ? branch === 'main' && docs.some(doc => doc.kind === 'file') && ++mainWrites === 40
-                : docs[0].kind === (stage === 'applied' ? 'merge-applied-v1' : 'merge-result-v1')) fail();
+                : docs[0].kind === 'publication-v1') fail();
         };
-        await assert.rejects(merge('second'), { code: 'MERGE_RESUMABLE', details: { requestId: 'second' } }, label);
+        fixture.beforeRollback = () => { throw Object.assign(new Error('Unavailable'), { statusCode: 503 }); };
+        await assert.rejects(merge('second'), { code: 'DATABASE_ERROR', status: 400 }, label);
         assert(failed, label);
-        fixture.beforeUpsert = undefined;
-        const attempted = completionWrites(fixture).slice(1);
-        assert.equal(attempted.length, stage === 'completion' ? 1 : 0, label);
-        assert.equal(journalOf(fixture).has('completion:2'), false, label);
-
-        // Nothing changes the fork while the merge is unfinished, in this process or a new one.
+        fixture.beforeUpsert = fixture.beforeRollback = undefined;
+        const state = fixture.collections.get(name);
+        assert.equal(journalOf(fixture).has('publication:2'), false, label);
+        assert.equal(state.tags.has('md-main-v2'), stage === 'record', label);
+        // Main holds unpublished writes; readers still see v1.
+        assert.notDeepEqual([...state.branches.get('main').docs.keys()].sort(), [...state.tags.get('md-main-v1').docs.keys()].sort(), label);
         const held = structuredClone([...forkDocs(fixture)]);
-        const observer = await MemDrive.open({ client: { ...fixture.client }, name });
-        for (const operation of [{ op: 'create', path: '/after-interruption', content: 'later' },
-            { op: 'update', fileId: files[103].fileId, content: 'later' }, { op: 'update', fileId: files[0].fileId, content: 'later again' }]) {
-            await assert.rejects(write(operation), { code: 'MERGE_BLOCKED', details: { requestId: 'second' } }, label);
-            await assert.rejects(observer.write({ at: draft, ...operation }), { code: 'MERGE_BLOCKED', details: { requestId: 'second' } }, label);
-        }
-        assert.deepEqual([...forkDocs(fixture)], held, label);
 
-        const restarted = await MemDrive.open({ client: { ...fixture.client }, name, recover: resume === 'recover' });
-        assert.deepEqual(await restarted.merge({ at: draft, ...request('second') }), published('second', 'v2'), label);
-        const completion = journalOf(fixture).get('completion:2');
-        assert.deepEqual(completion.fileIds, affected.slice(0, 100), label);
-        assert.equal(completion.fileIdsTruncated, true, label);
-        // The new process derives the record again. Only its timestamp may differ.
-        for (const record of attempted) assert.deepEqual({ ...record, completedAt: completion.completedAt }, completion, label);
-        assert.equal(completionWrites(fixture).length, stage === 'completion' ? 3 : 2, label);
+        const restarted = await MemDrive.open({ client: { ...fixture.client }, name });
+        assert.equal((await restarted.status()).mainVersion, 'v1', label);
+        const before = fixture.calls.length;
+        assert.deepEqual(await restarted.merge({ at: draft, ...request('second') }), published('v2'), label);
+        const calls = fixture.calls.slice(before);
+        // The first merge of the new process restores main and removes the unrecorded tag before reusing its version.
+        assert.deepEqual(calls.filter(call => call.kind === 'branch-rollback').map(call => call.tag), ['md-main-v1'], label);
+        assert.deepEqual(calls.filter(call => call.kind === 'tag-delete').map(call => call.name), stage === 'record' ? ['md-main-v2'] : [], label);
+        assert.deepEqual([...state.branches.get('main').docs.keys()].sort(), [...state.tags.get('md-main-v2').docs.keys()].sort(), label);
+        const record = journalOf(fixture).get('publication:2');
+        assert.deepEqual(record.fileIds, affected.slice(0, 100), label);
+        assert.equal(record.fileIdsTruncated, true, label);
+        // The fork held the same changes, so the first attempt submitted the same record but its time.
+        for (const submitted of recordWrites(fixture).slice(1, -1)) assert.deepEqual({ ...submitted, publishedAt: record.publishedAt }, record, label);
+        assert.notDeepEqual([...forkDocs(fixture)], held, label);
         const [, entry] = (await restarted.history()).entries;
         assertRecorded(entry, 2, 'second', label);
-        assert.deepEqual(await (await MemDrive.open({ client: { ...fixture.client }, name })).history(), await restarted.history(), label);
     }
 });
 
-test('a published completion must carry 1–100 strictly ascending file IDs and a consistent truncation flag', () => {
+test('a publication record must carry 1–100 strictly ascending file IDs and a consistent truncation flag', () => {
     const ids = Array.from({ length: 101 }, (_, i) => `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`);
     const at = '2026-01-01T00:00:00.000Z';
-    const reservation = { id: 'reservation:3', driveId: 'drive', kind: 'merge-reservation-v1', requestId: 'request', summary: 'Summary',
-        branch: 'fork-draft', startedAt: at, priorVersion: 'v2', version: 'v3' };
-    const record = fields => ({ id: 'completion:3', driveId: 'drive', kind: 'merge-result-v1', completedAt: at, ...fields });
-    const publication = (fileIds, fileIdsTruncated) => record({ status: 'published', version: 'v3', fileIds, fileIdsTruncated });
-    const rejected = (doc, label) => assert.throws(() => parseOutcome(doc, reservation), { code: 'INVALID_RESULT' }, label);
+    const publication = (fileIds, fileIdsTruncated) => ({ id: 'publication:3', driveId: 'drive', kind: 'publication-v1',
+        version: 'v3', publishedAt: at, summary: 'Summary', fileIds, fileIdsTruncated });
+    const rejected = (doc, label) => assert.throws(() => parsePublication(doc, 3n), { code: 'INVALID_RESULT' }, label);
 
     for (const [fileIds, truncated] of [[ids.slice(0, 1), false], [ids.slice(40, 43), false], [ids.slice(0, 99), false],
         [ids.slice(0, 100), false], [ids.slice(1, 101), true]]) {
-        assert.deepEqual(parseOutcome(publication(fileIds, truncated), reservation),
-            { status: 'published', version: 'v3', fileIds, fileIdsTruncated: truncated, completedAt: at });
+        assert.deepEqual(parsePublication(publication(fileIds, truncated), 3n),
+            { version: 'v3', publishedAt: at, summary: 'Summary', fileIds, fileIdsTruncated: truncated });
     }
 
     const { fileIds: _fileIds, ...withoutIds } = publication(ids.slice(0, 2), false);
     const { fileIdsTruncated: _flag, ...withoutFlag } = publication(ids.slice(0, 2), false);
-    rejected(record({ status: 'published', version: 'v3' }), 'neither field');
     rejected(withoutIds, 'missing fileIds');
     rejected(withoutFlag, 'missing fileIdsTruncated');
     for (const [label, fileIds, truncated = false] of [
@@ -234,21 +230,13 @@ test('a published completion must carry 1–100 strictly ascending file IDs and 
         ['truncation with 1 ID', ids.slice(0, 1), true], ['truncation with 99 IDs', ids.slice(0, 99), true],
         ['a string flag', ids.slice(0, 100), 'true'], ['a numeric flag', ids.slice(0, 2), 0], ['a null flag', ids.slice(0, 2), null],
     ]) rejected(publication(fileIds, truncated), label);
-    // The existing conditions still apply.
-    rejected({ ...publication(ids.slice(0, 1), false), version: 'v2' }, 'another version');
-
-    // Other outcomes keep their format and need no file list.
-    assert.deepEqual(parseOutcome(record({ status: 'unchanged', version: 'v2' }), reservation),
-        { status: 'unchanged', version: 'v2', completedAt: at });
-    rejected(record({ status: 'unchanged', version: 'v3' }), 'unchanged at the reserved version');
-    assert.deepEqual(parseOutcome(record({ status: 'conflict', fileIds: [ids[1], ids[0]], paths: ['/note'] }), reservation),
-        { status: 'conflict', fileIds: [ids[1], ids[0]], paths: ['/note'], completedAt: at });
-    assert.deepEqual(parseOutcome(record({ status: 'conflict', fileIds: [], paths: ['/note'] }), reservation),
-        { status: 'conflict', fileIds: [], paths: ['/note'], completedAt: at });
-    rejected(record({ status: 'conflict', fileIds: [], paths: [] }), 'a conflict without a cause');
+    const valid = publication(ids.slice(0, 1), false);
+    for (const [label, doc] of [['another version', { ...valid, version: 'v2' }], ['another ID', { ...valid, id: 'publication:2' }],
+        ['another kind', { ...valid, kind: 'merge-result-v1' }], ['an empty summary', { ...valid, summary: ' ' }],
+        ['an invalid time', { ...valid, publishedAt: 'yesterday' }]]) rejected(doc, label);
 });
 
-test('a malformed published completion in the journal fails status, history, version selection and replay', async () => {
+test('a malformed publication record fails history while merges and version selection need only its existence', async () => {
     const { fixture, write, merge, create } = await setup();
     const files = await create(2, 'note');
     await merge('first');
@@ -261,15 +249,16 @@ test('a malformed published completion in the journal fails status, history, ver
         [1, doc => { delete doc.fileIds; }], [1, doc => { delete doc.fileIdsTruncated; }], [1, doc => { doc.fileIds.reverse(); }],
         [1, doc => { doc.fileIdsTruncated = true; }], [2, doc => { doc.fileIds = []; }], [2, doc => { doc.fileIds.push(doc.fileIds[0]); }],
     ]) {
-        const id = `completion:${slot}`, original = structuredClone(records.get(id));
+        const id = `publication:${slot}`, original = structuredClone(records.get(id));
         corrupt(records.get(id));
         const label = `${id} ${corrupt}`;
         await assert.rejects((await fresh()).history(), { code: 'INVALID_RESULT' }, label);
-        await assert.rejects((await fresh()).merge({ at: draft, ...request(slot === 1 ? 'first' : 'second') }), { code: 'INVALID_RESULT' }, label);
-        await assert.rejects((await fresh()).checkpoint({ name: 'selected', version: `v${slot}` }), { code: 'INVALID_RESULT' }, label);
-        // A cold client reads the head slot to learn the published version.
-        if (slot === 2) await assert.rejects((await fresh()).status(), { code: 'INVALID_RESULT' }, label);
+        assert.deepEqual(await (await fresh()).merge({ at: draft, ...request('again') }), { status: 'unchanged', version: 'v2' }, label);
+        assert.deepEqual(await (await fresh()).status(), { at: { kind: 'main' }, mainVersion: 'v2' }, label);
         records.set(id, original);
         assert.deepEqual(await (await fresh()).history(), intact, label);
     }
+    // A record from another store generation is never accepted.
+    records.get('publication:2').driveId = 'other';
+    await assert.rejects((await fresh()).status(), { code: 'INVALID_RESULT' });
 });

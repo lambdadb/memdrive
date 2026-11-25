@@ -6,7 +6,7 @@ export async function retentionConsumer(connection: ConnectionOptions) {
     // @ts-expect-error Retention is automatic; no public cleanup API.
     await drive.pruneHistory();
     const { at } = await drive.fork({ name: 'draft' });
-    await drive.merge({ at, requestId: 'publish', summary: 'Publish draft' });
+    await drive.merge({ at, summary: 'Publish draft' });
     const external = await create({ ...connection, retentionInDays: 7,
         embedding: { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'fixture' } });
     // @ts-expect-error Retention is automatic in both embedding modes.

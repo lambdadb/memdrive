@@ -105,7 +105,7 @@ test('live external vectors preserve private application text and frozen vector 
     const native = client(), handle = native.collection(name);
     // A view is one drive object plus an explicit at; omitted at selects main.
     const open = async at => ({ drive: await MemDrive.open({ client: client(), name, mode: 'external' }, options()), at });
-    const merge = (work, summary) => work.drive.merge({ at: work.at, requestId: randomUUID(), summary }, options());
+    const merge = (work, summary) => work.drive.merge({ at: work.at, summary }, options());
     const toTag = result => tag(`md-main-${result.version}`);
     async function records(ref, ids) {
         const response = await handle.docs.fetch({ ref, ids: ids.map(originalId), includeVectors: true,

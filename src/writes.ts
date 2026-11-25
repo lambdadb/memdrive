@@ -117,15 +117,9 @@ export async function listChunkIds(handle: Handle, name: string, ref: ViewRef, f
     throw new MemDriveError('CHUNK_SCAN_LIMIT', 'Current chunk lookup exceeded the supported number of pages.');
 }
 
-/**
- * The single writer of one working fork. `requireWritable` rejects a write
- * while an unsettled merge holds the fork still; `first` asks it to read that
- * state before this writer's first write.
- */
-export function workingWriter(handle: Handle, name: string, branch: string, schema: MetadataSchema, dimensions?: number, chunker?: TextChunker,
-    requireWritable?: (first: boolean, signal?: AbortSignal) => Promise<void>) {
+/** The single writer of one working fork. Its queue also orders the fork's diffs, references and merges. */
+export function workingWriter(handle: Handle, name: string, branch: string, schema: MetadataSchema, dimensions?: number, chunker?: TextChunker) {
     let queue = Promise.resolve();
-    let writable = false;
     function enqueue<T>(operation: () => Promise<T>): Promise<T> {
         const result = queue.then(operation);
         queue = result.then(() => undefined, () => undefined);
@@ -175,9 +169,6 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
         void prepared.catch(() => {});
         return enqueue(async () => {
             checkAbort(signal);
-            // A write queued behind a merge runs after it and proceeds only if that merge settled.
-            await requireWritable?.(!writable, signal);
-            writable = true;
             const inputs = await prepared;
             const targetIds = inputs.flatMap(input => input.op === 'create' ? [] : [input.fileId]);
             requireInput(new Set(targetIds).size === targetIds.length, 'Target file IDs must be distinct within one write.');
@@ -394,10 +385,10 @@ export function workingWriter(handle: Handle, name: string, branch: string, sche
     return {
         write,
         /**
-         * Run a merge, or its recovery, as one operation of this queue. Writes,
-         * diffs, references and other merges of the fork wait until it ends,
-         * while the operation itself reads and advances the fork directly.
-         * Its `confirmSource` must pass before the merge reserves anything.
+         * Run a merge as one operation of this queue. Writes, diffs,
+         * references and other merges of the fork wait until it ends, while
+         * the operation itself reads and advances the fork directly. Its
+         * `confirmSource` must pass before the merge writes anything.
          */
         enqueueMerge<T>(operation: (confirmSource: () => Promise<void>) => Promise<T>, signal?: AbortSignal) {
             return enqueue(async () => {

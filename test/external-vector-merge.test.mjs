@@ -4,14 +4,14 @@ import { MemDrive } from '@functional-systems/memdrive';
 import { fileClient } from './helpers/file-client.mjs';
 
 const name = 'workspace';
-const request = requestId => ({ requestId, summary: `Publish ${requestId}` });
+const request = label => ({ summary: `Publish ${label}` });
 const dimensions = 64;
 const vector = (x, y) => [x, y, ...Array(dimensions - 2).fill(0)];
 const originalVector = vector(0.1, 0.2);
 const publishedVector = vector(0.3, 0.4);
 const laterVector = vector(0.5, 0.6);
 
-test('external vector publication replays the held fork\'s vector and rebases later edits on the published vector', async () => {
+test('external vector publication rolls back a failed merge, replays the fork\'s vector and rebases later edits on it', async () => {
     const fixture = fileClient();
     const main = await MemDrive.create({ client: fixture.client, name,
         metadataSchema: { label: { type: 'string' } },
@@ -48,15 +48,16 @@ test('external vector publication replays the held fork\'s vector and rebases la
         if (branch === 'main' && docs[0].id === id)
             throw Object.assign(new Error('Rejected before dispatch'), { statusCode: 400 });
     };
-    await assert.rejects(work.merge(request('replace')), { code: 'MERGE_RESUMABLE' });
-    // The unfinished merge holds the fork's vector still, in this process and a new one.
-    await assert.rejects(work.write({ op: 'update', fileId, content: laterVector }), { code: 'MERGE_BLOCKED', details: { requestId: 'replace' } });
+    await assert.rejects(work.merge(request('replace')), { code: 'DATABASE_ERROR', status: 400 });
+    // Main is rolled back to the published version and the fork keeps its vector.
+    assert.deepEqual(fixture.calls.filter(call => call.kind === 'branch-rollback').map(call => call.tag), ['md-main-v1']);
+    assert.deepEqual(state.branches.get('main').docs.get(id).embedding, originalVector.map(Math.fround));
     assert.deepEqual(published('v1').embedding, originalVector.map(Math.fround));
+    assert.deepEqual(await work.diff(), [{ op: 'update', fileId, path: '/notes' }]);
 
     fixture.beforeUpsert = undefined;
     const fresh = await MemDrive.open({ client: { ...fixture.client }, name, mode: 'external' });
     const reopened = bind(fresh);
-    await assert.rejects(reopened.write({ op: 'update', fileId, content: laterVector }), { code: 'MERGE_BLOCKED', details: { requestId: 'replace' } });
     await reopened.merge(request('replace'));
     assert.deepEqual(published('v2').embedding.map(Math.fround), publishedVector.map(Math.fround));
     assert.deepEqual(await reopened.diff(), []);
@@ -68,7 +69,7 @@ test('external vector publication replays the held fork\'s vector and rebases la
     assert.deepEqual(await reopened.diff(), []);
     await main.write({ at: staleAt, op: 'update', fileId, content: laterVector });
     await assert.rejects(main.merge({ at: staleAt, ...request('stale') }), { code: 'MERGE_CONFLICT',
-        details: { fileIds: [fileId], paths: [], requestId: 'stale' } });
+        details: { fileIds: [fileId], paths: [] } });
 
     await reopened.write({ op: 'update', fileId, newPath: '/renamed', metadata: {} });
     const { version } = await reopened.merge(request('move'));

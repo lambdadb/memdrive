@@ -49,7 +49,7 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
         assert.equal(before.hits[0].content, 'Hello world.');
         assert.deepEqual(before.hits[0].range, { start: 11, end: 23 });
         phase = 'publish structured chunks';
-        await main.merge({ at, requestId: 'publish-structured', summary: 'Publish synthetic structured note' },
+        await main.merge({ at, summary: 'Publish synthetic structured note' },
             { signal: AbortSignal.timeout(270_000) });
         phase = 'checkpoint published snapshot';
         const checkpoint = (await main.checkpoint({ name: 'saved' }, options())).at;
@@ -67,7 +67,7 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
         assert.deepEqual(await main.read({ at: workingSaved, fileId: file.fileId }, options()), file);
         phase = 'publish a later revision';
         const updated = await main.write({ at, op: 'update', fileId: file.fileId, content: '# Heading\n\nGoodbye world.' }, options());
-        const later = await main.merge({ at, requestId: 'publish-later', summary: 'Publish later synthetic revision' },
+        const later = await main.merge({ at, summary: 'Publish later synthetic revision' },
             { signal: AbortSignal.timeout(270_000) });
         phase = 'create historical refs after later publication';
         // merge publishes only; the source fork remains until deleted explicitly.
@@ -93,25 +93,21 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
         assert.equal(metadata.tags['memdrive.owner'], driveId);
         assert.equal(metadata.tags['memdrive.format'], 'merge-publication-v1');
         const ref = { ref: { kind: 'branch', name: 'main' }, consistentRead: true };
-        const completions = new Map((await journal.docs.fetch({ ...ref, ids: ['completion:1', 'completion:2'] }, options())).docs
+        const publications = new Map((await journal.docs.fetch({ ...ref, ids: ['publication:1', 'publication:2'] }, options())).docs
             .map(({ doc }) => [doc.id, doc]));
-        for (const [id, version] of [['completion:1', 'v1'], ['completion:2', 'v2']]) {
-            assert.equal(completions.get(id).driveId, driveId);
-            assert.equal(completions.get(id).status, 'published');
-            assert.equal(completions.get(id).version, version);
+        for (const [id, version] of [['publication:1', 'v1'], ['publication:2', 'v2']]) {
+            assert.equal(publications.get(id).driveId, driveId);
+            assert.equal(publications.get(id).kind, 'publication-v1');
+            assert.equal(publications.get(id).version, version);
         }
         // Age only timestamps in this owned synthetic fixture. This validates
         // the real cleanup path without pretending days elapsed in real time.
         // The second publication superseded v1, whose tag ages from that publication.
         const aged = Date.now() - 2 * 86_400_000;
         await journal.docs.update({ branch: 'main', docs: [
-            { id: 'reservation:1', startedAt: new Date(aged - 3000).toISOString() },
-            { id: 'completion:1', completedAt: new Date(aged - 2000).toISOString() },
-            { id: 'reservation:2', startedAt: new Date(aged - 1000).toISOString() },
-            { id: 'completion:2', completedAt: new Date(aged).toISOString() },
+            { id: 'publication:1', publishedAt: new Date(aged - 2000).toISOString() },
+            { id: 'publication:2', publishedAt: new Date(aged).toISOString() },
         ] }, options());
-        const reservation = (await journal.docs.fetch({ ...ref, ids: ['reservation:1'] }, options())).docs[0].doc;
-        assert.equal(Object.hasOwn(reservation, 'sourceTag'), false);
         // Merges pinned their versions only; the other tags are this test's checkpoints.
         const tagNames = (await client.collection(name).tags.list(options())).tags.map(tag => tag.name).sort();
         assert.deepEqual(tagNames, ['checkpoint-main-past', 'checkpoint-saved', 'checkpoint-working-saved', 'md-main-v1', 'md-main-v2']);
@@ -128,30 +124,32 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
         assert.equal('pruneHistory' in retentionMain, false);
         phase = 'retain the superseded version within the default SDK window';
         // Two days exceeds one-day native retention but not the 30-day SDK window.
-        assert.equal((await retentionMain.merge({ at, requestId: 'publish-structured', summary: 'Publish synthetic structured note' }, options())).version, 'v1');
+        // Merging the published fork again is unchanged and runs a retention pass.
+        const unchanged = { status: 'unchanged', version: 'v2' };
+        assert.deepEqual(await retentionMain.merge({ at, summary: 'Publish synthetic structured note' }, options()), unchanged);
         assert(await supersededPresent(), 'A superseded version inside the SDK window was released.');
         phase = 'configure one-day SDK window';
         assert.equal((await retentionMain.configure({ retentionInDays: 1 }, options())).retentionInDays, 1);
         assert.deepEqual(await settings(), { native: 1, window: 1 });
         const observer = await MemDrive.open({ client: new LambdaDBClient(connection), name }, options());
         assert.equal((await observer.describe(options())).retentionInDays, 1);
-        phase = 'automatic retention after merge replay';
+        phase = 'automatic retention after a repeated merge';
         assert.equal(await MemDrive.open({ client: retentionClient, name }, options()), retentionMain);
         // Each automatic pass is best effort and has a short budget. A later
-        // terminal replay retries unfinished cleanup without changing its result.
+        // merge retries unfinished cleanup without changing its result.
         let removed = false;
         for (let attempt = 0; attempt < 5 && !removed; attempt++) {
-            assert.equal((await retentionMain.merge({ at, requestId: 'publish-structured', summary: 'Publish synthetic structured note' }, options())).version, 'v1');
+            assert.deepEqual(await retentionMain.merge({ at, summary: 'Publish synthetic structured note' }, options()), unchanged);
             removed = !await supersededPresent();
         }
-        assert(removed, 'Automatic retention did not remove the expired superseded version within five merge replays.');
+        assert(removed, 'Automatic retention did not remove the expired superseded version within five repeated merges.');
         // The current version stays pinned.
         await client.collection(name).tags.get('md-main-v2', options());
         assert.deepEqual(await retentionMain.history({}, options()), history);
         assert.deepEqual(await retentionMain.read({ fileId: file.fileId }, options()), updated);
         assert.deepEqual(await retentionMain.read({ at: savedPast, fileId: file.fileId }, options()), file);
         assert.deepEqual(await retentionMain.read({ at: checkpoint, fileId: file.fileId }, options()), file);
-        assert.equal((await retentionMain.merge({ at, requestId: 'publish-structured', summary: 'Publish synthetic structured note' }, options())).version, 'v1');
+        assert.deepEqual(await retentionMain.merge({ at, summary: 'Publish synthetic structured note' }, options()), unchanged);
     } catch (error) {
         collision = error?.code === 'STORE_EXISTS';
         const detail = error instanceof assert.AssertionError ? ` ${error.message}` : '';

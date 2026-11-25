@@ -83,15 +83,15 @@ test('a dropped drive is collected and a later open builds a working one from th
     const ref = await scenario(connection, async drive => {
         assert.equal(await open(connection), drive);
         await drive.write({ at: draft, op: 'create', path: '/note', content: 'kept' });
-        await drive.merge({ at: draft, requestId: 'first', summary: 'Publish note' });
+        await drive.merge({ at: draft, summary: 'Publish note' });
         assert.deepEqual((await drive.list()).files.map(file => file.path), ['/note']);
     });
     assert(await collected(ref), 'An idle store stayed registered after its drive was dropped.');
     const reopened = await open(connection);
     assert.deepEqual(await reopened.status(), { at: { kind: 'main' }, mainVersion: 'v1' });
     assert.equal((await reopened.read({ path: '/note' })).content, 'kept');
-    assert.deepEqual(await reopened.merge({ at: draft, requestId: 'first', summary: 'Publish note' }),
-        { requestId: 'first', status: 'published', version: 'v1' });
+    assert.deepEqual(await reopened.merge({ at: draft, summary: 'Publish note' }),
+        { status: 'unchanged', version: 'v1' });
     assert.equal(await open(connection), reopened);
     assert.equal(fixture.calls.filter(call => call.kind === 'tag-create' && call.request.tagName === 'md-main-v1').length, 1);
 });
@@ -126,7 +126,7 @@ test('an unconfirmed reference deletion keeps the store and its fence after the 
     assert(await collected(ref), 'A settled store stayed pinned.');
 });
 
-test('pending configuration, reference creation, merge and write outcomes pin the store until they settle', async () => {
+test('pending configuration, reference creation and write outcomes pin the store until they settle', async () => {
     const cases = {
         async configuration(fixture, drive) {
             fixture.beforeCollectionUpdate = () => { throw lost(); };
@@ -147,20 +147,6 @@ test('pending configuration, reference creation, merge and write outcomes pin th
                 assert.equal(fixture.calls.filter(call => call.kind === 'tag-create').length, creations);
                 // Inspecting the uncertain checkpoint clears its creation fence.
                 assert.deepEqual((await reopened.status({ at: { kind: 'checkpoint', name: 'saved' } })).at, { kind: 'checkpoint', name: 'saved' });
-            };
-        },
-        async merge(fixture, drive) {
-            await drive.write({ at: draft, op: 'create', path: '/note', content: 'pending' });
-            await drive.fork({ name: 'other' });
-            fixture.beforeUpsert = ({ docs }) => { if (docs[0].kind === 'merge-reservation-v1') throw lost(); };
-            await assert.rejects(drive.merge({ at: draft, requestId: 'first', summary: 'Publish note' }), { code: 'MERGE_RESUMABLE' });
-            fixture.beforeUpsert = undefined;
-            return async reopened => {
-                // The unconfirmed reservation still blocks other requests on this client.
-                await assert.rejects(reopened.merge({ at: { kind: 'fork', name: 'other' }, requestId: 'second', summary: 'Other' }),
-                    { code: 'MERGE_BLOCKED', details: { requestId: 'first' } });
-                assert.deepEqual(await reopened.merge({ at: draft, requestId: 'first', summary: 'Publish note' }),
-                    { requestId: 'first', status: 'published', version: 'v1' });
             };
         },
         async write(fixture, drive) {

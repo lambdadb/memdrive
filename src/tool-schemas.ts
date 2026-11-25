@@ -109,7 +109,7 @@ export function fileToolSchemas(external: boolean) {
         write: withAt({ ...object({ ...editAt, ...create.properties, ...updateProperties, op: { type: 'string', enum: ['create', 'update', 'delete'], description: 'Single write operation. Omit when using operations for a batch.' },
             fileId, operations }, ['at']),
             oneOf: [targeted(create), targeted(update), targeted(remove), object({ ...editAt, operations }, ['at', 'operations'])] }),
-        merge: withAt(object({ ...editAt, requestId: { type: 'string', minLength: 1, maxLength: 128, description: 'Stable identifier for this publication. Retry the same merge with the identical at, requestId and summary.', examples: ['publish-notes-2026-11-23'] },
-            summary: { type: 'string', minLength: 1, maxLength: 1024, description: 'Short description of what changed and why. Keep removed sensitive content out of this retained summary.' } }, ['at', 'requestId', 'summary'])),
+        merge: withAt(object({ ...editAt,
+            summary: { type: 'string', minLength: 1, maxLength: 1024, description: 'Short description of what changed and why. Keep removed sensitive content out of this retained summary.' } }, ['at', 'summary'])),
     };
 }

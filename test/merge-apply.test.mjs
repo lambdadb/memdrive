@@ -30,10 +30,10 @@ async function setup() {
     await handle.branches.create({ branchName: branch, source: initial });
     const writer = workingWriter(handle, name, branch, schema, undefined, chunker);
     const prepare = (previous = initial) => prepareMerge(handle, name, { kind: 'branch', name: branch }, previous, schema);
-    // Bookkeeping compares with the plan of the run that published, or, when it is
-    // resumed without one, with the version's tag. Each test pins a version as a tag of that name.
-    const advance = (version, plan) => advanceMergeSource(handle, name, branch, version,
-        plan ? { plan } : { tag: { kind: 'tag', name: version } }, schema);
+    // Bookkeeping advances the plan's targets to the published version and its
+    // settled files to the versions that already hold them. Each test pins a version as a tag of that name.
+    const advance = (version, plan) => advanceMergeSource(handle, name, branch, [...plan.targets.map(({ change, fingerprint }) =>
+        ({ fileId: change.fileId, fingerprint, version })), ...plan.settled], schema);
     /** Publish the fork's changes as `version` and advance its baselines. */
     async function publish(version, previous) {
         const plan = await prepare(previous);
@@ -98,8 +98,6 @@ test('a published creation that is deleted and replaced afterwards publishes the
     const { state, writer, advance, publish } = await setup();
     const created = await writer.write({ op: 'create', path: '/notes', content: 'published' });
     const v1 = await publish('v1');
-    // A repeated bookkeeping pass finds nothing left to advance.
-    await advance('v1');
     assert.deepEqual(await writer.diff(), []);
 
     await writer.write({ op: 'delete', fileId: created.fileId });
@@ -118,13 +116,16 @@ test('a published creation that is deleted and replaced afterwards publishes the
     assert.equal(state.branches.get(branch).docs.has(originalId(created.fileId)), false);
 });
 
-test('source bookkeeping resumes a partial pass from the fork alone, even where the merge plan no longer holds', async () => {
-    const { fixture, state, handle, writer, tag, prepare, advance, publish } = await setup();
+test('an interrupted bookkeeping pass is settled by the next plan without a conflict', async () => {
+    const { fixture, state, handle, writer, tag, prepare, advance } = await setup();
     // Roles follow ID order, which is also bookkeeping order: the first file
     // vacates its path, the second takes that path and the third is deleted.
     const [first, second, removed] = (await writer.write(['/a', '/b', '/c'].map(path => ({ op: 'create', path, content: path }))))
         .sort((a, b) => a.fileId < b.fileId ? -1 : 1);
-    const v1 = await publish('v1');
+    const initialPlan = await prepare();
+    await applyMerge(handle, name, initialPlan, 'v1');
+    const v1 = await tag('v1');
+    await advance('v1', initialPlan);
     await writer.write({ op: 'update', fileId: first.fileId, newPath: '/vacated-to' });
     await writer.write({ op: 'update', fileId: second.fileId, newPath: first.path });
     await writer.write({ op: 'delete', fileId: removed.fileId });
@@ -141,11 +142,12 @@ test('source bookkeeping resumes a partial pass from the fork alone, even where 
     await assert.rejects(advance('v2', plan), { code: 'DATABASE_ERROR', status: 429 });
     fixture.beforeUpsert = fixture.beforeDelete = undefined;
     assert.deepEqual((await writer.diff()).map(change => change.fileId), [second.fileId, removed.fileId]);
-    // The half-advanced fork cannot be planned against the prior version again:
-    // the vacated path now looks occupied. Bookkeeping must not depend on a plan.
-    await assert.rejects(prepare(v1), { code: 'MERGE_CONFLICT', details: { fileIds: [], paths: [first.path] } });
 
-    await advance('v2');
+    // Main already holds the remaining changes: they are settled, neither targets nor conflicts.
+    const next = await prepare(v2);
+    assert.deepEqual(next.targets, []);
+    assert.deepEqual(next.settled.map(({ fileId, version }) => [fileId, version]), [[second.fileId, 'v2'], [removed.fileId, undefined]]);
+    await advance('v3', next);
     assert.deepEqual(await writer.diff(), []);
     const docs = state.branches.get(branch).docs;
     for (const [file, path] of [[first, '/vacated-to'], [second, first.path]]) {
@@ -155,89 +157,70 @@ test('source bookkeeping resumes a partial pass from the fork alone, even where 
     }
     assert.equal(docs.has(originalId(removed.fileId)), false);
     // The next merge starts from the advanced baselines.
-    assert.deepEqual((await prepare(v2)).targets, []);
+    assert.deepEqual(await prepare(v2), { ...next, settled: [] });
 });
 
-test('source bookkeeping advances only originals whose current state was published, by the plan or by the version tag', async () => {
-    for (const known of ['plan', 'tag']) {
-        const { fixture, state, handle, writer, tag, prepare, advance, publish } = await setup();
-        const [updated, moved, removed, untouched] = await writer.write(['/a', '/b', '/c', '/d'].map(path => ({ op: 'create', path, content: path })));
-        const v1 = await publish('v1');
-        await writer.write([{ op: 'update', fileId: updated.fileId, content: 'published edit' }, { op: 'update', fileId: moved.fileId, newPath: '/moved' },
-            { op: 'delete', fileId: removed.fileId }]);
-        const created = await writer.write({ op: 'create', path: '/created', content: 'published creation' });
-        const plan = await prepare(v1);
-        await applyMerge(handle, name, plan, 'v2');
-        const v2 = await tag('v2');
-        await verifyMerge(handle, name, plan, 'v2', v2);
+test('source bookkeeping advances only originals whose current state was published', async () => {
+    const { fixture, state, handle, writer, tag, prepare, advance, publish } = await setup();
+    const [updated, moved, removed, untouched] = await writer.write(['/a', '/b', '/c', '/d'].map(path => ({ op: 'create', path, content: path })));
+    const v1 = await publish('v1');
+    await writer.write([{ op: 'update', fileId: updated.fileId, content: 'published edit' }, { op: 'update', fileId: moved.fileId, newPath: '/moved' },
+        { op: 'delete', fileId: removed.fileId }]);
+    const created = await writer.write({ op: 'create', path: '/created', content: 'published creation' });
+    const plan = await prepare(v1);
+    await applyMerge(handle, name, plan, 'v2');
+    const v2 = await tag('v2');
+    await verifyMerge(handle, name, plan, 'v2', v2);
 
-        // Writes reach the fork between publication and bookkeeping. This writer has no hold.
-        await writer.write({ op: 'update', fileId: updated.fileId, content: 'unpublished edit' });
-        await writer.write({ op: 'delete', fileId: moved.fileId });
-        await writer.write({ op: 'update', fileId: untouched.fileId, metadata: { label: 'unpublished' } });
-        const slipped = await writer.write({ op: 'create', path: '/slipped', content: 'unpublished creation' });
-        const docs = state.branches.get(branch).docs;
-        const kept = structuredClone([updated, moved, untouched, slipped].map(file => docs.get(originalId(file.fileId))));
+    // Writes reach the fork between publication and bookkeeping outside the merge's queue.
+    await writer.write({ op: 'update', fileId: updated.fileId, content: 'unpublished edit' });
+    await writer.write({ op: 'delete', fileId: moved.fileId });
+    await writer.write({ op: 'update', fileId: untouched.fileId, metadata: { label: 'unpublished' } });
+    const slipped = await writer.write({ op: 'create', path: '/slipped', content: 'unpublished creation' });
+    const docs = state.branches.get(branch).docs;
+    const kept = structuredClone([updated, moved, untouched, slipped].map(file => docs.get(originalId(file.fileId))));
 
-        const before = fixture.calls.length;
-        await advance('v2', known === 'plan' ? plan : undefined);
-        const calls = fixture.calls.slice(before);
-        // The plan needs no request. Without it, one read of the version covers the batch.
-        assert.deepEqual(calls.filter(call => call.request?.ref?.name === 'v2').map(call => [call.kind, call.request.ids.length]),
-            known === 'plan' ? [] : [['fetch', 6]], known);
-        // The scan, the batch read, and a mutation with its confirming read per advanced original.
-        assert.equal(calls.length, known === 'plan' ? 6 : 7, known);
-        assert.deepEqual(calls.filter(call => call.kind === 'upsert').map(call => call.request.docs[0].id), [originalId(created.fileId)], known);
-        assert.deepEqual(calls.filter(call => call.kind === 'delete').map(call => call.request.ids), [[originalId(removed.fileId)]], known);
-        // The published creation and deletion are settled; everything else is left as it was.
-        const advanced = docs.get(originalId(created.fileId));
-        assert.deepEqual([advanced.changed, advanced.version, advanced.baseline.version], [false, 'v2', 'v2'], known);
-        assert.equal(docs.has(originalId(removed.fileId)), false, known);
-        assert.deepEqual([updated, moved, untouched, slipped].map(file => docs.get(originalId(file.fileId))), kept, known);
-        const byId = changes => new Map(changes.map(change => [change.fileId, change]));
-        assert.deepEqual(byId(await writer.diff()), byId([
-            { op: 'update', fileId: updated.fileId, path: '/a' },
-            { op: 'delete', fileId: moved.fileId, previousPath: '/b' },
-            { op: 'update', fileId: untouched.fileId, path: '/d' },
-            { op: 'create', fileId: slipped.fileId, path: '/slipped' }]), known);
+    const before = fixture.calls.length;
+    await advance('v2', plan);
+    // One read of the plan's originals, then one mutation per advanced original.
+    assert.deepEqual(fixture.calls.slice(before).map(call => call.kind).sort(), ['delete', 'fetch', 'upsert']);
+    const calls = fixture.calls.slice(before);
+    assert.deepEqual(calls.filter(call => call.kind === 'upsert').map(call => call.request.docs[0].id), [originalId(created.fileId)]);
+    assert.deepEqual(calls.filter(call => call.kind === 'delete').map(call => call.request.ids), [[originalId(removed.fileId)]]);
+    // The published creation and deletion are settled; everything else is left as it was.
+    const advanced = docs.get(originalId(created.fileId));
+    assert.deepEqual([advanced.changed, advanced.version, advanced.baseline.version], [false, 'v2', 'v2']);
+    assert.equal(docs.has(originalId(removed.fileId)), false);
+    assert.deepEqual([updated, moved, untouched, slipped].map(file => docs.get(originalId(file.fileId))), kept);
+    const byId = changes => new Map(changes.map(change => [change.fileId, change]));
+    assert.deepEqual(byId(await writer.diff()), byId([
+        { op: 'update', fileId: updated.fileId, path: '/a' },
+        { op: 'delete', fileId: moved.fileId, previousPath: '/b' },
+        { op: 'update', fileId: untouched.fileId, path: '/d' },
+        { op: 'create', fileId: slipped.fileId, path: '/slipped' }]));
 
-        // A repeated pass, on either basis, reads again and changes nothing.
-        const again = fixture.calls.length;
-        await advance('v2', plan);
-        await advance('v2');
-        assert(fixture.calls.slice(again).every(call => call.kind === 'query' || call.kind === 'fetch'), known);
-        // The leftovers are ordinary changes: main moved past the baselines of the two files it published.
-        await assert.rejects(prepare(v2), error => error.code === 'MERGE_CONFLICT'
-            && JSON.stringify([...error.details.fileIds].sort()) === JSON.stringify([updated.fileId, moved.fileId].sort()), known);
-    }
+    // A repeated pass reads again and changes nothing.
+    const again = fixture.calls.length;
+    await advance('v2', plan);
+    assert(fixture.calls.slice(again).every(call => call.kind === 'fetch'));
+    // The leftovers are ordinary changes: main moved past the baselines of the two files it published.
+    await assert.rejects(prepare(v2), error => error.code === 'MERGE_CONFLICT'
+        && JSON.stringify([...error.details.fileIds].sort()) === JSON.stringify([updated.fileId, moved.fileId].sort()));
 });
 
-test('unknown mutation outcomes stop application and source bookkeeping, and a repeated pass completes them', async () => {
-    const { fixture, handle, writer, tag, prepare, advance } = await setup();
-    const file = await writer.write({ op: 'create', path: '/notes', content: 'published' });
+test('a lost main acknowledgment fails application, and repeating it writes the same records', async () => {
+    const { fixture, state, handle, writer, prepare } = await setup();
+    await writer.write({ op: 'create', path: '/notes', content: 'published' });
     const plan = await prepare();
     fixture.afterUpsert = request => {
         if (request.branch === 'main') throw new Error('lost acknowledgment');
     };
-    await assert.rejects(applyMerge(handle, name, plan, 'v1'), { code: 'MERGE_MUTATION_UNCONFIRMED' });
+    await assert.rejects(applyMerge(handle, name, plan, 'v1'), { code: 'DATABASE_ERROR' });
     assert.equal(fixture.calls.filter(call => call.kind === 'upsert' && call.request.branch === 'main').length, 1);
     fixture.afterUpsert = undefined;
+    const partial = structuredClone([...state.branches.get('main').docs]);
     await applyMerge(handle, name, plan, 'v1');
-    await tag('v1');
-
-    fixture.afterUpsert = request => {
-        if (request.docs[0].baseline?.version === 'v1') throw new Error('lost acknowledgment');
-    };
-    await assert.rejects(advance('v1', plan), { code: 'MERGE_MUTATION_UNCONFIRMED' });
-    fixture.afterUpsert = undefined;
-    // The publication module stops this client here and rejects writes to the
-    // fork. A replacement owner repeats the pass before the fork is written again.
-    const recovered = workingWriter(handle, name, branch, schema, undefined, chunker);
-    await advance('v1');
-    assert.deepEqual(await recovered.diff(), []);
-    const later = { op: 'update', fileId: file.fileId, content: 'later' };
-    assert.equal((await recovered.write(later)).content, 'later');
-    assert.equal((await recovered.diff())[0].op, 'update');
+    assert.deepEqual([...state.branches.get('main').docs], partial);
 });
 
 test('publication copies the exact persisted vectors of the fork\'s chunks, including after a move', async () => {

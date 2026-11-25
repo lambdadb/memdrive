@@ -32,7 +32,7 @@ first verify core consumers without that peer, then install it explicitly and
 exercise the real Hybrid chunker with a small synthetic tokenizer. The fixture
 checks integration and deterministic behavior, not retrieval quality. Preserve
 exact originals, avoid invented ranges for rendered text, and reuse stored
-chunks and vectors during publication and recovery.
+chunks and vectors during publication.
 The default live suite additionally checks Docling writes, checkpoint reads and
 publication against the real backend. It publishes a later revision, then creates
 main refs by exact publication version and forks an explicit saved checkpoint,
@@ -40,8 +40,8 @@ verifying their earlier originals before
 destroying its isolated store and journal.
 It checks that the store keeps native snapshot retention at one day with the
 default 30-day SDK window, then ages timestamps in that isolated synthetic journal.
-The superseded first version's tag inside the window survives merge replay; after
-configuring a one-day window, replay automatically releases it while retained
+The superseded first version's tag inside the window survives a repeated merge; after
+configuring a one-day window, a repeated merge automatically releases it while retained
 history, checkpoint reads and refs created from that version remain. It does not
 wait a real retention period or measure physical GC.
 
@@ -61,7 +61,7 @@ The installed-package check exercises the tool workflow, authorization boundary
 and store/ref lifecycle, including partial deletion recovery, as well as ESM,
 CommonJS, TypeScript and browser imports.
 The installed core package also runs history-retention regressions covering
-protected refs, supersession timing, history kept after release, terminal outcomes and
+protected refs, supersession timing, history kept after release, merge outcomes and
 uncertain or partial cleanup, the stored cleanup watermark, cancellation and read
 concurrency, and the SDK window kept separate from one-day native retention. Public type checks
 verify that retention needs no separate cleanup API. Historical-ref regressions
@@ -73,22 +73,24 @@ The LambdaDB dependency is pinned to an exact release. Update it deliberately wi
 The publication journal is read on demand by document ID, with batched
 fetches of at most 1,000 IDs, and never through an index query. Keep per-store
 memory independent of the number of merges: journal regressions assert a hard
-bound on cold-client fetches and that later reads return to the journal. Every
-journal record except the retention watermark is written once: confirm a
-reservation before its request index, and the index before any terminal record. Stores
-are registered weakly and pinned only while they hold state a new object would
-lose; the release regressions enable `gc` inside their own test file.
+bound on cold-client fetches and that later reads return to the journal. The
+journal holds one record per published version, written after its tag is
+confirmed, and the retention watermark. Stores are registered weakly and pinned
+only while they hold state a new object would lose; the release regressions
+enable `gc` inside their own test file.
 
 A merge reads its fork directly and creates no tag but its target version, so
-the fork must not change until the merge is settled. Keep the order fork queue,
-then merge queue, for every operation that needs both, and keep the journal read
-off the write path after a fork's first write. Source bookkeeping must stay
-independent of the hold and must work without the merge plan: it advances an
-original only when the published version holds its current state, as stated by
-the plan of the run that published, without an extra request, or by the
-version's tag when the merge was resumed. The hold regressions in `test/merge-hold.test.mjs`
-interrupt a merge at each step, in process and from a new client, and assert
-the native tag calls and journal fetch counts.
+the fork must not change while the merge runs. Keep the order fork queue, then
+merge queue, for every operation that needs both. Only the merge queue writes to
+the main branch. A merge either records its publication or rolls main back to
+the latest published tag (or clears main before the first publication); a merge
+that cannot roll back leaves that to the next merge that writes to main. Keep
+merges idempotent by content: a changed file that main already holds is settled,
+not published again or reported as a conflict, which makes best-effort source
+bookkeeping safe to lose. The publication regressions in
+`test/public-merge.test.mjs` and `test/publication-file-ids.test.mjs` interrupt a
+merge after main writes, at its tag and at its record, in process and across a
+new client, and assert the native rollback, tag and journal calls.
 
 ## Validation and evidence
 
@@ -104,8 +106,9 @@ runs the live suite against the exact installed tarball. Set
 `MEMDRIVE_RUN_LIVE_MERGE_TESTS=1` to additionally run the opt-in public merge
 scenario, which owns and cleans up its content collection and merge journal.
 The default live smoke also exercises ref listing/deletion and public store
-destruction. The merge scenario verifies retained history after source deletion
-and public destruction of both owned collections. Partial deletion and recovery
+destruction. The merge scenario verifies a failed merge's rollback after real main writes,
+a repeated merge, retained history after source deletion and public destruction
+of both owned collections. Partial deletion and recovery
 faults are covered by the isolated fixture suite.
 Document unperformed checks accurately.
 
@@ -119,8 +122,8 @@ working and checkpoint cursors, and continued scans across multiple native
 query pages. The test creates one isolated collection and verifies its deletion.
 
 Set `MEMDRIVE_RUN_LIVE_STATUS_HISTORY_TESTS=1` to also verify read-only
-publication status, stable history pages, and visibility before merge
-bookkeeping finishes. The test verifies cleanup of its isolated collection
+publication status, stable history pages, and the publication of a merge whose
+source bookkeeping failed. The test verifies cleanup of its isolated collection
 and publication journal.
 
 The [model tool-use harness](benchmark/tool-use/README.md) consumes the shared

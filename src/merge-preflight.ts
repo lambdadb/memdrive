@@ -47,10 +47,12 @@ async function loadTargets(handle: Handle, name: string, source: BranchRef, sche
 }
 
 /**
- * Plan a merge of the `working` fork against the published main
- * version. Call it in the main publication queue while the fork is held still:
- * its merge owns the fork's queue, or an unfinished reservation rejects writes
- * to it. A resumed merge then reads the same source and rebuilds the same plan.
+ * Plan a merge of the `working` fork against the published main version. Call
+ * it in the main publication queue while the merge owns the fork's queue.
+ * A changed file whose state published main already holds, such as one an
+ * earlier merge published before its source bookkeeping, is `settled`: it is
+ * neither applied nor a conflict, and its baseline can advance to the version
+ * that holds it.
  */
 export async function prepareMerge(handle: Handle, name: string, working: BranchRef, publishedMain: PublishedMain,
     schema: MetadataSchema, signal?: AbortSignal, dimensions?: number) {
@@ -70,10 +72,11 @@ export async function prepareMerge(handle: Handle, name: string, working: Branch
 
     const mainPaths = new Map<string, string>();
     const fileConflicts: string[] = [];
+    const settled = new Map<string, string | undefined>();
     for (let start = 0; start < targets.length; start += originalBatchSize) {
         const batch = targets.slice(start, start + originalBatchSize);
         const originals = await fetchOriginals(handle, name, main, batch.map(({ change }) => change.fileId), signal, dimensions !== undefined);
-        for (const { baseline, change: { fileId } } of batch) {
+        for (const { baseline, fingerprint, change: { fileId } } of batch) {
             const doc = originals.get(fileId);
             const file = doc ? decodeStoredFile(doc, schema, dimensions) : undefined;
             if (file) {
@@ -81,9 +84,14 @@ export async function prepareMerge(handle: Handle, name: string, working: Branch
                     throw new MemDriveError('INVALID_RESULT', 'Published main returned multiple files for one path.');
                 mainPaths.set(file.path, fileId);
             }
-            if (baseline === undefined ? file !== undefined
-                : !file || file.path !== baseline.path || doc?.version !== baseline.version
-                    || await fingerprintOf(file) !== baseline.fingerprint) {
+            const held = file && await fingerprintOf(file);
+            // The fingerprint covers path, metadata and content or vector; a deletion has none.
+            if (held === fingerprint) {
+                const version = doc?.version;
+                if (file && typeof version !== 'string') throw new MemDriveError('INVALID_RESULT', 'Published main returned a file without its version.');
+                settled.set(fileId, version as string | undefined);
+            } else if (baseline === undefined ? file !== undefined
+                : !file || file.path !== baseline.path || doc?.version !== baseline.version || held !== baseline.fingerprint) {
                 fileConflicts.push(fileId);
             }
         }
@@ -127,5 +135,7 @@ export async function prepareMerge(handle: Handle, name: string, working: Branch
     if (fileConflicts.length || pathConflicts.length)
         throw new MemDriveError('MERGE_CONFLICT', 'Published main changed a targeted file or occupies a requested destination.',
             { details: { fileIds: fileConflicts, paths: pathConflicts } });
-    return { source, publishedMain: main, targets, dimensions };
+    return { source, publishedMain: main, targets: targets.filter(({ change }) => !settled.has(change.fileId)),
+        settled: targets.flatMap(({ change: { fileId }, fingerprint }) => settled.has(fileId) ? [{ fileId, fingerprint, version: settled.get(fileId) }] : []),
+        dimensions };
 }

@@ -2,10 +2,11 @@
 // Like LambdaDB, a recreated ref gets a later creation time and a new snapshot ID.
 let lastCreated = 0;
 const createdAt = () => new Date(lastCreated = Math.max(Date.now(), lastCreated + 1));
+// Collection creation times are unique in a process, so every fixture store is a separate generation.
+let generation = 0;
 
 export function fileClient() {
     const collections = new Map();
-    let generation = 0;
     const calls = [];
     const fixture = { collections, calls };
     const fail = (statusCode, message) => { throw Object.assign(new Error(message), { statusCode }); };
@@ -68,6 +69,16 @@ export function fileClient() {
                     async list() {
                         return fixture.listBranches?.() ?? { branches: [...state().branches.keys()].map(name => ({ name })) };
                     },
+                    // Restores the branch to the tag's documents. `fixture.beforeRollback` may throw, for
+                    // example the definite 400 of a tag whose snapshot is not yet published.
+                    async rollback(branchName, { tag }, options) {
+                        calls.push({ kind: 'branch-rollback', name: branchName, tag, retries: options?.retries });
+                        await fixture.beforeRollback?.(branchName, tag);
+                        const source = state().tags.get(tag) ?? fail(404, `Reference not found: ${tag}`);
+                        const branch = state().branches.get(branchName) ?? fail(404, 'Branch missing');
+                        branch.docs = new Map(structuredClone([...source.docs]));
+                        return { branchId: branchName, headSnapshot: { snapshotId: globalThis.crypto.randomUUID() } };
+                    },
                     async delete(branchName, options) {
                         calls.push({ kind: 'branch-delete', name: branchName, retries: options?.retries });
                         await fixture.beforeRefDelete?.('fork', branchName);
@@ -124,6 +135,8 @@ export function fileClient() {
                         return response(docs.slice(0, request.size), request.fields);
                     }
                     const direct = request.query.queryString;
+                    if (direct?.defaultField === 'id' && direct.query === '/.*/')
+                        return response(source.slice(0, request.size), request.fields);
                     if (direct?.defaultField === 'id' && direct.skipSyntax)
                         return response(source.filter(doc => doc.id === direct.query).slice(0, request.size), request.fields);
                     if (request.query.queryString?.defaultField === 'id' && request.query.queryString.skipSyntax)

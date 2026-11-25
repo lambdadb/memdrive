@@ -62,7 +62,7 @@ export async function prepareScenario(id) {
         { op: 'create', path: '/decisions/2026-01-01.md', content: archive },
     ] });
     const ids = Object.fromEntries(files.map(file => [file.path, file.fileId]));
-    await main.merge({ at: seed, requestId: 'seed', summary: 'Seed synthetic evaluation files' });
+    await main.merge({ at: seed, summary: 'Seed synthetic evaluation files' });
     await main.deleteFork({ at: seed });
     const at = scenario.start ?? { kind: 'main' };
     if (at.kind === 'fork') await main.fork({ name: at.name });
@@ -75,13 +75,13 @@ export async function prepareScenario(id) {
             { op: 'update', fileId: ids['/policy.md'], content: policy(42) },
         ] });
         else await main.write({ at: other, op: 'update', fileId: ids['/faq.md'], content: faq(id === 'conflict' ? 14 : 42) });
-        await main.merge({ at: other, requestId: 'other', summary: 'Publish a later synthetic change' });
+        await main.merge({ at: other, summary: 'Publish a later synthetic change' });
         await main.deleteFork({ at: other });
     }
     if (scenario.group === 'retrieval') {
         const { at: notes } = await main.fork({ name: 'notes' });
         await main.write({ at: notes, operations: Object.entries(retrievalFiles).map(([path, content]) => ({ op: 'create', path, content })) });
-        await main.merge({ at: notes, requestId: 'notes', summary: 'Publish synthetic notes and runbooks' });
+        await main.merge({ at: notes, summary: 'Publish synthetic notes and runbooks' });
         await main.deleteFork({ at: notes });
         // Fixture search ignores the query. Path order keeps its candidates stable across conversations.
         fixture.rank = docs => [...docs].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);

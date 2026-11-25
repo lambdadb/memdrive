@@ -8,7 +8,7 @@ const enabled = process.env.MEMDRIVE_RUN_LIVE_TESTS === '1' && process.env.MEMDR
 const options = () => ({ signal: AbortSignal.timeout(240_000) });
 const statusOf = error => error?.status ?? error?.statusCode;
 
-test('live status and history read retained main publications without mutating the store', {
+test('live status and history read retained main publications without mutating the store, including after failed bookkeeping', {
     skip: enabled ? false : 'Set MEMDRIVE_RUN_LIVE_TESTS=1 and MEMDRIVE_RUN_LIVE_STATUS_HISTORY_TESTS=1 for live resources.',
     timeout: 600_000,
 }, async t => {
@@ -37,9 +37,10 @@ test('live status and history read retained main publications without mutating t
             if (!read) mutations++;
             if (pathname === root && request.method === 'POST')
                 assert(allowed.has((await request.clone().json()).collectionName), 'Unknown collection create.');
-            if (rejectBookkeeping && collection !== name && request.method === 'POST' && pathname.endsWith('/docs/upsert')) {
-                const { docs } = await request.clone().json();
-                if (docs.some(doc => doc.kind === 'merge-bookkeeping-v1')) {
+            if (rejectBookkeeping && collection === name && request.method === 'POST' && pathname.endsWith('/docs/upsert')) {
+                const { branch, docs } = await request.clone().json();
+                // Source bookkeeping advances a fork original's baseline to the published version.
+                if (branch === 'fork-history-source' && docs.some(doc => doc.baseline?.version === 'v2')) {
                     interrupted++;
                     return Response.json({ message: 'Synthetic interruption before bookkeeping' }, { status: 400 });
                 }
@@ -61,7 +62,7 @@ test('live status and history read retained main publications without mutating t
     }
 
     const client = native();
-    const merge = (at, requestId) => drive.merge({ at, requestId, summary: `Publish ${requestId}` }, options());
+    const merge = (at, label) => drive.merge({ at, summary: `Publish ${label}` }, options());
     const fresh = () => MemDrive.open({ client: native(), name }, options());
     let failure, drive;
     try {
@@ -71,51 +72,49 @@ test('live status and history read retained main publications without mutating t
         assert.deepEqual(await main.history({}, options()), { entries: [], throughVersion: 'v0' });
         assert.equal(mutations, beforeEmptyReads);
 
-        phase = 'Publish and interrupt bookkeeping';
+        phase = 'Publish with failed source bookkeeping';
         const { at: work } = await main.fork({ name: 'history-source' }, options());
         const first = await main.write({ at: work, op: 'create', path: '/one.txt', content: 'Alpine history fixture.' }, options());
         assert.equal((await merge(work, 'first')).version, 'v1');
         const { at: checkpoint } = await main.checkpoint({ name: 'first-publication' }, options());
-        assert.equal((await merge(work, 'unchanged')).status, 'unchanged');
+        assert.deepEqual(await merge(work, 'unchanged'), { status: 'unchanged', version: 'v1' });
         const second = await main.write({ at: work, op: 'create', path: '/two.txt', content: 'Marigold history fixture.' }, options());
         rejectBookkeeping = true;
-        await assert.rejects(merge(work, 'second'), { code: 'MERGE_RESUMABLE',
-            details: { requestId: 'second', publishedVersion: 'v3' } });
+        // Bookkeeping is best effort: the publication stands.
+        assert.deepEqual(await merge(work, 'second'), { status: 'published', version: 'v2' });
         assert.equal(interrupted, 1);
         rejectBookkeeping = false;
+        assert.deepEqual((await main.diff({ at: work }, options())).map(({ fileId }) => fileId), [second.fileId]);
 
-        phase = 'Read unfinished status and the published completion';
+        phase = 'Read status and history';
         const reader = await fresh();
         const beforePendingReads = mutations;
-        assert.deepEqual(await reader.status({}, options()),
-            { at: { kind: 'main' }, mainVersion: 'v3', merge: { requestId: 'second', phase: 'bookkeeping' } });
-        assert.deepEqual(await main.status({ at: work }, options()), { at: { kind: 'fork', name: 'history-source' },
-            mainVersion: 'v3', merge: { requestId: 'second', phase: 'bookkeeping' } });
-        assert.deepEqual(await reader.status({ at: checkpoint }, options()), { at: { kind: 'checkpoint', name: 'first-publication' },
-            mainVersion: 'v3', merge: { requestId: 'second', phase: 'bookkeeping' } });
-        await assert.rejects(reader.history({ sinceVersion: 'v2' }, options()), { code: 'VERSION_NOT_FOUND' });
+        assert.deepEqual(await reader.status({}, options()), { at: { kind: 'main' }, mainVersion: 'v2' });
+        assert.deepEqual(await main.status({ at: work }, options()), { at: { kind: 'fork', name: 'history-source' }, mainVersion: 'v2' });
+        assert.deepEqual(await reader.status({ at: checkpoint }, options()), { at: { kind: 'checkpoint', name: 'first-publication' }, mainVersion: 'v2' });
+        await assert.rejects(reader.history({ sinceVersion: 'v3' }, options()), { code: 'VERSION_NOT_FOUND' });
         const page = await main.history({ limit: 1 }, options());
         assert.deepEqual(Object.keys(page.next ?? {}), ['cursor']);
-        assert.equal(page.throughVersion, 'v3');
+        assert.equal(page.throughVersion, 'v2');
         assert.deepEqual(page.entries.map(({ version, summary, fileIds, fileIdsTruncated }) =>
             [version, summary, fileIds, fileIdsTruncated]), [['v1', 'Publish first', [first.fileId], false]]);
         assert.equal(new Date(page.entries[0].publishedAt).toISOString(), page.entries[0].publishedAt);
         assert.deepEqual((await reader.history({ sinceVersion: 'v1' }, options())).entries.map(({ fileIds }) => fileIds), [[second.fileId]]);
         assert.equal(mutations, beforePendingReads);
 
-        phase = 'Recover and publish after the pagination cutoff';
-        const recovered = await MemDrive.open({ client, name, recover: true }, options());
-        assert.equal(recovered, main);
-        assert.deepEqual(await recovered.status({}, options()), { at: { kind: 'main' }, mainVersion: 'v3' });
+        phase = 'Settle the published file and publish after the pagination cutoff';
+        // Main already holds the file whose baseline was not advanced.
+        assert.deepEqual(await merge(work, 'second again'), { status: 'unchanged', version: 'v2' });
+        assert.deepEqual(await main.diff({ at: work }, options()), []);
         await main.write({ at: work, op: 'delete', fileId: first.fileId }, options());
-        assert.equal((await merge(work, 'third')).version, 'v4');
+        assert.equal((await merge(work, 'third')).version, 'v3');
         const beforeContinuedReads = mutations;
         const continued = await main.history(page.next, options());
-        assert.equal(continued.throughVersion, 'v3');
+        assert.equal(continued.throughVersion, 'v2');
         assert.equal(continued.next, undefined);
-        assert.deepEqual(continued.entries.map(({ version, fileIds }) => [version, fileIds]), [['v3', [second.fileId]]]);
-        assert.deepEqual((await reader.history({ sinceVersion: 'v3' }, options())).entries.map(({ version, fileIds }) =>
-            [version, fileIds]), [['v4', [first.fileId]]]);
+        assert.deepEqual(continued.entries.map(({ version, fileIds }) => [version, fileIds]), [['v2', [second.fileId]]]);
+        assert.deepEqual((await reader.history({ sinceVersion: 'v2' }, options())).entries.map(({ version, fileIds }) =>
+            [version, fileIds]), [['v3', [first.fileId]]]);
         assert.equal(mutations, beforeContinuedReads);
     } catch (error) {
         failure = new Error(`${phase} failed (${error?.code ?? error?.name ?? 'Error'}${statusOf(error) ? `, HTTP ${statusOf(error)}` : ''}).`);
