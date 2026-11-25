@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Replay one prepared original-BEAM conversation session by session and report how
-// the model used the file tools. The harness only observes: it never writes, merges
-// or deletes on the model's behalf.
+// the model used the file tools. The harness only observes: it never writes or
+// deletes on the model's behalf; it only makes each model write a checkpointed write.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -12,11 +12,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs, parseEnv } from 'node:util';
 import { MemDrive, fileToolError, fileToolInstructions } from '@functional-systems/memdrive';
 import { fileClient } from '../../test/helpers/file-client.mjs';
-import { createToolHost, failureCodes, limits, openAI, protocol, ReplayFailure, runSession, scriptedTransport, toolDefinitions, toolNames } from './replay-agent.mjs';
+import { checkpointName, createToolHost, failureCodes, limits, openAI, protocol, ReplayFailure, runSession, scriptedTransport, toolDefinitions, toolNames,
+    withGuide } from './replay-agent.mjs';
 import { conversationMetrics, sessionMetrics } from './replay-metrics.mjs';
 import { dateOf, fingerprint, hash, loadSessions } from './replay-sessions.mjs';
 import { questionsSucceeded, runQuestions, runRejudge } from './replay-questions.mjs';
-import { cleanupStore, lambdadbConnection, ledgerFile, newStoreName, storeLabels, storeProtocol, writeLedger } from './replay-store.mjs';
+import { cleanupStore, lambdadbConnection, ledgerFile, listAll, newStoreName, readFiles, storeLabels, storeProtocol, writeLedger } from './replay-store.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const json = value => JSON.stringify(value, null, 2) + '\n';
@@ -25,61 +26,123 @@ const positive = value => value === undefined || (Number.isSafeInteger(value) &&
 const backends = { fixture: 'native-client-fixture', lambdadb: 'lambdadb' };
 const sorted = map => Object.fromEntries(Object.entries(map).sort(([a], [b]) => a.localeCompare(b)));
 
-/** Read-only harness observations after a session. A failed read is recorded and left null. */
-export async function observe(drive, mainVersionBefore) {
-    const observation = { mainVersionBefore, mainVersionAfter: null, publications: null, forks: null, errors: [] };
+/**
+ * IDs of the files a write call wrote or may have written, as the SDK reported them: every
+ * result of a successful call, and the file IDs in a failed call's details. A model's own
+ * arguments are not trusted: a failed call may name a file that never existed.
+ */
+export function writtenFileIds(event) {
+    const ids = new Set();
+    const add = value => { if (typeof value === 'string' && value) ids.add(value); };
+    if (event.ok) for (const file of [event.result].flat()) add(file?.fileId);
+    // A partly applied or unrestored write lists file IDs under keys ending in FileIds.
+    const visit = value => {
+        if (value === null || typeof value !== 'object') return;
+        for (const [key, nested] of Object.entries(value))
+            if (key.endsWith('FileIds') && Array.isArray(nested)) nested.forEach(add);
+            else visit(nested);
+    };
+    if (!event.ok) visit(event.error?.details);
+    return ids;
+}
+
+const byPath = (a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : a.fileId < b.fileId ? -1 : 1;
+/** Paths of listed entries that no longer exist at the listed path. */
+const staleEntries = (listed, files) => [...listed.values()].filter(entry => files.get(entry.fileId)?.path !== entry.path).map(entry => entry.path).sort();
+
+/**
+ * Read-only harness observation after a session. `list` is eventual, so the inventory
+ * is not the listing: it reads by file ID, consistently, every file the listing
+ * returned and every file the run is known to have written (`known`), and keeps
+ * those that exist. Only the model writes, so that is all of main except a file a
+ * failed write created without reporting its ID and the listing missed. A failed
+ * read is recorded and leaves its value null.
+ */
+export async function observe(drive, { latestCheckpointBefore, known }) {
+    const observation = { latestCheckpointBefore, latestCheckpointAfter: null, inventory: null, unlisted: null, stale: null, errors: [] };
     const attempt = async (step, read) => {
         try { return await read(); }
         catch (error) { observation.errors.push({ step, code: fileToolError(error).error.code }); return null; }
     };
-    observation.mainVersionAfter = await attempt('status', async () => (await drive.status()).mainVersion);
-    observation.publications = await attempt('history', async () => {
-        const entries = [];
-        for (let page = await drive.history({ sinceVersion: mainVersionBefore, limit: 100 }); ; page = await drive.history(page.next)) {
-            entries.push(...page.entries);
-            if (!page.next) return entries;
-        }
-    });
-    const listed = await attempt('listForks', () => drive.listForks());
-    if (listed) {
-        observation.forks = [];
-        for (const { at } of listed.forks) {
-            const changes = await attempt(`diff:${at.name}`, () => drive.diff({ at }));
-            observation.forks.push({ at, changes: changes ? changes.length : null });
+    observation.latestCheckpointAfter = await attempt('describe', async () => (await drive.describe()).latestCheckpoint?.at.name ?? null);
+    const listed = await attempt('list', () => listAll(drive));
+    const files = await attempt('read', () => readFiles(drive, new Set([...known, ...(listed?.keys() ?? [])])));
+    if (files) {
+        observation.inventory = [...files.values()].filter(Boolean).sort(byPath);
+        if (listed) {
+            // The harness's own listing against the reads: files it missed, and entries that are gone or moved.
+            observation.unlisted = observation.inventory.filter(file => !listed.has(file.fileId)).map(file => file.path);
+            observation.stale = staleEntries(listed, files);
         }
     }
     return observation;
 }
 
 /**
- * Check one successful model `list` call against a consistent read of the same view.
- * Every file in the store was written by the model, so the paths seen in its successful
- * `write` results, read back with the same `at` (a paths batch omits missing files),
- * are the files that existed when it listed. Only an unpaginated listing without
- * `cursor` or `delimiter` is compared; `prefix` and `nameContains` apply exactly as in
- * the SDK. Observation only: the model never sees this, and a failed read is unchecked.
+ * Check the model's `list` traversals of main against consistent reads. A traversal
+ * is a call without `cursor` followed by the calls that forward each returned
+ * `next.cursor`; it is judged once a page returns no `next`, before the model's next
+ * call. Expected files are those that exist, read by file ID, among the files the
+ * run is known to have written and the files the traversal returned, filtered by
+ * `prefix` and `nameContains` as the SDK applies them. A traversal is left unchecked
+ * when it groups with `delimiter`, a successful write came between its pages, its
+ * cursor continues no traversal the harness saw, the harness read fails, or it is
+ * not followed to the end within the session (`delimiter`, `write_during`,
+ * `unknown_cursor`, `read_failed`, `unfinished`). Observation only: the model
+ * receives every `list` result unchanged.
  */
-export async function checkList(drive, event, written) {
-    const { at, prefix = '', nameContains = '', delimiter, cursor } = event.args;
-    const record = { turn: event.turn, round: event.round, at: at ?? { kind: 'main' }, delivered: event.delivered };
-    const reason = cursor !== undefined ? 'cursor' : delimiter !== undefined ? 'delimiter' : event.result.next ? 'next' : null;
-    if (reason) return { ...record, checked: false, reason };
-    const candidates = [...written].filter(file => file.startsWith(prefix) && file.slice(file.lastIndexOf('/') + 1).includes(nameContains)).sort();
-    const existing = [];
-    try {
-        for (let start = 0; start < candidates.length; start += 100)
-            existing.push(...(await drive.read({ ...(at ? { at } : {}), paths: candidates.slice(start, start + 100) })).map(file => file.path));
-    } catch (error) { return { ...record, checked: false, reason: 'read_failed', code: fileToolError(error).error.code }; }
-    const listed = new Set(event.result.files.map(file => file.path));
-    return { ...record, checked: true, existing: existing.length, listed: listed.size, missed: existing.filter(file => !listed.has(file)) };
+export function listChecker(drive, known) {
+    const open = [];
+    const base = traversal => ({ turn: traversal.first.turn, round: traversal.first.round, pages: traversal.pages, delivered: traversal.delivered });
+    async function judge(traversal) {
+        const { prefix = '', nameContains = '', delimiter } = traversal.first.args;
+        if (delimiter !== undefined) return { ...base(traversal), checked: false, reason: 'delimiter' };
+        if (traversal.writeDuring) return { ...base(traversal), checked: false, reason: 'write_during' };
+        let files;
+        try { files = await readFiles(drive, new Set([...known, ...traversal.files.keys()])); }
+        catch (error) { return { ...base(traversal), checked: false, reason: 'read_failed', code: fileToolError(error).error.code }; }
+        const selected = file => file.path.startsWith(prefix) && file.path.slice(file.path.lastIndexOf('/') + 1).includes(nameContains);
+        const expected = [...files.values()].filter(file => file && selected(file));
+        const current = new Map([...files].filter(([, file]) => file && selected(file)));
+        return { ...base(traversal), checked: true, expected: expected.length, listed: traversal.files.size,
+            missed: expected.filter(file => !traversal.files.has(file.fileId)).map(file => file.path).sort(),
+            stale: staleEntries(traversal.files, current) };
+    }
+    return {
+        /** Feed every recorded tool event in order; returns the checks it completed. */
+        async onEvent(event) {
+            if (event.name === 'write' && event.ok) for (const traversal of open) traversal.writeDuring = true;
+            if (event.name !== 'list' || !event.ok) return [];
+            let traversal;
+            if (event.args.cursor === undefined) open.push(traversal = { first: event, pages: 0, delivered: true, files: new Map(), writeDuring: false });
+            else {
+                traversal = open.find(item => item.next === event.args.cursor);
+                if (!traversal) return [{ turn: event.turn, round: event.round, pages: 1, delivered: event.delivered, checked: false, reason: 'unknown_cursor' }];
+            }
+            traversal.pages++;
+            traversal.delivered &&= event.delivered;
+            for (const file of event.result.files) traversal.files.set(file.fileId, file);
+            traversal.next = event.result.next?.cursor;
+            if (traversal.next !== undefined) return [];
+            open.splice(open.indexOf(traversal), 1);
+            return [await judge(traversal)];
+        },
+        /** Traversals still open when the session ends. */
+        finish() {
+            return open.splice(0).map(traversal => ({ ...base(traversal), checked: false, reason: 'unfinished' }));
+        },
+    };
 }
 
 /** Durations from the injected clock, kept apart from the deterministic metrics. */
-function sessionTiming(wallMs, requests, events) {
+function sessionTiming(wallMs, userTurns, requests, events) {
     const toolMsByName = {};
     for (const event of events) toolMsByName[event.name] = (toolMsByName[event.name] ?? 0) + event.elapsedMs;
-    return { wallMs, modelRequestMs: requests.reduce((sum, receipt) => sum + (receipt.elapsedMs ?? 0), 0),
-        toolMs: events.reduce((sum, event) => sum + event.elapsedMs, 0), toolMsByName: sorted(toolMsByName) };
+    const total = items => items.reduce((sum, item) => sum + (item.elapsedMs ?? 0), 0);
+    return { wallMs, modelRequestMs: total(requests), toolMs: total(events), toolMsByName: sorted(toolMsByName),
+        // Per utterance: model request time and tool-call time. Wall time per utterance is not recorded.
+        perTurn: Array.from({ length: userTurns }, (_, turn) => ({ modelRequestMs: total(requests.filter(receipt => receipt.turn === turn)),
+            toolMs: total(events.filter(event => event.turn === turn)) })) };
 }
 
 const backendLimitations = {
@@ -93,6 +156,7 @@ export function summarize(manifest, results, cleanup) {
     const completed = results.filter(result => result.status === 'completed').length;
     return { protocol, mode: manifest.mode, transport: manifest.transport, backend: manifest.backend, model: manifest.model,
         conversationId: manifest.source.conversationId, instructions: { source: manifest.instructions.source, sha256: manifest.instructions.sha256 },
+        guide: manifest.guide, tools: manifest.tools,
         planned: manifest.plan.length, attempted: results.length, completed, failed: results.length - completed,
         complete: completed === manifest.plan.length, cleanup, store: manifest.store,
         // Scripted and injected transports exercise the harness; they are not model measurements.
@@ -106,11 +170,17 @@ export function summarize(manifest, results, cleanup) {
             'One model conversation per session and one conversation per run; a failed session ends the run without resume.'] };
 }
 
+/**
+ * Replay one conversation. `guide: 'off'` leaves the `guide` tool out of the catalog;
+ * the instruction text stays the SDK's, which asks for the guide only when it is available.
+ * Every `write` call is a checkpointed write named by `checkpointName`.
+ */
 export async function runReplay({ manifest: manifestFile, conversation, output, mode = 'model', model = 'gpt-6.1-sol', instructions = 'sdk',
-    policyFile, sessions: sessionLimit, turns: turnLimit, key, askFactory, budget = limits, sessionTokens, sessionSeconds, contextTokens,
+    policyFile, guide = 'on', sessions: sessionLimit, turns: turnLimit, key, askFactory, budget = limits, sessionTokens, sessionSeconds, contextTokens,
     backend = 'fixture', env = {}, connect = lambdadbConnection, clock = () => performance.now() }) {
     assert(['model', 'scripted'].includes(mode), 'Invalid mode');
     assert(Object.hasOwn(backends, backend), 'Use --backend fixture or lambdadb');
+    const tools = withGuide(toolNames, guide);
     assert(positive(sessionTokens) && positive(sessionSeconds) && positive(contextTokens),
         'session-tokens, session-seconds and context-tokens must be positive integers');
     budget = { ...budget, ...(sessionTokens === undefined ? {} : { sessionTokens }), ...(sessionSeconds === undefined ? {} : { sessionSeconds }),
@@ -129,10 +199,10 @@ export async function runReplay({ manifest: manifestFile, conversation, output, 
         date: dateOf(session.timestamp), markersStripped: session.markersStripped,
         userTurns: session.turns.length, plannedTurns: Math.min(turnLimit ?? session.turns.length, session.turns.length) }));
     // Validate credentials before creating an artifact directory or any SDK state.
-    const transport = askFactory ? askFactory(plan) : mode === 'scripted' ? scriptedTransport(plan.map(entry => entry.plannedTurns)) : openAI({ key });
+    const transport = askFactory ? askFactory(plan) : mode === 'scripted' ? scriptedTransport() : openAI({ key });
     const connection = backend === 'lambdadb' ? connect(env) : null;
     const name = newStoreName(), labels = storeLabels(randomUUID());
-    const definitions = toolDefinitions();
+    const definitions = toolDefinitions(tools);
     const sources = { ...Object.fromEntries(await Promise.all(['replay.mjs', 'replay-agent.mjs', 'replay-metrics.mjs', 'replay-sessions.mjs', 'replay-store.mjs', 'original-config.json']
         .map(async name => [`benchmark/beam/${name}`, hash(await readFile(path.join(root, 'benchmark/beam', name)))]))),
     ...await fingerprint(path.join(root, 'dist/esm'), root),
@@ -148,14 +218,17 @@ export async function runReplay({ manifest: manifestFile, conversation, output, 
         // Each session also gets its batch date as a separate developer message, and utterances lose their trailing generation marker.
         context: { currentDate: 'session-date', trailingMarkers: 'stripped' },
         request: { reasoning: { effort: 'low' }, store: false, include: ['reasoning.encrypted_content'], parallel_tool_calls: false },
-        tools: toolNames, toolDefinitions: definitions, toolDefinitionsSha256: hash(JSON.stringify(definitions)), plan };
+        // The host makes every write tool call a checkpointed write on main.
+        writes: { checkpointed: true, checkpointNames: 'turn-<base-36 milliseconds>-<8 hex>' },
+        guide, tools, toolDefinitions: definitions, toolDefinitionsSha256: hash(JSON.stringify(definitions)), plan };
     output = path.resolve(output);
     await mkdir(path.dirname(output), { recursive: true });
     await mkdir(output); // Existing runs cannot be overwritten or replayed as fresh measurements.
     await writeFile(path.join(output, 'manifest.json'), json(manifest), privateFile);
 
     const fixture = connection ? null : fileClient(), client = connection?.client ?? fixture.client;
-    const results = [], written = new Set();
+    // Every file the run is known to have written, pruned to the inventory after each session.
+    const results = [], known = new Set();
     let cleanup = 'not_started';
     try {
         // A live create can succeed even when its response is lost: record ownership first.
@@ -163,25 +236,22 @@ export async function runReplay({ manifest: manifestFile, conversation, output, 
         if (ledger) await writeLedger(output, ledger, { create: true });
         const drive = await MemDrive.create({ client, name, labels });
         if (ledger) await writeLedger(output, { ...ledger, status: 'ready' });
-        const call = createToolHost({ drive, resultBytes: budget.resultBytes });
+        const call = createToolHost({ drive, resultBytes: budget.resultBytes, tools, checkpoint: checkpointName });
         for (const entry of plan) {
             const directory = path.join(output, `session-${String(entry.index + 1).padStart(3, '0')}-${entry.id}`);
             await mkdir(directory);
             const append = file => value => appendFile(path.join(directory, file), JSON.stringify(value) + '\n', privateFile);
             const state = { input: [], requests: [], events: [], userTurns: 0 }, listChecks = [];
             const result = { ...entry, status: 'failed' };
-            const before = (await drive.status()).mainVersion;
+            const latestCheckpointBefore = (await drive.describe()).latestCheckpoint?.at.name ?? null;
             const logEvent = append('events.jsonl'), logCheck = append('list-checks.jsonl');
+            const checker = listChecker(drive, known);
+            const check = async records => { for (const record of records) { listChecks.push(record); await logCheck(record); } };
             // Runs before the next model call, so the harness sees the state the model listed.
             const event = async recorded => {
                 await logEvent(recorded);
-                if (!recorded.ok) return;
-                if (recorded.name === 'write') for (const file of [recorded.result].flat()) if (typeof file?.path === 'string') written.add(file.path);
-                if (recorded.name === 'list') {
-                    const check = await checkList(drive, recorded, written);
-                    listChecks.push(check);
-                    await logCheck(check);
-                }
+                if (recorded.name === 'write') for (const fileId of writtenFileIds(recorded)) known.add(fileId);
+                await check(await checker.onEvent(recorded));
             };
             const started = clock();
             try {
@@ -194,9 +264,14 @@ export async function runReplay({ manifest: manifestFile, conversation, output, 
                     message: 'Inspect the request receipts and tool events; no automatic retry was attempted.' };
             }
             const wallMs = clock() - started;
-            const observation = await observe(drive, before);
+            await check(checker.finish());
+            const observation = await observe(drive, { latestCheckpointBefore, known });
+            if (observation.inventory) {
+                known.clear();
+                for (const file of observation.inventory) known.add(file.fileId);
+            }
             result.metrics = sessionMetrics({ userTurns: state.userTurns, requests: state.requests, events: state.events, observation, listChecks });
-            result.timing = sessionTiming(wallMs, state.requests, state.events);
+            result.timing = sessionTiming(wallMs, state.userTurns, state.requests, state.events);
             await writeFile(path.join(directory, 'observation.json'), json(observation), privateFile);
             await writeFile(path.join(directory, 'result.json'), json(result), privateFile);
             results.push(result);
@@ -230,13 +305,13 @@ export function describeFailure(error) {
 
 const help = `Replay one prepared original-BEAM conversation against the MemDrive file tools.
   --manifest FILE --conversation ID --output NEW_DIR
-  [--mode model|scripted] [--model ID] [--instructions sdk|none] [--policy-file FILE]
+  [--mode model|scripted] [--model ID] [--instructions sdk|none] [--policy-file FILE] [--guide on|off]
   [--sessions COUNT] [--turns COUNT] [--session-tokens N] [--session-seconds N] [--context-tokens N]
   [--backend fixture|lambdadb] [--env-file FILE]
 Ask and judge the BEAM questions against the store a LambdaDB run retained:
   --questions --run RUN_DIR --manifest FILE --output NEW_DIR [--scope replayed|all]
   [--model ID] [--judge-model ID] [--judge-effort low|medium|high] [--limit N]
-  [--answer-policy-file FILE] [--env-file FILE]
+  [--answer-policy-file FILE] [--guide on|off] [--env-file FILE]
 Delete the LambdaDB store a run retained:
   --cleanup --output RUN_DIR [--env-file FILE]
 Model mode needs LLM_API_KEY and makes paid requests. Scripted mode makes none.
@@ -252,7 +327,7 @@ Rejudge needs only LLM_API_KEY and makes paid judge requests.
 
 async function main() {
     const { values } = parseArgs({ options: Object.fromEntries([
-        ...['manifest', 'conversation', 'output', 'mode', 'model', 'instructions', 'policy-file', 'sessions', 'turns', 'env-file',
+        ...['manifest', 'conversation', 'output', 'mode', 'model', 'instructions', 'policy-file', 'guide', 'sessions', 'turns', 'env-file',
             'backend', 'session-tokens', 'session-seconds', 'context-tokens', 'run', 'scope', 'judge-model', 'judge-effort', 'limit', 'answer-policy-file', 'answers', 'repeats'].map(option => [option, { type: 'string' }]),
         ['help', { type: 'boolean' }], ['cleanup', { type: 'boolean' }], ['questions', { type: 'boolean' }], ['rejudge', { type: 'boolean' }],
     ]) });
@@ -265,13 +340,13 @@ async function main() {
         return;
     }
     const count = value => value === undefined ? undefined : Number(value);
-    const questionOptions = ['questions', 'run', 'manifest', 'output', 'scope', 'model', 'judge-model', 'judge-effort', 'limit', 'answer-policy-file', 'env-file'];
+    const questionOptions = ['questions', 'run', 'manifest', 'output', 'scope', 'model', 'judge-model', 'judge-effort', 'limit', 'answer-policy-file', 'guide', 'env-file'];
     if (values.questions) {
         assert(values.run && values.manifest && values.output && Object.keys(values).every(option => questionOptions.includes(option)),
-            'Questions take --run RUN_DIR --manifest FILE --output NEW_DIR and optionally --scope, --model, --judge-model, --judge-effort, --limit, --answer-policy-file and --env-file');
+            'Questions take --run RUN_DIR --manifest FILE --output NEW_DIR and optionally --scope, --model, --judge-model, --judge-effort, --limit, --answer-policy-file, --guide and --env-file');
         const { summary } = await runQuestions({ run: values.run, manifest: values.manifest, output: values.output, scope: values.scope,
             model: values.model, judgeModel: values['judge-model'], judgeEffort: values['judge-effort'], limit: count(values.limit),
-            answerPolicyFile: values['answer-policy-file'], env, key: env.LLM_API_KEY });
+            answerPolicyFile: values['answer-policy-file'], guide: values.guide, env, key: env.LLM_API_KEY });
         console.log(json(summary));
         if (!questionsSucceeded(summary)) process.exitCode = 1;
         return;
@@ -288,7 +363,7 @@ async function main() {
     }
     assert(values.manifest && values.conversation && values.output && !['run', 'scope', 'judge-model', 'judge-effort', 'limit', 'answer-policy-file', 'answers', 'repeats'].some(option => option in values), help);
     const { summary } = await runReplay({ manifest: values.manifest, conversation: values.conversation, output: values.output,
-        mode: values.mode, model: values.model, instructions: values.instructions, policyFile: values['policy-file'],
+        mode: values.mode, model: values.model, instructions: values.instructions, policyFile: values['policy-file'], guide: values.guide,
         sessions: count(values.sessions), turns: count(values.turns), sessionTokens: count(values['session-tokens']),
         sessionSeconds: count(values['session-seconds']), contextTokens: count(values['context-tokens']), backend: values.backend, env,
         key: env.LLM_API_KEY });

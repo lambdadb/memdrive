@@ -1,5 +1,6 @@
 // Store lifecycle for the session replay's live LambdaDB backend: connection,
-// the ownership ledger written before create, and explicit, verified cleanup.
+// the ownership ledger written before create, and explicit, verified cleanup;
+// and the harness's read-only inventory reads of main.
 // Never records credentials, headers or response bodies.
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
@@ -7,7 +8,10 @@ import { readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { HTTPClient, LambdaDBClient, MemDrive } from '@functional-systems/memdrive';
 
-export const storeProtocol = 'memdrive-beam-session-replay-store-v1';
+// v2 stores use the SDK's single-collection `files-v1` layout. A v1 ledger names a
+// `files-v0` store with a publication journal, which this SDK can neither open nor destroy.
+export const storeProtocol = 'memdrive-beam-session-replay-store-v2';
+const earlierStoreProtocol = 'memdrive-beam-session-replay-store-v1';
 export const ledgerFile = 'store.json';
 const storeName = /^beam-replay-[0-9a-f]{32}$/;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -52,6 +56,8 @@ export async function writeLedger(directory, ledger, { create = false } = {}) {
 /** Read one run's ledger and check its format, endpoint, project and ownership receipt. */
 export async function readLedger(directory, { endpoint, project }) {
     const ledger = JSON.parse(await readFile(path.join(directory, ledgerFile), 'utf8'));
+    assert(ledger.protocol !== earlierStoreProtocol, 'This ledger is from an earlier replay protocol whose store this SDK cannot open or destroy; '
+        + 'delete its collection and md-journal-* collection with LambdaDB directly');
     assert.equal(ledger.protocol, storeProtocol, 'Unexpected replay store ledger format');
     assert(ledger.endpoint === endpoint && ledger.project === project, 'Ledger belongs to another endpoint/project');
     assert(storeName.test(ledger.name) && uuid.test(ledger.labels?.['beam.owner'] ?? '')
@@ -68,8 +74,8 @@ export function assertOwner(collection, ledger) {
 
 /**
  * Delete the store recorded in one run's ledger, and nothing else. Requires the same
- * endpoint and project, checks the name and ownership labels, destroys the store with
- * its owned journal, confirms absence and marks the ledger cleaned. Idempotent.
+ * endpoint and project, checks the name and ownership labels, destroys the store's
+ * single collection, confirms absence and marks the ledger cleaned. Idempotent.
  */
 export async function cleanupStore({ output, client, endpoint, project }) {
     const directory = path.resolve(output);
@@ -97,4 +103,23 @@ export async function cleanupStore({ output, client, endpoint, project }) {
     }
     await writeLedger(directory, { ...ledger, status: 'cleaned' });
     return { status: 'cleaned', name: ledger.name };
+}
+
+/** Consistent reads of main by file ID: each file as it is now, or null when it is gone. */
+export async function readFiles(drive, fileIds) {
+    const files = new Map();
+    for (const fileId of fileIds) {
+        const file = await drive.read({ fileId });
+        files.set(fileId, file && { fileId, path: file.path, modifiedAt: file.modifiedAt, chars: file.content.length });
+    }
+    return files;
+}
+
+/** Every page of a recursive listing of main, deduplicated by file ID. The listing is eventual. */
+export async function listAll(drive) {
+    const files = new Map();
+    for (let page = await drive.list({ limit: 1000 }); ; page = await drive.list(page.next)) {
+        for (const file of page.files) files.set(file.fileId, file);
+        if (!page.next) return files;
+    }
 }

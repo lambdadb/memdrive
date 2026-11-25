@@ -1,15 +1,29 @@
 // One replayed session: user utterances are sent in order to a Responses model
-// that has the fixed MemDrive file-tool catalog. The model sees only what an MCP
+// that has the MemDrive file-tool catalog. The model sees only what an MCP
 // deployment could deliver: the utterances, the SDK tool definitions and results,
 // and optional server instructions. Nothing else is injected.
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { get_encoding } from 'tiktoken';
 import { createFileTools, fileToolError, getFileToolDefinitions } from '@functional-systems/memdrive';
 
-export const protocol = 'memdrive-beam-session-replay-v1';
-export const toolNames = Object.freeze(['guide', 'status', 'history', 'list', 'read', 'search', 'findText', 'fork', 'checkpoint',
-    'listForks', 'listCheckpoints', 'deleteFork', 'deleteCheckpoint', 'diff', 'write', 'merge']);
+// v2: the six main-only tools with host-checkpointed writes. v1 used 16 tools with
+// an `at` view selector and published forks with merge; its runs are not comparable.
+export const protocol = 'memdrive-beam-session-replay-v2';
+/** The SDK's whole agent catalog, in its documented order. `--guide off` leaves out `guide`. */
+export const toolNames = Object.freeze(['guide', 'read', 'list', 'search', 'findText', 'write']);
+export const guideSettings = Object.freeze(['on', 'off']);
+/** The tools offered with a guide setting, from a full allowlist. */
+export const withGuide = (tools, guide) => {
+    assert(guideSettings.includes(guide), 'Use --guide on or off');
+    return Object.freeze(guide === 'on' ? [...tools] : tools.filter(name => name !== 'guide'));
+};
+/**
+ * Checkpoint names for the host hook, as the SDK README advises: a time and a random
+ * suffix, so they stay unique across sessions and across any later run on the same store.
+ */
+export const checkpointName = () => ({ name: `turn-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}` });
 // Host budgets, not model limits. The token estimator is cl100k_base.
 export const limits = Object.freeze({ roundsPerTurn: 16, toolCallsPerTurn: 40, contextTokens: 120000, sessionTokens: 4000000,
     outputTokens: 8192, resultBytes: 64000, requestSeconds: 180, sessionSeconds: 3600 });
@@ -41,23 +55,29 @@ function requireReplay(condition, code) {
     if (!condition) throw new ReplayFailure(code);
 }
 
-/** The fixed catalog advertised for the whole run, unchanged from the SDK. */
-export const toolDefinitions = () => getFileToolDefinitions({ embeddingMode: 'managed', tools: toolNames });
+/** The catalog advertised for the whole run, unchanged from the SDK. */
+export const toolDefinitions = (tools = toolNames) => getFileToolDefinitions({ embeddingMode: 'managed', tools });
 
 /**
- * Execute model tool calls against one drive. Every view of the store is authorized,
- * as for a personal drive. The model receives the SDK result unchanged, the SDK's
- * normalized error, or an explicit delivery-limit error; never a truncated result.
- * `tools` is the SDK allowlist; a call outside it gets the SDK's `TOOL_NOT_ALLOWED`.
+ * Execute model tool calls against main of one drive. The model receives the SDK
+ * result unchanged, the SDK's normalized error, or an explicit delivery-limit error;
+ * never a truncated result. `tools` is the SDK allowlist; a call outside it gets the
+ * SDK's `TOOL_NOT_ALLOWED`. With `checkpoint`, every `write` call is a checkpointed
+ * write; the event records the name the hook gave it, which the model never sees.
  */
-export function createToolHost({ drive, resultBytes = limits.resultBytes, tools: allowed = toolNames }) {
-    const tools = createFileTools({ drive, tools: allowed });
+export function createToolHost({ drive, resultBytes = limits.resultBytes, tools: allowed = toolNames, checkpoint }) {
+    let named;
+    const tools = createFileTools({ drive, tools: allowed,
+        ...(checkpoint ? { checkpoint: () => (named = checkpoint().name, { name: named }) } : {}) });
     return async function call(name, rawArguments, { signal } = {}) {
         let event;
         try {
             const args = JSON.parse(rawArguments);
+            named = undefined;
             try { event = { name, args, ok: true, result: await tools.execute(name, structuredClone(args), { signal }) }; }
             catch (error) { event = { name, args, ok: false, error: fileToolError(error).error }; }
+            // The hook runs once per write call that reaches the SDK; its tag exists only after a success.
+            if (named !== undefined) event.checkpoint = named;
         } catch (error) {
             if (!(error instanceof SyntaxError)) throw error;
             event = { name, rawArguments, ok: false, error: { code: 'INVALID_JSON', message: 'Tool arguments must be valid JSON.' } };
@@ -184,52 +204,37 @@ export function openAI({ key, fetcher = fetch, endpoint = 'responses' }) {
 
 /**
  * Deterministic transport and metrics smoke only; never evidence of model behavior.
- * `plan[i]` is the number of utterances replayed in session i. Session 0 lists its
- * fork after a write, publishes a note and republishes it from the same fork,
- * session 1 meets a fork-name conflict and leaves an unpublished draft, session 3
- * publishes later and deletes its fork.
- * Every other session only replies.
+ * Session 0 reads the guide, searches, creates a note and lists main in its first
+ * turn; in its second, when it has one, it reads the note, edits it exactly and tries
+ * to create it again (`PATH_EXISTS`, which changes nothing). Session 1 creates a file
+ * without looking first, finds the note literally and deletes it. Every other turn only replies. A step whose tool the run
+ * does not offer (`guide` with `--guide off`) is skipped.
  */
-export function scriptedTransport(plan) {
-    const fork = name => ({ kind: 'fork', name });
+export function scriptedTransport() {
+    const note = '/notes/scripted.md';
     const steps = (session, turn) => {
-        const first = turn === 0, last = turn === plan[session] - 1, list = [];
+        const list = [];
         const add = (name, args) => list.push({ name, args });
-        if (session === 0) {
-            const at = fork('notes');
-            if (first) {
-                add('fork', { name: 'notes' });
-                add('write', { at, op: 'create', path: '/notes.md', content: 'Scripted note.\n' });
-                add('list', { at });
-                add('diff', { at });
-                add('merge', { at, requestId: 'scripted-notes-1', summary: 'Add the scripted note' });
-            }
-            if (last) {
-                add('read', { at, path: '/notes.md' });
-                add('write', previous => ({ at, op: 'update', fileId: previous.fileId, content: 'Scripted note, revised.\n' }));
-                add('diff', { at });
-                add('merge', { at, requestId: 'scripted-notes-2', summary: 'Revise the scripted note' });
-            }
-        } else if (session === 1 && first) {
-            add('fork', { name: 'notes' });
-            add('fork', { name: 'notes-2' });
-            add('write', { at: fork('notes-2'), op: 'create', path: '/draft.md', content: 'Scripted draft.\n' });
-        } else if (session === 3) {
-            const at = fork('cleanup');
-            if (first) {
-                add('fork', { name: 'cleanup' });
-                add('write', { at, op: 'create', path: '/cleanup.md', content: 'Scripted cleanup note.\n' });
-            }
-            if (last) {
-                add('diff', { at });
-                add('merge', { at, requestId: 'scripted-cleanup', summary: 'Add the scripted cleanup note' });
-                add('deleteFork', { at });
-            }
+        if (session === 0 && turn === 0) {
+            add('guide', {});
+            add('guide', { topic: 'editing' });
+            add('search', { query: 'scripted note', mode: 'keyword' });
+            add('write', { op: 'create', path: note, content: 'Scripted note.\n' });
+            add('list', {});
+        } else if (session === 0 && turn === 1) {
+            add('read', { path: note });
+            add('write', previous => ({ op: 'update', fileId: previous.fileId, edits: [{ oldText: 'Scripted note.', newText: 'Scripted note, revised.' }] }));
+            add('write', { op: 'create', path: note, content: 'A second note at the same path.\n' });
+        } else if (session === 1 && turn === 0) {
+            add('write', { op: 'create', path: '/notes/unsearched.md', content: 'Saved without looking first.\n' });
+            add('findText', { query: 'revised', prefix: '/notes/' });
+            add('write', previous => ({ op: 'delete', fileId: previous.hits[0].fileId }));
         }
         return list;
     };
     return async (request, { session, turn, round }) => {
-        const step = steps(session, turn)[round];
+        const offered = new Set(request.tools.map(tool => tool.name));
+        const step = steps(session, turn).filter(item => offered.has(item.name))[round];
         const prior = request.input.filter(item => item.type === 'function_call_output').at(-1);
         const output = step
             ? [{ type: 'function_call', call_id: `scripted-${session}-${turn}-${round}`, name: step.name,

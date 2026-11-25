@@ -1,7 +1,7 @@
 // Ask a finished replay's BEAM probing questions against the LambdaDB store it kept, and
 // judge each answer with upstream BEAM's per-rubric-item prompt. This stage is the only
 // reader of the evaluation annotations. It offers the model read tools only, and the
-// harness itself only reads: nothing writes, merges, forks or deletes in the store.
+// harness itself only reads: nothing writes or deletes in the store.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { appendFile, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
@@ -9,13 +9,17 @@ import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { MemDrive, fileToolInstructions, getFileToolDefinitions } from '@functional-systems/memdrive';
-import { createToolHost, failureCodes, limits, openAI, protocol as replayProtocol, ReplayFailure, runSession } from './replay-agent.mjs';
+import { createToolHost, failureCodes, limits, openAI, protocol as replayProtocol, ReplayFailure, runSession, withGuide } from './replay-agent.mjs';
 import { fingerprint, groupSessions, hash } from './replay-sessions.mjs';
-import { assertOwner, lambdadbConnection, ledgerFile, readLedger } from './replay-store.mjs';
+import { assertOwner, lambdadbConnection, ledgerFile, listAll, readFiles, readLedger } from './replay-store.mjs';
 
-export const questionsProtocol = 'memdrive-beam-replay-questions-v1';
+// v2 asks with the SDK's read-only main tools; v1 offered 9 tools with an `at` view selector.
+export const questionsProtocol = 'memdrive-beam-replay-questions-v2';
+// Rejudging reads only stored answers and judgments, whose format both versions share.
+const judgeableProtocols = ['memdrive-beam-replay-questions-v1', questionsProtocol];
 export const rejudgeProtocol = 'memdrive-beam-replay-rejudge-v1';
-export const readToolNames = Object.freeze(['guide', 'status', 'history', 'list', 'read', 'search', 'findText', 'listForks', 'listCheckpoints']);
+/** The read-only catalog; `--guide off` leaves out `guide`. */
+export const readToolNames = Object.freeze(['guide', 'read', 'list', 'search', 'findText']);
 export const defaultJudgeModel = 'gpt-4.1-mini-2025-04-14';
 // `unresolved` questions cite a message ID the conversation lacks and are never asked.
 const scopes = { replayed: ['user_replayed', 'no_sources'], all: ['user_replayed', 'no_sources', 'needs_assistant', 'not_replayed'] };
@@ -192,8 +196,16 @@ function answerMetrics({ requests, events }) {
 const finalText = response => response.output.filter(item => item.type === 'message' && item.role === 'assistant')
     .flatMap(item => item.content.map(part => part.text)).join('\n\n');
 
-const refState = async drive => ({ mainVersion: (await drive.status()).mainVersion,
-    forks: (await drive.listForks()).forks.map(fork => fork.at.name), checkpoints: (await drive.listCheckpoints()).checkpoints.map(ref => ref.at.name) });
+/**
+ * Main's latest checkpoint and its files, read by file ID as the replay's observation does:
+ * the listed files and the run's final inventory (`known`), so a listing that still lags
+ * behind the run's last writes cannot make the store look changed.
+ */
+async function storeState(drive, known) {
+    const files = await readFiles(drive, new Set([...known, ...(await listAll(drive)).keys()]));
+    return { latestCheckpoint: (await drive.describe()).latestCheckpoint?.at.name ?? null,
+        files: [...files.values()].filter(Boolean).sort((a, b) => a.fileId < b.fileId ? -1 : 1) };
+}
 
 export function summarizeQuestions(manifest, results, store = null) {
     const judgeItems = results.flatMap(result => result.judge?.items ?? []);
@@ -201,7 +213,7 @@ export function summarizeQuestions(manifest, results, store = null) {
     const measured = manifest.transport === 'openai-responses' && manifest.judgeTransport === 'openai-chat-completions';
     return { protocol: questionsProtocol, transport: manifest.transport, judgeTransport: manifest.judgeTransport, measured,
         conversationId: manifest.source.conversationId, run: manifest.run.directory, scope: manifest.scope, limit: manifest.limit,
-        model: manifest.model, judgeModel: manifest.judgeModel,
+        model: manifest.model, judgeModel: manifest.judgeModel, guide: manifest.guide,
         questions: { ...classCounts(manifest.classification), selected: manifest.selected.length, asked: results.length,
             complete: results.length === manifest.selected.length },
         scores: scoreSummary(results),
@@ -221,6 +233,7 @@ export function summarizeQuestions(manifest, results, store = null) {
             'event_ordering reports only the rubric judge score; upstream\'s headline event-ordering metric (Kendall tau-b times F1 after an LLM alignment) is not computed.',
             'The answering model has the run\'s instructions, read-only file tools and its own general knowledge; nothing restricts its answer to the drive.',
             ...(manifest.instructions.sameAsRun ? [] : ['The answers used a policy text that differs from the one the run saved with; a deployment has one text for both.']),
+            ...(manifest.guide === manifest.run.guide ? [] : [`The answers were asked with the guide tool ${manifest.guide} while the run saved with it ${manifest.run.guide}.`]),
             'needs_assistant and not_replayed questions cite messages the replay never sent; scores are reported per class and must not be pooled across classes.',
             ...(measured ? [] : ['Injected test transports exercise the harness; they are not model or judge measurements.'])] };
 }
@@ -231,12 +244,13 @@ export function summarizeQuestions(manifest, results, store = null) {
  * rubric item of each answered question. Everything is validated before `output` exists.
  */
 export async function runQuestions({ run, manifest: manifestFile, output, scope = 'replayed', model, judgeModel = defaultJudgeModel, judgeEffort, limit, answerPolicyFile,
-    key, env = {}, connect = lambdadbConnection, ask, judge, budget = limits, clock = () => performance.now() }) {
+    guide = 'on', key, env = {}, connect = lambdadbConnection, ask, judge, budget = limits, clock = () => performance.now() }) {
     assert(typeof run === 'string' && run && typeof manifestFile === 'string' && manifestFile, 'Provide --run RUN_DIR and --manifest FILE');
     assert(typeof output === 'string' && output, 'Provide a new output directory');
     selectQuestions([], scope, limit);
     for (const value of [model, judgeModel]) assert(value === undefined || (typeof value === 'string' && value.length > 0 && value.length <= 100), 'Invalid model');
     assert(validEffort(judgeEffort), 'Use --judge-effort low, medium or high');
+    const tools = withGuide(readToolNames, guide);
     // Credentials first: no run, store or output is touched without them.
     const answerTransport = ask ?? openAI({ key }), judgeTransport = judge ?? openAI({ key, endpoint: 'chat/completions' });
     const connection = connect(env);
@@ -244,7 +258,9 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
     const runDirectory = path.resolve(run);
     const runManifestBytes = await readFile(path.join(runDirectory, 'manifest.json'));
     const runManifest = JSON.parse(runManifestBytes);
-    assert.equal(runManifest.protocol, replayProtocol, 'Use a BEAM session replay run');
+    assert(typeof runManifest.protocol === 'string' && runManifest.protocol.startsWith('memdrive-beam-session-replay-'), 'Use a BEAM session replay run');
+    assert.equal(runManifest.protocol, replayProtocol, `The run used ${runManifest.protocol}; the question stage reads only ${replayProtocol} runs, `
+        + 'whose store layout and tools it knows');
     assert(runManifest.backend === 'lambdadb' && runManifest.store?.ledger === ledgerFile, 'Use a LambdaDB replay run; a fixture run keeps no store');
     const runSummary = await readJSON(path.join(runDirectory, 'summary.json'));
     assert(runSummary.protocol === replayProtocol && runSummary.cleanup === 'retained' && runSummary.store?.name === runManifest.store.name,
@@ -285,15 +301,19 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
     const completed = runManifest.plan.filter(planned => runSummary.sessions.find(session => session.id === planned.id)?.status === 'completed');
     const date = runManifest.context?.currentDate === 'session-date' ? completed.at(-1)?.date ?? null : null;
     const selected = selectQuestions(classification, scope, limit);
+    // The files the run's last session observed; none when that observation failed.
+    const last = runSummary.sessions.at(-1);
+    const observed = last && await readJSON(path.join(runDirectory, `session-${String(last.index + 1).padStart(3, '0')}-${last.id}`, 'observation.json'));
+    const known = new Set((observed?.inventory ?? []).map(file => file.fileId));
 
-    // Read-only from here: open never recovers, and the model gets read tools only.
+    // Read-only from here: open only reads the configuration, and the model gets read tools only.
     const { client } = connection;
     const { collection } = await client.collection(ledger.name).get();
     assert.equal(collection.collectionName, ledger.name, 'Unexpected replay store name');
     assertOwner(collection, ledger);
     const drive = await MemDrive.open({ client, name: ledger.name });
 
-    const definitions = getFileToolDefinitions({ embeddingMode: 'managed', tools: readToolNames });
+    const definitions = getFileToolDefinitions({ embeddingMode: 'managed', tools });
     const judgeSha256 = hash(judgePrompt);
     const manifest = { protocol: questionsProtocol, transport: ask ? 'injected-test' : 'openai-responses',
         judgeTransport: judge ? 'injected-test' : 'openai-chat-completions', startedAt: new Date().toISOString(), node: process.version,
@@ -303,7 +323,7 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
             'original-config.json', 'original-judge-prompt.json'].map(async name => [`benchmark/beam/${name}`, hash(await readFile(path.join(root, 'benchmark/beam', name)))]))),
         ...await fingerprint(path.join(root, 'dist/esm'), root), 'package-lock.json': hash(await readFile(path.join(root, 'package-lock.json'))) },
         run: { directory: path.relative(root, runDirectory) || '.', manifestSha256: hash(runManifestBytes), transport: runManifest.transport,
-            model: runManifest.model, complete: runSummary.complete },
+            model: runManifest.model, guide: runManifest.guide, complete: runSummary.complete },
         store: { name: ledger.name },
         source: { split: source.split, conversationId: id, manifestSha256: source.manifestSha256, runtimeSha256: source.runtimeSha256,
             evaluationSha256: entry.evaluationSha256 },
@@ -312,7 +332,7 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
             sameAsRun: answerPolicy === null, ...(answerPolicy === null ? {} : { answerPolicySha256: hash(answerPolicy), text: instructions }) }, currentDate: date,
         request: { reasoning: { effort: 'low' }, store: false, include: ['reasoning.encrypted_content'], parallel_tool_calls: false },
         judgeRequest: { ...judgeSettings(judgeEffort), perRubricItem: true, retries: 0 },
-        tools: readToolNames, toolDefinitions: definitions, toolDefinitionsSha256: hash(JSON.stringify(definitions)),
+        guide, tools, toolDefinitions: definitions, toolDefinitionsSha256: hash(JSON.stringify(definitions)),
         judgePrompt: { file: 'benchmark/beam/original-judge-prompt.json', name: 'unified_llm_judge_base_prompt', sha256: judgeSha256,
             upstreamRevision: judgeSource.upstreamRevision, upstreamFile: judgeSource.upstreamFile, upstreamFileSha256: judgeSource.upstreamFileSha256 },
         classification, selected: selected.map(question => question.id) };
@@ -324,8 +344,8 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
     const results = [];
     const writeSummary = store => writeFile(path.join(output, 'summary.json'), json(summarizeQuestions(manifest, results, store)), privateFile);
     await writeSummary();
-    const before = await refState(drive);
-    const call = createToolHost({ drive, resultBytes: budget.resultBytes, tools: readToolNames });
+    const before = await storeState(drive, known);
+    const call = createToolHost({ drive, resultBytes: budget.resultBytes, tools });
     const texts = new Map(runtime.questions.map(question => [question.id, question.text]));
     const items = new Map(evaluation.map(item => [item.id, item]));
     for (const [ordinal, question] of selected.entries()) {
@@ -366,8 +386,8 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
         results.push(result);
         await writeSummary();
     }
-    // Refs and main version only; the read-only catalog is what keeps file contents unchanged.
-    const after = await refState(drive);
+    // File IDs, paths, modification times and lengths; the read-only catalog is what keeps file contents unchanged.
+    const after = await storeState(drive, known);
     const store = { before, after, unchanged: JSON.stringify(before) === JSON.stringify(after) };
     await writeSummary(store);
     return { manifest, results, summary: summarizeQuestions(manifest, results, store) };
@@ -407,7 +427,7 @@ export async function runRejudge({ answers, manifest: manifestFile, output, judg
     const directory = path.resolve(answers);
     const stageBytes = await readFile(path.join(directory, 'manifest.json'));
     const stage = JSON.parse(stageBytes);
-    assert.equal(stage.protocol, questionsProtocol, 'Use a question-stage output directory');
+    assert(judgeableProtocols.includes(stage.protocol), 'Use a question-stage output directory');
     const source = stage.source, id = source.conversationId;
     const manifestBytes = await readFile(manifestFile);
     assert.equal(hash(manifestBytes), source.manifestSha256, 'Prepared manifest differs from the question stage');

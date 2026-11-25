@@ -151,10 +151,9 @@ could deliver:
   dataset's trailing generation marker (`->-> 1,11`, `->-> 5,14)`,
   `->-> 2,N/A`), which 2,155 of the 2,866 utterances in the 100K split end
   with and which no user said; the plan records how many each session lost;
-- the fixed SDK catalog from `getFileToolDefinitions`: `guide`, `status`,
-  `history`, `list`, `read`, `search`, `findText`, `fork`, `checkpoint`,
-  `listForks`, `listCheckpoints`, `deleteFork`, `deleteCheckpoint`, `diff`,
-  `write` and `merge`, unchanged for the whole run;
+- the SDK's agent catalog from `getFileToolDefinitions`: `guide`, `read`,
+  `list`, `search`, `findText` and `write`, all on main of one drive and
+  unchanged for the whole run. `--guide off` leaves out `guide`;
 - each tool result as the SDK returned it, the SDK's normalized error, or an
   explicit delivery-limit error when a result exceeds 64,000 bytes;
 - optionally one developer message standing in for server instructions;
@@ -167,13 +166,29 @@ could deliver:
 verbatim; `--instructions none` supplies nothing. `--policy-file FILE` appends
 that file's text to the same message after a blank line, or makes it the whole
 message with `none`. The manifest records the exact text and its SHA-256. No
-task, starting view or reminder is added, and nothing is injected during a
-conversation. The date message is separate from the instructions and is sent
-with either setting. Every view of the store is authorized, as for a personal drive.
-The runner never writes, merges or deletes for the model. After each session
-it only reads `status`, `history`, `listForks` and each fork's `diff`, and
-after each successful model `list` call it reads the paths described under
-the `list` check below.
+task, reminder or benchmark annotation is added, and nothing is injected
+during a conversation. The date message is separate from the instructions and
+is sent with either setting.
+
+`--guide on` (default) offers the `guide` tool; `--guide off` leaves it out of
+the allowlist and the definitions, as the `none` guide channel of the
+[tool-use benchmark](../tool-use/README.md) does. The instruction text stays
+the same: `fileToolInstructions` asks for the guide only "when guide is
+available", so it never tells the model to call a tool it lacks. The manifest
+and summary record the setting.
+
+The runner acts as the host. It connects the tools with `createFileTools` and a
+`checkpoint` hook, so every `write` call is a
+[checkpointed write](../../README.md#checkpointed-writes): applied whole and
+recorded as main's latest checkpoint, or undone back to the previous one. The
+hook names each checkpoint `turn-<base-36 milliseconds>-<8 hex>`, as the SDK
+README advises, so names stay unique across sessions and across any later
+run or restart on the same store. The model never sees a name; each `write`
+event in `events.jsonl` records it. There is no switch for this. The runner
+never writes or deletes for the model. Before each session it reads main's
+latest checkpoint with `describe`; when a model `list` traversal ends and
+after each session it reads as described under the `list` check and the
+observation below.
 
 ```sh
 npm ci
@@ -188,6 +203,13 @@ node benchmark/beam/replay.mjs --manifest artifacts/beam-original-100k/manifest.
   --conversation 1 --sessions 2 --turns 5 --env-file /path/to/model.env \
   --output artifacts/beam-replay/pilot-1
 ```
+
+Scripted mode follows a fixed script. Session 1 reads the guide index and the
+`editing` topic, searches, creates a note and lists main in its first turn; in
+its second it reads the note, edits it with an exact edit and tries to create
+it again, which fails with `PATH_EXISTS` and changes nothing. Session 2 creates
+a file without looking first, finds the note with `findText` and deletes it.
+Every other turn only replies. With `--guide off` the guide calls are skipped.
 
 Model mode uses OpenAI Responses with the explicit model ID (`gpt-6.1-sol` by
 default, or `--model`), low reasoning, `store: false`, sequential tool calls
@@ -206,11 +228,10 @@ three-minute request timeout and one hour (`--session-seconds N`). The
 manifest records the budgets used. The estimator is `cl100k_base` over the
 serialized request, not the model's tokenizer: it counts opaque reasoning
 items as text and can exceed the provider's reported input by a wide margin.
-One session stopped at this reservation while its largest reported request
-was 85,000 tokens. The conversation is never shortened, so every tool result
-stays in each later request of the session. These are untuned defaults. A session that fails or exceeds a budget is recorded as
-failed and ends the run on either backend. There is no resume: later sessions
-depend on that drive.
+The conversation is never shortened, so every tool result stays in each later
+request of the session. These are untuned defaults. A session that fails or
+exceeds a budget is recorded as failed and ends the run on either backend.
+There is no resume: later sessions depend on that drive.
 
 ### Backends
 
@@ -218,24 +239,27 @@ depend on that drive.
 native-client fixture used by the unit tests and destroys the store at the
 end. For this runner it differs from LambdaDB in three ways: ranked search
 ignores the query and returns the same candidates with a fixed score for every
-query, `list` is always current, and there is no latency or cost. Reads,
-searches and diffs of a fork use consistent reads on both backends, and main
-and checkpoints read a pinned published version, so the visibility of fresh
-writes to those operations is the same.
+query, `list` is always current, and there is no latency or cost. `read`,
+`search` and `findText` on main use consistent reads on both backends.
 
 `--backend lambdadb` creates the store in a LambdaDB project. Use a dedicated
 test project: the run makes paid requests (managed embeddings on every write,
-searches) on top of any model requests. The LambdaDB deployment must be able
-to create a tag on a branch before its first snapshot commits, as required by
-LambdaDB client `0.14.0` (see the changelog). The environment or an untracked
-`--env-file` must supply `LAMBDADB_BASE_URL` (an HTTPS origin),
-`LAMBDADB_PROJECT_NAME` and `LAMBDADB_PROJECT_API_KEY`; missing or malformed
-settings fail before the run directory exists. Requests are confined to that
-project, have a 30-second deadline and are not retried, and responses that
-need an external download are rejected. The store is created with the same
-settings as on the fixture (default managed embeddings, the default text
-analyzer and chunking), named `beam-replay-<32 hex>`, and labeled with
-`beam.application` and a random `beam.owner`.
+searches) on top of any model requests. The LambdaDB deployment must support
+the versioned reference API of LambdaDB client `0.14.0`, including tags,
+aliases and branch rollback. The environment or an untracked `--env-file`
+must supply `LAMBDADB_BASE_URL` (an HTTPS origin), `LAMBDADB_PROJECT_NAME` and
+`LAMBDADB_PROJECT_API_KEY`; missing or malformed settings fail before the run
+directory exists. Requests are confined to that project, have a 30-second
+deadline and are not retried, and responses that need an external download
+are rejected. The store is created with the same settings as on the fixture
+(default managed embeddings, the default text analyzer and chunking), named
+`beam-replay-<32 hex>`, and labeled with `beam.application` and a random
+`beam.owner`. It is one collection; each checkpointed write adds a tag and
+moves main's `latest-main` alias. LambdaDB can reject a rollback to a
+checkpoint created moments earlier, so a checkpointed write that fails after
+it has changed main within seconds of the previous one can report
+`CHECKPOINT_RESTORE_FAILED` instead of being undone; the SDK README describes
+this.
 
 Before the create request the runner writes `store.json` in the run
 directory with the store name, endpoint origin, project name, labels and
@@ -250,86 +274,121 @@ node benchmark/beam/replay.mjs --cleanup --output artifacts/beam-replay/live-1 \
 ```
 
 Cleanup requires the same endpoint and project as the ledger, checks the
-store's name and ownership labels, destroys it with its publication journal
-through `MemDrive.destroy`, confirms that it is gone and marks the ledger
-`cleaned`. It deletes nothing else, can be repeated, and also handles a
-`pending` ledger whose create outcome is unknown.
+store's name and ownership labels, deletes its collection through
+`MemDrive.destroy`, confirms that it is gone and marks the ledger `cleaned`.
+It deletes nothing else, can be repeated, and also handles a `pending` ledger
+whose create outcome is unknown. A ledger from the earlier protocol
+(`memdrive-beam-session-replay-store-v1`) names a store in the earlier SDK
+layout, which this SDK cannot open or destroy; cleanup refuses it, and such a
+store and its `md-journal-*` collection have to be deleted with LambdaDB
+directly.
+
+### Observation after each session
+
+`list` is eventual on LambdaDB, so the runner does not take its inventory from
+a listing alone. After each session it reads main's latest checkpoint with
+`describe`, lists main to the end (every `next`, deduplicated by file ID),
+and reads by file ID, with consistent reads, every listed file and every file
+the run is known to have written: the files of the previous inventory and the
+file IDs in this session's write results, operations and failure details.
+The inventory is the files those reads return, each with `fileId`, `path`,
+`modifiedAt` and `chars` (UTF-16 length of the original). Only the model
+writes, so this is all of main except a file that a failed write created
+without reporting its ID and that the listing also missed. `observation.json`
+records `latestCheckpointBefore`, `latestCheckpointAfter`, the `inventory`,
+`unlisted` (inventory paths the runner's own listing missed), `stale` (listed
+paths that no longer exist there) and `errors`. A failed read is recorded by
+step and code (`describe`, `list`, `read`) and leaves its value null.
 
 ### Metrics
 
 `summary.json` is rewritten after every session with per-session metrics and
-conversation totals:
+conversation totals. Unless stated otherwise, a total is the sum of the
+per-session values. A turn is one user utterance.
 
-- utterances sent, model requests, reported tokens, tool calls by name and
-  tool errors by code;
-- forks created, fork-name conflicts (`BRANCH_CONFLICT`) and forks deleted;
-- merges that published, replayed, returned unchanged or failed. A merge
-  repeated with a completed request ID returns its original `published`
-  result without publishing again; it counts as replayed, not as a publication;
-- publication lag: for each successful `write` call, the number of utterances
-  until the next `merge` of the same fork that published a new version in
-  that session, or null when there was none. An `unchanged` or replayed
-  merge publishes nothing. A batch write is one call;
-- utterance-to-publication lag: for each utterance, the number of utterances
-  until the next turn in which a merge published, or null when none followed
-  in that session. A model can postpone the write itself instead of holding
-  edits on a fork, which the publication lag above cannot show. `afterLast`
-  counts the utterances after the session's last publication, or all of them
-  in a session without one. Their content cannot have been published in that
-  session. An earlier utterance may have been saved, but nothing here checks
-  what a publication contained;
-- turns with a successful write and turns with a publication;
-- published and republished files: distinct file IDs in the session's
-  publications, and those in two or more of them, from `history()`. An
-  addition to a file counts like a correction of it. A truncated history
-  entry makes both lower bounds;
-- after the last utterance: forks remaining, forks with unpublished changes,
-  the number of those changes, and fully published forks left behind;
-- sessions without a successful write;
-- the `list` check (`listCheck`): successful model `list` calls, those
-  checked, unchecked ones by reason, checked calls that missed at least one
-  existing file and the number of missed files.
+- `userTurns`, `modelRequests`, `inputTokens`, `outputTokens`,
+  `unknownUsageRequests`: utterances sent, model requests, reported tokens and
+  requests without valid usage;
+- `toolCalls`, `toolCallsByName`, `toolErrorsByCode`: every model tool call,
+  including rejected ones, by name and by error code;
+- `toolCallsPerTurn`: mean and maximum number of tool calls per turn, over
+  every turn sent, including turns without a call. The conversation mean is
+  over all its turns; the maximum is the largest of any session;
+- `toolRounds`, `toolRoundsPerTurn`: model responses that called at least one
+  tool, in total and per turn (mean and maximum, as above);
+- `guideCalls`: `guide` calls without a topic (`index`) and with a topic
+  (`byTopic`, by the topic requested, including invalid ones);
+- `writeCalls`: every `write` call, including rejected ones;
+  `failedWritesByCode`: failed `write` calls by error code;
+- `turnsWithWrite`: turns with at least one successful `write` call;
+  `turnsWithMultipleWriteCalls`: turns with more than one `write` call,
+  successful or not. The SDK instructions ask for one per turn;
+- `operations`: operations in successful `write` calls by kind: `create`,
+  `updateEdits` (exact `edits`), `updateContent` (replaced `content`),
+  `updateOther` (only a new path or metadata) and `delete`. A batch counts each
+  of its operations;
+- `filesCreated`, `filesUpdated`: distinct file IDs created, and distinct file
+  IDs updated, by successful `write` calls in the session;
+  `filesWrittenInSeveralTurns`: distinct file IDs that successful operations
+  (create, update or delete) touched in more than one turn of the session;
+- `createsAfterLookup`, `createsWithoutLookup`: create operations in
+  successful `write` calls that came after, or before, the session's first
+  successful `search`, `findText`, `list` or `read` call. The SDK
+  instructions ask to search and read before writing;
+- `noSuccessfulWrite` (per session) and `sessionsWithoutWrite` (total);
+- `filesAfter`: files in the inventory after the session, null when the
+  observation failed; `finalFiles` is the last session's value;
+- `latestCheckpointAsExpected`: whether main's latest checkpoint after the
+  session is the checkpoint of the session's last successful `write` call, or
+  the one before the session when no write succeeded. A failed checkpointed
+  write must leave it unchanged. Null when `describe` failed;
+  `sessionsWithUnexpectedLatestCheckpoint` counts sessions where it is false;
+- `listCheck`: the `list` check below: `traversals`, `checked`,
+  `uncheckedByReason`, `withMissedFiles`, `missedFiles`, `withStaleFiles` and
+  `staleFiles`.
 
-The SDK documents `list` as eventually consistent, while `read`, `search` and
-`diff` see a fork's writes immediately. After each successful model `list`
-call, before the model's next call, the runner reads every path it has seen in
-a successful `write` result in the run, with the same `at`, in batches of 100
-paths. A paths read omits missing files, and every file in the store was
-written by the model, so the result is what existed in that view. A file that
-read returns and the listing lacks is a miss. `prefix` and `nameContains` are
-applied to the expected paths exactly as the SDK applies them: the path starts
-with `prefix` and its last component contains `nameContains`. A call is
-recorded as unchecked when it continues with `cursor`, groups with
-`delimiter`, returns `next` (a partial page) or when the harness read fails
-(`cursor`, `delimiter`, `next`, `read_failed`). The check only observes: the
-model receives the `list` result unchanged and the harness reads are not
-model tool calls. It does not detect a listed file that no longer exists. On
-the fixture `list` is always current, so a miss is expected only on LambdaDB.
-
-Totals of the end-of-session fork states count a fork once for every session
-it was still present in; the `final*` fields give the last observation.
-Republication is a per-session count: a file revised in a later session is the
-drive growing, not a publication being redone. The conversation total,
-`republishedWithinSessions`, is the sum of the per-session counts, so a file
-republished within two sessions counts in both and one published once in each
-counts in neither.
+The `list` check observes the model's own listings. A traversal is a `list`
+call without `cursor` followed by the calls that forward each returned
+`next.cursor`. Once a page returns no `next`, before the model's next call,
+the runner reads by file ID every file the run is known to have written and
+every file the traversal returned, and keeps the existing ones whose path
+starts with `prefix` and whose last path component contains `nameContains`,
+as the SDK applies them. An expected file whose ID no page returned is
+missed; a returned entry whose file is gone or now has another path, or no
+longer matches the criteria, is stale. A traversal is unchecked when it
+groups with `delimiter`, a successful `write` came between its pages, its
+cursor continues no traversal the runner saw, the runner's read failed, or
+the model did not follow it to the end within the session (`delimiter`,
+`write_during`, `unknown_cursor`, `read_failed`, `unfinished`). The model
+receives every `list` result unchanged and the runner's reads are not model
+tool calls. Only the model writes, so a file is missed from this check only
+when the runner does not know it. On the fixture `list` is always current, so
+misses are expected only on LambdaDB.
 
 `manifest.json` freezes the source hashes, runner and SDK build hashes, source
-commit, backend, model, budgets, instruction text, tool definitions and
-planned sessions. Each session directory holds `transcript.jsonl` (every input
-item in order), `requests.jsonl` (a pending and an outcome receipt per
-request, with the number of transcript items it sent), `events.jsonl` (the
-model's tool calls and results), `list-checks.jsonl` (the runner's `list`
-checks), `observation.json` (the runner's reads) and `result.json`. Receipts
-can contain provider response IDs and opaque reasoning. Keep runs under
-ignored `artifacts/`.
+commit, backend, model, budgets, instruction text, guide setting, tool names
+and definitions, the checkpoint naming and planned sessions. Each session
+directory holds `transcript.jsonl` (every input item in order),
+`requests.jsonl` (a pending and an outcome receipt per request, with the
+number of transcript items it sent), `events.jsonl` (the model's tool calls
+and results, with each write's checkpoint name), `list-checks.jsonl` (the
+runner's `list` checks), `observation.json` and `result.json`. Receipts can
+contain provider response IDs and opaque reasoning. Keep runs under ignored
+`artifacts/`.
 
 Durations are kept out of the metrics. Each outcome receipt and each tool
 event carries `elapsedMs`, and `result.json` and each session in
 `summary.json` carry `timing`: the session's wall time (model requests, tool
 calls, the runner's `list` checks, token estimation and local recording), the
 total model request time, the total model tool-call time and that time by
-tool name, in milliseconds. Fixture timings show only local overhead.
+tool name, and `perTurn`, the model request time and tool-call time of each
+turn, in milliseconds. Wall time per turn is not recorded. Fixture timings
+show only local overhead.
+
+Runs of the earlier protocol, `memdrive-beam-session-replay-v1`, used 16 tools
+with an `at` view selector and published forks with `merge`. Their metrics
+(forks, merges, publication lag) are not comparable with these, and the
+question stage refuses those runs.
 
 ### Limits of this measurement
 
@@ -360,9 +419,10 @@ node benchmark/beam/replay.mjs --questions --run artifacts/beam-replay/live-1 \
   --output artifacts/beam-replay/live-1-questions --env-file /path/to/evaluation.env
 ```
 
-The run must use `--backend lambdadb`, have finished (`summary.json` reports
-`cleanup: "retained"`) and still hold its store (`store.json` status `ready`).
-A fixture run is rejected because its store is gone. The run does not record
+The run must use the current replay protocol and `--backend lambdadb`, have
+finished (`summary.json` reports `cleanup: "retained"`) and still hold its
+store (`store.json` status `ready`). A run of the earlier protocol is rejected
+with its protocol named, and a fixture run because its store is gone. The run does not record
 where its prepared data lives, so `--manifest` names it; the stage checks the
 SHA-256 of that manifest and of the runtime file against the run's manifest,
 and the evaluation file against the prepared manifest. It needs `LLM_API_KEY`
@@ -403,17 +463,20 @@ answering can be tried on a finished drive without replaying the
 conversation. The manifest records that text and that it differs from the
 run's; a deployment has one text for saving and answering. There is no
 "answer only from the drive" instruction, so the model can also answer from
-its general knowledge. The tool catalog is read-only: `guide`, `status`,
-`history`, `list`, `read`, `search`, `findText`, `listForks` and
-`listCheckpoints`, from `getFileToolDefinitions` and executed through
-`createFileTools` with the same allowlist, so any other call returns
-`TOOL_NOT_ALLOWED`. The answer model defaults to the run's model (`--model`
+its general knowledge. The tool catalog is read-only: `guide`, `read`,
+`list`, `search` and `findText` on main, from `getFileToolDefinitions` and
+executed through `createFileTools` with the same allowlist, so any other call,
+`write` included, returns `TOOL_NOT_ALLOWED`. `--guide off` leaves out
+`guide`, with the instruction text unchanged as in the replay. It defaults to
+`on` whatever the run used; the manifest records both settings and the summary
+notes when they differ. The answer model defaults to the run's model (`--model`
 overrides it). Requests, budgets and failure handling are those of a replay
 session with one utterance; a failed question keeps its failure code, is not
 judged, and the stage continues. The answer is the final response's assistant
-text. The harness opens the store without recovery and only reads it: it
-compares the main version, forks and checkpoints before and after and reports
-them in `summary.json`.
+text. The harness only reads the store: before and after the questions it
+takes main's latest checkpoint and an inventory as the replay's observation
+does (the listed files and the run's final inventory, read by file ID), and
+reports both and whether they are equal in `summary.json`.
 
 Judging follows upstream BEAM's `evaluate_*` functions: one Chat Completions
 request per rubric item with `unified_llm_judge_base_prompt`, replacing
@@ -436,7 +499,7 @@ score is reported. This is not a reproduction of the BEAM paper's scores.
 
 `NEW_DIR/manifest.json` records the run directory and manifest hash, store
 name, source hashes, scope, limit, models, budgets, the instruction hash, the
-read-only tool definitions and their hash, the judge prompt hash and upstream
+guide setting, the read-only tool definitions and their hash, the judge prompt hash and upstream
 revision, and the classification. Each asked question has a directory with
 `transcript.jsonl`, `requests.jsonl`, `events.jsonl` (with `elapsedMs`),
 `judge.jsonl` (one record per rubric item: score, reason, judge text, usage,
@@ -454,7 +517,9 @@ Injected test transports report `measured: false`.
 `--rejudge --answers QUESTIONS_DIR --manifest FILE --output NEW_DIR
 [--judge-model ID] [--judge-effort low|medium|high] [--repeats N]` judges the answers a question stage already
 stored, without asking anything and without a store. It needs only
-`LLM_API_KEY`. Each rubric item of each answered question is judged
+`LLM_API_KEY`. It reads only stored answers and judgments, so it also accepts
+the output of the earlier question protocol
+(`memdrive-beam-replay-questions-v1`), whose files have the same format. Each rubric item of each answered question is judged
 `--repeats` times (1 to 10, default 1) with the same upstream prompt and
 request as the stage, and any judge model. Use it to see whether the judge
 repeats its own scores and whether another judge model agrees.
