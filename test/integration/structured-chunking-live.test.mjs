@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import test from 'node:test';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { LambdaDBClient, MemDrive } from '@functional-systems/memdrive';
 import { createDoclingChunker } from '@functional-systems/memdrive/docling';
 
 const enabled = process.env.MEMDRIVE_RUN_LIVE_TESTS === '1';
 const options = () => ({ signal: AbortSignal.timeout(60_000) });
 
-test('live local Docling chunks retain exact originals through checkpoint and publication', {
+test('live local Docling chunks retain exact originals through checkpoints, main writes and rollback', {
     skip: enabled ? false : 'Set MEMDRIVE_RUN_LIVE_TESTS=1 to permit live resources.',
     timeout: 600_000,
 }, async () => {
@@ -28,128 +29,84 @@ test('live local Docling chunks retain exact originals through checkpoint and pu
     let phase = 'create store';
     try {
         const main = await MemDrive.create({ client, name, chunker }, options());
-        phase = 'verify default retention settings';
-        const settings = async () => {
-            const { collection } = await client.collection(name).get(options());
-            assert(collection.description.startsWith('memdrive-config-v1:'));
-            return { native: collection.snapshotRetentionInDays,
-                window: JSON.parse(collection.description.slice('memdrive-config-v1:'.length)).retentionInDays };
-        };
-        // Native snapshot retention stays at its minimum; the SDK window is separate.
-        assert.deepEqual(await settings(), { native: 1, window: 30 });
-        assert.equal((await main.describe(options())).retentionInDays, 30);
+        phase = 'verify store settings';
+        const { collection } = await client.collection(name).get(options());
+        // Native snapshot retention is one day; the description holds only the chunking settings.
+        assert.equal(collection.snapshotRetentionInDays, 1);
+        assert(collection.description.startsWith('memdrive-config-v1:'));
+        assert.deepEqual(Object.keys(JSON.parse(collection.description.slice('memdrive-config-v1:'.length))), ['chunking']);
+        assert.equal(Object.hasOwn(await main.describe(options()), 'retentionInDays'), false);
         phase = 'create working fork';
         const { at } = await main.fork({ name: 'draft' }, options());
         assert.deepEqual(at, { kind: 'fork', name: 'draft' });
+        // Removed selectors fail locally.
+        for (const removed of [{ version: 'v1' }, { asOf: new Date().toISOString() }])
+            await assert.rejects(main.fork({ name: 'removed-selector', ...removed }, options()), { code: 'INVALID_INPUT' });
         phase = 'write structured original';
         const file = await main.write({ at, op: 'create', path: '/note.md', content: '# Heading\n\nHello world.' }, options());
+        assert.equal(await main.read({ fileId: file.fileId }, options()), null);
         phase = 'search working chunks';
         const before = await main.search({ at, query: 'Hello world', rerank: false }, options());
         assert.equal(before.hits.length, 1);
         assert.equal(before.hits[0].content, 'Hello world.');
         assert.deepEqual(before.hits[0].range, { start: 11, end: 23 });
-        phase = 'publish structured chunks';
-        await main.merge({ at, summary: 'Publish synthetic structured note' },
-            { signal: AbortSignal.timeout(270_000) });
-        phase = 'checkpoint published snapshot';
-        const checkpoint = (await main.checkpoint({ name: 'saved' }, options())).at;
-        phase = 'reopen published original without parser';
+        phase = 'checkpoint the fork';
+        const checkpoint = (await main.checkpoint({ at, name: 'saved' }, options())).at;
+        assert.deepEqual(checkpoint, { kind: 'checkpoint', name: 'saved' });
+        phase = 'reopen the checkpoint without parser';
         const reopened = await MemDrive.open({ client: new LambdaDBClient(connection), name }, options());
-        assert.deepEqual(await reopened.read({ fileId: file.fileId }, options()), file);
         assert.deepEqual(await reopened.read({ at: checkpoint, fileId: file.fileId }, options()), file);
-        phase = 'search published chunks';
-        const after = await reopened.search({ query: 'Hello world', rerank: false }, options());
-        assert.deepEqual(after.hits, before.hits);
+        assert.deepEqual(await reopened.read({ at, fileId: file.fileId }, options()), file);
 
-        phase = 'preserve explicit working checkpoint';
-        const firstVersion = (await main.history({}, options())).entries[0].version;
-        const workingSaved = (await main.checkpoint({ at, name: 'working-saved' }, options())).at;
-        assert.deepEqual(await main.read({ at: workingSaved, fileId: file.fileId }, options()), file);
-        phase = 'publish a later revision';
+        phase = 'write a structured original to main';
+        const mainFile = await main.write({ op: 'create', path: '/main.md', content: '# Main\n\nMain world.' }, options());
+        assert.deepEqual(await reopened.read({ path: '/main.md' }, options()), mainFile);
+        assert.equal(await reopened.read({ at, path: '/main.md' }, options()), null);
+        const onMain = await reopened.search({ query: 'Main world', rerank: false }, options());
+        assert.deepEqual(onMain.hits.map(hit => hit.fileId), [mainFile.fileId]);
+
+        phase = 'change the fork after its checkpoint';
         const updated = await main.write({ at, op: 'update', fileId: file.fileId, content: '# Heading\n\nGoodbye world.' }, options());
-        const later = await main.merge({ at, summary: 'Publish later synthetic revision' },
-            { signal: AbortSignal.timeout(270_000) });
-        phase = 'create historical refs after later publication';
-        // merge publishes only; the source fork remains until deleted explicitly.
-        assert.equal(later.status, 'published');
-        assert.deepEqual(await main.listForks({}, options()), { forks: [{ at }] });
-        const mainPast = (await main.fork({ name: 'main-past', version: firstVersion }, options())).at;
-        const savedPast = (await main.checkpoint({ at: { kind: 'main' }, name: 'main-past', version: firstVersion }, options())).at;
-        const forkPast = (await main.fork({ at: workingSaved, name: 'fork-past' }, options())).at;
-        for (const past of [mainPast, savedPast, forkPast])
-            assert.deepEqual(await main.read({ at: past, fileId: file.fileId }, options()), file);
-        assert.deepEqual(await main.read({ fileId: file.fileId }, options()), updated);
-        for (const source of [at, workingSaved])
-            await assert.rejects(main.fork({ at: source, name: 'past-copy', version: firstVersion }, options()), { code: 'INVALID_INPUT' });
+        const extra = await main.write({ at, op: 'create', path: '/extra.md', content: '# Extra\n\nAfter the checkpoint.' }, options());
+        assert.deepEqual(await main.read({ at, fileId: file.fileId }, options()), updated);
+        assert.deepEqual(await main.read({ at: checkpoint, fileId: file.fileId }, options()), file);
+        assert.equal(await main.read({ at: checkpoint, fileId: extra.fileId }, options()), null);
 
-        for (const source of [undefined, at, workingSaved])
-            await assert.rejects(main.fork({ ...(source ? { at: source } : {}), name: 'removed-time', asOf: new Date().toISOString() }, options()), { code: 'INVALID_INPUT' });
-
-        phase = 'prepare aged retention fixture';
-        const { collection } = await client.collection(name).get(options());
-        const driveId = createHash('sha256').update(JSON.stringify([name, collection.projectName, collection.createdAt.toISOString()])).digest('hex');
-        const journal = client.collection(`md-journal-${driveId.slice(0, 40)}`);
-        const metadata = (await journal.get(options())).collection;
-        assert.equal(metadata.tags['memdrive.owner'], driveId);
-        assert.equal(metadata.tags['memdrive.format'], 'merge-publication-v1');
-        const ref = { ref: { kind: 'branch', name: 'main' }, consistentRead: true };
-        const publications = new Map((await journal.docs.fetch({ ...ref, ids: ['publication:1', 'publication:2'] }, options())).docs
-            .map(({ doc }) => [doc.id, doc]));
-        for (const [id, version] of [['publication:1', 'v1'], ['publication:2', 'v2']]) {
-            assert.equal(publications.get(id).driveId, driveId);
-            assert.equal(publications.get(id).kind, 'publication-v1');
-            assert.equal(publications.get(id).version, version);
-        }
-        // Age only timestamps in this owned synthetic fixture. This validates
-        // the real cleanup path without pretending days elapsed in real time.
-        // The second publication superseded v1, whose tag ages from that publication.
-        const aged = Date.now() - 2 * 86_400_000;
-        await journal.docs.update({ branch: 'main', docs: [
-            { id: 'publication:1', publishedAt: new Date(aged - 2000).toISOString() },
-            { id: 'publication:2', publishedAt: new Date(aged).toISOString() },
-        ] }, options());
-        // Merges pinned their versions only; the other tags are this test's checkpoints.
-        const tagNames = (await client.collection(name).tags.list(options())).tags.map(tag => tag.name).sort();
-        assert.deepEqual(tagNames, ['checkpoint-main-past', 'checkpoint-saved', 'checkpoint-working-saved', 'md-main-v1', 'md-main-v2']);
-        const supersededPresent = async () => {
-            try { await client.collection(name).tags.get('md-main-v1', options()); return true; }
-            catch (error) {
-                if ((error.status ?? error.statusCode) !== 404) throw error;
-                return false;
+        phase = 'roll the fork back to its checkpoint';
+        // The SDK sends one rollback. A just-created checkpoint can be rejected with a
+        // definite 400 until its snapshot is published; only this test waits for that.
+        const deadline = Date.now() + 120_000;
+        for (let attempt = 1; ; attempt++) {
+            try {
+                assert.deepEqual(await main.rollback({ at, to: checkpoint }, options()), { at });
+                break;
+            } catch (error) {
+                if (error?.status !== 400 || !/published snapshot/i.test(String(error?.cause?.message)) || Date.now() > deadline) throw error;
+                await sleep(5_000);
             }
-        };
-        const retentionClient = new LambdaDBClient(connection);
-        const retentionMain = await MemDrive.open({ client: retentionClient, name }, options());
-        const history = await retentionMain.history({}, options());
-        assert.equal('pruneHistory' in retentionMain, false);
-        phase = 'retain the superseded version within the default SDK window';
-        // Two days exceeds one-day native retention but not the 30-day SDK window.
-        // Merging the published fork again is unchanged and runs a retention pass.
-        const unchanged = { status: 'unchanged', version: 'v2' };
-        assert.deepEqual(await retentionMain.merge({ at, summary: 'Publish synthetic structured note' }, options()), unchanged);
-        assert(await supersededPresent(), 'A superseded version inside the SDK window was released.');
-        phase = 'configure one-day SDK window';
-        assert.equal((await retentionMain.configure({ retentionInDays: 1 }, options())).retentionInDays, 1);
-        assert.deepEqual(await settings(), { native: 1, window: 1 });
-        const observer = await MemDrive.open({ client: new LambdaDBClient(connection), name }, options());
-        assert.equal((await observer.describe(options())).retentionInDays, 1);
-        phase = 'automatic retention after a repeated merge';
-        assert.equal(await MemDrive.open({ client: retentionClient, name }, options()), retentionMain);
-        // Each automatic pass is best effort and has a short budget. A later
-        // merge retries unfinished cleanup without changing its result.
-        let removed = false;
-        for (let attempt = 0; attempt < 5 && !removed; attempt++) {
-            assert.deepEqual(await retentionMain.merge({ at, summary: 'Publish synthetic structured note' }, options()), unchanged);
-            removed = !await supersededPresent();
         }
-        assert(removed, 'Automatic retention did not remove the expired superseded version within five repeated merges.');
-        // The current version stays pinned.
-        await client.collection(name).tags.get('md-main-v2', options());
-        assert.deepEqual(await retentionMain.history({}, options()), history);
-        assert.deepEqual(await retentionMain.read({ fileId: file.fileId }, options()), updated);
-        assert.deepEqual(await retentionMain.read({ at: savedPast, fileId: file.fileId }, options()), file);
-        assert.deepEqual(await retentionMain.read({ at: checkpoint, fileId: file.fileId }, options()), file);
-        assert.deepEqual(await retentionMain.merge({ at, summary: 'Publish synthetic structured note' }, options()), unchanged);
+        assert.deepEqual(await reopened.read({ at, fileId: file.fileId }, options()), file);
+        assert.equal(await reopened.read({ at, fileId: extra.fileId }, options()), null);
+        const after = await reopened.search({ at, query: 'Hello world', rerank: false }, options());
+        assert.deepEqual(after.hits, before.hits);
+        // Main is unaffected by a fork's rollback.
+        assert.deepEqual(await reopened.read({ path: '/main.md' }, options()), mainFile);
+
+        phase = 'fork from the checkpoint and inspect refs';
+        const restored = (await main.fork({ at: checkpoint, name: 'restored' }, options())).at;
+        assert.deepEqual(await main.read({ at: restored, fileId: file.fileId }, options()), file);
+        // One collection per store and only user refs: no internal tags or companion collection.
+        const tagNames = (await client.collection(name).tags.list(options())).tags.map(tag => tag.name).sort();
+        assert.deepEqual(tagNames, ['checkpoint-saved']);
+        const branchNames = (await client.collection(name).branches.list(options())).branches.map(branch => branch.name).sort();
+        assert.deepEqual(branchNames, ['fork-draft', 'fork-restored', 'main']);
+        assert.deepEqual(await main.listForks({}, options()), { forks: [{ at }, { at: restored }] });
+        assert.deepEqual(await main.listCheckpoints({}, options()), { checkpoints: [{ at: checkpoint }] });
+        assert.deepEqual(await main.deleteCheckpoint({ at: checkpoint }, options()), { at: checkpoint });
+        await assert.rejects(main.read({ at: checkpoint, fileId: file.fileId }, options()), { code: 'CHECKPOINT_NOT_FOUND' });
+        await assert.rejects(main.deleteCheckpoint({ at: checkpoint }, options()), { code: 'CHECKPOINT_NOT_FOUND' });
+        assert.deepEqual(await main.deleteFork({ at: restored }, options()), { at: restored });
+        await assert.rejects(main.read({ at: restored, fileId: file.fileId }, options()), { code: 'BRANCH_NOT_FOUND' });
     } catch (error) {
         collision = error?.code === 'STORE_EXISTS';
         const detail = error instanceof assert.AssertionError ? ` ${error.message}` : '';

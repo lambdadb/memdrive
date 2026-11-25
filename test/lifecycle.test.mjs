@@ -5,28 +5,53 @@ import { fileClient } from './helpers/file-client.mjs';
 
 const name = 'lifecycle-store';
 const edit = { op: 'create', path: '/note.md', content: 'Remember this.' };
-const merge = { summary: 'Publish note' };
 const forkAt = refName => ({ kind: 'fork', name: refName });
 const checkpointAt = refName => ({ kind: 'checkpoint', name: refName });
-async function setup(published = false) {
+async function setup() {
     const fixture = fileClient();
     const connection = { client: fixture.client, name };
     const drive = await create(connection);
     const { at: fork } = await drive.fork({ name: 'draft' });
-    if (published) { await drive.write({ at: fork, ...edit }); await drive.merge({ at: fork, ...merge }); }
+    await drive.write({ at: fork, ...edit });
     const { at: checkpoint } = await drive.checkpoint({ at: fork, name: 'saved' });
     return { ...fixture, fixture, connection, drive, fork, checkpoint };
 }
-const fresh = connection => ({ ...connection, client: { ...connection.client } });
 const deletes = calls => calls.filter(call => call.kind.endsWith('-delete'));
 
-test('lists all user forks and checkpoints as sorted at values, hides internal refs and rejects malformed lists', async () => {
-    const { fixture, drive, checkpoint, collections } = await setup(true);
+test('create makes one collection with one-day native snapshot retention and no internal refs or journal', async () => {
+    const { client, collections, calls } = fileClient();
+    const drive = await create({ client, name, metadataSchema: { topic: { type: 'string' } } });
+    assert.deepEqual([...collections.keys()], [name]);
+    const { metadata, branches, tags } = collections.get(name);
+    assert.equal(metadata.snapshotRetentionInDays, 1);
+    assert.equal(metadata.tags['memdrive.format'], 'files-v1');
+    assert.equal(metadata.description, 'memdrive-config-v1:{"chunking":{"strategy":"auto"}}');
+    assert.equal(Object.hasOwn(metadata.indexConfigs, 'changed'), false);
+    assert.deepEqual([...branches.keys()], ['main']);
+    assert.equal(tags.size, 0);
+    assert.deepEqual(calls, []);
+    const description = await drive.describe();
+    assert.equal(Object.hasOwn(description, 'retentionInDays'), false);
+    assert.deepEqual(await (await open({ client, name })).describe(), description);
+    for (const removed of ['configure', 'status', 'history', 'diff', 'merge']) assert.equal(drive[removed], undefined);
+    await assert.rejects(create({ client, name: 'other-store', retentionInDays: 7 }), { code: 'INVALID_INPUT' });
+    await assert.rejects(create({ client, name }), { code: 'STORE_EXISTS', status: 409 });
+
+    const external = await create({ client, name: 'external-store',
+        embedding: { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'fixture' } });
+    assert.equal(collections.get('external-store').metadata.snapshotRetentionInDays, 1);
+    assert.equal(collections.get('external-store').metadata.description, 'memdrive-config-v1:{}');
+    assert.equal(Object.hasOwn(await external.describe(), 'retentionInDays'), false);
+    await assert.rejects(open({ client, name: 'external-store' }), { code: 'INCOMPATIBLE_STORE' });
+    await assert.rejects(open({ client, name, mode: 'external' }), { code: 'INCOMPATIBLE_STORE' });
+});
+
+test('lists all user forks and checkpoints as sorted at values, hides other refs and rejects malformed lists', async () => {
+    const { fixture, drive, checkpoint, collections } = await setup();
     await drive.fork({ at: checkpoint, name: 'another' });
     await drive.checkpoint({ name: 'alpha' });
-    const storage = collections.get(name);
-    assert(storage.branches.has('md-main-v0'));
-    assert(storage.tags.has('md-main-v1'));
+    await fixture.client.collection(name).branches.create({ branchName: 'unrelated', source: { kind: 'branch', name: 'main' } });
+    assert(collections.get(name).branches.has('unrelated'));
     assert.deepEqual(await drive.listForks(), { forks: [{ at: forkAt('another') }, { at: forkAt('draft') }] });
     assert.deepEqual(await drive.listCheckpoints({}), { checkpoints: [{ at: checkpointAt('alpha') }, { at: checkpointAt('saved') }] });
     await assert.rejects(drive.listForks({ at: forkAt('draft') }), { code: 'INVALID_INPUT' });
@@ -36,28 +61,29 @@ test('lists all user forks and checkpoints as sorted at values, hides internal r
     await assert.rejects(drive.listCheckpoints(), { code: 'INVALID_RESULT' });
 });
 
-test('ref deletion returns at, preserves publication history and independent snapshots, and later uses report absence', async () => {
-    const { connection, drive, fork, checkpoint, calls } = await setup(true);
+test('ref deletion returns at, keeps independent snapshots, and later uses report absence', async () => {
+    const { connection, drive, fork, checkpoint, calls } = await setup();
     const { at: child } = await drive.fork({ at: checkpoint, name: 'child' });
     const tools = createFileTools({ drive, tools: ['read', 'write', 'deleteFork'] });
     assert.deepEqual(await drive.deleteFork({ at: fork }), { at: fork });
     assert.deepEqual(await drive.deleteCheckpoint({ at: checkpoint }), { at: checkpoint });
     assert.deepEqual(await drive.listForks(), { forks: [{ at: child }] });
     assert.deepEqual(await drive.listCheckpoints(), { checkpoints: [] });
-    assert.equal((await drive.history()).entries[0].summary, merge.summary);
     assert.equal((await drive.read({ at: child, path: edit.path })).content, edit.content);
     await assert.rejects(drive.write({ at: fork, ...edit }), { code: 'BRANCH_NOT_FOUND' });
-    await assert.rejects(drive.status({ at: fork }), { code: 'BRANCH_NOT_FOUND' });
     await assert.rejects(drive.read({ at: checkpoint, path: edit.path }), { code: 'CHECKPOINT_NOT_FOUND' });
     await assert.rejects(tools.execute('read', { at: fork, path: edit.path }), { code: 'BRANCH_NOT_FOUND' });
     await assert.rejects(drive.deleteFork({ at: fork }), { code: 'BRANCH_NOT_FOUND' });
     await assert.rejects(drive.deleteCheckpoint({ at: checkpoint }), { code: 'CHECKPOINT_NOT_FOUND' });
     // A recreated name is a new view without the deleted fork's state.
     await drive.fork({ name: 'draft' });
-    assert.equal((await drive.read({ at: fork, path: edit.path })).content, edit.content);
-    assert.equal(await open(connection), drive);
+    assert.equal(await drive.read({ at: fork, path: edit.path }), null);
+    const reopened = await open(connection);
+    assert.notEqual(reopened, drive);
     assert.deepEqual(await tools.execute('deleteFork', { at: fork }), { at: fork });
     assert(deletes(calls).every(call => call.retries.strategy === 'none'));
+    // One native call per deletion request, including the two that found nothing; no confirmation reads or fences.
+    assert.equal(deletes(calls).length, 5);
 });
 
 test('delete requests require an existing at of the matching kind and main cannot be deleted', async () => {
@@ -70,200 +96,58 @@ test('delete requests require an existing at of the matching kind and main canno
     assert.equal('delete' in drive, false);
 });
 
-test('fork and checkpoint creation from a fork source waits for that fork\'s in-flight writes', async () => {
-    const { fixture, drive, fork, calls } = await setup();
-    let release, entered;
-    const pending = new Promise(resolve => { entered = resolve; });
-    fixture.beforeUpsert = async () => { entered(); await new Promise(resolve => { release = resolve; }); };
-    const writing = drive.write({ at: fork, ...edit });
-    await pending;
-    const saving = drive.checkpoint({ at: fork, name: 'after-write' });
-    const copying = drive.fork({ at: fork, name: 'copy-after-write' });
-    const independent = await drive.checkpoint({ name: 'from-main' }); // Main is not queued behind the fork.
-    await new Promise(resolve => setTimeout(resolve, 10));
-    const created = () => calls.filter(call => ['tag-create', 'branch-create'].includes(call.kind)
-        && [call.request.tagName, call.request.branchName].some(ref => ref?.endsWith('after-write')));
-    assert.equal(created().length, 0);
-    fixture.beforeUpsert = undefined;
-    release();
-    const file = await writing;
-    assert.deepEqual(await saving, { at: { kind: 'checkpoint', name: 'after-write' } });
-    assert.deepEqual(await copying, { at: { kind: 'fork', name: 'copy-after-write' } });
-    assert.equal(created().length, 2);
-    for (const { at } of [await saving, await copying])
-        assert.equal((await drive.read({ at, fileId: file.fileId })).content, edit.content);
-    assert.equal(await drive.read({ at: independent.at, fileId: file.fileId }), null);
-});
-
-test('deletion excludes active operations and blocks new work while native deletion is pending', async () => {
+test('the SDK does not serialize operations: a ref deletion runs while a write to it is in flight', async () => {
     const { fixture, connection, drive, fork } = await setup();
     let release, entered;
     const pending = new Promise(resolve => { entered = resolve; });
     fixture.beforeUpsert = async () => { entered(); await new Promise(resolve => { release = resolve; }); };
-    const writing = drive.write({ at: fork, ...edit });
+    const writing = drive.write({ at: fork, op: 'create', path: '/late.md', content: 'late' });
     await pending;
-    await assert.rejects(drive.deleteFork({ at: fork }), { code: 'STORE_BUSY' });
-    await assert.rejects(destroy(connection), { code: 'STORE_BUSY' });
+    assert.deepEqual(await drive.deleteFork({ at: fork }), { at: fork });
+    assert.equal((await open(connection)).name, name);
     fixture.beforeUpsert = undefined;
     release();
-    await writing;
-    const deleting = new Promise(resolve => { entered = resolve; });
-    fixture.beforeRefDelete = async () => { entered(); await new Promise(resolve => { release = resolve; }); };
-    const removal = drive.deleteFork({ at: fork });
-    await deleting;
-    await assert.rejects(drive.read({ path: edit.path }), { code: 'STORE_BUSY' });
-    await assert.rejects(open(connection), { code: 'STORE_BUSY' });
-    await assert.rejects(create(connection), { code: 'STORE_BUSY' });
-    release();
-    await removal;
+    // The in-flight write now targets a missing branch; the caller owns this ordering.
+    await assert.rejects(writing, { code: 'BRANCH_NOT_FOUND' });
 });
 
-test('uncertain ref deletion fences every use of that at and recreation until an explicit deletion retry', async () => {
-    for (const kind of ['fork', 'checkpoint']) for (const applied of [false, true]) {
-        const { fixture, connection, drive, fork, checkpoint, calls } = await setup();
-        const at = kind === 'fork' ? fork : checkpoint;
-        const remove = kind === 'fork' ? 'deleteFork' : 'deleteCheckpoint';
-        const hook = applied ? 'afterRefDelete' : 'beforeRefDelete';
-        fixture[hook] = () => { throw new Error('Connection lost'); };
-        await assert.rejects(drive[remove]({ at }), { code: 'REF_DELETION_UNCONFIRMED' });
-        assert.equal(deletes(calls).length, 1);
-        for (const use of [() => drive.list({ at }), () => drive.read({ at, path: edit.path }), () => drive.status({ at }),
-            () => drive.fork({ at, name: 'from-fenced' }), () => drive.checkpoint({ at, name: 'from-fenced' }),
-            () => drive.write({ at: fork, ...edit })].slice(0, kind === 'fork' ? 6 : 5))
-            await assert.rejects(use(), { code: 'REF_DELETION_UNCONFIRMED' });
-        await assert.rejects(destroy(connection), { code: 'REF_DELETION_UNCONFIRMED' });
-        await assert.rejects(drive[kind]({ name: at.name }), { code: 'REF_DELETION_UNCONFIRMED' });
-        assert.equal(deletes(calls).length, 1);
-        fixture[hook] = undefined; // Models the host fencing the outstanding request.
-        assert.deepEqual(await drive[remove]({ at }), { at });
-        assert.deepEqual(await drive[kind]({ name: at.name }), { at });
-        assert.deepEqual((await drive.status({ at })).at, at);
-    }
-});
-
-test('definite ref rejection leaves the at usable and unconfirmed writes block deletion', async () => {
-    const { fixture, drive, fork, connection, calls } = await setup();
-    fixture.beforeRefDelete = () => { throw Object.assign(new Error('Forbidden'), { statusCode: 403 }); };
-    await assert.rejects(drive.deleteFork({ at: fork }), { status: 403 });
-    assert.deepEqual(await drive.listForks(), { forks: [{ at: fork }] });
-    assert.deepEqual((await drive.status({ at: fork })).at, fork);
-    fixture.beforeRefDelete = undefined;
-    fixture.beforeUpsert = () => { throw new Error('Unconfirmed write'); };
-    await assert.rejects(drive.write({ at: fork, ...edit }), { code: 'WRITE_UNCONFIRMED' });
-    const before = deletes(calls).length;
-    await assert.rejects(drive.deleteFork({ at: fork }), { code: 'WRITE_UNCONFIRMED' });
-    await assert.rejects(destroy(connection), { code: 'WRITE_UNCONFIRMED' });
-    assert.equal(deletes(calls).length, before);
-});
-
-test('a failed merge leaves nothing that blocks ref or store deletion', async () => {
-    const { fixture, drive, fork, connection, calls, collections } = await setup();
-    await drive.write({ at: fork, ...edit });
-    fixture.beforeTagCreate = tag => { if (tag === 'md-main-v1') throw Object.assign(new Error('Forbidden'), { statusCode: 403 }); };
-    await assert.rejects(drive.merge({ at: fork, ...merge }), { code: 'DATABASE_ERROR', status: 403 });
-    // Main held nothing at v0, so the failed merge's writes were removed.
-    assert.equal(collections.get(name).branches.get('main').docs.size, 0);
-    const reopened = await open(fresh(connection));
-    await reopened.deleteFork({ at: fork });
-    await destroy(fresh(connection));
-    assert.deepEqual(deletes(calls).map(call => call.kind), ['branch-delete', 'collection-delete', 'collection-delete']);
-});
-
-test('destroy removes only owned resources, invalidates the drive, and permits a fresh store generation', async () => {
-    const { connection, drive, fork, checkpoint, collections, calls } = await setup(true);
+test('destroy deletes only the content collection, is idempotent, and refuses foreign collections', async () => {
+    const { connection, drive, fork, checkpoint, collections, calls, client } = await setup();
     await create({ ...connection, name: 'unrelated' });
+    const listed = await drive.list({ at: fork, limit: 1 });
     assert.equal(MemDrive.destroy, destroy);
     await destroy(connection);
     assert.deepEqual([...collections.keys()], ['unrelated']);
-    assert(deletes(calls)[0].collection.startsWith('md-journal-'));
-    assert.equal(deletes(calls)[1].collection, name);
+    assert.deepEqual(deletes(calls).map(call => [call.kind, call.collection, call.retries]),
+        [['collection-delete', name, { strategy: 'none' }]]);
     await destroy(connection);
+    assert.equal(deletes(calls).length, 1);
+    for (const at of [undefined, fork, checkpoint]) await assert.rejects(drive.read({ at, path: edit.path }), { code: 'STORE_NOT_FOUND' });
+    await assert.rejects(open(connection), { code: 'STORE_NOT_FOUND', status: 404 });
+
     const replacement = await create(connection);
-    assert.notEqual(replacement, drive);
-    for (const at of [undefined, fork, checkpoint]) await assert.rejects(drive.status({ at }), { code: 'STORE_DELETED' });
-    await assert.rejects(drive.deleteFork({ at: fork }), { code: 'STORE_DELETED' });
     assert.deepEqual(await replacement.listForks(), { forks: [] });
+    await replacement.fork({ name: 'draft' });
+    await replacement.write({ at: fork, ...edit });
+    // A cursor from the destroyed generation never continues on the new store.
+    if (listed.next) await assert.rejects(replacement.list(listed.next), { code: 'LIST_CURSOR_UNAVAILABLE' });
+
+    await client.createCollection({ collectionName: 'foreign', indexConfigs: { memId: { type: 'keyword' } }, tags: {} });
+    await assert.rejects(destroy({ client, name: 'foreign' }), { code: 'INCOMPATIBLE_STORE' });
+    assert(collections.has('foreign'));
 });
 
-test('marked partial destruction resumes on a fresh client after either collection deletion fails', async () => {
-    for (const stage of ['journal', 'content']) {
-        const { fixture, connection, drive, collections } = await setup(true);
-        fixture.beforeCollectionDelete = collection => {
-            if ((collection === name) === (stage === 'content')) throw new Error('Deletion interrupted');
-        };
-        await assert.rejects(destroy(connection), { code: 'STORE_DELETION_UNCONFIRMED' });
-        assert.equal(collections.get(name).metadata.tags['memdrive.format'], 'files-deleting-v0');
-        await assert.rejects(drive.read({ path: edit.path }), { code: 'STORE_DELETED' });
-        await assert.rejects(open(fresh(connection)), { code: 'STORE_DELETING' });
-        fixture.beforeCollectionDelete = undefined;
-        await destroy(fresh(connection));
-        assert.equal(collections.size, 0);
-    }
-});
-
-test('lost marker or final deletion responses remain resumable without an orphaned journal', async () => {
-    for (const stage of ['marker', 'content']) {
-        const { fixture, connection, collections } = await setup(true);
-        if (stage === 'marker') fixture.afterCollectionUpdate = () => { throw new Error('Lost marker response'); };
-        else fixture.afterCollectionDelete = collection => { if (collection === name) throw new Error('Lost delete response'); };
-        await assert.rejects(destroy(connection), { code: 'STORE_DELETION_UNCONFIRMED' });
-        fixture.afterCollectionUpdate = undefined;
-        fixture.afterCollectionDelete = undefined;
-        await destroy(fresh(connection));
-        assert.equal(collections.size, 0);
-    }
-});
-
-test('destroy rejects foreign journal ownership before marking or deleting any resource', async () => {
-    const { connection, drive, fork, collections, calls } = await setup(true);
-    const journal = [...collections.entries()].find(([key]) => key.startsWith('md-journal-'))[1];
-    journal.metadata.tags['memdrive.owner'] = 'another-owner';
-    await assert.rejects(destroy(connection), { code: 'INCOMPATIBLE_STORE' });
-    assert.equal(calls.filter(call => call.kind === 'collection-update').length, 0);
-    assert.equal(deletes(calls).length, 0);
-    assert.deepEqual(await drive.listForks(), { forks: [{ at: fork }] });
-});
-
-test('a lost unapplied marker fences even a previously unopened client until destroy is retried', async () => {
-    const { fixture, connection } = await setup();
-    const remote = fresh(connection);
-    fixture.beforeCollectionUpdate = () => { throw new Error('Marker outcome unknown'); };
-    await assert.rejects(destroy(remote), { code: 'STORE_DELETION_UNCONFIRMED' });
-    await assert.rejects(open(remote), { code: 'STORE_DELETED' });
-    await assert.rejects(create(remote), { code: 'STORE_DELETED' });
-    fixture.beforeCollectionUpdate = undefined;
-    await destroy(remote);
-    await create(remote);
-});
-
-test('malformed collection lookup cannot acknowledge destruction and ref absence must be confirmed', async () => {
-    const { fixture, connection, drive, fork, collections, calls } = await setup();
-    fixture.getCollection = () => ({});
-    await assert.rejects(destroy(connection), { code: 'INVALID_RESULT' });
-    assert.equal(deletes(calls).length, 0);
-    fixture.getCollection = undefined;
-    const branches = collections.get(name).branches;
-    const original = branches.get('fork-draft');
-    fixture.afterRefDelete = () => { branches.set('fork-draft', original); };
-    await assert.rejects(drive.deleteFork({ at: fork }), { code: 'REF_DELETION_UNCONFIRMED' });
-    fixture.afterRefDelete = undefined;
-    await drive.deleteFork({ at: fork });
-});
-
-test('destroy preserves the tag budget and works with external stores and no journal', async () => {
-    const { client, collections, calls } = fileClient();
-    const connection = { client, name };
-    const drive = await create({ ...connection, labels: { a: 'one', b: 'two', c: 'three' },
-        embedding: { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'fixture' } });
-    const { at: fork } = await drive.fork({ name: 'draft' });
-    const { at: checkpoint } = await drive.checkpoint({ at: fork, name: 'saved' });
-    await drive.deleteCheckpoint({ at: checkpoint });
-    await drive.deleteFork({ at: fork });
+test('destroy passes native deletion errors through', async () => {
+    const { fixture, connection, collections } = await setup();
+    const rejected = Object.assign(new Error('Forbidden'), { statusCode: 403 });
+    fixture.beforeCollectionDelete = () => { throw rejected; };
+    await assert.rejects(destroy(connection), { code: 'DATABASE_ERROR', status: 403, cause: rejected });
+    fixture.beforeCollectionDelete = () => { throw new Error('Connection reset'); };
+    await assert.rejects(destroy(connection), error => error.code === 'DATABASE_ERROR' && error.status === undefined);
+    assert(collections.has(name));
+    fixture.beforeCollectionDelete = undefined;
     await destroy(connection);
-    const tags = calls.find(call => call.kind === 'collection-update').request.tags;
-    assert.equal(Object.keys(tags).length, 5);
-    assert.equal(tags.a, 'one');
-    assert.equal(collections.size, 0);
+    assert.equal(collections.has(name), false);
 });
 
 test('invalid and pre-aborted lifecycle requests do not submit mutations', async () => {
@@ -275,5 +159,7 @@ test('invalid and pre-aborted lifecycle requests do not submit mutations', async
     await assert.rejects(destroy(connection, options), { code: 'ABORTED' });
     await assert.rejects(drive.deleteFork({ at: fork }, options), { code: 'ABORTED' });
     await assert.rejects(drive.listForks({}, options), { code: 'ABORTED' });
+    await assert.rejects(drive.rollback({ at: fork, to: checkpointAt('saved') }, options), { code: 'ABORTED' });
     assert.equal(deletes(calls).length, 0);
+    assert.equal(calls.some(call => call.kind === 'branch-rollback'), false);
 });

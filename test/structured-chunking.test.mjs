@@ -67,30 +67,26 @@ test('structured chunks retain exact originals and distinguish preview bodies fr
     await assert.rejects(fresh.write(createFile('new content')), { code: 'CHUNKER_UNAVAILABLE' });
 });
 
-test('publication and a repeated merge use frozen rendered chunks without invoking the parser again', async () => {
+test('moves reuse stored rendered chunks and a fresh client reads without invoking the parser again', async () => {
     const fixture = fileClient();
     let parses = 0;
     const chunker = { id: 'table-fixture-v1', async chunk() {
         parses++;
-        if (parses > 1) throw new Error('Parser must not run during publication');
+        if (parses > 1) throw new Error('Parser must not run again');
         return [{ text: 'Mira, Age = 30', contextualized: 'Data\nMira, Age = 30' }];
     } };
     const main = await create({ client: fixture.client, name: 'table-store', chunking: { strategy: 'docling' }, chunker });
     await main.fork({ name: 'draft' });
     const file = await main.write(createFile('# Data\n\n| Name | Age |\n| --- | --- |\n| Mira | 30 |'));
-    fixture.beforeTagCreate = tag => { if (tag === 'md-main-v1') throw Object.assign(new Error('Pause publication'), { statusCode: 403 }); };
-    await assert.rejects(main.merge({ at, summary: 'Publish table' }), { code: 'DATABASE_ERROR', status: 403 });
-    fixture.beforeTagCreate = undefined;
-    const recovered = await open({ client: { ...fixture.client }, name: 'table-store' });
-    await recovered.merge({ at, summary: 'Publish table' });
-    const hit = (await recovered.search({ query: 'Mira', rerank: false })).hits[0];
+    const reader = await open({ client: { ...fixture.client }, name: 'table-store' });
+    const hit = (await reader.search({ at, query: 'Mira', rerank: false })).hits[0];
     assert.equal(hit.content, 'Mira, Age = 30');
     assert.equal(hit.range, undefined);
-    assert.equal((await recovered.read({ fileId: file.fileId })).content, file.content);
-    assert.equal(parses, 1);
+    assert.equal((await reader.read({ at, fileId: file.fileId })).content, file.content);
     await main.write({ at, op: 'update', fileId: file.fileId, newPath: '/moved.md' });
-    await main.merge({ at, summary: 'Move table' });
-    assert.equal((await main.search({ query: 'Mira', rerank: false })).hits[0].path, '/moved.md');
+    const { at: saved } = await main.checkpoint({ at, name: 'saved' });
+    await main.rollback({ at: { kind: 'main' }, to: saved });
+    assert.equal((await reader.search({ query: 'Mira', rerank: false })).hits[0].path, '/moved.md');
     assert.equal(parses, 1);
     await destroy({ client: { ...fixture.client }, name: 'table-store' });
 });

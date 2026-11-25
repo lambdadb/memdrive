@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
 import { createHost, guideURI } from '../benchmark/tool-use/host.mjs';
-import { prepareScenario, scenarios, selectScenarios, evaluate, retrievalMetrics, aggregateRetrieval, paraphraseTargets, enumeratedCode,
+import { prepareScenario, scenarios, selectScenarios, evaluate, retrievalMetrics, aggregateRetrieval, paraphraseTargets, enumeratedCode, faq,
     enumeratedPaths } from '../benchmark/tool-use/scenarios.mjs';
 import { runAgent, openAI, limits, startingView } from '../benchmark/tool-use/agent.mjs';
 import { scriptedAgent } from '../benchmark/tool-use/scripted.mjs';
@@ -20,12 +20,12 @@ const viewNotices = request => request.input.filter(item => item.role === 'devel
 const trial = { kind: 'fork', name: 'trial' };
 async function usingScenario(id, guide, run) {
     const context = await prepareScenario(id);
-    const host = createHost({ drive: context.drive, writable: context.scenario.writable, guide, start: context.at });
+    const host = createHost({ drive: context.drive, writable: context.scenario.writable, guide, start: context.at, available: context.available });
     try { await run(context, host); } finally { await context.cleanup(); }
 }
 
-test('scripted smoke exercises actual SDK state across nine scenarios, three guide channels and three instruction profiles', async () => {
-    assert.equal(scenarios.length, 9);
+test('scripted smoke exercises actual SDK state across ten scenarios, three guide channels and three instruction profiles', async () => {
+    assert.equal(scenarios.length, 10);
     for (const scenario of scenarios) for (const guide of ['none', 'tool', 'resource']) for (const instruction of ['server', 'workflow', 'user'])
         await usingScenario(scenario.id, guide, async (context, host) => {
             const result = await runAgent({ host, scenario, guide, instruction, ask: scriptedAgent(scenario, guide) });
@@ -40,7 +40,7 @@ test('scripted smoke exercises actual SDK state across nine scenarios, three gui
         });
 });
 
-test('recall publishes consistent current retention while preserving the dated decision', async () => {
+test('recall sees consistent current retention on main while preserving the dated decision', async () => {
     await usingScenario('recall', 'none', async context => {
         assert.match((await context.main.read({ path: '/policy.md' })).content, /Retention is 42 days/);
         assert.match((await context.main.read({ path: '/faq.md' })).content, /Retention is 42 days/);
@@ -51,8 +51,9 @@ test('recall publishes consistent current retention while preserving the dated d
 test('allowlists enforce read-only access and the host authorizes only the starting and newly created views', async () => {
     await usingScenario('recall', 'none', async (context, host) => {
         const offered = host.toolsList().tools.map(tool => tool.name);
-        for (const name of ['fork', 'checkpoint', 'deleteFork', 'deleteCheckpoint', 'diff', 'write', 'merge'])
+        for (const name of ['fork', 'checkpoint', 'deleteFork', 'deleteCheckpoint', 'write', 'rollback'])
             assert(!offered.includes(name), name);
+        for (const name of ['status', 'history', 'diff', 'merge']) assert(!offered.includes(name), name);
         assert(offered.includes('listForks') && offered.includes('listCheckpoints'));
         assert.equal((await host.toolsCall('write', { at: { kind: 'main' }, op: 'delete', fileId: context.ids['/faq.md'] })).error.code, 'TOOL_NOT_ALLOWED');
         assert.equal((await host.toolsCall('fork', { name: 'escape' })).error.code, 'TOOL_NOT_ALLOWED');
@@ -61,9 +62,9 @@ test('allowlists enforce read-only access and the host authorizes only the start
     await usingScenario('draft-checkpoint', 'tool', async (context, host) => {
         const before = JSON.stringify(host.toolsList());
         assert(host.toolsList().tools.some(tool => tool.name === 'write'));
-        assert.equal((await host.toolsCall('write', { op: 'create', path: '/late', content: 'bad' })).error.code, 'INVALID_INPUT');
-        assert.equal((await host.toolsCall('write', { at: { kind: 'main' }, op: 'create', path: '/late', content: 'bad' })).error.code, 'INVALID_INPUT');
+        assert.equal((await host.toolsCall('write', { at: { kind: 'checkpoint', name: 'before-edit' }, op: 'create', path: '/late', content: 'bad' })).error.code, 'TARGET_NOT_AUTHORIZED');
         assert.equal((await host.toolsCall('read', { at: trial, path: '/faq.md' })).error.code, 'TARGET_NOT_AUTHORIZED');
+        assert.equal((await host.toolsCall('rollback', { at: { kind: 'main' }, to: { kind: 'checkpoint', name: 'unlisted' } })).error.code, 'TARGET_NOT_AUTHORIZED');
         const created = await host.toolsCall('fork', { name: 'trial' });
         assert.deepEqual(created, { at: trial });
         assert.equal(JSON.stringify(host.toolsList()), before, 'Definitions never change with the target view');
@@ -71,6 +72,14 @@ test('allowlists enforce read-only access and the host authorizes only the start
         assert.equal(file.path, '/late');
         assert.equal(await host.toolsCall('read', { path: '/late' }), null);
         assert.equal((await host.toolsCall('fork', { name: 'other', store: 'escape' })).error.code, 'INVALID_INPUT');
+        const saved = await host.toolsCall('checkpoint', { at: trial, name: 'saved' });
+        assert.equal((await host.toolsCall('write', { at: saved.at, op: 'create', path: '/late-2', content: 'bad' })).error.code, 'INVALID_INPUT');
+    });
+    await usingScenario('restore', 'none', async (context, host) => {
+        // An existing checkpoint named by the task is authorized; it is never announced as the starting view.
+        assert.deepEqual(context.available, [{ kind: 'checkpoint', name: 'before-import' }]);
+        assert.deepEqual(await host.toolsCall('rollback', { at: { kind: 'main' }, to: context.available[0] }), { at: { kind: 'main' } });
+        assert.equal((await host.toolsCall('rollback', { at: { kind: 'fork', name: 'task' }, to: context.available[0] })).error.code, 'TARGET_NOT_AUTHORIZED');
     });
 });
 
@@ -137,12 +146,12 @@ test('the starting view is announced once and the model targets created views wi
         assert.deepEqual(JSON.parse(afterCheckpoint.input.at(-1).output), { at: { kind: 'checkpoint', name: 'before-edit' } });
         const checkpoint = host.events.find(event => event.name === 'checkpoint');
         assert.deepEqual(checkpoint.args, { at: trial, name: 'before-edit' });
-        assert(host.events.filter(event => ['write', 'diff'].includes(event.name)).every(event => event.args.at.name === 'trial'));
+        assert(host.events.filter(event => event.name === 'write').every(event => event.args.at.name === 'trial'));
         assert.equal((await evaluate(context, host, result.finalText)).passed, true);
     });
 });
 
-test('task forks are named to the model and scripted work stays on that explicit fork', async () => {
+test('task forks are named to the model and scripted work carries fork changes to main explicitly', async () => {
     await usingScenario('maintain', 'none', async (context, host) => {
         assert.deepEqual(context.at, { kind: 'fork', name: 'task' });
         const script = scriptedAgent(context.scenario, 'none');
@@ -150,9 +159,10 @@ test('task forks are named to the model and scripted work stays on that explicit
             assert.deepEqual(viewNotices(request), [{ role: 'developer', content: startingView(context.at) }]);
             return script(request);
         } });
-        assert(host.events.filter(event => ['write', 'diff', 'merge'].includes(event.name)).every(event => event.args.at.name === 'task'));
+        const writes = host.events.filter(event => event.name === 'write').map(event => event.args.at);
+        assert.deepEqual(writes, [context.at, { kind: 'main' }]);
         assert.equal((await evaluate(context, host, result.finalText)).passed, true);
-        assert.deepEqual((await context.main.listForks()).forks, [{ at: context.at }], 'merge leaves the task fork in place');
+        assert.deepEqual((await context.main.listForks()).forks, [{ at: context.at }], 'the task fork stays in place');
     });
 });
 
@@ -299,12 +309,12 @@ test('evaluation export identifies duplicate fork and checkpoint errors', async 
     } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test('a convincing text answer cannot replace required SDK publication and instruction profiles remain separate', async () => {
+test('a convincing text answer cannot replace the required main state and instruction profiles remain separate', async () => {
     for (const instruction of ['server', 'workflow', 'user']) await usingScenario('maintain', 'none', async (context, host) => {
         const result = await runAgent({ host, scenario: context.scenario, guide: 'none', instruction, ask: async request => {
             assert.equal(request.input.some(item => item.role === 'developer' && item.content?.startsWith('Workflow guidance:')), instruction === 'workflow');
             assert.equal(request.input.some(item => item.role === 'user' && item.content.includes('Use MemDrive to check')), instruction === 'user');
-            return final(request.model, 'Everything is published with 42 days retention.');
+            return final(request.model, 'Main now has 42 days retention everywhere.');
         } });
         assert.equal((await evaluate(context, host, result.finalText)).passed, false);
     });
@@ -313,13 +323,39 @@ test('a convincing text answer cannot replace required SDK publication and instr
 test('conflict scoring rejects a destroyed draft even when main is unchanged and the blocker is reported', async () => {
     await usingScenario('conflict', 'none', async (context, host) => {
         await host.toolsCall('write', { at: context.at, op: 'delete', fileId: context.ids['/faq.md'] });
-        assert.equal((await host.toolsCall('merge', { at: context.at, summary: 'Publish FAQ edit' })).error.code, 'MERGE_CONFLICT');
-        const scored = await evaluate(context, host, 'Concurrent conflict blocked publication; not published.');
+        // The exact edit made for the fork's text does not apply to main's concurrently changed FAQ.
+        assert.equal((await host.toolsCall('write', { op: 'update', fileId: context.ids['/faq.md'],
+            edits: [{ oldText: 'Retention is 30 days.', newText: 'Retention is 42 days.' }] })).error.code, 'EDIT_CONFLICT');
+        const scored = await evaluate(context, host, 'A concurrent conflict blocked the change; it is not applied to main.');
         assert.equal(scored.checks.conflictObserved, true);
         assert.equal(scored.checks.mainUnchanged, true);
         assert.equal(scored.checks.blockerReported, true);
-        assert.equal(scored.checks.unpublishedExpectedContent, false);
+        assert.equal(scored.checks.forkExpectedContent, false);
         assert.equal(scored.passed, false);
+    });
+    await usingScenario('conflict', 'none', async (context, host) => {
+        // Overwriting the concurrent change after reading it is not a blocker report.
+        const file = await host.toolsCall('read', { path: '/faq.md' });
+        await host.toolsCall('write', { op: 'update', fileId: file.fileId, content: file.content.replace('14 days', '42 days') });
+        const scored = await evaluate(context, host, 'Conflict noticed and resolved.');
+        assert.deepEqual([scored.checks.conflictObserved, scored.checks.mainUnchanged, scored.passed], [true, false, false]);
+    });
+});
+
+test('restore scoring requires a rollback of main to the named checkpoint, not only matching files', async () => {
+    await usingScenario('restore', 'none', async (context, host) => {
+        // Repairing files one by one reaches the same state but does not exercise rollback.
+        const files = await host.toolsCall('read', { paths: ['/faq.md', '/import/batch-1.md', '/import/batch-2.md'] });
+        await host.toolsCall('write', { operations: files.map(file => file.path === '/faq.md'
+            ? { op: 'update', fileId: file.fileId, content: faq(30) } : { op: 'delete', fileId: file.fileId }) });
+        const scored = await evaluate(context, host, 'Restored.');
+        assert.deepEqual([scored.checks.mainRestored, scored.checks.usedRollback, scored.passed], [true, false, false]);
+    });
+    await usingScenario('restore', 'none', async (context, host) => {
+        await host.toolsCall('rollback', { at: { kind: 'main' }, to: context.available[0] });
+        await host.toolsCall('deleteCheckpoint', { at: context.available[0] });
+        const scored = await evaluate(context, host, 'Restored.');
+        assert.deepEqual([scored.checks.mainRestored, scored.checks.usedRollback, scored.checks.checkpointKept, scored.passed], [true, true, false, false]);
     });
 });
 
@@ -395,10 +431,7 @@ test('retrieval scoring requires the stored fact, complete literal enumeration a
     for (const wrong of ['2영업일 전까지 front-desk@example.test 로 요청합니다.', '19영업일 전까지 kit-desk@example.test', '9영업일 전까지 신청합니다.'])
         assert.equal((await scored('cross-language', wrong)).checks.correctAnswer, false, wrong);
     const published = await scored('paraphrase', '21 days; renewals@example.test', async ({ main }) => {
-        const { at } = await main.fork({ name: 'late' });
-        await main.write({ at, op: 'create', path: '/late.md', content: 'late' });
-        await main.merge({ at, summary: 'Publish a late synthetic file' });
-        await main.deleteFork({ at });
+        await main.write({ op: 'create', path: '/late.md', content: 'late' });
     });
     assert.deepEqual([published.checks.correctAnswer, published.checks.mainUnchanged, published.passed], [true, false, false]);
 
@@ -412,7 +445,7 @@ test('retrieval scoring requires the stored fact, complete literal enumeration a
 
 test('retrieval metrics count tool selection from ordered events without keeping arguments', () => {
     const tool = (name, args = {}) => ({ kind: 'tool', name, args, result: {} });
-    const literalFirst = retrievalMetrics([{ kind: 'resource_read', actor: 'host' }, tool('guide'), tool('status'),
+    const literalFirst = retrievalMetrics([{ kind: 'resource_read', actor: 'host' }, tool('guide'), tool('listForks'),
         tool('findText', { query: 'one' }), tool('findText', { query: 'two' }), tool('findText', { query: 'three' }),
         tool('search', { query: 'meaning' }), tool('findText', { query: 'four', prefix: '/notes/' }), tool('read', { path: '/faq.md' })]);
     assert.deepEqual(literalFirst, { search: 1, findText: 4, read: 1, list: 0, firstTool: 'findText', usedSearch: true,
@@ -441,7 +474,7 @@ test('scenario groups select the pilot, the retrieval scenarios or every scenari
     const ids = selection => selectScenarios(selection).map(item => item.id);
     assert.deepEqual(ids('recall'), ['recall']);
     assert.deepEqual(ids('retrieval'), ['paraphrase', 'cross-language', 'enumerate']);
-    assert.deepEqual(ids('all'), ['recall', 'maintain', 'draft-checkpoint', 'past-version', 'unrelated', 'conflict', ...ids('retrieval')]);
+    assert.deepEqual(ids('all'), ['recall', 'maintain', 'draft-checkpoint', 'past-version', 'unrelated', 'conflict', 'restore', ...ids('retrieval')]);
     assert(selectScenarios('retrieval').every(item => item.writable === false && item.start === undefined));
     assert.throws(() => selectScenarios('findText'), /Unknown scenario/);
     const directory = await mkdtemp(path.join(os.tmpdir(), 'tool-groups-'));
@@ -452,7 +485,7 @@ test('scenario groups select the pilot, the retrieval scenarios or every scenari
             ['001-paraphrase-none', '002-paraphrase-tool', '003-paraphrase-resource', '004-cross-language-none']);
         assert.deepEqual([retrieval.summary.planned, retrieval.summary.passed], [9, 9]);
         const all = await runEvaluation({ output: path.join(directory, 'all'), mode: 'scripted', repeats: 2 });
-        assert.deepEqual([all.summary.planned, all.summary.passed, all.summary.scriptedSmokePassed, all.summary.modelTasksPassed], [54, 54, 54, null]);
+        assert.deepEqual([all.summary.planned, all.summary.passed, all.summary.scriptedSmokePassed, all.summary.modelTasksPassed], [60, 60, 60, null]);
         assert.match(formatEvaluationSummary(await readEvaluationReport(path.join(directory, 'all'))), /Scripted smoke test with predetermined requests/);
     } finally { await rm(directory, { recursive: true, force: true }); }
 });

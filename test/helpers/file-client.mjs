@@ -71,6 +71,7 @@ export function fileClient() {
                     },
                     // Restores the branch to the tag's documents. `fixture.beforeRollback` may throw, for
                     // example the definite 400 of a tag whose snapshot is not yet published.
+                    // Like the native client, rollback is never retried.
                     async rollback(branchName, { tag }, options) {
                         calls.push({ kind: 'branch-rollback', name: branchName, tag, retries: options?.retries });
                         await fixture.beforeRollback?.(branchName, tag);
@@ -142,16 +143,6 @@ export function fileClient() {
                     if (request.query.queryString?.defaultField === 'id' && request.query.queryString.skipSyntax)
                         return response(source.filter(doc => doc.id === request.query.queryString.query).slice(0, request.size), request.fields);
                     const [kind, path, exclude] = request.query.bool;
-                    if (path?.queryString?.defaultField === 'changed') {
-                        const overridden = await fixture.diffPage?.(request, options);
-                        if (overridden !== undefined) return overridden;
-                        const kinds = kind.bool.map(clause => JSON.parse(clause.queryString.query));
-                        const after = exclude && /^\{(.+) TO \*\}$/.exec(exclude.queryString.query)?.[1];
-                        const docs = source.filter(doc => kinds.includes(doc.kind) && doc.changed === true
-                            && (after === undefined || doc.id > after));
-                        docs.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
-                        return response(docs.slice(0, request.size), request.fields);
-                    }
                     if (path?.queryString?.defaultField === 'id' && path.queryString.query.startsWith('/')) {
                         const regex = clause => new RegExp(`^${clause.queryString.query.slice(1, -1)}$`);
                         const owned = regex(path);

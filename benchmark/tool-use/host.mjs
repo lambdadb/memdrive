@@ -6,18 +6,19 @@ const guideResources = [
     ...Object.entries(fileToolGuideTopics).map(([topic, document]) =>
         ({ uri: `memdrive://docs/${topic}`, name: document.title, document })),
 ];
-const reads = ['status', 'history', 'list', 'read', 'search', 'findText', 'listForks', 'listCheckpoints'];
-const writes = ['fork', 'checkpoint', 'deleteFork', 'deleteCheckpoint', 'diff', 'write', 'merge'];
+const reads = ['list', 'read', 'search', 'findText', 'listForks', 'listCheckpoints'];
+const writes = ['fork', 'checkpoint', 'deleteFork', 'deleteCheckpoint', 'write', 'rollback'];
 const viewKey = at => at === undefined || at?.kind === 'main' ? 'main' : `${at?.kind}:${at?.name}`;
 
 // A protocol-shaped, in-process host. It is not an MCP server or wire implementation.
 // It connects one authorized drive with a fixed allowlist. The model selects
-// views with `at`; the host accepts main, the task's starting view and views
-// returned by this conversation's successful fork or checkpoint calls.
-export function createHost({ drive, writable, guide, start = { kind: 'main' } }) {
+// views with `at`; the host accepts main, the task's starting view, existing
+// views the task names (`available`) and views returned by this conversation's
+// successful fork or checkpoint calls.
+export function createHost({ drive, writable, guide, start = { kind: 'main' }, available = [] }) {
     const events = [];
     const tools = createFileTools({ drive, tools: [...(guide === 'tool' ? ['guide'] : []), ...reads, ...(writable ? writes : [])] });
-    const authorized = new Set(['main', viewKey(start)]);
+    const authorized = new Set(['main', viewKey(start), ...available.map(viewKey)]);
     return {
         events,
         start: structuredClone(start),
@@ -34,7 +35,7 @@ export function createHost({ drive, writable, guide, start = { kind: 'main' } })
         async toolsCall(name, args, { signal } = {}) {
             let result;
             // Evaluation policy, not hosted authentication. The SDK validates at.
-            if (args?.at !== undefined && !authorized.has(viewKey(args.at)))
+            if (['at', 'to'].some(key => args?.[key] !== undefined && !authorized.has(viewKey(args[key]))))
                 result = { ok: false, error: { code: 'TARGET_NOT_AUTHORIZED', message: 'The host has not authorized this view for the task.' } };
             else {
                 try {
