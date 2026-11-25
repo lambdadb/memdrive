@@ -45,11 +45,13 @@ checks integration and deterministic behavior, not retrieval quality. Preserve
 exact originals, avoid invented ranges for rendered text, and reuse stored
 chunks and vectors when moving files.
 
-The shared file-tool catalog also lives at the package root. Keep tools one-to-one
-with public SDK operations, one fixed schema set per embedding mode and the
-explicit allowlist when adding tools. Each request selects its view with `at`;
-results, including fork/checkpoint creation and rollback, come unchanged from the
-public SDK. Schemas describe JSON input while SDK validation enforces semantic
+The shared file-tool catalog also lives at the package root. It is deliberately
+minimal: six tools (`guide`, `read`, `list`, `search`, `findText`, `write`) on
+main, without `at` in schemas, inputs or results, one fixed schema set per
+embedding mode and an explicit allowlist. Each tool except `guide` calls the
+public SDK method of the same name; refs, rollback and checkpoint retention stay
+host operations. The optional host `checkpoint` hook makes every `write` call a
+checkpointed write without exposing the checkpoint to the agent. Schemas describe JSON input while SDK validation enforces semantic
 constraints. Schema tests use Ajv only as a development dependency. Keep guide
 text independent of host authentication, product policy and provider adapters.
 Change the shared guide `version` only in release pull requests, not for each
@@ -74,12 +76,17 @@ dedicated test project; missing settings fail rather than silently skipping. The
 publication workflow runs the live suite against the exact installed tarball.
 The default suite creates stores, forks them, writes on forks and on main,
 reads, lists, searches and matches text, checkpoints a fork and rolls it back to
-that checkpoint, deletes the refs it created, and destroys every store,
-confirming each collection's deletion with a native not-found response.
+that checkpoint, deletes the refs it created (deleting a fork before its latest
+checkpoint), and destroys every store, confirming each collection's deletion
+with a native not-found response.
 
 Opt-in flags extend it, each cleaning up what it creates:
 `MEMDRIVE_RUN_LIVE_CHECKPOINT_TESTS=1` adds checkpoint conflicts and reads,
-forking from checkpoints and forks, and another fork rollback to the basic store;
+forking from checkpoints and forks, and another fork rollback to the basic store,
+plus a separate store with checkpointed writes on main: it waits until a rollback
+to the first checkpoint is accepted, reporting the delay, injects an alias
+failure into the second checkpointed write and verifies the restore, and pages
+`listCheckpoints`;
 `MEMDRIVE_RUN_LIVE_EXTERNAL_VECTOR_TESTS=1` exercises external-vector writes,
 filters and checkpoints in an isolated collection;
 `MEMDRIVE_RUN_LIVE_FIND_TEXT_TESTS=1` verifies literal matching, live and
@@ -87,8 +94,8 @@ checkpoint cursors and continued scans across multiple native query pages in an
 isolated collection. Document unperformed checks accurately.
 
 The [model tool-use harness](benchmark/tool-use/README.md) consumes the shared
-SDK tool catalog in an in-process host with explicit allowlists and per-call
-`at` targets. Keep its scenarios, provider transport and scoring outside `src/` and
+SDK tool catalog in an in-process host with explicit allowlists, main-only tools
+and host-checkpointed writes. Keep its scenarios, provider transport and scoring outside `src/` and
 the package archive. Its fixture/scripted tests run in ordinary CI without keys;
 real model calls require explicit model mode and `LLM_API_KEY`. Scripted or
 injected transports must never be reported as model performance, and fixture

@@ -6,8 +6,8 @@ import path from 'node:path';
 import { fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
 import { createHost, guideURI } from '../benchmark/tool-use/host.mjs';
 import { prepareScenario, scenarios, selectScenarios, evaluate, retrievalMetrics, aggregateRetrieval, paraphraseTargets, enumeratedCode, faq,
-    enumeratedPaths } from '../benchmark/tool-use/scenarios.mjs';
-import { runAgent, openAI, limits, startingView } from '../benchmark/tool-use/agent.mjs';
+    enumeratedPaths, handoff, junk, policy } from '../benchmark/tool-use/scenarios.mjs';
+import { runAgent, openAI, limits } from '../benchmark/tool-use/agent.mjs';
 import { scriptedAgent } from '../benchmark/tool-use/scripted.mjs';
 import { runEvaluation } from '../benchmark/tool-use/run.mjs';
 import { formatEvaluationSummary, readEvaluationReport } from '../benchmark/tool-use/report.mjs';
@@ -16,16 +16,14 @@ const final = (model, text = 'done') => ({ model, status: 'completed', usage: { 
     output: [{ type: 'message', role: 'assistant', phase: 'final_answer', content: [{ type: 'output_text', text }] }] });
 const response = (model, output) => ({ ...final(model), output });
 const call = (name, args, id = 'call-1') => ({ type: 'function_call', name, arguments: JSON.stringify(args), call_id: id });
-const viewNotices = request => request.input.filter(item => item.role === 'developer' && item.content.startsWith('Starting view for this task: '));
-const trial = { kind: 'fork', name: 'trial' };
 async function usingScenario(id, guide, run) {
     const context = await prepareScenario(id);
-    const host = createHost({ drive: context.drive, writable: context.scenario.writable, guide, start: context.at, available: context.available });
+    const host = createHost({ drive: context.drive, writable: context.scenario.writable, guide, afterCall: context.afterCall });
     try { await run(context, host); } finally { await context.cleanup(); }
 }
 
-test('scripted smoke exercises actual SDK state across ten scenarios, three guide channels and three instruction profiles', async () => {
-    assert.equal(scenarios.length, 10);
+test('scripted smoke exercises actual SDK state across eight scenarios, three guide channels and three instruction profiles', async () => {
+    assert.equal(scenarios.length, 8);
     for (const scenario of scenarios) for (const guide of ['none', 'tool', 'resource']) for (const instruction of ['server', 'workflow', 'user'])
         await usingScenario(scenario.id, guide, async (context, host) => {
             const result = await runAgent({ host, scenario, guide, instruction, ask: scriptedAgent(scenario, guide) });
@@ -48,38 +46,27 @@ test('recall sees consistent current retention on main while preserving the date
     });
 });
 
-test('allowlists enforce read-only access and the host authorizes only the starting and newly created views', async () => {
-    await usingScenario('recall', 'none', async (context, host) => {
+test('the host offers the six main-only tools, read-only tasks get no write and every write is checkpointed by the host', async () => {
+    await usingScenario('recall', 'tool', async (context, host) => {
         const offered = host.toolsList().tools.map(tool => tool.name);
-        for (const name of ['fork', 'checkpoint', 'deleteFork', 'deleteCheckpoint', 'write', 'rollback'])
-            assert(!offered.includes(name), name);
-        for (const name of ['status', 'history', 'diff', 'merge']) assert(!offered.includes(name), name);
-        assert(offered.includes('listForks') && offered.includes('listCheckpoints'));
-        assert.equal((await host.toolsCall('write', { at: { kind: 'main' }, op: 'delete', fileId: context.ids['/faq.md'] })).error.code, 'TOOL_NOT_ALLOWED');
-        assert.equal((await host.toolsCall('fork', { name: 'escape' })).error.code, 'TOOL_NOT_ALLOWED');
-        assert.equal((await host.toolsCall('deleteFork', { at: { kind: 'fork', name: 'other' } })).error.code, 'TARGET_NOT_AUTHORIZED');
+        assert.deepEqual(offered, ['guide', 'read', 'list', 'search', 'findText']);
+        assert.equal((await host.toolsCall('write', { op: 'delete', fileId: context.ids['/faq.md'] })).error.code, 'TOOL_NOT_ALLOWED');
+        for (const name of ['fork', 'checkpoint', 'rollback', 'listCheckpoints'])
+            assert.equal((await host.toolsCall(name, { name: 'escape' })).error.code, 'TOOL_NOT_ALLOWED', name);
+        assert.equal((await host.toolsCall('read', { at: { kind: 'fork', name: 'other' }, path: '/faq.md' })).error.code, 'INVALID_INPUT');
     });
-    await usingScenario('draft-checkpoint', 'tool', async (context, host) => {
+    await usingScenario('maintain', 'none', async (context, host) => {
         const before = JSON.stringify(host.toolsList());
-        assert(host.toolsList().tools.some(tool => tool.name === 'write'));
-        assert.equal((await host.toolsCall('write', { at: { kind: 'checkpoint', name: 'before-edit' }, op: 'create', path: '/late', content: 'bad' })).error.code, 'TARGET_NOT_AUTHORIZED');
-        assert.equal((await host.toolsCall('read', { at: trial, path: '/faq.md' })).error.code, 'TARGET_NOT_AUTHORIZED');
-        assert.equal((await host.toolsCall('rollback', { at: { kind: 'main' }, to: { kind: 'checkpoint', name: 'unlisted' } })).error.code, 'TARGET_NOT_AUTHORIZED');
-        const created = await host.toolsCall('fork', { name: 'trial' });
-        assert.deepEqual(created, { at: trial });
-        assert.equal(JSON.stringify(host.toolsList()), before, 'Definitions never change with the target view');
-        const file = await host.toolsCall('write', { at: trial, op: 'create', path: '/late', content: 'draft' });
-        assert.equal(file.path, '/late');
-        assert.equal(await host.toolsCall('read', { path: '/late' }), null);
-        assert.equal((await host.toolsCall('fork', { name: 'other', store: 'escape' })).error.code, 'INVALID_INPUT');
-        const saved = await host.toolsCall('checkpoint', { at: trial, name: 'saved' });
-        assert.equal((await host.toolsCall('write', { at: saved.at, op: 'create', path: '/late-2', content: 'bad' })).error.code, 'INVALID_INPUT');
-    });
-    await usingScenario('restore', 'none', async (context, host) => {
-        // An existing checkpoint named by the task is authorized; it is never announced as the starting view.
-        assert.deepEqual(context.available, [{ kind: 'checkpoint', name: 'before-import' }]);
-        assert.deepEqual(await host.toolsCall('rollback', { at: { kind: 'main' }, to: context.available[0] }), { at: { kind: 'main' } });
-        assert.equal((await host.toolsCall('rollback', { at: { kind: 'fork', name: 'task' }, to: context.available[0] })).error.code, 'TARGET_NOT_AUTHORIZED');
+        assert.deepEqual(host.toolsList().tools.map(tool => tool.name), ['read', 'list', 'search', 'findText', 'write']);
+        assert(host.toolsList().tools.every(tool => !JSON.stringify(tool.inputSchema).includes('"at"')));
+        assert.deepEqual((await context.main.describe()).latestCheckpoint, { at: { kind: 'checkpoint', name: 'setup' } });
+        const file = await host.toolsCall('write', { op: 'create', path: '/late.md', content: 'draft' });
+        assert.equal(file.path, '/late.md');
+        assert.equal(file.checkpoint, undefined, 'the model sees a plain write result');
+        assert.deepEqual((await context.main.describe()).latestCheckpoint, { at: { kind: 'checkpoint', name: 'turn-1' } });
+        assert.equal((await host.toolsCall('write', { op: 'create', path: '/late-2.md', content: 'x', checkpoint: { name: 'mine' } })).error.code, 'INVALID_INPUT');
+        assert.equal((await host.toolsCall('write', { at: { kind: 'main' }, op: 'create', path: '/late-2.md', content: 'x' })).error.code, 'INVALID_INPUT');
+        assert.equal(JSON.stringify(host.toolsList()), before, 'Definitions never change');
     });
 });
 
@@ -113,7 +100,6 @@ test('model continuation preserves reasoning items and message phases and delive
         const ask = async request => {
             assert.equal(request.store, false);
             assert.deepEqual(request.include, ['reasoning.encrypted_content']);
-            assert.deepEqual(viewNotices(request), [request.input[1]]);
             if (round++ === 0) return response(request.model, [opaque,
                 { type: 'message', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: 'Checking.' }] },
                 { ...call('read', {}), arguments: '{broken' }]);
@@ -127,42 +113,44 @@ test('model continuation preserves reasoning items and message phases and delive
     });
 });
 
-test('the starting view is announced once and the model targets created views with returned at', async () => {
-    await usingScenario('draft-checkpoint', 'none', async (context, host) => {
-        const requests = [];
-        const script = scriptedAgent(context.scenario, 'none');
-        const result = await runAgent({ host, scenario: context.scenario, guide: 'none', ask: async request => {
-            requests.push(request);
-            return script(request);
-        } });
-        const [mainRequest, forkRequest, afterCheckpoint] = requests;
-        const notice = { role: 'developer', content: startingView({ kind: 'main' }) };
-        for (const request of requests) {
-            assert.deepEqual(viewNotices(request), [notice]);
-            assert.deepEqual(request.tools, mainRequest.tools);
-        }
-        assert.equal(mainRequest.tools.some(tool => tool.name === 'write'), true);
-        assert.deepEqual(JSON.parse(forkRequest.input.at(-1).output), { at: trial });
-        assert.deepEqual(JSON.parse(afterCheckpoint.input.at(-1).output), { at: { kind: 'checkpoint', name: 'before-edit' } });
-        const checkpoint = host.events.find(event => event.name === 'checkpoint');
-        assert.deepEqual(checkpoint.args, { at: trial, name: 'before-edit' });
-        assert(host.events.filter(event => event.name === 'write').every(event => event.args.at.name === 'trial'));
+test('the conflict scenario injects one concurrent change after the first FAQ read and the scripted edit is rejected', async () => {
+    await usingScenario('conflict', 'none', async (context, host) => {
+        const result = await runAgent({ host, scenario: context.scenario, guide: 'none', ask: scriptedAgent(context.scenario, 'none') });
+        const write = host.events.find(event => event.name === 'write');
+        assert.equal(write.result.error.code, 'EDIT_CONFLICT');
+        assert.equal((await context.main.read({ path: '/faq.md' })).content, faq(14));
+        // A validation error changes nothing, so no checkpoint was taken and the concurrent change stays.
+        assert.deepEqual((await context.main.describe()).latestCheckpoint, { at: { kind: 'checkpoint', name: 'setup' } });
         assert.equal((await evaluate(context, host, result.finalText)).passed, true);
     });
 });
 
-test('task forks are named to the model and scripted work carries fork changes to main explicitly', async () => {
-    await usingScenario('maintain', 'none', async (context, host) => {
-        assert.deepEqual(context.at, { kind: 'fork', name: 'task' });
-        const script = scriptedAgent(context.scenario, 'none');
-        const result = await runAgent({ host, scenario: context.scenario, guide: 'none', ask: async request => {
-            assert.deepEqual(viewNotices(request), [{ role: 'developer', content: startingView(context.at) }]);
-            return script(request);
-        } });
-        const writes = host.events.filter(event => event.name === 'write').map(event => event.args.at);
-        assert.deepEqual(writes, [context.at, { kind: 'main' }]);
-        assert.equal((await evaluate(context, host, result.finalText)).passed, true);
-        assert.deepEqual((await context.main.listForks()).forks, [{ at: context.at }], 'the task fork stays in place');
+test('record scoring requires the user\'s wording in one checkpointed write', async () => {
+    const recorded = async (writes, text = 'Saved.') => {
+        let scored;
+        await usingScenario('record', 'none', async (context, host) => {
+            for (const args of writes) await host.toolsCall('write', args);
+            scored = await evaluate(context, host, text);
+        });
+        return scored;
+    };
+    const verbatim = await recorded([{ op: 'create', path: '/notes/handoff.md', content: `# Handoff\n\n> ${handoff}\n` }]);
+    assert.deepEqual([verbatim.passed, verbatim.checks.verbatimRecorded, verbatim.checks.singleWrite, verbatim.checks.checkpointedWrites], [true, true, true, true]);
+    const paraphrased = await recorded([{ op: 'create', path: '/notes/handoff.md', content: 'Handoff is Monday morning; the backup covers.' }]);
+    assert.deepEqual([paraphrased.passed, paraphrased.checks.verbatimRecorded], [false, false]);
+    const split = await recorded([{ op: 'create', path: '/notes/a.md', content: handoff }, { op: 'create', path: '/notes/b.md', content: 'More.' }]);
+    assert.deepEqual([split.passed, split.checks.verbatimRecorded, split.checks.singleWrite], [false, true, false]);
+});
+
+test('cleanup scoring requires the junk deleted after reading it, with other files unchanged', async () => {
+    await usingScenario('cleanup', 'none', async (context, host) => {
+        // Deleting without reading the originals does not earn read-before-write credit.
+        const listed = await host.toolsCall('list', { prefix: '/import/' });
+        await host.toolsCall('write', { operations: listed.files.map(file => ({ op: 'delete', fileId: file.fileId })) });
+        const scored = await evaluate(context, host, 'Deleted.');
+        assert.deepEqual([scored.checks.junkRemoved, scored.checks.otherFilesUnchanged, scored.checks.readOriginalBeforeWrite, scored.passed],
+            [true, true, false, false]);
+        assert.deepEqual(Object.keys(context.initial.main).filter(path => path in junk), Object.keys(junk));
     });
 });
 
@@ -191,7 +179,7 @@ test('oversized delivered reads cannot earn read-before-write credit', async () 
             return final(request.model);
         };
         await runAgent({ host, scenario: context.scenario, guide: 'none', ask, budget: { ...limits, resultBytes: 1 } });
-        await host.toolsCall('write', { at: context.at, op: 'update', fileId: context.ids['/faq.md'], edits: [{ oldText: '30 days', newText: '42 days' }] });
+        await host.toolsCall('write', { op: 'update', fileId: context.ids['/faq.md'], edits: [{ oldText: '30 days', newText: '42 days' }] });
         const result = await evaluate(context, host, 'done');
         assert.equal(result.behavior.readBeforeWrite, false);
     });
@@ -294,18 +282,21 @@ test('evaluation export preserves diagnostic outcomes without provider payloads 
     } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test('evaluation export identifies duplicate fork and checkpoint errors', async () => {
-    const directory = await mkdtemp(path.join(os.tmpdir(), 'tool-ref-conflicts-'));
+test('evaluation export identifies edit conflicts and removed tools', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'tool-write-errors-'));
     try {
         const output = path.join(directory, 'run');
-        const calls = [call('fork', { name: 'trial' }, 'fork'), call('fork', { name: 'trial' }, 'duplicate-fork'),
-            call('checkpoint', { at: trial, name: 'before-edit' }, 'checkpoint'),
-            call('checkpoint', { at: trial, name: 'before-edit' }, 'duplicate-checkpoint')];
-        await runEvaluation({ output, scenario: 'draft-checkpoint', guide: 'none',
-            askFactory: () => async (request, { round }) => calls[round] ? response(request.model, [calls[round]]) : final(request.model) });
-        const { cases: [draft] } = await readEvaluationReport(output);
-        assert.deepEqual(draft.events.filter(event => event.outcome === 'error').map(event => [event.name, event.errorCode]),
-            [['fork', 'BRANCH_CONFLICT'], ['checkpoint', 'CHECKPOINT_CONFLICT']]);
+        // The read's fileId feeds an exact edit that the injected concurrent change makes stale.
+        const calls = [() => call('read', { path: '/faq.md' }, 'read'),
+            previous => call('write', { op: 'update', fileId: previous.fileId, edits: [{ oldText: 'Retention is 30 days.', newText: 'Retention is 42 days.' }] }, 'write'),
+            () => call('rollback', { at: { kind: 'main' }, to: { kind: 'checkpoint', name: 'setup' } }, 'rollback')];
+        await runEvaluation({ output, scenario: 'conflict', guide: 'none',
+            askFactory: () => async (request, { round }) => calls[round]
+                ? response(request.model, [calls[round](JSON.parse(request.input.findLast(item => item.type === 'function_call_output')?.output ?? '{}'))])
+                : final(request.model) });
+        const { cases: [conflict] } = await readEvaluationReport(output);
+        assert.deepEqual(conflict.events.filter(event => event.outcome === 'error').map(event => [event.name, event.errorCode]),
+            [['write', 'EDIT_CONFLICT'], ['rollback', 'TOOL_NOT_ALLOWED']]);
     } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -320,64 +311,29 @@ test('a convincing text answer cannot replace the required main state and instru
     });
 });
 
-test('conflict scoring rejects a destroyed draft even when main is unchanged and the blocker is reported', async () => {
-    await usingScenario('conflict', 'none', async (context, host) => {
-        await host.toolsCall('write', { at: context.at, op: 'delete', fileId: context.ids['/faq.md'] });
-        // The exact edit made for the fork's text does not apply to main's concurrently changed FAQ.
-        assert.equal((await host.toolsCall('write', { op: 'update', fileId: context.ids['/faq.md'],
-            edits: [{ oldText: 'Retention is 30 days.', newText: 'Retention is 42 days.' }] })).error.code, 'EDIT_CONFLICT');
-        const scored = await evaluate(context, host, 'A concurrent conflict blocked the change; it is not applied to main.');
-        assert.equal(scored.checks.conflictObserved, true);
-        assert.equal(scored.checks.mainUnchanged, true);
-        assert.equal(scored.checks.blockerReported, true);
-        assert.equal(scored.checks.forkExpectedContent, false);
-        assert.equal(scored.passed, false);
-    });
+test('conflict scoring rejects an overwrite of the concurrent change even when a blocker is claimed', async () => {
     await usingScenario('conflict', 'none', async (context, host) => {
         // Overwriting the concurrent change after reading it is not a blocker report.
         const file = await host.toolsCall('read', { path: '/faq.md' });
-        await host.toolsCall('write', { op: 'update', fileId: file.fileId, content: file.content.replace('14 days', '42 days') });
-        const scored = await evaluate(context, host, 'Conflict noticed and resolved.');
-        assert.deepEqual([scored.checks.conflictObserved, scored.checks.mainUnchanged, scored.passed], [true, false, false]);
+        const current = await host.toolsCall('read', { path: '/faq.md' });
+        assert.equal(current.content, faq(14));
+        await host.toolsCall('write', { op: 'update', fileId: file.fileId, content: current.content.replace('14 days', '42 days') });
+        const scored = await evaluate(context, host, 'A concurrent change was noticed; my change was not applied.');
+        assert.deepEqual([scored.checks.conflictObserved, scored.checks.blockerReported, scored.checks.concurrentChangeKept, scored.passed],
+            [true, true, false, false]);
     });
 });
 
-test('restore scoring requires a rollback of main to the named checkpoint, not only matching files', async () => {
-    await usingScenario('restore', 'none', async (context, host) => {
-        // Repairing files one by one reaches the same state but does not exercise rollback.
-        const files = await host.toolsCall('read', { paths: ['/faq.md', '/import/batch-1.md', '/import/batch-2.md'] });
-        await host.toolsCall('write', { operations: files.map(file => file.path === '/faq.md'
-            ? { op: 'update', fileId: file.fileId, content: faq(30) } : { op: 'delete', fileId: file.fileId }) });
-        const scored = await evaluate(context, host, 'Restored.');
-        assert.deepEqual([scored.checks.mainRestored, scored.checks.usedRollback, scored.passed], [true, false, false]);
+test('maintain scoring requires both updated originals and the host checkpoint of the final write', async () => {
+    await usingScenario('maintain', 'none', async (context, host) => {
+        const files = await host.toolsCall('read', { paths: ['/faq.md', '/policy.md'] });
+        await host.toolsCall('write', { op: 'update', fileId: files[0].fileId, edits: [{ oldText: 'Retention is 30 days.', newText: 'Retention is 42 days.' }] });
+        // A direct SDK write behind the host's back leaves main ahead of its latest checkpoint.
+        await context.main.write({ op: 'update', fileId: files[1].fileId, content: policy(42) });
+        const scored = await evaluate(context, host, 'Updated.');
+        assert.deepEqual([scored.checks.mainExpectedContent, scored.checks.readOriginalBeforeWrite, scored.checks.checkpointedWrites, scored.passed],
+            [true, true, false, false]);
     });
-    await usingScenario('restore', 'none', async (context, host) => {
-        await host.toolsCall('rollback', { at: { kind: 'main' }, to: context.available[0] });
-        await host.toolsCall('deleteCheckpoint', { at: context.available[0] });
-        const scored = await evaluate(context, host, 'Restored.');
-        assert.deepEqual([scored.checks.mainRestored, scored.checks.usedRollback, scored.checks.checkpointKept, scored.passed], [true, true, false, false]);
-    });
-});
-
-test('checkpoint scoring requires draft provenance before its first mutation', async () => {
-    for (const timing of ['main-before-fork', 'main-after-edit', 'draft-after-edit'])
-        await usingScenario('draft-checkpoint', 'none', async (context, host) => {
-            if (timing === 'main-before-fork') await host.toolsCall('checkpoint', { name: 'before-edit' });
-            await host.toolsCall('fork', { name: 'trial' });
-            await host.toolsCall('read', { at: trial, path: '/faq.md' });
-            // A same-content write still mutates the draft and must follow its before-edit checkpoint.
-            if (timing === 'draft-after-edit') {
-                await host.toolsCall('write', { at: trial, op: 'update', fileId: context.ids['/faq.md'], content: context.initial.main['/faq.md'] });
-                await host.toolsCall('checkpoint', { at: trial, name: 'before-edit' });
-            }
-            await host.toolsCall('write', { at: trial, op: 'update', fileId: context.ids['/faq.md'], edits: [{ oldText: '30 days', newText: '42 days' }] });
-            if (timing === 'main-after-edit') await host.toolsCall('checkpoint', { at: { kind: 'main' }, name: 'before-edit' });
-            const scored = await evaluate(context, host, 'The private draft is ready.');
-            assert.equal(scored.checks.checkpointContent, true, timing);
-            assert.equal(scored.checks.forkContent, true, timing);
-            assert.equal(scored.checks.checkpointOfDraftBeforeEditing, false, timing);
-            assert.equal(scored.passed, false, timing);
-        });
 });
 
 test('paraphrase targets are ranked candidates for any query while the question wording has no literal hit', async () => {
@@ -474,8 +430,8 @@ test('scenario groups select the pilot, the retrieval scenarios or every scenari
     const ids = selection => selectScenarios(selection).map(item => item.id);
     assert.deepEqual(ids('recall'), ['recall']);
     assert.deepEqual(ids('retrieval'), ['paraphrase', 'cross-language', 'enumerate']);
-    assert.deepEqual(ids('all'), ['recall', 'maintain', 'draft-checkpoint', 'past-version', 'unrelated', 'conflict', 'restore', ...ids('retrieval')]);
-    assert(selectScenarios('retrieval').every(item => item.writable === false && item.start === undefined));
+    assert.deepEqual(ids('all'), ['recall', 'maintain', 'record', 'conflict', 'cleanup', ...ids('retrieval')]);
+    assert(selectScenarios('retrieval').every(item => item.writable === false));
     assert.throws(() => selectScenarios('findText'), /Unknown scenario/);
     const directory = await mkdtemp(path.join(os.tmpdir(), 'tool-groups-'));
     try {
@@ -485,7 +441,7 @@ test('scenario groups select the pilot, the retrieval scenarios or every scenari
             ['001-paraphrase-none', '002-paraphrase-tool', '003-paraphrase-resource', '004-cross-language-none']);
         assert.deepEqual([retrieval.summary.planned, retrieval.summary.passed], [9, 9]);
         const all = await runEvaluation({ output: path.join(directory, 'all'), mode: 'scripted', repeats: 2 });
-        assert.deepEqual([all.summary.planned, all.summary.passed, all.summary.scriptedSmokePassed, all.summary.modelTasksPassed], [60, 60, 60, null]);
+        assert.deepEqual([all.summary.planned, all.summary.passed, all.summary.scriptedSmokePassed, all.summary.modelTasksPassed], [48, 48, 48, null]);
         assert.match(formatEvaluationSummary(await readEvaluationReport(path.join(directory, 'all'))), /Scripted smoke test with predetermined requests/);
     } finally { await rm(directory, { recursive: true, force: true }); }
 });

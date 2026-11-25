@@ -35,7 +35,7 @@ test('live local Docling chunks retain exact originals through checkpoints, main
         assert.equal(collection.snapshotRetentionInDays, 1);
         assert(collection.description.startsWith('memdrive-config-v1:'));
         assert.deepEqual(Object.keys(JSON.parse(collection.description.slice('memdrive-config-v1:'.length))), ['chunking']);
-        assert.equal(Object.hasOwn(await main.describe(options()), 'retentionInDays'), false);
+        assert.equal(Object.hasOwn(await main.describe({}, options()), 'retentionInDays'), false);
         phase = 'create working fork';
         const { at } = await main.fork({ name: 'draft' }, options());
         assert.deepEqual(at, { kind: 'fork', name: 'draft' });
@@ -100,8 +100,12 @@ test('live local Docling chunks retain exact originals through checkpoints, main
         assert.deepEqual(tagNames, ['checkpoint-saved']);
         const branchNames = (await client.collection(name).branches.list(options())).branches.map(branch => branch.name).sort();
         assert.deepEqual(branchNames, ['fork-draft', 'fork-restored', 'main']);
-        assert.deepEqual(await main.listForks({}, options()), { forks: [{ at }, { at: restored }] });
-        assert.deepEqual(await main.listCheckpoints({}, options()), { checkpoints: [{ at: checkpoint }] });
+        assert.deepEqual((await main.listForks({}, options())).forks.map(entry => entry.at), [at, restored]);
+        assert.deepEqual((await main.listCheckpoints({}, options())).checkpoints.map(entry => entry.at), [checkpoint]);
+        // The checkpoint of the fork is that fork's latest checkpoint until the fork is deleted.
+        assert.deepEqual((await main.describe({ at }, options())).latestCheckpoint, { at: checkpoint });
+        await assert.rejects(main.deleteCheckpoint({ at: checkpoint }, options()), { code: 'CHECKPOINT_IN_USE' });
+        assert.deepEqual(await main.deleteFork({ at }, options()), { at });
         assert.deepEqual(await main.deleteCheckpoint({ at: checkpoint }, options()), { at: checkpoint });
         await assert.rejects(main.read({ at: checkpoint, fileId: file.fileId }, options()), { code: 'CHECKPOINT_NOT_FOUND' });
         await assert.rejects(main.deleteCheckpoint({ at: checkpoint }, options()), { code: 'CHECKPOINT_NOT_FOUND' });

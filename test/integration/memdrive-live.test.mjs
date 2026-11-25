@@ -68,7 +68,8 @@ test('live file store writes main and forks, searches, lists, checkpoints and ro
         // One collection per store: no internal journal or companion collection.
         assert.equal(collectionCreations, 1);
         assert.equal((await client.collection(name).get(options())).collection.snapshotRetentionInDays, 1);
-        assert.equal(Object.hasOwn(await main.describe(options()), 'retentionInDays'), false);
+        assert.equal(Object.hasOwn(await main.describe({}, options()), 'retentionInDays'), false);
+        assert.equal((await main.describe({}, options())).latestCheckpoint, null);
         await assert.rejects(main.read({ at: { kind: 'checkpoint', name: 'never-created' }, path: '/x' }, options()),
             { code: 'CHECKPOINT_NOT_FOUND', status: 404 });
         // Checkpoints are read-only; the SDK rejects the target before any storage call.
@@ -78,7 +79,7 @@ test('live file store writes main and forks, searches, lists, checkpoints and ro
         const research = { kind: 'fork', name: 'research' };
         assert.deepEqual(await main.fork({ name: 'research' }, options()), { at: research });
         const at = research;
-        assert.deepEqual(await main.listForks({}, options()), { forks: [{ at: research }] });
+        assert.deepEqual((await main.listForks({}, options())).forks.map(entry => entry.at), [research]);
         assert.deepEqual(await main.listCheckpoints({}, options()), { checkpoints: [] });
 
         // Omitted at writes to main directly; the fork created before it stays isolated.
@@ -285,12 +286,12 @@ test('live file store writes main and forks, searches, lists, checkpoints and ro
             assert.equal(await pinned.read({ at: child, path: '/child-only.txt' }, options()), null);
             const copied = (await pinned.checkpoint({ at: retained, name: 'copied' }, options())).at;
             assert.deepEqual(await pinned.read({ at: copied, fileId: sample.fileId }, options()), sample);
-            assert.deepEqual(await main.listCheckpoints({}, options()), { checkpoints: [{ at: copied }, { at: retained }] });
+            assert.deepEqual((await main.listCheckpoints({}, options())).checkpoints.map(entry => entry.at), [copied, retained]);
             assert.deepEqual(await pinned.deleteCheckpoint({ at: copied }, options()), { at: copied });
             assert.deepEqual(await pinned.deleteCheckpoint({ at: retained }, options()), { at: retained });
             await assert.rejects(pinned.read({ at: retained, fileId: sample.fileId }, options()), { code: 'CHECKPOINT_NOT_FOUND', status: 404 });
             assert.deepEqual(await main.listCheckpoints({}, options()), { checkpoints: [] });
-            assert.deepEqual(await main.listForks({}, options()), { forks: [{ at: child }, { at: fromWorking }] });
+            assert.deepEqual((await main.listForks({}, options())).forks.map(entry => entry.at), [child, fromWorking]);
         } else {
             t.diagnostic('Checkpoint capture, fork and rollback validation are opt-in through MEMDRIVE_RUN_LIVE_CHECKPOINT_TESTS=1.');
             assert.deepEqual(await reopened.deleteFork({ at }, options()), { at });
@@ -311,6 +312,104 @@ test('live file store writes main and forks, searches, lists, checkpoints and ro
             try {
                 await client.collection(name).delete(options());
             } catch (error) {
+                if (statusOf(error) !== 404) {
+                    const cleanup = safeFailure(`Cleanup of ${name}`, error);
+                    failure = failure ? new AggregateError([failure, cleanup], 'Smoke and cleanup failed.') : cleanup;
+                }
+            }
+            try {
+                await assert.rejects(client.collection(name).get(options()), error => statusOf(error) === 404);
+                t.diagnostic(`Temporary collection ${name} deletion verified with HTTP 404.`);
+            } catch (error) {
+                const cleanup = safeFailure(`Deletion verification for ${name}`, error);
+                failure = failure ? new AggregateError([failure, cleanup], 'Smoke or cleanup verification failed.') : cleanup;
+            }
+        }
+    }
+    if (failure) throw failure;
+});
+
+test('live checkpointed writes record the latest checkpoint and restore it after an injected failure', {
+    skip: !enabled ? 'Set MEMDRIVE_RUN_LIVE_TESTS=1 to permit live resources.'
+        : !verifyCheckpoints ? 'Checkpointed writes are opt-in through MEMDRIVE_RUN_LIVE_CHECKPOINT_TESTS=1.' : false,
+    timeout: 600_000,
+}, async t => {
+    for (const key of required) assert(process.env[key]?.trim(), `Missing live configuration: ${key}`);
+    const httpClient = new HTTPClient();
+    httpClient.addHook('response', (response, request) => {
+        if (!response.ok && response.status !== 404) t.diagnostic(`${request.method} ${new URL(request.url).pathname} -> HTTP ${response.status}`);
+    });
+    const client = new LambdaDBClient({ httpClient, baseUrl: process.env.LAMBDADB_BASE_URL,
+        projectName: process.env.LAMBDADB_PROJECT_NAME, projectApiKey: process.env.LAMBDADB_PROJECT_API_KEY,
+        timeoutMs: 60_000, retryConfig: { strategy: 'none' }, debugLogger: { log() {}, group() {}, groupEnd() {} } });
+    const name = `memdrive-smoke-latest-${randomUUID().replaceAll('-', '').slice(0, 16)}`;
+    const main = { kind: 'main' };
+    const turn = label => ({ kind: 'checkpoint', name: label });
+    let failure, collision = false, phase = 'create the store';
+    try {
+        const drive = await MemDrive.create({ client, name }, options());
+        const native = client.collection(name);
+        assert.equal((await drive.describe({}, options())).latestCheckpoint, null);
+
+        phase = 'first checkpointed write';
+        const first = await drive.write({ op: 'create', path: '/turn.md', content: 'First turn wording.', checkpoint: { name: 'turn-1' } }, options());
+        const tagged = Date.now();
+        assert.deepEqual(first.checkpoint, { at: turn('turn-1') });
+        assert.deepEqual(await drive.read({ fileId: first.result.fileId }, options()), first.result);
+        assert.deepEqual((await drive.describe({}, options())).latestCheckpoint, { at: turn('turn-1') });
+        assert.equal((await native.aliases.get('latest-main', options())).alias.targetName, 'checkpoint-turn-1');
+
+        // Until LambdaDB publishes the new checkpoint's snapshot, a rollback to it is
+        // rejected with 400. Main equals turn-1 now, so this probe changes no files.
+        phase = 'wait until the first checkpoint can be restored';
+        await rollbackWhenPublished(drive, { at: main, to: turn('turn-1') }, t);
+        t.diagnostic(`A rollback to the just-created checkpoint succeeded ${Date.now() - tagged} ms after its checkpointed write returned.`);
+
+        phase = 'second checkpointed write with an injected alias failure';
+        // The same client, except that moving the alias fails with a definite 503.
+        const failing = { collection(collection) {
+            const handle = client.collection(collection), aliases = handle.aliases;
+            return Object.assign(Object.create(handle), { aliases: { get: aliases.get.bind(aliases), create: aliases.create.bind(aliases),
+                delete: aliases.delete.bind(aliases), listPage: aliases.listPage.bind(aliases),
+                retarget: async () => { throw Object.assign(new Error('Injected alias failure'), { statusCode: 503 }); } } });
+        } };
+        const injected = await MemDrive.open({ client: failing, name }, options());
+        const error = await injected.write({ operations: [{ op: 'create', path: '/second.md', content: 'Second turn wording.' },
+            { op: 'update', fileId: first.result.fileId, content: 'Overwritten by the second turn.' }],
+        checkpoint: { name: 'turn-2' } }, options()).catch(cause => cause);
+        assert.equal(error?.code, 'CHECKPOINT_WRITE_FAILED', `Unexpected outcome ${error?.code} ${JSON.stringify(error?.details?.restoreCause ?? null)}`);
+        assert.deepEqual([error.details.stage, error.details.restored, error.details.restoredTo, error.details.checkpointRemoved],
+            ['alias', true, turn('turn-1'), true]);
+        assert.deepEqual(await drive.read({ fileId: first.result.fileId }, options()), first.result);
+        assert.equal(await drive.read({ path: '/second.md' }, options()), null);
+        await assert.rejects(native.tags.get('checkpoint-turn-2', options()), cause => statusOf(cause) === 404);
+        assert.deepEqual((await drive.describe({}, options())).latestCheckpoint, { at: turn('turn-1') });
+
+        phase = 'third checkpointed write and paged checkpoint listing';
+        const third = await drive.write({ op: 'create', path: '/third.md', content: 'Third turn wording.', checkpoint: { name: 'turn-3' } }, options());
+        assert.deepEqual((await drive.describe({}, options())).latestCheckpoint, third.checkpoint);
+        const listed = [];
+        for (let page = await drive.listCheckpoints({ limit: 1 }, options()); ; page = await drive.listCheckpoints(page.next, options())) {
+            assert(page.checkpoints.length <= 1);
+            listed.push(...page.checkpoints);
+            if (!page.next) break;
+        }
+        assert.deepEqual(listed.map(entry => entry.at), [turn('turn-1'), turn('turn-3')]);
+        assert(listed.every(entry => !Number.isNaN(Date.parse(entry.createdAt)) && new Date(entry.createdAt).toISOString() === entry.createdAt));
+        assert(listed[0].createdAt <= listed[1].createdAt);
+        await assert.rejects(drive.deleteCheckpoint({ at: turn('turn-3') }, options()), { code: 'CHECKPOINT_IN_USE' });
+        assert.deepEqual(await drive.deleteCheckpoint({ at: turn('turn-1') }, options()), { at: turn('turn-1') });
+
+        phase = 'destroy the store';
+        await MemDrive.destroy({ client, name }, options());
+        await assert.rejects(native.get(options()), cause => statusOf(cause) === 404);
+    } catch (error) {
+        collision = error?.code === 'STORE_EXISTS';
+        failure = safeFailure(`Checkpointed write smoke (${phase})`, error);
+    } finally {
+        if (!collision) {
+            try { await client.collection(name).delete(options()); }
+            catch (error) {
                 if (statusOf(error) !== 404) {
                     const cleanup = safeFailure(`Cleanup of ${name}`, error);
                     failure = failure ? new AggregateError([failure, cleanup], 'Smoke and cleanup failed.') : cleanup;

@@ -1,47 +1,37 @@
 // Deterministic transport smoke only. This is never evidence of model behavior.
-import { faq, paraphraseTargets, enumeratedCode } from './scenarios.mjs';
+import { faq, paraphraseTargets, enumeratedCode, handoff, junk } from './scenarios.mjs';
 
 const retention = [{ oldText: 'Retention is 30 days.', newText: 'Retention is 42 days.' }];
-const mainAt = { kind: 'main' };
 
 export function scriptedAgent(scenario, guide) {
     const steps = [];
-    // Work on the host-named starting view, or on the requested draft.
-    const at = scenario.id === 'draft-checkpoint' ? { kind: 'fork', name: 'trial' } : scenario.start;
-    const target = at ? { at } : {};
     const add = (name, args) => steps.push({ name, args });
     if (guide === 'tool') {
         add('guide', {});
         add('guide', { topic: 'retrieval' });
     }
-    if (scenario.id === 'past-version') {
-        add('listCheckpoints', {});
-        add('fork', previous => ({ at: previous.checkpoints.find(item => item.at.name === 'before-change').at, name: 'earlier' }));
-    } else if (scenario.id === 'restore') {
-        add('listCheckpoints', {});
-        add('rollback', previous => ({ at: mainAt, to: previous.checkpoints.find(item => item.at.name === 'before-import').at }));
-        add('read', { path: '/faq.md' });
-    } else if (scenario.id === 'enumerate') {
+    if (scenario.id === 'enumerate') {
         // The literal control: an exact identifier across every directory.
         add('findText', { query: enumeratedCode });
     } else if (scenario.id in paraphraseTargets) {
         add('search', { query: scenario.task });
         add('read', { path: paraphraseTargets[scenario.id] });
+    } else if (scenario.id === 'record') {
+        add('search', { query: 'on-call handoff', mode: 'keyword' });
+        add('write', { op: 'create', path: '/notes/on-call-handoff.md', content: `# On-call handoff\n\nAs stated by the user:\n\n> ${handoff}\n` });
+    } else if (scenario.id === 'cleanup') {
+        add('list', { prefix: '/import/' });
+        add('read', { paths: Object.keys(junk) });
+        add('write', previous => ({ operations: previous.map(file => ({ op: 'delete', fileId: file.fileId })) }));
     } else {
-        if (scenario.id === 'draft-checkpoint') {
-            add('fork', { name: 'trial' });
-            add('checkpoint', previous => ({ at: previous.at, name: 'before-edit' }));
-        }
-        add('search', { ...target, query: 'current support retention', rerank: false });
-        add('read', { ...target, path: '/faq.md' });
-        if (scenario.id !== 'recall') add('write', previous => ({ at, op: 'update', fileId: previous.fileId, edits: retention }));
-        if (scenario.id === 'conflict') add('read', { at: mainAt, path: '/faq.md' });
-        else if (scenario.id === 'maintain' || scenario.id === 'unrelated') {
-            // Carry the fork's changes to main: compare both views, then edit main's originals.
-            const paths = scenario.id === 'maintain' ? ['/faq.md', '/policy.md'] : ['/faq.md'];
-            add('read', { at, paths });
-            add('read', { at: mainAt, paths });
-            add('write', previous => ({ at: mainAt, operations: previous.map(file => ({ op: 'update', fileId: file.fileId, edits: retention })) }));
+        add('search', { query: 'current support retention', rerank: false });
+        if (scenario.id === 'maintain') {
+            add('read', { paths: ['/faq.md', '/policy.md'] });
+            add('write', previous => ({ operations: previous.map(file => ({ op: 'update', fileId: file.fileId, edits: retention })) }));
+        } else {
+            add('read', { path: '/faq.md' });
+            // In the conflict task, the FAQ changes after this read; the exact edit is rejected.
+            if (scenario.id === 'conflict') add('write', previous => ({ op: 'update', fileId: previous.fileId, edits: retention }));
         }
     }
     let index = 0;
@@ -55,11 +45,10 @@ export function scriptedAgent(scenario, guide) {
                 text: scenario.id === 'recall' ? faq(42) + 'Source: /faq.md'
                     : scenario.id === 'enumerate' ? [...new Set(previous.hits.map(hit => hit.path))].join('\n')
                     : scenario.id in paraphraseTargets ? `${previous.content}Source: ${previous.path}`
-                    : scenario.id === 'conflict' ? 'Blocked: main has a concurrent conflicting change to the FAQ, so the edit is not applied to main.'
-                        : scenario.id === 'draft-checkpoint' ? 'Private draft trial and before-edit checkpoint are saved; main is unchanged.'
-                            : scenario.id === 'past-version' ? 'Created earlier from the before-change checkpoint; main is unchanged.'
-                                : scenario.id === 'restore' ? 'Rolled main back to the before-import checkpoint; the checkpoint remains.'
-                                    : 'Updated the current FAQ on the fork and on main.' }] }];
+                    : scenario.id === 'conflict' ? 'Blocked: someone else changed the FAQ retention concurrently, so my edit was not applied.'
+                        : scenario.id === 'record' ? 'Saved the statement verbatim in /notes/on-call-handoff.md.'
+                            : scenario.id === 'cleanup' ? 'Deleted the two imported junk files.'
+                                : 'Updated the support FAQ and the retention policy to 42 days.' }] }];
         return { model: request.model, status: 'completed', output, usage: { input_tokens: 0, output_tokens: 0 } };
     };
 }

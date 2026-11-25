@@ -61,10 +61,15 @@ async function serialize<T>(keys: string[], signal: AbortSignal | undefined, ope
     finally { settle(); }
 }
 
-/** Run a state-changing operation on one branch of a store in call order, after a pending store deletion. */
-export function onBranch<T>(store: string, branch: string, signal: AbortSignal | undefined, operation: () => Promise<T>) {
+/**
+ * Run a state-changing operation on one branch, or on several branches in one
+ * turn, of a store in call order, after a pending store deletion. Several
+ * branches are joined at once, so their queues cannot wait on each other.
+ */
+export function onBranch<T>(store: string, branch: string | string[], signal: AbortSignal | undefined, operation: () => Promise<T>) {
     const deletion = queueKey(store, '');
-    return serialize([queueKey(store, branch), ...queues.has(deletion) ? [deletion] : []], signal, operation);
+    const keys = [...new Set([branch].flat())].map(name => queueKey(store, name));
+    return serialize([...keys, ...queues.has(deletion) ? [deletion] : []], signal, operation);
 }
 
 /**

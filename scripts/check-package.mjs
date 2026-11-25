@@ -43,13 +43,11 @@ try {
     }
     if (sdk.MemDrive.create !== sdk.create || sdk.MemDrive.open !== sdk.open || sdk.MemDrive.destroy !== sdk.destroy) throw new Error('Missing static factory');
     if (Object.keys(sdk.MemDrive).sort().join() !== 'create,destroy,open') throw new Error('Unexpected static factory members');
-    const catalog = sdk.getFileToolDefinitions({ embeddingMode: 'managed', tools: ['fork', 'write', 'listForks', 'deleteFork', 'rollback'] });
-    if (!Object.isFrozen(catalog) || catalog[0].inputSchema.properties.version || !catalog[0].inputSchema.properties.at
-        || catalog[1].name !== 'write' || catalog[1].inputSchema.required.includes('at') || !catalog[1].inputSchema.$defs.forkAt
-        || catalog[2].name !== 'listForks' || catalog[3].readOnly !== false
-        || catalog[4].name !== 'rollback' || catalog[4].readOnly !== false || catalog[4].inputSchema.required.join() !== 'at,to')
+    const catalog = sdk.getFileToolDefinitions({ embeddingMode: 'managed', tools: ['guide', 'read', 'list', 'search', 'findText', 'write'] });
+    if (!Object.isFrozen(catalog) || catalog.length !== 6 || catalog.some(tool => tool.inputSchema.properties.at || tool.inputSchema.properties.checkpoint)
+        || catalog[5].name !== 'write' || catalog[5].readOnly !== false || catalog.slice(0, 5).some(tool => !tool.readOnly))
         throw new Error('Invalid fixed tool catalog');
-    for (const removed of ['merge', 'diff', 'status', 'history']) {
+    for (const removed of ['merge', 'diff', 'status', 'history', 'fork', 'checkpoint', 'listForks', 'listCheckpoints', 'deleteFork', 'deleteCheckpoint', 'rollback']) {
         try { sdk.getFileToolDefinitions({ embeddingMode: 'managed', tools: [removed] }); throw new Error('Removed tool is still listed: ' + removed); }
         catch (error) { if (error.code !== 'INVALID_INPUT') throw error; }
     }
@@ -85,7 +83,9 @@ try {
     copyFileSync(join(root, 'test/lifecycle.test.mjs'), join(temporary, 'test/lifecycle.test.mjs'));
     copyFileSync(join(root, 'test/read-range.test.mjs'), join(temporary, 'test/read-range.test.mjs'));
     copyFileSync(join(root, 'test/find-text.test.mjs'), join(temporary, 'test/find-text.test.mjs'));
-    run(process.execPath, ['--test', 'test/memdrive-files.test.mjs', 'test/file-tools.test.mjs', 'test/lifecycle.test.mjs', 'test/read-range.test.mjs', 'test/find-text.test.mjs']);
+    copyFileSync(join(root, 'test/checkpointed-writes.test.mjs'), join(temporary, 'test/checkpointed-writes.test.mjs'));
+    run(process.execPath, ['--test', 'test/memdrive-files.test.mjs', 'test/file-tools.test.mjs', 'test/lifecycle.test.mjs', 'test/read-range.test.mjs',
+        'test/find-text.test.mjs', 'test/checkpointed-writes.test.mjs']);
     // Core consumers above work without the optional native package. Test its
     // separate entry point only after explicitly installing the pinned backend.
     run('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund', '--save-exact', 'docling.rs@2.85.0']);

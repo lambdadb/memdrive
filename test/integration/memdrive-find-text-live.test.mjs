@@ -92,7 +92,11 @@ test('live findText enumerates original occurrences and resumes on main, forks a
         assert.equal(held.hits[0]?.content, '🙂A.*\r\n');
         assert.deepEqual(held.next?.at, checkpoint);
         phase = 'Reject a changed working continuation and keep the checkpoint continuation';
-        const live = await main.findText(narrowed, options());
+        // Like the checkpoint scan, the file can sort into a later batch behind empty pages.
+        // The cursor must resume inside the file for the update to invalidate it.
+        let live = await main.findText(narrowed, options());
+        while (!live.hits.length && live.next) live = await main.findText(live.next, options());
+        assert.equal(live.hits[0]?.content, '🙂A.*\r\n');
         assert.deepEqual(live.next?.at, at);
         await main.write({ at, op: 'update', fileId: file.fileId, content: 'Updated' }, options());
         await assert.rejects(main.findText(live.next, options()), { code: 'FIND_TEXT_CURSOR_UNAVAILABLE' });

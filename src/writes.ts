@@ -20,6 +20,8 @@ type Mutation = WriteFileRequest | CreateExternalFileRequest | UpdateExternalFil
 type FileRecords = Awaited<ReturnType<typeof createRecords>>;
 type Plan = { op: 'create'; records: FileRecords } | Awaited<ReturnType<typeof planEdit>>;
 type Stage = 'write-chunks' | 'write-original' | 'delete-original' | 'cleanup-chunks';
+/** Filled by a tracked write: created and targeted file IDs, and whether a native mutation was sent. */
+export type WriteTrack = { created: string[]; changed: string[]; dispatched?: boolean };
 type Expected = { present: Pick<NativeRecord, 'id' | 'kind' | 'fileId' | 'revision'>[] } | { absent: string[] };
 
 export function writeBatches(records: { docs: WriteRecord[] }[], branch: string): WriteRecord[][] {
@@ -142,7 +144,11 @@ export function fileWriter(handle: Handle, name: string, schema: MetadataSchema,
         if (originals.size) throw new MemDriveError('INVALID_RESULT', 'The written file or complete chunk set was not confirmed.');
     }
 
-    async function write(branch: string, request: Mutation | Mutation[], options?: RequestOptions) {
+    /**
+     * `track`, when given, receives the file IDs this call creates and the
+     * existing file IDs it targets, before the first native mutation.
+     */
+    async function write(branch: string, request: Mutation | Mutation[], options?: RequestOptions, track?: WriteTrack) {
         const { signal } = operationOptions(options);
         checkAbort(signal);
         const multi = Array.isArray(request);
@@ -154,6 +160,10 @@ export function fileWriter(handle: Handle, name: string, schema: MetadataSchema,
         checkAbort(signal);
         const targetIds = inputs.flatMap(input => input.op === 'create' ? [] : [input.fileId]);
         requireInput(new Set(targetIds).size === targetIds.length, 'Target file IDs must be distinct within one write.');
+        if (track) {
+            track.created.push(...inputs.flatMap(input => input.op === 'create' ? [input.records.file.fileId] : []));
+            track.changed.push(...targetIds);
+        }
         const branchSettings = branchRead(branch);
 
         const originals = await fetchOriginals(handle, name, branchRef(branch), targetIds, signal, dimensions !== undefined);
@@ -240,8 +250,12 @@ export function fileWriter(handle: Handle, name: string, schema: MetadataSchema,
                 });
             try { checkAbort(signal); }
             catch (cause) { throw failed(databaseError(cause, 'Write was aborted before dispatch.'), stage, targets); }
-            try { await nativeRequest(operation, signal); }
-            catch (cause) {
+            try {
+                await nativeRequest(() => {
+                    if (track) track.dispatched = true;
+                    return operation();
+                }, signal);
+            } catch (cause) {
                 const error = databaseError(cause, 'The file mutation was rejected.');
                 if (knownRejected.has(error.status ?? 0)) throw failed(error, stage, targets);
                 throw uncertain(cause);

@@ -55,7 +55,7 @@ export function summarize(manifest, cases) {
             'Real public SDK on an immediate-visibility native-client fixture; not live LambdaDB retrieval or consistency.',
             'Fixture search returns the same candidates for every query and mode; retrieval counts describe tool selection, not retrieval relevance.',
             'Resource content is fetched and injected by the host, not autonomously fetched by the model.',
-            'No MCP wire server/client compatibility, bundled-skill discovery, concurrent writers or automatic conflict resolution is tested.'] };
+            'No MCP wire server/client compatibility, bundled-skill discovery, separate writer processes or automatic conflict resolution is tested; the conflict scenario injects one concurrent write between tool calls.'] };
 }
 
 export async function runEvaluation({ output, mode = 'model', guide = 'all', instruction = 'server', scenario = 'all', repeats = 1,
@@ -92,7 +92,7 @@ export async function runEvaluation({ output, mode = 'model', guide = 'all', ins
         try {
             context = await prepare(entry.scenario);
             result.initial = context.initial;
-            host = createHost({ drive: context.drive, writable: context.scenario.writable, guide: entry.guide, start: context.at, available: context.available });
+            host = createHost({ drive: context.drive, writable: context.scenario.writable, guide: entry.guide, afterCall: context.afterCall });
             const transport = askFactory ? askFactory(context.scenario, entry.guide)
                 : mode === 'scripted' ? scriptedAgent(context.scenario, entry.guide) : modelAsk;
             signal = AbortSignal.timeout(900_000);

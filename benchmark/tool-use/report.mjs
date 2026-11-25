@@ -5,7 +5,8 @@ import { agentFailureCodes } from './agent.mjs';
 import { summarize } from './run.mjs';
 import { retrievalMetrics } from './scenarios.mjs';
 
-// status, history, diff and merge are tools of protocol-v1 and v2 run directories.
+// Protocol v4 offers guide, list, read, search, findText and write. The ref tools belong to
+// protocol-v3 and earlier run directories; status, history, diff and merge to v1 and v2.
 const toolNames = ['guide', 'list', 'read', 'search', 'findText', 'fork', 'checkpoint', 'listForks', 'listCheckpoints',
     'deleteFork', 'deleteCheckpoint', 'write', 'rollback', 'status', 'history', 'diff', 'merge'];
 // BINDING_CHANGED and REF_DELETED identify errors in protocol-v1 run directories. The HISTORY_*,
@@ -13,6 +14,7 @@ const toolNames = ['guide', 'list', 'read', 'search', 'findText', 'fork', 'check
 // codes are no longer raised; earlier run directories can hold them.
 const toolErrorCodes = [
     'ABORTED', 'BINDING_CHANGED', 'BRANCH_CONFLICT', 'BRANCH_NOT_FOUND', 'CHECKPOINT_CONFLICT', 'CHECKPOINT_NOT_FOUND',
+    'CHECKPOINT_RESTORE_FAILED', 'CHECKPOINT_WRITE_FAILED',
     'CURSOR_VIEW_MISMATCH', 'DATABASE_ERROR', 'EDIT_CONFLICT', 'FILE_NOT_FOUND',
     'FIND_TEXT_CURSOR_UNAVAILABLE', 'HISTORICAL_VIEW_UNAVAILABLE', 'HISTORY_CURSOR_UNAVAILABLE', 'HISTORY_UNAVAILABLE',
     'INVALID_INPUT', 'INVALID_JSON', 'INVALID_RESULT', 'LIST_CURSOR_UNAVAILABLE', 'LIST_SCAN_LIMIT', 'MERGE_BLOCKED',
@@ -69,7 +71,9 @@ function caseDiagnostic(entry, result, receipts, model) {
             checks: Object.fromEntries(Object.entries(evaluation.checks).filter(([, value]) => typeof value === 'boolean')),
             behavior: { toolCalls: count(behavior.toolCalls), guideCalls: count(behavior.guideCalls),
                 resourceReadsByHost: count(behavior.resourceReadsByHost), exactEdits: count(behavior.exactEdits),
-                readBeforeWrite: behavior.readBeforeWrite, mainWrites: count(behavior.mainWrites), rollbacks: count(behavior.rollbacks) } },
+                readBeforeWrite: behavior.readBeforeWrite, writeCalls: count(behavior.writeCalls),
+                // Protocol v3 and earlier runs record writes to main and rollback calls.
+                mainWrites: count(behavior.mainWrites), rollbacks: count(behavior.rollbacks) } },
         // Counts and tool names recomputed from the recorded events; no arguments are exported.
         retrieval: Array.isArray(result?.events) ? retrievalMetrics(result.events) : undefined,
         events: (result?.events ?? []).map(toolEvent).filter(Boolean),
