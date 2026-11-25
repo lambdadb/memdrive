@@ -168,6 +168,20 @@ test('each question is a fresh read-only conversation with the run instructions 
     assert.deepEqual(await jsonl(path.join(directory, 'transcript.jsonl')), requests[1].request.input.concat(message(requests[1].request, 'Answer 0').output));
     assert.equal((await jsonl(path.join(directory, 'requests.jsonl'))).length, 4);
 
+    assert.deepEqual(manifest.instructions, { source: 'sdk', sha256: hash(fileToolInstructions), runSha256: hash(fileToolInstructions), sameAsRun: true });
+    // An answer policy replaces the run's policy text after the SDK instructions, for the answers only.
+    const policyFile = path.join(files.root, 'answer-policy.txt'), policy = 'Synthetic answering rule.\n', policed = [];
+    await writeFile(policyFile, policy);
+    const answered = await files.stage('policy', { limit: 1, answerPolicyFile: policyFile, ask: async request => { policed.push(request.input); return message(request, 'a'); } });
+    const combined = fileToolInstructions + '\n\n' + policy;
+    assert.deepEqual(policed[0][0], { role: 'developer', content: combined });
+    assert.deepEqual(answered.manifest.instructions, { source: 'sdk', sha256: hash(combined), runSha256: hash(fileToolInstructions), sameAsRun: false,
+        answerPolicySha256: hash(policy), text: combined });
+    assert(answered.summary.limitations.some(text => text.includes('differs from the one the run saved with')));
+    await writeFile(policyFile, ' \n');
+    await assert.rejects(files.stage('empty-policy', { answerPolicyFile: policyFile }), /answer policy file is empty/);
+    assert.equal(await exists(path.join(files.root, 'empty-policy')), false);
+
     // A run without instructions asks with the question alone.
     const none = { ...files.replay.manifest.instructions, source: 'none', text: null, sha256: null };
     const runManifest = await json(path.join(files.run, 'manifest.json'));

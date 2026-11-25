@@ -8,7 +8,7 @@ import { appendFile, mkdir, readFile, readdir, writeFile } from 'node:fs/promise
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
-import { MemDrive, getFileToolDefinitions } from '@functional-systems/memdrive';
+import { MemDrive, fileToolInstructions, getFileToolDefinitions } from '@functional-systems/memdrive';
 import { createToolHost, failureCodes, limits, openAI, protocol as replayProtocol, ReplayFailure, runSession } from './replay-agent.mjs';
 import { fingerprint, groupSessions, hash } from './replay-sessions.mjs';
 import { assertOwner, lambdadbConnection, ledgerFile, readLedger } from './replay-store.mjs';
@@ -220,6 +220,7 @@ export function summarizeQuestions(manifest, results, store = null) {
         limitations: ['Rubric judge only: one request per rubric item with upstream BEAM\'s unified judge prompt, no retries and one run. Not a reproduction of the BEAM paper\'s scores.',
             'event_ordering reports only the rubric judge score; upstream\'s headline event-ordering metric (Kendall tau-b times F1 after an LLM alignment) is not computed.',
             'The answering model has the run\'s instructions, read-only file tools and its own general knowledge; nothing restricts its answer to the drive.',
+            ...(manifest.instructions.sameAsRun ? [] : ['The answers used a policy text that differs from the one the run saved with; a deployment has one text for both.']),
             'needs_assistant and not_replayed questions cite messages the replay never sent; scores are reported per class and must not be pooled across classes.',
             ...(measured ? [] : ['Injected test transports exercise the harness; they are not model or judge measurements.'])] };
 }
@@ -229,7 +230,7 @@ export function summarizeQuestions(manifest, results, store = null) {
  * conversation with the run's instructions and the read-only catalog, then judge every
  * rubric item of each answered question. Everything is validated before `output` exists.
  */
-export async function runQuestions({ run, manifest: manifestFile, output, scope = 'replayed', model, judgeModel = defaultJudgeModel, judgeEffort, limit,
+export async function runQuestions({ run, manifest: manifestFile, output, scope = 'replayed', model, judgeModel = defaultJudgeModel, judgeEffort, limit, answerPolicyFile,
     key, env = {}, connect = lambdadbConnection, ask, judge, budget = limits, clock = () => performance.now() }) {
     assert(typeof run === 'string' && run && typeof manifestFile === 'string' && manifestFile, 'Provide --run RUN_DIR and --manifest FILE');
     assert(typeof output === 'string' && output, 'Provide a new output directory');
@@ -250,8 +251,14 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
         'The replay run is unfinished or did not retain its store');
     const ledger = await readLedger(runDirectory, connection);
     assert(ledger.name === runManifest.store.name && ledger.status === 'ready', 'The run\'s store is not ready or was cleaned up');
-    const { text: instructions, sha256: instructionsSha256 } = runManifest.instructions;
-    assert(instructions === null ? instructionsSha256 === null : hash(instructions) === instructionsSha256, 'Run instruction text changed');
+    const { text: runInstructions, sha256: instructionsSha256 } = runManifest.instructions;
+    assert(runInstructions === null ? instructionsSha256 === null : hash(runInstructions) === instructionsSha256, 'Run instruction text changed');
+    // Rules for answering can be tried on a finished drive without replaying: the file replaces the
+    // run's policy text, after the SDK instructions when the run had them.
+    const answerPolicy = answerPolicyFile === undefined ? null : await readFile(answerPolicyFile, 'utf8');
+    assert(answerPolicy === null || answerPolicy.trim(), 'The answer policy file is empty');
+    const instructions = answerPolicy === null ? runInstructions
+        : [...(runManifest.instructions.source === 'sdk' ? [fileToolInstructions] : []), answerPolicy].join('\n\n');
     model ??= runManifest.model;
 
     // The prepared data must be the bytes the run recorded.
@@ -301,7 +308,8 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
         source: { split: source.split, conversationId: id, manifestSha256: source.manifestSha256, runtimeSha256: source.runtimeSha256,
             evaluationSha256: entry.evaluationSha256 },
         scope, limit: limit ?? null, model, judgeModel, limits: budget,
-        instructions: { source: runManifest.instructions.source, sha256: instructionsSha256 }, currentDate: date,
+        instructions: { source: runManifest.instructions.source, sha256: instructions === null ? null : hash(instructions), runSha256: instructionsSha256,
+            sameAsRun: answerPolicy === null, ...(answerPolicy === null ? {} : { answerPolicySha256: hash(answerPolicy), text: instructions }) }, currentDate: date,
         request: { reasoning: { effort: 'low' }, store: false, include: ['reasoning.encrypted_content'], parallel_tool_calls: false },
         judgeRequest: { ...judgeSettings(judgeEffort), perRubricItem: true, retries: 0 },
         tools: readToolNames, toolDefinitions: definitions, toolDefinitionsSha256: hash(JSON.stringify(definitions)),

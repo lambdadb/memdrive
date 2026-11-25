@@ -392,7 +392,11 @@ Each question is a fresh model conversation in dataset order with no memory of
 other questions: the run's exact instruction text as the developer message
 (none when the run had none), the date of the run's last completed session as
 `Current date: …` when the run told its sessions their date, then the question
-text verbatim. There is no
+text verbatim. `--answer-policy-file FILE` replaces the run's policy text for
+the answers, after the SDK instructions when the run had them, so a rule about
+answering can be tried on a finished drive without replaying the
+conversation. The manifest records that text and that it differs from the
+run's; a deployment has one text for saving and answering. There is no
 "answer only from the drive" instruction, so the model can also answer from
 its general knowledge. The tool catalog is read-only: `guide`, `status`,
 `history`, `list`, `read`, `search`, `findText`, `listForks` and
