@@ -275,7 +275,7 @@ test('guide index and all topics share immutable content without accessing the d
     assert.match(index.content, /Omitting at selects main/);
     assert.doesNotMatch(JSON.stringify(fileToolGuideTopics), /bound view|binding/);
     assert.match(fileToolGuideTopics.references.content, /never retried automatically/);
-    assert.match(fileToolGuideTopics.editing.content, /Writes are not serialized/);
+    assert.match(fileToolGuideTopics.editing.content, /Writers in other processes are not coordinated/);
     assert.match(fileToolGuideTopics.retrieval.content, /CURSOR_VIEW_MISMATCH/);
     assert.match(fileToolGuideTopics.retrieval.content, /same prefix can appear again/);
     assert.doesNotMatch(JSON.stringify(fileToolGuideTopics), /\bmerge\(|\bdiff\b|history\(|status\(|mainVersion|publication/);

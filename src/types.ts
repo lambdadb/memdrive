@@ -209,8 +209,9 @@ export interface RollbackResult {
 
 /**
  * One store object. Each request selects its view with `at`; omission selects main.
- * The object holds no state between calls: ordering, concurrency and ownership
- * across calls, processes and clients belong to the caller.
+ * State-changing calls on one branch run one at a time within this process (see
+ * README "Concurrent calls"); ordering across processes and SDK copies belongs to
+ * the caller.
  */
 export interface FileDrive<Mode extends EmbeddingMode = 'managed'> {
     readonly name: string;

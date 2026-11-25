@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { createRequire } from 'node:module';
 import { create, open } from '@functional-systems/memdrive';
 import { fileClient } from './helpers/file-client.mjs';
+
+// The CommonJS build is a separate SDK copy with its own branch queues, so it
+// races this module's writers the way another process would.
+const separateCopy = createRequire(import.meta.url)('@functional-systems/memdrive');
+// If both imports ever shared one module instance, the race tests below would wait forever.
+assert.notEqual(separateCopy.open, open, 'the CommonJS build must be a separate module instance');
 
 const request = (path, content = '') => ({ op: 'create', path, content });
 const fork = name => ({ kind: 'fork', name });
@@ -115,15 +122,15 @@ test('invalid at shapes are rejected before storage access', async () => {
     assert.equal(fixture.calls.length, before);
 });
 
-test('path uniqueness is checked before writing but is best effort across concurrent writers', async () => {
+test('path uniqueness is checked before writing but is best effort across separate SDK copies', async () => {
     const fixture = fileClient();
     const { client, calls } = fixture;
     const drive = await create({ client, name: 'workspace' });
     await drive.write(request('/a.txt', 'first'));
     await assert.rejects(drive.write(request('/a.txt', 'second')), { code: 'PATH_EXISTS', details: { paths: ['/a.txt'] } });
     assert.equal(calls.filter(call => call.kind === 'upsert').length, 1);
-    // Unserialized writers both pass the read-then-write check; nothing orders them.
-    const reopened = await open({ client, name: 'workspace' });
+    // Writers in separate SDK copies or processes both pass the read-then-write check; nothing orders them.
+    const reopened = await separateCopy.open({ client, name: 'workspace' });
     let arrived = 0, release;
     const bothChecked = new Promise(resolve => { release = resolve; });
     fixture.beforeUpsert = async () => { if (++arrived === 2) release(); await bothChecked; };
@@ -691,7 +698,7 @@ test('chunk cleanup keeps the generation of the original it reads back, so a con
     const fixture = fileClient();
     const drive = await create({ client: fixture.client, name: 'workspace' });
     const file = await drive.write(request('/a.txt', 'zero'));
-    const other = await open({ client: { ...fixture.client }, name: 'workspace' });
+    const other = await separateCopy.open({ client: { ...fixture.client }, name: 'workspace' });
     let originalFetches = 0;
     fixture.beforeFetch = async request => {
         if (request.fields || request.ids.length !== 1 || request.ids[0] !== `file:${file.fileId}`) return;
@@ -705,12 +712,12 @@ test('chunk cleanup keeps the generation of the original it reads back, so a con
     assert.deepEqual((await drive.search({ query: 'second writer', rerank: false })).hits.map(hit => hit.content), ['second writer']);
 });
 
-test('racing updates that remove each other\'s chunks are repaired by resending an update', async () => {
+test('racing updates from separate SDK copies that remove each other\'s chunks are repaired by resending an update', async () => {
     const fixture = fileClient();
     const { collections } = fixture;
     const drive = await create({ client: fixture.client, name: 'workspace' });
     const file = await drive.write(request('/a.txt', 'zero'));
-    const other = await open({ client: { ...fixture.client }, name: 'workspace' });
+    const other = await separateCopy.open({ client: { ...fixture.client }, name: 'workspace' });
     const docs = collections.get('workspace').branches.get('main').docs;
     // The first update reads its own original back before cleanup; the second
     // update then completes entirely before the first deletes stale chunks.
@@ -738,11 +745,11 @@ test('racing updates that remove each other\'s chunks are repaired by resending 
     assert.deepEqual((await drive.search({ query: 'second', rerank: false })).hits.map(hit => hit.path), ['/moved.txt']);
 });
 
-test('files sharing a path after racing creates stay readable and writable by fileId', async () => {
+test('files sharing a path after racing creates in separate SDK copies stay readable and writable by fileId', async () => {
     const fixture = fileClient();
     const { client } = fixture;
     const drive = await create({ client, name: 'workspace' });
-    const other = await open({ client: { ...client }, name: 'workspace' });
+    const other = await separateCopy.open({ client: { ...client }, name: 'workspace' });
     let arrived = 0, release;
     const bothChecked = new Promise(resolve => { release = resolve; });
     fixture.beforeUpsert = async () => { if (++arrived === 2) release(); await bothChecked; };

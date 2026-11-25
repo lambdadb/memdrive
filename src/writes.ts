@@ -113,9 +113,9 @@ export async function listChunkIds(handle: Handle, name: string, ref: ViewRef, f
 
 
 /**
- * Write files to one branch. Each call stands alone: it holds no state between
- * calls and does not serialize with other calls, so concurrent writers to the
- * same branch, file or path can interleave and the last native write wins.
+ * Write files to one branch. The caller runs it in that branch's queue, so writes
+ * in one process do not interleave; writers in other processes or SDK copies can,
+ * and the last native write then wins.
  */
 export function fileWriter(handle: Handle, name: string, schema: MetadataSchema, dimensions?: number, chunker?: TextChunker) {
     async function confirm(branch: string, expected: Expected, signal?: AbortSignal) {

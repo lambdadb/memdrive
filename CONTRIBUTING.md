@@ -30,8 +30,11 @@ The package root, `package.json`, and optional Node-only `docling` subpath are t
 The SDK is a thin file abstraction over LambdaDB primitives: a store is one
 collection, main and forks are branches and checkpoints are tags. Expose what
 LambdaDB supports and keep the SDK free of state between calls: no caches,
-queues, locks, registries or internal collections. Ordering, concurrency and
-multi-process ownership belong to the caller; document such limits plainly
+locks, registries or internal collections. The one exception is the in-process
+per-branch queue that runs state-changing calls one at a time, because a file is
+several documents and LambdaDB has no multi-document transaction or conditional
+write; its entries exist only while calls are pending. Ordering across processes
+and multi-process ownership belong to the caller; document such limits plainly
 instead of adding coordination. Features LambdaDB lacks, such as merge, history
 or conditional writes, are not emulated in the SDK.
 
