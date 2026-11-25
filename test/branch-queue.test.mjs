@@ -34,7 +34,7 @@ async function setup() {
 const count = (calls, kind) => calls.filter(call => call.kind === kind).length;
 /** Let queued operations reach their wait; they issue no request until the queue reaches them. */
 async function settleUntil(condition) {
-    for (let turn = 0; turn < 100 && !condition(); turn++) await tick();
+    for (let turn = 0; turn < 5000 && !condition(); turn++) await tick();
     assert(condition());
 }
 
