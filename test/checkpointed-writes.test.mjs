@@ -8,7 +8,7 @@ const main = { kind: 'main' };
 const draft = { kind: 'fork', name: 'draft' };
 const checkpointAt = label => ({ kind: 'checkpoint', name: label });
 const create = (path, content = `Text of ${path}.`) => ({ op: 'create', path, content });
-const refKinds = ['tag-create', 'tag-delete', 'alias-create', 'alias-retarget', 'alias-get', 'alias-delete', 'alias-list', 'branch-rollback'];
+const refKinds = ['tag-create', 'tag-get', 'tag-delete', 'alias-create', 'alias-retarget', 'alias-get', 'alias-delete', 'alias-list', 'branch-rollback'];
 const failure = (statusCode, message = 'Injected failure') => Object.assign(new Error(message), statusCode === undefined ? {} : { statusCode });
 
 async function setup() {
@@ -137,8 +137,9 @@ test('a failed or partial write restores the branch to its latest checkpoint', a
 test('an applied write whose checkpoint or alias move fails is rolled back and the new checkpoint removed', async () => {
     const cases = {
         'tag rejected': { hook: 'beforeTagCreate', error: failure(400), stage: 'checkpoint', refs: ['tag-create', 'alias-get', 'branch-rollback'] },
-        'tag unknown, absent': { hook: 'beforeTagCreate', error: failure(503), stage: 'checkpoint', refs: ['tag-create', 'alias-get', 'branch-rollback', 'tag-delete'] },
-        'tag unknown, created': { hook: 'afterTagCreate', error: failure(undefined, 'Lost response'), stage: 'checkpoint', refs: ['tag-create', 'alias-get', 'branch-rollback', 'tag-delete'] },
+        // An unknown creation outcome is resolved by reading the tag: absent, or created by this call.
+        'tag unknown, absent': { hook: 'beforeTagCreate', error: failure(503), stage: 'checkpoint', refs: ['tag-create', 'alias-get', 'branch-rollback', 'tag-get'] },
+        'tag unknown, created': { hook: 'afterTagCreate', error: failure(undefined, 'Lost response'), stage: 'checkpoint', refs: ['tag-create', 'alias-get', 'branch-rollback', 'tag-get', 'tag-delete'] },
         'alias rejected': { hook: 'beforeAliasRetarget', error: failure(400), stage: 'alias', refs: ['tag-create', 'alias-retarget', 'alias-get', 'branch-rollback', 'tag-delete'] },
         'alias unknown, not moved': { hook: 'beforeAliasRetarget', error: failure(undefined, 'Lost response'), stage: 'alias', refs: ['tag-create', 'alias-retarget', 'alias-get', 'branch-rollback', 'tag-delete'] },
     };
@@ -157,6 +158,7 @@ test('an applied write whose checkpoint or alias move fails is rolled back and t
         assert.equal(state().aliases.get('latest-main').targetName, 'checkpoint-one');
         assert.deepEqual(fixture.calls.slice(start).filter(call => refKinds.includes(call.kind)).map(call => call.kind), refs, label);
         assert.equal(error.details.checkpointRemoved, refs.includes('tag-delete') ? true : undefined, label);
+        if (label === 'tag unknown, absent') assert.equal(error.details.checkpointCreated, false);
     }
 });
 
@@ -346,4 +348,103 @@ test('the latest checkpoint cannot be deleted, rollback moves it and deleting a 
     assert.deepEqual(await drive.deleteCheckpoint({ at: checkpointAt('fork-one') }), { at: checkpointAt('fork-one') });
     await drive.fork({ name: 'draft' });
     assert.equal((await drive.describe({ at: draft })).latestCheckpoint, null);
+});
+
+test('a lost 409 on tag creation never deletes the existing checkpoint with that name', async () => {
+    const { fixture, drive, docs, tagDocs, state, start } = await withLatest();
+    // A checkpoint of a checkpoint leaves main's alias alone; make it clearly older than this call.
+    await drive.checkpoint({ at: checkpointAt('one'), name: 'taken' });
+    state().tags.get('checkpoint-taken').tag.createdAt = new Date(Date.now() - 60_000);
+    const taken = tagDocs('taken');
+    // LambdaDB answered 409, but the response was lost.
+    fixture.beforeTagCreate = tagName => { if (state().tags.has(tagName)) throw failure(undefined, 'Lost response'); };
+    const error = await drive.write({ ...create('/new.md'), checkpoint: { name: 'taken' } }).catch(cause => cause);
+    fixture.beforeTagCreate = undefined;
+    assert.equal(error.code, 'CHECKPOINT_WRITE_FAILED');
+    assert.equal(error.details.checkpointCreated, 'unknown');
+    assert.equal(error.details.checkpointRemoved, undefined);
+    assert.deepEqual(tagDocs('taken'), taken);
+    assert.deepEqual(docs(), tagDocs('one'));
+    assert(!fixture.calls.slice(start).some(call => call.kind === 'tag-delete'));
+});
+
+test('a recreated fork never inherits a latest checkpoint left by an earlier fork with its name', async () => {
+    const { fixture, drive, state } = await setup();
+    await drive.write(create('/main.md', 'Main.'));
+    await drive.fork({ name: 'draft' });
+    await drive.write({ at: draft, ...create('/old-fork.md', 'Old fork.'), checkpoint: { name: 'old-fork' } });
+    // The branch is deleted outside deleteFork, so its alias survives.
+    await fixture.client.collection(name).branches.delete('fork-draft');
+    assert(state().aliases.has('latest-fork-draft'));
+    const start = fixture.calls.length;
+    await drive.fork({ name: 'draft' });
+    assert.deepEqual(fixture.calls.slice(start).map(call => call.kind), ['branch-create', 'alias-delete']);
+    assert.equal(state().aliases.has('latest-fork-draft'), false);
+    assert.equal((await drive.describe({ at: draft })).latestCheckpoint, null);
+    // A failing first checkpointed write on the new fork removes its own files and restores nothing else.
+    fixture.beforeAliasCreate = () => { throw failure(503); };
+    const error = await drive.write({ at: draft, ...create('/new.md'), checkpoint: { name: 'new-fork' } }).catch(cause => cause);
+    fixture.beforeAliasCreate = undefined;
+    assert.equal(error.code, 'CHECKPOINT_WRITE_FAILED');
+    assert.equal(error.details.restoredTo, null);
+    assert.equal(await drive.read({ at: draft, path: '/old-fork.md' }), null);
+    assert.equal(await drive.read({ at: draft, path: '/new.md' }), null);
+    assert.equal((await drive.read({ at: draft, path: '/main.md' })).content, 'Main.');
+    // If the stale alias cannot be removed, the new fork is reported and the alias named.
+    await drive.write({ at: draft, ...create('/again.md'), checkpoint: { name: 'draft-again' } });
+    await fixture.client.collection(name).branches.delete('fork-draft');
+    fixture.beforeAliasDelete = () => { throw failure(503); };
+    const stale = await drive.fork({ name: 'draft' }).catch(cause => cause);
+    fixture.beforeAliasDelete = undefined;
+    assert.equal(stale.code, 'LATEST_CHECKPOINT_NOT_MOVED');
+    assert.deepEqual([stale.details.forkCreated, stale.details.checkpoint, stale.details.latestCheckpoint], [true, null, checkpointAt('draft-again')]);
+    assert(state().branches.has('fork-draft'));
+});
+
+test('a rollback whose target disappears before the alias move reports the alias left behind', async () => {
+    const { fixture, drive, docs, tagDocs } = await withLatest();
+    await drive.write(create('/later.md'));
+    await drive.checkpoint({ at: checkpointAt('one'), name: 'copy' });
+    // The retarget finds no target: copy was deleted between the rollback and the move.
+    fixture.beforeAliasRetarget = () => { throw failure(404, 'Reference not found'); };
+    const error = await drive.rollback({ at: main, to: checkpointAt('copy') }).catch(cause => cause);
+    fixture.beforeAliasRetarget = undefined;
+    assert.equal(error.code, 'LATEST_CHECKPOINT_NOT_MOVED');
+    assert.equal(error.details.rolledBack, true);
+    assert.deepEqual(error.details.latestCheckpoint, checkpointAt('one'));
+    assert.deepEqual(docs(), tagDocs('copy'));
+    // A branch without a latest checkpoint keeps none.
+    await drive.fork({ name: 'draft' });
+    assert.deepEqual(await drive.rollback({ at: draft, to: checkpointAt('copy') }), { at: draft });
+    assert.equal((await drive.describe({ at: draft })).latestCheckpoint, null);
+});
+
+test('fork deletion that removed the alias but not the branch says so, and a server 409 on a latest checkpoint is CHECKPOINT_IN_USE', async () => {
+    const { fixture, drive } = await setup();
+    await drive.fork({ name: 'draft' });
+    await drive.write({ at: draft, ...create('/fork.md'), checkpoint: { name: 'fork-one' } });
+    fixture.beforeRefDelete = kind => { if (kind === 'fork') throw failure(503); };
+    const error = await drive.deleteFork({ at: draft }).catch(cause => cause);
+    fixture.beforeRefDelete = undefined;
+    assert.equal(error.status, 503);
+    assert.equal(error.details.latestCheckpointCleared, true);
+    assert.match(error.message, /the fork itself remains/);
+    // Another process moved an alias to the checkpoint after the SDK's alias check.
+    await drive.checkpoint({ name: 'main-one' });
+    await drive.checkpoint({ name: 'main-two' });
+    fixture.beforeRefDelete = (kind, tagName) => {
+        if (tagName === 'checkpoint-main-one') fixture.collections.get(name).aliases.get('latest-main').targetName = tagName;
+    };
+    await assert.rejects(drive.deleteCheckpoint({ at: checkpointAt('main-one') }), { code: 'CHECKPOINT_IN_USE', status: 409 });
+    fixture.beforeRefDelete = undefined;
+});
+
+test('an abort before the write sends anything leaves the branch untouched without a restore', async () => {
+    const { fixture, drive, start } = await withLatest();
+    const controller = new AbortController();
+    // The abort arrives during the destination check, before any mutation.
+    fixture.pathLookup = () => { controller.abort(); return undefined; };
+    await assert.rejects(drive.write({ ...create('/new.md'), checkpoint: { name: 'two' } }, { signal: controller.signal }), { code: 'ABORTED' });
+    fixture.pathLookup = undefined;
+    assert(!fixture.calls.slice(start).some(call => [...refKinds, 'upsert', 'update', 'delete'].includes(call.kind)));
 });

@@ -27,7 +27,12 @@ export interface FileTools {
     execute(name: string, input: unknown, options?: RequestOptions): Promise<unknown>;
 }
 
-/** Host hook naming the checkpoint each `write` tool call creates. */
+/**
+ * Host hook naming the checkpoint each `write` tool call creates. Names must be
+ * unique for the store's lifetime, including across host restarts, for example
+ * `turn-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`; a reused
+ * name fails tag creation and the write is rolled back.
+ */
 export type FileToolCheckpoint = () => { name: string } | Promise<{ name: string }>;
 
 export interface FileToolErrorResult {
@@ -86,6 +91,31 @@ export function getFileToolDefinitions(options: { embeddingMode: EmbeddingMode; 
     return definitionsFor(tools, embeddingMode === 'external');
 }
 
+const checkpointFailures: Record<string, string> = {
+    CHECKPOINT_WRITE_FAILED: 'The write was not kept: the drive is as it was before this call.',
+    CHECKPOINT_RESTORE_FAILED: 'The write failed and could not be fully undone; the drive may hold part of it. Read the affected files before retrying.',
+};
+
+/**
+ * Checkpoints belong to the host: keep a checkpointed-write failure's code, stage,
+ * restore outcome and file IDs, but no checkpoint names or native messages.
+ */
+function agentFailure(cause: unknown) {
+    if (!(cause instanceof MemDriveError) || !Object.hasOwn(checkpointFailures, cause.code)) return cause;
+    const details = cause.details ?? {};
+    const brief = (value: unknown) => isObject(value) && typeof value.code === 'string'
+        ? { code: value.code, ...(typeof value.status === 'number' ? { status: value.status } : {}) } : undefined;
+    const original = isObject(details.cause) ? details.cause : undefined;
+    const failure = new MemDriveError(cause.code, checkpointFailures[cause.code]!, { cause, details: {
+        stage: details.stage, restored: details.restored,
+        // Write-stage causes carry the writer's file details; later stages concern only the checkpoint.
+        ...(original ? { cause: { ...brief(original), ...(details.stage === 'write' && isObject(original.details) ? { details: original.details } : {}) } } : {}),
+        ...(brief(details.restoreCause) ? { restoreCause: brief(details.restoreCause) } : {}),
+        ...Object.fromEntries(['unrestoredFileIds', 'createdFileIds'].filter(key => Array.isArray(details[key])).map(key => [key, details[key]])),
+    } });
+    return failure;
+}
+
 /** Drop the view selectors of a read page, list or findText result: tools always use main. */
 function withoutAt(result: unknown) {
     if (!isObject(result)) return result;
@@ -133,8 +163,8 @@ export function createFileTools(options: { drive: FileDrive<EmbeddingMode>; tool
         if (name === 'write') {
             requireInput(!Object.hasOwn(input, 'checkpoint'), 'The host decides checkpoints; omit checkpoint.');
             if (checkpoint === undefined) return sdk.write(input, requestOptions);
-            const written = await sdk.write({ ...input, checkpoint: await checkpoint() }, requestOptions) as { result: unknown };
-            return written.result;
+            try { return (await sdk.write({ ...input, checkpoint: await checkpoint() }, requestOptions) as { result: unknown }).result; }
+            catch (cause) { throw agentFailure(cause); }
         }
         const result = await sdk[name as Exclude<FileToolName, 'guide' | 'write'>]!(input, requestOptions);
         return name === 'search' ? result : withoutAt(result);

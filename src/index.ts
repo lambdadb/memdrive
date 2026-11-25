@@ -47,6 +47,15 @@ const pathReadSize = 1000;
 const refToken = 'r1';
 const validRefLimit = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 1 && (value as number) <= 100;
 const validPageToken = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 16_384;
+/**
+ * How much earlier than the client's clock a checkpoint's server creation time
+ * may be and still count as created by the request sent after that clock
+ * reading. Synchronized hosts differ by milliseconds; a larger skew only leaves
+ * a checkpoint in place, while a checkpoint with the same name created by
+ * another call within this window would be misattributed. Checkpoint names
+ * must be unique, which makes that case a name reuse within two seconds.
+ */
+const creationTolerance = 2_000;
 /** A native 4xx other than a timeout: the request was not applied. */
 const rejected = (error: MemDriveError) => error.status !== undefined && error.status >= 400 && error.status < 500 && error.status !== 408;
 const atShape = 'at must be { kind: "main" }, { kind: "fork", name } or { kind: "checkpoint", name }';
@@ -390,15 +399,19 @@ function store(handle: Handle, description: FileStoreDescription<EmbeddingMode>,
      * After a failed alias move, read the alias back: a move whose response was
      * lost can still have happened. Otherwise report LATEST_CHECKPOINT_NOT_MOVED.
      */
-    async function confirmLatest(at: WritableAt, name: string, error: MemDriveError, details: Record<string, unknown>) {
+    async function confirmLatest(at: WritableAt, name: string | null, error: MemDriveError, details: Record<string, unknown>,
+        accept: (current: string | null) => boolean = current => current === name) {
         let current: string | null | undefined;
         try { current = await latestCheckpoint(branchOf(at)); }
         catch { current = undefined; }
-        if (current === name) return;
-        throw new MemDriveError('LATEST_CHECKPOINT_NOT_MOVED', `The latest checkpoint of ${at.kind === 'main' ? 'main' : `the fork ${at.name}`} could not be moved to ${name}.`,
-            { cause: error, details: { at: { ...at }, checkpoint: { kind: 'checkpoint', name }, ...details,
-                latestCheckpoint: current === undefined ? 'unknown' : current === null ? null : { kind: 'checkpoint', name: current },
-                cause: errorSummary(error) } });
+        if (current !== undefined && accept(current)) return;
+        const branch = at.kind === 'main' ? 'main' : `the fork ${at.name}`;
+        throw new MemDriveError('LATEST_CHECKPOINT_NOT_MOVED', name === null
+            ? `${branch} was created, but a latest checkpoint left by an earlier fork with this name could not be removed. Delete the fork and create it again.`
+            : `The latest checkpoint of ${branch} could not be moved to ${name}.`,
+        { cause: error, details: { at: { ...at }, checkpoint: name === null ? null : { kind: 'checkpoint', name }, ...details,
+            latestCheckpoint: current === undefined ? 'unknown' : current === null ? null : { kind: 'checkpoint', name: current },
+            cause: errorSummary(error) } });
     }
 
     /**
@@ -413,34 +426,46 @@ function store(handle: Handle, description: FileStoreDescription<EmbeddingMode>,
         const tagName = checkpointPrefix + name;
         const checkpoint = { at: { kind: 'checkpoint' as const, name } };
         const track: WriteTrack = { created: [], changed: [] };
-        let result: unknown;
+        let result: unknown, requested = 0;
 
         async function restore(stage: 'write' | 'checkpoint' | 'alias', error: MemDriveError, tagged: boolean | undefined): Promise<CheckpointedWriteResult<unknown>> {
             const fail = (code: string, message: string, details: Record<string, unknown>) =>
                 new MemDriveError(code, message, { cause: error, details: { stage, cause: errorSummary(error), ...details } });
             const notRestored = (message: string, restoreError: unknown, details: Record<string, unknown>) => fail('CHECKPOINT_RESTORE_FAILED', message,
                 { restored: false, ...(restoreError === undefined ? {} : { restoreCause: errorSummary(databaseError(restoreError, 'The restore failed.')) }), ...details });
-            const partial = 'The write failed and the branch could not be fully restored; it may hold part of the write. Read the affected files before deciding what to do.';
+            const applied = stage === 'write' ? 'The write failed' : 'The write was applied, but its checkpoint could not be recorded';
+            const partial = `${applied}, and the branch could not be fully restored; it may hold part of the write. Read the affected files before deciding what to do.`;
             const created = { checkpointCreated: tagged ?? 'unknown' };
             let previous: string | null;
             try { previous = await latestCheckpoint(branch); }
             catch (restoreError) { throw notRestored(partial, restoreError, created); }
             // An alias move with a lost response can still have happened.
             if (stage === 'alias' && previous === name) return { result, checkpoint };
-            /** Best effort: remove the checkpoint this call created or may have created, never the latest one. */
-            const removeTag = async () => {
+            /**
+             * Best effort: remove the checkpoint this call created, never the latest one.
+             * After an unknown creation outcome the tag is removed only when its creation
+             * time shows this call created it; a lost 409 leaves an older checkpoint alone.
+             */
+            const removeTag = async (): Promise<Record<string, unknown>> => {
                 if (tagged === false || previous === name) return {};
+                if (tagged === undefined) {
+                    let createdAt: unknown;
+                    try { createdAt = (await nativeRequest(() => handle.tags.get(tagName)))?.tag?.createdAt; }
+                    catch (cause) {
+                        return databaseError(cause, 'Could not inspect the checkpoint.').status === 404 ? { checkpointCreated: false } : created;
+                    }
+                    if (!(createdAt instanceof Date) || createdAt.getTime() < requested - creationTolerance) return created;
+                }
                 try { await nativeRequest(() => handle.tags.delete(tagName, mutationOptions())); }
-                catch (cause) { return { checkpointRemoved: databaseError(cause, 'Could not delete the checkpoint.').status === 404 }; }
-                return { checkpointRemoved: true };
+                catch (cause) { return { checkpointCreated: true, checkpointRemoved: databaseError(cause, 'Could not delete the checkpoint.').status === 404 }; }
+                return { checkpointCreated: true, checkpointRemoved: true };
             };
-            const applied = stage === 'write' ? 'The write failed' : 'The write was applied, but its checkpoint could not be recorded';
             if (previous !== null) {
                 const restoredTo = { kind: 'checkpoint' as const, name: previous };
                 // Sent once: resending a rollback can undo later writes.
                 try { await nativeRequest(() => handle.branches.rollback(branch, { tag: checkpointPrefix + previous }, mutationOptions())); }
                 catch (restoreError) { throw notRestored(partial, restoreError, { previousCheckpoint: restoredTo, ...created }); }
-                throw fail('CHECKPOINT_WRITE_FAILED', `${applied}; the branch was restored to its latest checkpoint ${previous}.`,
+                throw fail('CHECKPOINT_WRITE_FAILED', `${applied}; the branch was restored to its latest checkpoint.`,
                     { restored: true, restoredTo, ...await removeTag() });
             }
             // No latest checkpoint yet: remove the files this call created. Updates
@@ -460,11 +485,12 @@ function store(handle: Handle, description: FileStoreDescription<EmbeddingMode>,
 
         try { result = await writer.write(branch, operations, { signal }, track); }
         catch (cause) {
-            // Errors raised before the first native mutation leave the branch untouched.
-            if (!(cause instanceof MemDriveError) || cause.details?.stage === undefined) throw cause;
+            // Errors raised before the first native mutation, including an abort, leave the branch untouched.
+            if (!track.dispatched || !(cause instanceof MemDriveError)) throw cause;
             return restore('write', cause, false);
         }
         let sent = false;
+        requested = Date.now();
         try {
             const response = await remote(() => handle.tags.create({ tagName, source: branchRef(branch) }, mutationOptions(signal)),
                 'Could not create the checkpoint.', signal, { 409: 'CHECKPOINT_CONFLICT' });
@@ -498,6 +524,17 @@ function store(handle: Handle, description: FileStoreDescription<EmbeddingMode>,
                 'Could not create the checkpoint.', signal, { 409: 'CHECKPOINT_CONFLICT' }).then(response => response?.tag?.name), signal);
         const createAndMove = async () => {
             if (await createNative() !== nativeName) throw new MemDriveError('INVALID_RESULT', `${kind} creation returned another reference.`);
+            // A new fork starts without a latest checkpoint. An alias left by an earlier
+            // fork of that name (deleted outside deleteFork, or by a race) is removed
+            // in the new fork's queue turn, before any checkpointed write can use it.
+            if (kind === 'fork') {
+                try {
+                    await remote(() => handle.aliases.delete(latestAlias(nativeName), mutationOptions()), 'Could not clear the fork\'s latest checkpoint.');
+                } catch (cause) {
+                    if (!(cause instanceof MemDriveError) || cause.status !== 404)
+                        await confirmLatest(at as ForkAt, null, databaseError(cause, 'Could not clear the latest checkpoint.'), { forkCreated: true }, current => current === null);
+                }
+            }
             // A checkpoint of main or a fork becomes that branch's latest checkpoint in the same
             // queue turn. The move completes even after an abort, since the checkpoint exists.
             if (kind === 'checkpoint' && source.kind !== 'checkpoint') {
@@ -507,7 +544,9 @@ function store(handle: Handle, description: FileStoreDescription<EmbeddingMode>,
             }
         };
         // A ref taken from a branch waits for that branch's pending writes; a checkpoint source cannot change.
-        await (source.kind === 'checkpoint' ? createAndMove() : onBranch(cursorStore, branchOf(source), signal, createAndMove));
+        // A new fork also holds its own queue for the turn.
+        const branches = [...(source.kind === 'checkpoint' ? [] : [branchOf(source)]), ...(kind === 'fork' ? [nativeName] : [])];
+        await (branches.length ? onBranch(cursorStore, branches, signal, createAndMove) : createAndMove());
         return { at: { ...at } };
     }
 
@@ -521,15 +560,27 @@ function store(handle: Handle, description: FileStoreDescription<EmbeddingMode>,
         const remove = () => onViews([at], async () => {
             if (kind === 'fork') {
                 // The reserved alias goes first, so a recreated fork never inherits it.
-                try { await remote(() => handle.aliases.delete(latestAlias(nativeName), mutationOptions(signal)), 'Could not delete the fork\'s latest checkpoint.', signal); }
-                catch (cause) { if (!(cause instanceof MemDriveError) || cause.status !== 404) throw cause; }
-                return remote(() => handle.branches.delete(nativeName, mutationOptions(signal)), 'Could not delete the fork.', signal);
+                let cleared = false;
+                try {
+                    await remote(() => handle.aliases.delete(latestAlias(nativeName), mutationOptions(signal)), 'Could not delete the fork\'s latest checkpoint.', signal);
+                    cleared = true;
+                } catch (cause) { if (!(cause instanceof MemDriveError) || cause.status !== 404) throw cause; }
+                try { return await remote(() => handle.branches.delete(nativeName, mutationOptions(signal)), 'Could not delete the fork.', signal); }
+                catch (cause) {
+                    if (!cleared || !(cause instanceof MemDriveError) || cause.status === 404) throw cause;
+                    const error = new MemDriveError(cause.code, `${cause.message} The fork's latest checkpoint was already removed; the fork itself remains.`,
+                        { cause, details: { ...cause.details, latestCheckpointCleared: true } });
+                    error.status = cause.status;
+                    throw error;
+                }
             }
             const branches = await latestOf(nativeName, signal);
             if (branches.length) throw new MemDriveError('CHECKPOINT_IN_USE',
                 `The checkpoint ${at.name} is the latest checkpoint of ${branches.map(item => item.kind === 'main' ? 'main' : `the fork ${item.name}`).join(', ')} and cannot be deleted.`,
                 { details: { latestOf: branches } });
-            return remote(() => handle.tags.delete(nativeName, mutationOptions(signal)), 'Could not delete the checkpoint.', signal);
+            // LambdaDB also refuses to delete an alias target, with 409.
+            return remote(() => handle.tags.delete(nativeName, mutationOptions(signal)), 'Could not delete the checkpoint.', signal,
+                { 409: 'CHECKPOINT_IN_USE' });
         }, signal);
         await (kind === 'fork' ? onBranch(cursorStore, nativeName, signal, remove) : remove());
         return { at: { ...at } };
@@ -595,8 +646,15 @@ function store(handle: Handle, description: FileStoreDescription<EmbeddingMode>,
                 // A branch with a latest checkpoint now holds the target's contents, so
                 // the target becomes the checkpoint a failed checkpointed write restores.
                 // A branch without one keeps none. This runs even after an abort.
-                try { await moveLatest(branch, to.name, undefined, false); }
-                catch (cause) { await confirmLatest(at, to.name, databaseError(cause, 'Could not move the latest checkpoint.'), { rolledBack: true }); }
+                try {
+                    // A 404 means no alias, or a target deleted meanwhile; only the first is fine.
+                    if (!await moveLatest(branch, to.name, undefined, false))
+                        await confirmLatest(at, to.name, new MemDriveError('CHECKPOINT_NOT_FOUND', 'The latest checkpoint could not be moved to the rollback target.'),
+                            { rolledBack: true }, current => current === null || current === to.name);
+                } catch (cause) {
+                    if (cause instanceof MemDriveError && cause.code === 'LATEST_CHECKPOINT_NOT_MOVED') throw cause;
+                    await confirmLatest(at, to.name, databaseError(cause, 'Could not move the latest checkpoint.'), { rolledBack: true });
+                }
             });
             return { at: { ...at } };
         },

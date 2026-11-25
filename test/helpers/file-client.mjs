@@ -123,6 +123,9 @@ export function fileClient() {
                     async delete(tagName, options) {
                         calls.push({ kind: 'tag-delete', name: tagName, retries: options?.retries });
                         await fixture.beforeRefDelete?.('checkpoint', tagName);
+                        // Like LambdaDB, a tag that an alias targets cannot be deleted.
+                        if ([...state().aliases.values()].some(alias => alias.targetKind === 'TAG' && alias.targetName === tagName))
+                            fail(409, 'Tag is targeted by an alias');
                         if (!state().tags.delete(tagName)) fail(404, 'Checkpoint missing');
                         await fixture.afterRefDelete?.('checkpoint', tagName);
                         return { message: 'Deleted' };
@@ -169,6 +172,7 @@ export function fileClient() {
                     },
                     async delete(aliasName, options) {
                         calls.push({ kind: 'alias-delete', name: aliasName, retries: options?.retries });
+                        await fixture.beforeAliasDelete?.(aliasName);
                         if (!state().aliases.delete(aliasName)) fail(404, 'Alias missing');
                         return { message: 'Deleted' };
                     },

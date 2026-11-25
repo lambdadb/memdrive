@@ -16,7 +16,9 @@ async function setup() {
     const { at: checkpoint } = await drive.checkpoint({ at: fork, name: 'saved' });
     return { ...fixture, fixture, connection, drive, fork, checkpoint };
 }
-const deletes = calls => calls.filter(call => call.kind.endsWith('-delete'));
+// Fork creation also clears a stale alias of the new fork's name; count those separately.
+const allDeletes = calls => calls.filter(call => call.kind.endsWith('-delete'));
+const deletes = calls => allDeletes(calls).filter(call => call.kind !== 'alias-delete');
 
 test('create makes one collection with one-day native snapshot retention and no internal refs or journal', async () => {
     const { client, collections, calls } = fileClient();
@@ -121,10 +123,11 @@ test('ref deletion returns at, keeps independent snapshots, and later uses repor
     const reopened = await open(connection);
     assert.notEqual(reopened, drive);
     assert.deepEqual(await reopened.deleteFork({ at: fork }), { at: fork });
-    assert(deletes(calls).every(call => call.retries.strategy === 'none'));
+    assert(allDeletes(calls).every(call => call.retries.strategy === 'none'));
     // A fork deletion removes its reserved alias first (absent here), then the branch; no confirmation reads.
-    assert.deepEqual(deletes(calls).map(call => call.kind), ['alias-delete', 'branch-delete', 'tag-delete',
-        'alias-delete', 'branch-delete', 'tag-delete', 'alias-delete', 'branch-delete']);
+    // Creating a fork clears any alias left under its name.
+    assert.deepEqual(allDeletes(calls).map(call => call.kind), ['alias-delete', 'alias-delete', 'alias-delete', 'branch-delete', 'tag-delete',
+        'alias-delete', 'branch-delete', 'tag-delete', 'alias-delete', 'alias-delete', 'branch-delete']);
 });
 
 test('delete requests require an existing at of the matching kind and main cannot be deleted', async () => {

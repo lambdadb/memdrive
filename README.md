@@ -393,22 +393,26 @@ const { result, checkpoint } = await drive.write({
         { op: 'create', path: '/notes/handoff.md', content: 'On-call handoff happens at 09:30 KST every Monday.' },
         { op: 'update', fileId: file.fileId, edits: [{ oldText: 'Tuesday', newText: 'Monday' }] },
     ],
-    checkpoint: { name: 'turn-0042' }, // host-chosen, unique per write
+    // Host-chosen and unique for the store's lifetime, also across restarts.
+    checkpoint: { name: `turn-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}` },
 });
-// result: the ordinary write result; checkpoint: { at: { kind: 'checkpoint', name: 'turn-0042' } }
-const { latestCheckpoint } = await drive.describe(); // { at: { kind: 'checkpoint', name: 'turn-0042' } }
+// result: the ordinary write result; checkpoint: { at: { kind: 'checkpoint', name: 'turn-…' } }
+const { latestCheckpoint } = await drive.describe(); // the same { at }
 ```
 
 Add `checkpoint: { name }` to any single-operation or batch `write` on main or a
 fork. The result is `{ result, checkpoint: { at } }`, where `result` is what the
 same write without `checkpoint` returns. Checkpoint names follow the rules in
-[Save a checkpoint](#save-a-checkpoint).
+[Save a checkpoint](#save-a-checkpoint) and must be unique for the store's
+lifetime, including across host restarts: a counter that restarts at 1 reuses
+names, every such write then fails tag creation with `CHECKPOINT_CONFLICT` and is
+rolled back. Use a timestamp or random suffix within the 41-character limit.
 
 Each branch has one SDK-reserved LambdaDB alias naming its latest checkpoint:
-`latest-main` for main and `latest-fork-<name>` for a fork. The alias names the
-most recent checkpoint taken of the branch, whether by a checkpointed write or by
-`checkpoint({ at, name })` with that branch as source, or the checkpoint the
-branch was last rolled back to. The SDK has no alias API, so callers cannot
+`latest-main` for main and `latest-fork-<name>` for a fork. It names the base
+checkpoint of the branch's current state: the most recent checkpoint taken of the
+branch, whether by a checkpointed write or by `checkpoint({ at, name })` with
+that branch as source, or the checkpoint the branch was last rolled back to. The SDK has no alias API, so callers cannot
 create, move or delete it through the SDK, and `listCheckpoints` never lists it.
 `describe({ at? })` reports it as `latestCheckpoint: { at } | null` for main
 (default) or a fork with one alias read; a checkpoint `at` fails with
@@ -416,8 +420,13 @@ create, move or delete it through the SDK, and `listCheckpoints` never lists it.
 like a fork without checkpoints, reports `null`. `deleteCheckpoint` refuses a
 checkpoint that is some branch's latest with `CHECKPOINT_IN_USE`, whose details
 list `latestOf` (the branches), so retention can never leave the alias dangling;
-delete older checkpoints instead. `deleteFork` deletes the fork's alias before
-the branch, so a recreated fork starts without a latest checkpoint.
+delete older checkpoints instead; a 409 from LambdaDB for an alias target is
+reported the same way. `deleteFork` deletes the fork's alias before the branch;
+if the branch deletion then fails, the error keeps its code and status and adds
+`latestCheckpointCleared: true`. `fork` deletes any alias left under the new
+fork's name (for example by a branch deleted outside the SDK) in the new fork's
+queue turn, so a new fork always starts without a latest checkpoint; if that
+fails, it throws `LATEST_CHECKPOINT_NOT_MOVED` with `forkCreated: true`.
 
 One turn of the branch's queue (see [Concurrent calls](#concurrent-calls)) runs
 the whole sequence:
@@ -433,9 +442,9 @@ creation and one alias retarget (plus one alias creation the first time). The
 alias is not read beforehand. A plain `write` sends no tag, alias or rollback
 requests.
 
-Errors raised before the write changes anything, such as `INVALID_INPUT`,
-`PATH_EXISTS`, `EDIT_CONFLICT` or `FILE_NOT_FOUND`, are thrown unchanged and the
-branch is untouched. Any later failure (a rejected or partial write,
+Errors raised before the write sends its first mutation, such as
+`INVALID_INPUT`, `PATH_EXISTS`, `EDIT_CONFLICT`, `FILE_NOT_FOUND` or an abort, are
+thrown unchanged and the branch is untouched. Any later failure (a rejected or partial write,
 `WRITE_UNCONFIRMED`, a failed tag creation including `CHECKPOINT_CONFLICT`, or a
 failed alias move) restores the branch, then throws:
 
@@ -443,8 +452,12 @@ failed alias move) restores the branch, then throws:
   now names the new checkpoint, the call succeeded and returns normally.
 - Otherwise it rolls the branch back to the checkpoint the alias names with one
   `branches.rollback`, never retried, and deletes the new tag if the call
-  created it or may have created it (a pre-existing checkpoint with that name is
-  never deleted).
+  created it. When the tag creation's outcome is unknown, it reads the tag and
+  deletes it only when its creation time is no more than 2 seconds before the
+  client clock reading taken just before the request; otherwise, for example
+  after a lost 409 for an existing checkpoint, the tag stays and the details say
+  `checkpointCreated: 'unknown'`. The tolerance covers clock skew between client
+  and server; a larger skew only leaves a checkpoint behind.
 - Without an alias, on the branch's first checkpointed write, there is nothing to
   roll back to: the SDK deletes the files this call created, with their chunks.
   Updates and deletions of files that existed before cannot be undone this way.
@@ -454,7 +467,7 @@ of:
 
 | Code | Meaning | Details |
 | --- | --- | --- |
-| `CHECKPOINT_WRITE_FAILED` | Nothing from the call remains. `stage: 'write'`: the write failed; `'checkpoint'` or `'alias'`: the write was applied but its checkpoint could not be recorded. | `stage`, `restored: true`, `restoredTo` (the checkpoint `at`, or `null` when created files were deleted), `cause` (code, message, status, details of the original error), `checkpointRemoved` when the call deleted or tried to delete its tag |
+| `CHECKPOINT_WRITE_FAILED` | Nothing from the call remains. `stage: 'write'`: the write failed; `'checkpoint'` or `'alias'`: the write was applied but its checkpoint could not be recorded. | `stage`, `restored: true`, `restoredTo` (the checkpoint `at`, or `null` when created files were deleted), `cause` (code, message, status, details of the original error), `checkpointCreated` and `checkpointRemoved` when the call created or may have created its tag |
 | `CHECKPOINT_RESTORE_FAILED` | The restore failed or could not undo everything; the branch may hold part of the write. Read the affected files. | `stage`, `restored: false`, `cause`, `restoreCause` when a restore request failed, `previousCheckpoint` or `restoredTo: null`, `checkpointCreated` (`true`, `false` or `'unknown'`), `unrestoredFileIds` for existing files a first checkpointed write changed, `createdFileIds` when their deletion failed |
 
 LambdaDB can reject a rollback to a checkpoint created moments earlier with
@@ -509,6 +522,9 @@ branch), `checkpoint`, `checkpointCreated: true`, `latestCheckpoint` (what the
 alias names, `null` or `'unknown'`) and `cause`. The checkpoint exists and no
 files changed; take another checkpoint to retry the move.
 
+Creating a fork also deletes any alias left under the new fork's name, one more
+request; see [Checkpointed writes](#checkpointed-writes).
+
 Each call sends one native creation request, plus the alias move for a
 checkpoint of a branch. A name already in use fails with
 `BRANCH_CONFLICT` or `CHECKPOINT_CONFLICT`, and a missing source with
@@ -547,8 +563,9 @@ retry; try again later.
 When the branch has a latest checkpoint, the rollback also moves it to `to`, so
 a later failing checkpointed write restores the state the branch was rolled back
 to. A branch without one keeps none. If that alias move fails after the rollback
-succeeded, the SDK throws `LATEST_CHECKPOINT_NOT_MOVED` with `rolledBack: true`;
-the files are rolled back.
+succeeded, including a 404 because `to` was deleted meanwhile while the alias
+still names another checkpoint, the SDK throws `LATEST_CHECKPOINT_NOT_MOVED`
+with `rolledBack: true`; the files are rolled back.
 
 ## List and delete refs or destroy a store
 
@@ -616,12 +633,12 @@ tools. Hosts use the SDK directly for refs, rollback and retention.
 ```ts
 import { createFileTools, fileToolError, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
 
-let turn = 0;
 const tools = createFileTools({
     drive,
     tools: ['guide', 'read', 'list', 'search', 'findText', 'write'],
-    // Optional: every write tool call becomes a checkpointed write with this name.
-    checkpoint: () => ({ name: `turn-${++turn}` }),
+    // Optional: every write tool call becomes a checkpointed write with this name,
+    // unique across host restarts.
+    checkpoint: () => ({ name: `turn-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}` }),
 });
 
 // Register definitions with the host's model or MCP transport.
@@ -664,13 +681,17 @@ content hydration are supplied by the tool layer.
 `createFileTools({ drive, tools, checkpoint? })` takes an optional host hook,
 `checkpoint: () => ({ name })`, synchronous or asynchronous. With it, every
 `write` tool call becomes a [checkpointed write](#checkpointed-writes) named by
-the hook, and the tool still returns the plain write result; the checkpoint name
-stays with the host. The `write` schema has no checkpoint option, and an input
-with `checkpoint` fails with `INVALID_INPUT`, so the agent can neither choose nor
-skip a checkpoint. A failed write then reports `CHECKPOINT_WRITE_FAILED` (nothing
-kept) or `CHECKPOINT_RESTORE_FAILED` through `fileToolError`. The hook runs once
-per `write` call, before validation, so names can be skipped but are never
-reused. Without the hook, `write` is a plain write.
+the hook, and the tool still returns the plain write result; checkpoints stay
+with the host. The `write` schema has no checkpoint option, and an input with
+`checkpoint` fails with `INVALID_INPUT`, so the agent can neither choose nor skip
+a checkpoint. A failed write then reports `CHECKPOINT_WRITE_FAILED` (nothing
+kept) or `CHECKPOINT_RESTORE_FAILED` through `fileToolError`, with a fixed
+message and only `stage`, `restored`, the original and restore causes' code and
+status (plus the writer's file details for stage `write`) and
+`unrestoredFileIds`/`createdFileIds`; checkpoint names are removed. The hook runs
+once per `write` call, before validation. Its names must be unique for the
+store's lifetime, including across host restarts, so do not use a counter that
+restarts. Without the hook, `write` is a plain write.
 
 `fileToolInstructions` is the short, transport-neutral guidance shared with the
 guide index. Hosts can supply it to their agents alongside the tool definitions.

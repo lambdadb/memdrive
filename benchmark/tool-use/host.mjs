@@ -11,7 +11,9 @@ const reads = ['read', 'list', 'search', 'findText'];
 // A protocol-shaped, in-process host. It is not an MCP server or wire implementation.
 // It connects main of one authorized drive with a fixed allowlist. In writable
 // tasks the host, not the model, makes every write a checkpointed write named
-// turn-<n>, so a failed write leaves main at its latest checkpoint. `afterCall`
+// turn-<n>, so a failed write leaves main at its latest checkpoint. A counter is
+// unique here only because every conversation gets a fresh store; a real host
+// needs names unique across restarts. `afterCall`
 // lets a scenario act as a concurrent writer between tool calls.
 export function createHost({ drive, writable, guide, afterCall }) {
     const events = [];
