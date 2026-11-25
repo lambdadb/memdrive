@@ -26,6 +26,8 @@ export function nativeFixture() {
             return { name, parentBranch: null, headSnapshot: numDocs ? { snapshotId: 'synthetic', snapshotCommittedAt: 0 } : null,
                 parentSnapshot: null, createdAt: 0, dataUpdatedAt: numDocs ? 0 : null, numDocs, indexConfigs: collection.indexConfigs };
         };
+        // No checkpointed writes run here, so no reserved alias exists.
+        if (options.method === 'GET' && /\/aliases\/[^/]+$/.test(pathname)) return response({ message: 'not found' }, 404);
         const branchName = /\/branches\/([^/]+)$/.exec(pathname)?.[1];
         if (branchName && options.method === 'GET')
             return branches.has(branchName) ? response({ branch: branch(branchName) }) : response({ message: 'not found' }, 404);

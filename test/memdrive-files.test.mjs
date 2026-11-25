@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { createRequire } from 'node:module';
 import { create, open } from '@functional-systems/memdrive';
 import { fileClient } from './helpers/file-client.mjs';
+
+// The CommonJS build is a separate SDK copy with its own branch queues, so it
+// races this module's writers the way another process would.
+const separateCopy = createRequire(import.meta.url)('@functional-systems/memdrive');
+// If both imports ever shared one module instance, the race tests below would wait forever.
+assert.notEqual(separateCopy.open, open, 'the CommonJS build must be a separate module instance');
 
 const request = (path, content = '') => ({ op: 'create', path, content });
 const fork = name => ({ kind: 'fork', name });
@@ -12,9 +19,6 @@ test('file stores round-trip exact text and empty originals by path and stable I
     const fixture = fileClient();
     const { client, calls } = fixture;
     const drive = await create({ client, name: 'workspace' });
-    await assert.rejects(drive.write(request('/main.txt')), { code: 'INVALID_INPUT' });
-    assert.equal(calls.some(call => call.kind === 'upsert'), false);
-
     assert.deepEqual(await drive.fork({ name: 'research' }), { at: research });
     const path = '/notes/한글 "draft":*?.md';
     const content = '﻿# Task\r\n  café\t😀\n\u0000\n';
@@ -31,7 +35,6 @@ test('file stores round-trip exact text and empty originals by path and stable I
     assert.deepEqual(await reopened.read({ at: research, path }), file);
     assert.deepEqual(await reopened.read({ at: research, fileId: file.fileId }), file);
     assert.deepEqual(await reopened.read({ at: research, path: empty.path }), empty);
-    assert.strictEqual(await open({ client, name: 'workspace' }), drive);
     assert.equal(await drive.read({ fileId: file.fileId }), null);
     assert.equal(await drive.read({ at: { kind: 'main' }, fileId: file.fileId }), null);
     const { at: alternate } = await drive.fork({ name: 'alternate' });
@@ -41,13 +44,12 @@ test('file stores round-trip exact text and empty originals by path and stable I
     const writes = calls.filter(call => call.kind === 'upsert');
     assert.deepEqual(writes.map(call => call.request.branch), ['fork-research', 'fork-research', 'fork-alternate']);
     const [chunk, original] = writes[0].request.docs;
-    const { revision, fingerprint, chunking, ...storedOriginal } = original;
+    const { revision, chunking, ...storedOriginal } = original;
     assert.equal(typeof revision, 'string');
-    assert.match(fingerprint, /^[0-9a-f]{64}$/);
     assert.deepEqual(chunking, { strategy: 'boundary', version: '1' });
     assert.deepEqual(storedOriginal, {
         id: `file:${file.fileId}`, kind: 'file', fileId: file.fileId, path, body: content, modifiedAt: file.modifiedAt,
-        fileName: '한글 "draft":*?.md', ancestorPaths: ['/', '/notes/'], changed: true,
+        fileName: '한글 "draft":*?.md', ancestorPaths: ['/', '/notes/'],
     });
     assert.equal(chunk.kind, 'chunk');
     assert.equal(chunk.content, content);
@@ -57,7 +59,8 @@ test('file stores round-trip exact text and empty originals by path and stable I
     assert.equal(calls.filter(call => call.kind === 'fetch').every(call => call.request.consistentRead), true);
     const lookup = calls.find(call => call.kind === 'query').request;
     assert.deepEqual(lookup, {
-        size: 2, ref: { kind: 'branch', name: 'fork-research' }, consistentRead: true, includeVectors: false,
+        // Large enough to see every file at a destination, including ones that share it.
+        size: 1000, ref: { kind: 'branch', name: 'fork-research' }, consistentRead: true, includeVectors: false,
         fields: { include: ['id', 'kind', 'fileId', 'path'] },
         query: { bool: [
             { queryString: { query: '"file"', defaultField: 'kind' }, occur: 'filter' },
@@ -66,40 +69,41 @@ test('file stores round-trip exact text and empty originals by path and stable I
     });
 });
 
-test('omitted at reads main and explicit main returns the same published view', async () => {
+test('omitted at reads and writes the main branch directly, isolated from forks', async () => {
     const fixture = fileClient();
+    const { calls } = fixture;
     const drive = await create({ client: fixture.client, name: 'workspace' });
-    await drive.fork({ name: 'research' });
-    const file = await drive.write({ at: research, ...request('/published.txt', 'published') });
-    await drive.write({ at: research, ...request('/draft.txt', 'draft') });
-    await drive.merge({ at: research, requestId: 'publish', summary: 'Publish one file' });
-    await drive.write({ at: research, op: 'update', fileId: file.fileId, content: 'unpublished edit' });
-    assert.equal((await drive.read({ fileId: file.fileId })).content, 'published');
+    const file = await drive.write(request('/main.txt', 'on main'));
+    assert.deepEqual(calls.filter(call => call.kind === 'upsert').map(call => call.request.branch), ['main']);
     assert.deepEqual(await drive.read({ at: { kind: 'main' }, fileId: file.fileId }), await drive.read({ fileId: file.fileId }));
+    assert.equal((await drive.read({ path: '/main.txt' })).content, 'on main');
+    // Main reads are consistent branch reads; there is no published tag.
+    assert.deepEqual(calls.filter(call => call.kind === 'fetch').map(call => [call.request.ref, call.request.consistentRead]).at(-1),
+        [{ kind: 'branch', name: 'main' }, true]);
+    assert.equal(calls.some(call => call.kind === 'tag-create' || call.kind === 'branch-create'), false);
+
+    await drive.fork({ name: 'research' });
+    await drive.write({ at: research, op: 'update', fileId: file.fileId, content: 'fork edit' });
+    const added = await drive.write({ at: { kind: 'main' }, operations: [request('/later.txt', 'main only')] });
+    assert.equal((await drive.read({ fileId: file.fileId })).content, 'on main');
+    assert.equal((await drive.read({ at: research, fileId: file.fileId })).content, 'fork edit');
+    assert.equal(await drive.read({ at: research, fileId: added[0].fileId }), null);
     assert.deepEqual(await drive.list(), await drive.list({ at: { kind: 'main' } }));
-    assert.deepEqual(await drive.status(), { at: { kind: 'main' }, mainVersion: 'v1' });
-    assert.deepEqual(await drive.status({ at: research }), { at: research, mainVersion: 'v1' });
-    assert.equal((await drive.read({ at: research, fileId: file.fileId })).content, 'unpublished edit');
+    assert.deepEqual((await drive.write({ op: 'delete', fileId: file.fileId })), { fileId: file.fileId });
+    assert.equal(await drive.read({ fileId: file.fileId }), null);
+    assert.equal((await drive.read({ at: research, fileId: file.fileId })).content, 'fork edit');
 });
 
-test('write, diff and merge require an explicit working fork without storage calls or fallback', async () => {
+test('checkpoints reject writes before storage access', async () => {
     const fixture = fileClient();
     const drive = await create({ client: fixture.client, name: 'workspace' });
-    await drive.fork({ name: 'research' });
     await drive.checkpoint({ name: 'saved' });
     const before = fixture.calls.length;
-    for (const at of [undefined, { kind: 'main' }, checkpoint('saved')]) {
-        const target = at === undefined ? {} : { at };
-        await assert.rejects(drive.write({ ...target, ...request('/x.txt') }), { code: 'INVALID_INPUT' });
-        await assert.rejects(drive.write({ ...target, operations: [request('/x.txt')] }), { code: 'INVALID_INPUT' });
-        await assert.rejects(drive.diff(target), { code: 'INVALID_INPUT' });
-        await assert.rejects(drive.merge({ ...target, requestId: 'publish', summary: 'Publish' }), { code: 'INVALID_INPUT' });
-    }
-    await assert.rejects(drive.diff(), { code: 'INVALID_INPUT' });
-    await assert.rejects(drive.diff({ at: research, limit: 1 }), { code: 'INVALID_INPUT' });
+    await assert.rejects(drive.write({ at: checkpoint('saved'), ...request('/x.txt') }), { code: 'INVALID_INPUT', message: /read-only/ });
+    await assert.rejects(drive.write({ at: checkpoint('saved'), operations: [request('/x.txt')] }), { code: 'INVALID_INPUT' });
     await assert.rejects(drive.write({ at: research, operations: [request('/x.txt')], op: 'create' }), { code: 'INVALID_INPUT' });
+    for (const removed of ['diff', 'merge', 'status', 'history', 'configure']) assert.equal(drive[removed], undefined);
     assert.equal(fixture.calls.length, before);
-    assert.deepEqual((await drive.listForks()).forks, [{ at: research }]);
 });
 
 test('invalid at shapes are rejected before storage access', async () => {
@@ -112,53 +116,53 @@ test('invalid at shapes are rejected before storage access', async () => {
         { kind: 'checkpoint', name: 'x'.repeat(42) }, { kind: 'fork', name: 'research', extra: true },
         { fork: 'research' }, { kind: 'branch', name: 'research' }]) {
         await assert.rejects(drive.read({ at, path: '/a' }), { code: 'INVALID_INPUT' }, JSON.stringify(at));
-        await assert.rejects(drive.status({ at }), { code: 'INVALID_INPUT' });
+        await assert.rejects(drive.list({ at }), { code: 'INVALID_INPUT' });
         await assert.rejects(drive.write({ at, ...request('/a') }), { code: 'INVALID_INPUT' });
     }
     assert.equal(fixture.calls.length, before);
 });
 
-test('parallel creates on the same fork share a queue and check paths before writing', async () => {
-    const { client, calls } = fileClient();
+test('path uniqueness is checked before writing but is best effort across separate SDK copies', async () => {
+    const fixture = fileClient();
+    const { client, calls } = fixture;
     const drive = await create({ client, name: 'workspace' });
-    await drive.fork({ name: 'research' });
-    const reopened = await open({ client, name: 'workspace' });
-
-    const first = drive.write({ at: research, ...request('/a.txt', 'first') });
-    const second = reopened.write({ at: research, ...request('/a.txt', 'second') });
-    await assert.rejects(second, { code: 'PATH_EXISTS' });
-    assert.equal((await first).content, 'first');
+    await drive.write(request('/a.txt', 'first'));
+    await assert.rejects(drive.write(request('/a.txt', 'second')), { code: 'PATH_EXISTS', details: { paths: ['/a.txt'] } });
     assert.equal(calls.filter(call => call.kind === 'upsert').length, 1);
+    // Writers in separate SDK copies or processes both pass the read-then-write check; nothing orders them.
+    const reopened = await separateCopy.open({ client, name: 'workspace' });
+    let arrived = 0, release;
+    const bothChecked = new Promise(resolve => { release = resolve; });
+    fixture.beforeUpsert = async () => { if (++arrived === 2) release(); await bothChecked; };
+    const raced = await Promise.all([drive.write(request('/b.txt', 'one')), reopened.write(request('/b.txt', 'two'))]);
+    assert.notEqual(raced[0].fileId, raced[1].fileId);
 });
 
-test('an uncertain create response is inspectable and a queued retry cannot duplicate it', async () => {
+test('an uncertain write is reported with its targets and does not block later writes', async () => {
     const fixture = fileClient();
     const { client, calls } = fixture;
     const drive = await create({ client, name: 'workspace' });
     await drive.fork({ name: 'research' });
-    let releasePending;
     fixture.beforeUpsert = body => {
-        if (body.docs[0].path !== '/a.txt') return;
-        releasePending = () => {
-            const docs = fixture.collections.get('workspace').branches.get(body.branch).docs;
-            for (const doc of body.docs) docs.set(doc.id, doc);
-        };
-        throw new Error('Connection lost');
+        if (body.docs[0].path === '/a.txt') throw new Error('Connection lost');
     };
     let details;
     await assert.rejects(drive.write({ at: research, ...request('/a.txt', 'exact') }), error => {
         assert.equal(error.code, 'WRITE_UNCONFIRMED');
+        assert.equal(error.status, undefined);
         details = error.details;
         assert.equal(details.path, '/a.txt');
+        assert.equal(details.stage, 'write-original');
         return true;
     });
-    await assert.rejects(drive.write({ at: research, ...request('/a.txt', 'duplicate') }), { code: 'WRITE_UNCONFIRMED',
-        details: { fileId: details.fileId, path: details.path, targets: [{ fileId: details.fileId, path: details.path }], stage: 'write-original' } });
-    assert.equal(calls.filter(call => call.kind === 'upsert').length, 1);
-    releasePending();
-    assert.equal((await drive.read({ at: research, fileId: details.fileId })).content, 'exact');
-    await assert.rejects(drive.write({ at: research, ...request('/a.txt') }), { code: 'PATH_EXISTS' });
-    assert.equal((await drive.write({ at: research, ...request('/different.txt') })).path, '/different.txt');
+    // No fence: the caller inspects and decides. A retry is an ordinary new write.
+    fixture.beforeUpsert = undefined;
+    assert.equal(await drive.read({ at: research, fileId: details.fileId }), null);
+    assert.equal((await drive.write({ at: research, ...request('/a.txt', 'retried') })).content, 'retried');
+    assert.equal(calls.filter(call => call.kind === 'upsert').length, 2);
+    // A definite rejection keeps its status and is not reported as uncertain.
+    fixture.beforeUpsert = () => { throw Object.assign(new Error('Too large'), { statusCode: 413 }); };
+    await assert.rejects(drive.write({ at: research, ...request('/b.txt') }), { code: 'DATABASE_ERROR', status: 413 });
 });
 
 test('invalid paths, unsupported targets and legacy collections fail without writes', async () => {
@@ -169,8 +173,9 @@ test('invalid paths, unsupported targets and legacy collections fail without wri
     await assert.rejects(open({ client, name: 'absent' }), { code: 'STORE_NOT_FOUND' });
     const drive = await create({ client, name: 'workspace' });
     await assert.rejects(open({ client, name: 'workspace', at: research }), { code: 'INVALID_INPUT' });
-    await assert.rejects(drive.read({ at: fork('absent'), path: '/a' }), { code: 'BRANCH_NOT_FOUND' });
-    await assert.rejects(drive.write({ at: fork('absent'), ...request('/a') }), { code: 'BRANCH_NOT_FOUND' });
+    await assert.rejects(drive.read({ at: fork('absent'), path: '/a' }), { code: 'BRANCH_NOT_FOUND', status: 404 });
+    await assert.rejects(drive.write({ at: fork('absent'), ...request('/a') }), { code: 'BRANCH_NOT_FOUND', status: 404 });
+    await assert.rejects(drive.read({ at: checkpoint('absent'), path: '/a' }), { code: 'CHECKPOINT_NOT_FOUND', status: 404 });
     await assert.rejects(drive.fork({ name: 'main' }), { code: 'INVALID_INPUT' });
     await drive.fork({ name: 'research' });
     for (const path of ['relative', '/', '/a//b', '/a/../b', '/a/./b', '/a/', '/a\\b', '/a\n']) {
@@ -400,9 +405,8 @@ test('a large file publishes its original only after all chunk requests succeed'
     assert.equal((await drive.read({ at, fileId: retried.fileId })).content, content);
 });
 
-test('lists matching file metadata and globally deduplicated prefixes across native pages', async () => {
+test('list returns one native page per call in native order, with prefixes computed per page', async () => {
     const fixture = fileClient();
-    fixture.listPageSize = 2;
     const drive = await create({ client: fixture.client, name: 'workspace', metadataSchema: { topic: { type: 'string' } } });
     await drive.fork({ name: 'research' });
     const { at: alternate } = await drive.fork({ name: 'alternate' });
@@ -418,14 +422,26 @@ test('lists matching file metadata and globally deduplicated prefixes across nat
     await drive.write({ at: alternate, ...request('/alternate.txt') });
     assert.deepEqual(await drive.list(), { files: [], prefixes: [], consistency: 'eventual' });
     assert.deepEqual((await drive.list({ at: alternate })).files.map(file => file.path), ['/alternate.txt']);
-    const rootPage = await drive.list({ at: research, delimiter: '/', limit: 2 });
-    assert.deepEqual(rootPage.files, [{ fileId: root.fileId, path: root.path, modifiedAt: root.modifiedAt }]);
-    assert.deepEqual(rootPage.prefixes, ['/notes/']);
-    assert.deepEqual(Object.keys(rootPage.next), ['at', 'cursor']);
-    assert.deepEqual(rootPage.next.at, research);
-    const last = await drive.list(rootPage.next);
-    assert.deepEqual(last, { files: [], prefixes: ['/notesish/'], consistency: 'eventual' });
-    assert.deepEqual(await drive.list(rootPage.next), last);
+
+    // Each call is one native page of `limit` documents; a prefix repeats on later pages.
+    const pages = [];
+    for (let page = await drive.list({ at: research, delimiter: '/', limit: 2 }); ; page = await drive.list(page.next)) {
+        pages.push(page);
+        if (!page.next) break;
+        assert.deepEqual(Object.keys(page.next), ['at', 'cursor']);
+        assert.deepEqual(page.next.at, research);
+    }
+    assert.deepEqual(pages.map(page => [page.files.map(file => file.path), page.prefixes]), [
+        [['/Root.txt'], ['/notes/']],
+        [[], ['/notes/']],
+        [[], ['/notes/']],
+        [[], ['/notesish/']],
+    ]);
+    assert.deepEqual(pages[0].files, [{ fileId: root.fileId, path: root.path, modifiedAt: root.modifiedAt }]);
+    // Files keep native order rather than path order.
+    assert.deepEqual((await drive.list({ at: research, prefix: '/notes/' })).files.map(file => file.path), [
+        '/notes/B [x]*?.md', '/notes/archive/alpha.txt', '/notes/archive/"quoted"/sample.txt', '/notes/Alpha.txt', '/notes/archive/B [x]*?.txt',
+    ]);
     assert.deepEqual((await drive.list({ at: research, prefix: '/notes/', delimiter: '/' })).prefixes, ['/notes/archive/']);
 
     const filtered = await drive.list({ at: research, prefix: '/notes/', nameContains: 'B [x]*?', delimiter: '/' });
@@ -449,80 +465,46 @@ test('lists matching file metadata and globally deduplicated prefixes across nat
     }
 });
 
-test('listing continuation freezes groups and cloned metadata, including a repeatable last page', async t => {
+test('list cursors are stateless tokens that continue on a fresh drive object and stay bound to their view and store', async t => {
     const fixture = fileClient();
-    fixture.listPageSize = 1;
-    const { client, collections, calls } = fixture;
+    const { client, calls } = fixture;
     const drive = await create({ client, name: 'workspace', metadataSchema: { note: { type: 'string' } } });
     await drive.fork({ name: 'research' });
-    const [first, second] = await drive.write({ at: research, operations: [
-        { ...request('/a.txt'), metadata: { note: 'before a' } },
-        { ...request('/b.txt'), metadata: { note: 'before b' } },
-        request('/group/c.txt'),
+    await drive.write({ at: research, operations: [
+        { ...request('/a.txt'), metadata: { note: 'a' } }, request('/b.txt'), request('/c.txt'),
     ] });
-    const page = await drive.list({ at: research, delimiter: '/', limit: 1 });
-    assert.deepEqual(page.files.map(file => file.fileId), [first.fileId]);
-    page.files[0].metadata.note = 'caller mutation';
-    const state = collections.get('workspace').branches.get('fork-research').docs;
-    state.delete(`file:${second.fileId}`);
-    await drive.write({ at: research, ...request('/b2.txt'), metadata: { note: 'after' } });
-    const listedBefore = calls.filter(call => call.kind === 'list').length;
-    const next = await drive.list(page.next);
-    assert.deepEqual(next.files, [{ fileId: second.fileId, path: '/b.txt', modifiedAt: second.modifiedAt, metadata: { note: 'before b' } }]);
-    next.files[0].metadata.note = 'caller mutation';
-    assert.equal((await drive.list(page.next)).files[0].metadata.note, 'before b');
-    const final = await drive.list(next.next);
-    assert.deepEqual(final, { files: [], prefixes: ['/group/'], consistency: 'eventual' });
-    assert.deepEqual(await drive.list(next.next), final);
-    assert.equal(calls.filter(call => call.kind === 'list').length, listedBefore);
+    const page = await drive.list({ at: research, limit: 1 });
+    assert.deepEqual(page.files.map(file => file.path), ['/a.txt']);
+    // No time-based expiry and no process state: a new client continues the same cursor.
+    t.mock.method(Date, 'now', () => Date.UTC(2100, 0, 1));
+    const fresh = await open({ client: { ...client }, name: 'workspace' });
+    const second = await fresh.list(page.next);
+    assert.deepEqual(second.files.map(file => file.path), ['/b.txt']);
+    assert.deepEqual(await drive.list(page.next), second);
+    assert.equal(calls.findLast(call => call.kind === 'list').request.pageToken, '1');
+    assert.deepEqual((await fresh.list(second.next)).files.map(file => file.path), ['/c.txt']);
 
     const { cursor } = page.next;
     await assert.rejects(drive.list({ ...page.next, limit: 2 }), { code: 'INVALID_INPUT' });
-    // A cursor stays bound to its view: other views reject it without consuming it.
     await assert.rejects(drive.list({ cursor }), { code: 'CURSOR_VIEW_MISMATCH' });
     await assert.rejects(drive.list({ at: { kind: 'main' }, cursor }), { code: 'CURSOR_VIEW_MISMATCH' });
-    const { at: alternate } = await drive.fork({ name: 'alternate' });
-    await assert.rejects(drive.list({ at: alternate, cursor }), { code: 'CURSOR_VIEW_MISMATCH' });
-    assert.equal((await drive.list(page.next)).files[0].path, '/b.txt');
+    await assert.rejects(drive.list({ at: checkpoint('research'), cursor }), { code: 'CURSOR_VIEW_MISMATCH' });
     await assert.rejects(drive.list({ at: research, cursor: 'invalid' }), { code: 'LIST_CURSOR_UNAVAILABLE' });
-    const restarted = await open({ client: { ...client }, name: 'workspace' });
-    await assert.rejects(restarted.list(page.next), { code: 'LIST_CURSOR_UNAVAILABLE' });
-    assert.deepEqual((await drive.list({ at: research })).files.map(file => file.path), ['/a.txt', '/b2.txt', '/group/c.txt']);
+    const tampered = `l1.${Buffer.from(JSON.stringify({ ...JSON.parse(Buffer.from(cursor.slice(3), 'base64url')), l: 5000 })).toString('base64url')}`;
+    await assert.rejects(drive.list({ at: research, cursor: tampered }), { code: 'LIST_CURSOR_UNAVAILABLE' });
+    const other = await create({ client, name: 'other-store' });
+    await other.fork({ name: 'research' });
+    await assert.rejects(other.list(page.next), { code: 'LIST_CURSOR_UNAVAILABLE' });
 
-    const now = Date.now();
-    t.mock.method(Date, 'now', () => now + 5 * 60 * 1000 + 1);
-    await assert.rejects(drive.list(page.next), { code: 'LIST_CURSOR_UNAVAILABLE' });
-    // An expired cursor is unavailable everywhere rather than reported as a mismatch.
-    await assert.rejects(drive.list({ cursor }), { code: 'LIST_CURSOR_UNAVAILABLE' });
+    // Checkpoints list their tag snapshot with the same cursors.
+    const { at: saved } = await drive.checkpoint({ at: research, name: 'saved' });
+    await drive.write({ at: research, ...request('/d.txt') });
+    const first = await drive.list({ at: saved, limit: 2 });
+    assert.deepEqual(calls.findLast(call => call.kind === 'list').request.ref, { kind: 'tag', name: 'checkpoint-saved' });
+    assert.deepEqual([...first.files, ...(await drive.list(first.next)).files].map(file => file.path), ['/a.txt', '/b.txt', '/c.txt']);
 });
 
-test('list scan caches share one process-wide budget across stores and evict the least recently used scan', async t => {
-    const fixture = fileClient();
-    const first = await create({ client: fixture.client, name: 'first-store' });
-    const second = await create({ client: fixture.client, name: 'second-store' });
-    for (const drive of [first, second]) {
-        await drive.fork({ name: 'research' });
-        await drive.write({ at: research, operations: [request('/a.txt'), request('/b.txt')] });
-    }
-    // Start from an empty process-wide cache: an expired-clock listing sweeps earlier tests' scans.
-    const now = Date.now();
-    const clock = t.mock.method(Date, 'now', () => now + 5 * 60 * 1000 + 1);
-    await first.list({ at: research });
-    clock.mock.restore();
-    const oldest = await first.list({ at: research, limit: 1 });
-    const recent = await first.list({ at: research, limit: 1 });
-    // A continuation refreshes recency, and a mismatch does not consume the cursor.
-    await assert.rejects(first.list({ cursor: oldest.next.cursor }), { code: 'CURSOR_VIEW_MISMATCH' });
-    assert.equal((await first.list(oldest.next)).files[0].path, '/b.txt');
-    // Another store's scans fill the shared count budget (128 scans).
-    for (let i = 0; i < 127; i++) await second.list({ at: research, limit: 1 });
-    await assert.rejects(first.list(recent.next), { code: 'LIST_CURSOR_UNAVAILABLE' });
-    assert.equal((await first.list(oldest.next)).files[0].path, '/b.txt');
-    // A store never continues another store's cursor.
-    await assert.rejects(second.list({ at: research, cursor: oldest.next.cursor }), { code: 'LIST_CURSOR_UNAVAILABLE' });
-});
-
-test('listing fails closed for invalid input, aborts, nonprogress, and scan overflow', async () => {
+test('listing fails closed for invalid input, aborts and nonprogress, and passes short pages through', async () => {
     const fixture = fileClient();
     const drive = await create({ client: fixture.client, name: 'workspace' });
     await drive.fork({ name: 'research' });
@@ -538,12 +520,16 @@ test('listing fails closed for invalid input, aborts, nonprogress, and scan over
     assert.equal(fixture.calls.filter(call => call.kind === 'list').length, 0);
 
     const rows = [{ collection: 'workspace', doc: { ...file, kind: 'file', id: `file:${file.fileId}` } }];
-    fixture.listPage = () => ({ isDocsInline: true, docs: rows, nextPageToken: 'repeated' });
-    await assert.rejects(drive.list({ at: research }), { code: 'INVALID_RESULT' });
+    fixture.listPage = ({ pageToken }) => ({ isDocsInline: true, docs: rows, nextPageToken: pageToken ?? 'first' });
+    const first = await drive.list({ at: research });
+    await assert.rejects(drive.list(first.next), { code: 'INVALID_RESULT' });
+    // An empty native page with a token is returned as an empty page with next.
     fixture.listPage = ({ pageToken }) => pageToken === undefined
         ? { isDocsInline: true, docs: [], nextPageToken: 'empty' }
         : { isDocsInline: true, docs: rows };
-    assert.deepEqual((await drive.list({ at: research })).files.map(item => item.fileId), [file.fileId]);
+    const empty = await drive.list({ at: research });
+    assert.deepEqual([empty.files, empty.prefixes], [[], []]);
+    assert.deepEqual((await drive.list(empty.next)).files.map(item => item.fileId), [file.fileId]);
 
     const background = new AbortController();
     fixture.listPage = () => {
@@ -552,12 +538,6 @@ test('listing fails closed for invalid input, aborts, nonprogress, and scan over
     };
     await assert.rejects(drive.list({ at: research }, { signal: background.signal }), { code: 'ABORTED' });
     assert.strictEqual(fixture.calls.at(-1).signal, background.signal);
-
-    fixture.listPage = ({ pageToken }) => ({
-        isDocsInline: true, docs: Array.from({ length: 500 }, () => rows[0]),
-        nextPageToken: String(Number(pageToken ?? 0) + 1),
-    });
-    await assert.rejects(drive.list({ at: research }), { code: 'LIST_SCAN_LIMIT' });
 });
 
 test('working edits preserve identity, resolve substitutions against the original, and replace metadata', async () => {
@@ -628,25 +608,22 @@ test('edit conflicts and invalid operations fail before the first mutation of a 
     await assert.rejects(drive.write({ at: research, op: 'update', fileId: a.fileId, content: 'later' }), { code: 'FILE_NOT_FOUND' });
 });
 
-test('lost update acknowledgements fence an unchanged original and resume when its revision is observed', async () => {
+test('a lost update acknowledgement is reported without fencing, and an identical retry converges', async () => {
     const fixture = fileClient();
     const drive = await create({ client: fixture.client, name: 'workspace' });
     await drive.fork({ name: 'research' });
     const file = await drive.write({ at: research, ...request('/a', 'first') });
     const docs = fixture.collections.get('workspace').branches.get('fork-research').docs;
-    let release;
     fixture.beforeUpsert = request => {
-        release = () => { for (const doc of request.docs) docs.set(doc.id, doc); };
+        for (const doc of request.docs) docs.set(doc.id, doc);
         throw new Error('Response lost');
     };
     const update = { op: 'update', fileId: file.fileId, content: 'second' };
     await assert.rejects(drive.write({ at: research, ...update }), { code: 'WRITE_UNCONFIRMED' });
-    assert.equal((await drive.read({ at: research, fileId: file.fileId })).content, 'first');
-    await assert.rejects(drive.write({ at: research, ...update }), { code: 'WRITE_UNCONFIRMED' });
-    release();
     fixture.beforeUpsert = undefined;
-    const recovered = await drive.write({ at: research, ...update });
-    assert.equal(recovered.content, 'second');
+    // The write landed; the caller inspects, then an identical retry replaces it and cleans the old generation.
+    assert.equal((await drive.read({ at: research, fileId: file.fileId })).content, 'second');
+    assert.equal((await drive.write({ at: research, ...update })).content, 'second');
     assert.equal([...docs.values()].filter(doc => doc.kind === 'chunk').length, 1);
 });
 
@@ -660,7 +637,9 @@ test('an applied update or deletion resumes chunk cleanup after reopening', asyn
     const reject = () => { throw Object.assign(new Error('Rejected'), { statusCode: 400 }); };
     fixture.beforeDelete = reject;
     await assert.rejects(drive.write({ at: research, op: 'update', fileId: file.fileId, content: 'second' }), error =>
-        error.status === 400 && error.details.stage === 'cleanup-chunks' && error.details.appliedFileIds.includes(file.fileId));
+        error.status === 400 && error.details.stage === 'cleanup-chunks' && error.details.targets[0].fileId === file.fileId
+        // The original is written, so the update is reported as applied.
+        && error.details.completedFileIds.includes(file.fileId));
     assert.equal((await drive.read({ at: research, fileId: file.fileId })).content, 'second');
     assert(oldChunks.every(id => orig.has(id)));
     assert.deepEqual((await drive.search({ at: research, query: 'first', rerank: false })).hits.map(hit => hit.content), ['second']);
@@ -670,9 +649,11 @@ test('an applied update or deletion resumes chunk cleanup after reopening', asyn
     assert.equal(restored.content, 'second');
     assert(oldChunks.every(id => !orig.has(id)));
 
-    fixture.beforeDelete = reject;
+    // The original goes first; a rejected chunk cleanup leaves invisible orphans that a repeated delete removes.
+    fixture.beforeDelete = request => request.ids.some(id => id.startsWith('chunk:')) && reject();
     await assert.rejects(reopened.write({ at: research, op: 'delete', fileId: file.fileId }), error =>
-        error.status === 400 && error.details.stage === 'cleanup-chunks' && error.details.appliedFileIds.includes(file.fileId));
+        error.status === 400 && error.details.stage === 'cleanup-chunks' && error.details.targets[0].fileId === file.fileId
+        && error.details.completedFileIds.includes(file.fileId));
     assert.equal(await reopened.read({ at: research, fileId: file.fileId }), null);
     assert.equal((await reopened.search({ at: research, query: 'second', rerank: false })).hits.length, 0);
     fixture.beforeDelete = undefined;
@@ -713,34 +694,103 @@ test('reintroducing identical text uses new chunk IDs even if an earlier delete 
     assert.equal(hits[0].content, 'first');
 });
 
-test('an inherited published baseline is preserved through edits and a backed tombstone', async () => {
+test('chunk cleanup keeps the generation of the original it reads back, so a concurrent update keeps its chunks', async () => {
     const fixture = fileClient();
     const drive = await create({ client: fixture.client, name: 'workspace' });
-    await drive.fork({ name: 'research' });
-    const file = await drive.write({ at: research, ...request('/published', 'source') });
-    const docs = fixture.collections.get('workspace').branches.get('fork-research').docs;
-    const key = `file:${file.fileId}`;
-    docs.get(key).version = 'published-version';
-    delete docs.get(key).changed;
+    const file = await drive.write(request('/a.txt', 'zero'));
+    const other = await separateCopy.open({ client: { ...fixture.client }, name: 'workspace' });
+    let originalFetches = 0;
+    fixture.beforeFetch = async request => {
+        if (request.fields || request.ids.length !== 1 || request.ids[0] !== `file:${file.fileId}`) return;
+        // The second plain original fetch of the first update is its pre-cleanup read:
+        // let another writer replace the file completely at that moment.
+        if (++originalFetches === 2) await other.write({ op: 'update', fileId: file.fileId, content: 'second writer' });
+    };
+    await drive.write({ op: 'update', fileId: file.fileId, content: 'first writer' });
+    fixture.beforeFetch = undefined;
+    assert.equal((await drive.read({ fileId: file.fileId })).content, 'second writer');
+    assert.deepEqual((await drive.search({ query: 'second writer', rerank: false })).hits.map(hit => hit.content), ['second writer']);
+});
 
-    await drive.write({ at: research, op: 'update', fileId: file.fileId, newPath: '/working', content: 'working' });
-    const baseline = docs.get(key).baseline;
-    assert.equal(baseline.version, 'published-version');
-    assert.equal(baseline.path, '/published');
-    assert.match(baseline.fingerprint, /^[0-9a-f]{64}$/);
-    await drive.write({ at: research, op: 'update', fileId: file.fileId, newPath: file.path, content: file.content });
-    assert.deepEqual(docs.get(key).baseline, baseline);
-    assert.equal(docs.get(key).changed, false);
+test('racing updates from separate SDK copies that remove each other\'s chunks are repaired by resending an update', async () => {
+    const fixture = fileClient();
+    const { collections } = fixture;
+    const drive = await create({ client: fixture.client, name: 'workspace' });
+    const file = await drive.write(request('/a.txt', 'zero'));
+    const other = await separateCopy.open({ client: { ...fixture.client }, name: 'workspace' });
+    const docs = collections.get('workspace').branches.get('main').docs;
+    // The first update reads its own original back before cleanup; the second
+    // update then completes entirely before the first deletes stale chunks.
+    let originalFetches = 0;
+    fixture.beforeFetch = async (request, current) => {
+        if (request.fields || request.ids.length !== 1 || request.ids[0] !== `file:${file.fileId}` || ++originalFetches !== 2) return;
+        const observed = { isDocsInline: true, total: 1, docs: [{ collection: 'workspace', doc: structuredClone(current.get(request.ids[0])) }] };
+        await other.write({ op: 'update', fileId: file.fileId, content: 'second' });
+        return observed;
+    };
+    await drive.write({ op: 'update', fileId: file.fileId, content: 'first' });
+    fixture.beforeFetch = undefined;
+    assert.equal((await drive.read({ fileId: file.fileId })).content, 'second');
+    const chunks = () => [...docs.values()].filter(doc => doc.kind === 'chunk' && doc.fileId === file.fileId);
+    // The first writer's cleanup read its own original and removed the second writer's chunks.
+    assert.deepEqual(chunks(), []);
+    assert.deepEqual((await drive.search({ query: 'second', rerank: false })).hits, []);
+    // Resending the same content, or moving the file, chunks it again instead of failing.
+    const repaired = await drive.write({ op: 'update', fileId: file.fileId, content: 'second' });
+    assert.equal(repaired.content, 'second');
+    assert.equal(chunks().length, 1);
+    assert.deepEqual((await drive.search({ query: 'second', rerank: false })).hits.map(hit => hit.content), ['second']);
+    for (const doc of chunks()) docs.delete(doc.id);
+    assert.equal((await drive.write({ op: 'update', fileId: file.fileId, newPath: '/moved.txt' })).path, '/moved.txt');
+    assert.deepEqual((await drive.search({ query: 'second', rerank: false })).hits.map(hit => hit.path), ['/moved.txt']);
+});
 
-    await drive.write({ at: research, op: 'delete', fileId: file.fileId });
-    assert.deepEqual(docs.get(key).baseline, baseline);
-    assert.equal(docs.get(key).kind, 'tombstone');
-    assert.equal(docs.size, 1);
-    const reopened = await open({ client: { ...fixture.client }, name: 'workspace' });
-    assert.equal(await reopened.read({ at: research, fileId: file.fileId }), null);
-    assert.equal(await reopened.read({ at: research, path: file.path }), null);
-    assert.deepEqual(await reopened.write({ at: research, op: 'delete', fileId: file.fileId }), { fileId: file.fileId });
-    assert.equal(docs.size, 1);
+test('files sharing a path after racing creates in separate SDK copies stay readable and writable by fileId', async () => {
+    const fixture = fileClient();
+    const { client } = fixture;
+    const drive = await create({ client, name: 'workspace' });
+    const other = await separateCopy.open({ client: { ...client }, name: 'workspace' });
+    let arrived = 0, release;
+    const bothChecked = new Promise(resolve => { release = resolve; });
+    fixture.beforeUpsert = async () => { if (++arrived === 2) release(); await bothChecked; };
+    const [one, two] = await Promise.all([drive.write(request('/same.txt', 'one')), other.write(request('/same.txt', 'two'))]);
+    fixture.beforeUpsert = undefined;
+    const fileIds = [one.fileId, two.fileId].sort();
+    const ambiguous = { code: 'PATH_AMBIGUOUS', details: { paths: [{ path: '/same.txt', fileIds }] } };
+    await assert.rejects(drive.read({ path: '/same.txt' }), ambiguous);
+    await assert.rejects(drive.read({ paths: ['/same.txt', '/missing.txt'] }), ambiguous);
+    await assert.rejects(drive.read({ path: '/same.txt', maxChars: 10 }), ambiguous);
+    assert.equal((await drive.read({ fileId: one.fileId })).content, 'one');
+    // Updates that keep the path, moves and deletes by fileId keep working.
+    assert.equal((await drive.write({ op: 'update', fileId: one.fileId, content: 'one, edited' })).content, 'one, edited');
+    assert.equal((await drive.write({ op: 'update', fileId: two.fileId, metadata: {} })).path, '/same.txt');
+    await assert.rejects(drive.write(request('/same.txt', 'three')), { code: 'PATH_EXISTS', details: { paths: ['/same.txt'] } });
+    assert.equal((await drive.write({ op: 'update', fileId: two.fileId, newPath: '/two.txt' })).path, '/two.txt');
+    assert.equal((await drive.read({ path: '/same.txt' })).fileId, one.fileId);
+    await assert.rejects(drive.write({ op: 'update', fileId: two.fileId, newPath: '/same.txt' }), { code: 'PATH_EXISTS' });
+    assert.deepEqual(await drive.write({ op: 'delete', fileId: one.fileId }), { fileId: one.fileId });
+    assert.equal(await drive.read({ path: '/same.txt' }), null);
+});
+
+test('delete removes the original before its chunks and leaves no tombstone', async () => {
+    const fixture = fileClient();
+    const { calls } = fixture;
+    const drive = await create({ client: fixture.client, name: 'workspace', chunking: { strategy: 'boundary' } });
+    const [file, kept] = await drive.write({ operations: [request('/a.md', '# A\n\nfirst part\n\n# B\n\nsecond part'), request('/b', 'kept')] });
+    const docs = fixture.collections.get('workspace').branches.get('main').docs;
+    const owned = id => id === `file:${file.fileId}` || id.startsWith(`chunk:${file.fileId}:`);
+    assert([...docs.keys()].filter(owned).length > 1);
+    const before = calls.length;
+    assert.deepEqual(await drive.write({ op: 'delete', fileId: file.fileId }), { fileId: file.fileId });
+    assert.deepEqual([...docs.keys()].filter(owned), []);
+    assert([...docs.keys()].some(id => id === `file:${kept.fileId}`));
+    const deletes = calls.slice(before).filter(call => call.kind === 'delete').map(call => call.request.ids);
+    assert.deepEqual(deletes[0], [`file:${file.fileId}`]);
+    assert(deletes.slice(1).flat().every(id => id.startsWith(`chunk:${file.fileId}:`)));
+    assert.equal(await drive.read({ fileId: file.fileId }), null);
+    // Deleting again is a no-op that only checks for leftover chunks.
+    assert.deepEqual(await drive.write({ op: 'delete', fileId: file.fileId }), { fileId: file.fileId });
+    await assert.rejects(drive.write({ op: 'update', fileId: file.fileId, content: 'again' }), { code: 'FILE_NOT_FOUND' });
 });
 
 test('edit preflight rejects an ambiguous identity and cancellation after dispatch leaves a recoverable revision', async () => {
@@ -819,148 +869,13 @@ test('move scans every page of persisted chunk IDs with the same hash and writes
     assert([...docs.values()].every(doc => doc.path === '/new.txt'));
 });
 
-test('working diff reports net creates, body edits, moves and deletions using only changed originals', async () => {
+test('checkpoints are read-only tag views and forks copy independent state from fork and checkpoint sources', async () => {
     const fixture = fileClient();
-    const { client, calls, collections } = fixture;
-    const drive = await create({ client, name: 'workspace' });
-    await assert.rejects(drive.diff({ at: { kind: 'main' } }), { code: 'INVALID_INPUT' });
-    await drive.fork({ name: 'research' });
-    const { at: alternate } = await drive.fork({ name: 'alternate' });
-    assert.deepEqual(await drive.diff({ at: research }), []);
-    const [created, moved, body, deleted, restored, removed, interrupted] = await drive.write({ at: research, operations: [
-        request('/create', 'created'), request('/move', 'move'), request('/body', 'old'),
-        request('/delete', 'remove'), request('/restore', 'baseline'), request('/gone', ''), request('/interrupted', 'unfinished'),
-    ] });
-    const docs = collections.get('workspace').branches.get('fork-research').docs;
-    for (const file of [moved, body, deleted, restored]) {
-        const record = docs.get(`file:${file.fileId}`);
-        delete record.changed;
-        record.version = 'published';
-    }
-    await drive.write({ at: research, operations: [
-        { op: 'update', fileId: created.fileId, newPath: '/created-moved' },
-        { op: 'update', fileId: moved.fileId, newPath: '/moved-once' },
-        { op: 'update', fileId: body.fileId, content: 'new' },
-        { op: 'update', fileId: deleted.fileId, newPath: '/previously-moved' },
-        { op: 'update', fileId: restored.fileId, content: 'edited' },
-        { op: 'delete', fileId: removed.fileId },
-    ] });
-    await drive.write({ at: research, operations: [
-        { op: 'update', fileId: moved.fileId, newPath: '/moved-again' },
-        { op: 'delete', fileId: deleted.fileId },
-        { op: 'update', fileId: restored.fileId, content: restored.content },
-    ] });
-    fixture.beforeDelete = () => { throw Object.assign(new Error('Chunk cleanup rejected'), { statusCode: 400 }); };
-    await assert.rejects(drive.write({ at: research, op: 'delete', fileId: interrupted.fileId }), { code: 'DATABASE_ERROR' });
-    fixture.beforeDelete = undefined;
-    // Defensive equality also omits an exact revert if the candidate was marked changed.
-    docs.get(`file:${restored.fileId}`).changed = true;
-    await drive.write({ at: alternate, ...request('/other-fork') });
-    const reusedPath = await drive.write({ at: research, ...request('/delete') });
-
-    const reopened = await open({ client: { ...client }, name: 'workspace' });
-    // The first use of a fork on a fresh client verifies that it exists.
-    assert.deepEqual(await reopened.status({ at: research }), { at: research, mainVersion: 'v0' });
-    const before = calls.length;
-    const expected = [
-        { op: 'create', fileId: created.fileId, path: '/created-moved' },
-        { op: 'update', fileId: moved.fileId, path: '/moved-again', previousPath: '/move' },
-        { op: 'update', fileId: body.fileId, path: '/body' },
-        { op: 'delete', fileId: deleted.fileId, previousPath: '/delete' },
-        { op: 'create', fileId: reusedPath.fileId, path: '/delete' },
-    ].sort((a, b) => a.fileId.localeCompare(b.fileId));
-    assert.deepEqual(await reopened.diff({ at: research }), expected);
-    const call = calls.slice(before);
-    assert.equal(call.length, 1);
-    assert.equal(call[0].kind, 'query');
-    assert.equal(call[0].request.consistentRead, true);
-    assert.equal(call[0].request.includeVectors, false);
-    assert.deepEqual(call[0].request.ref, { kind: 'branch', name: 'fork-research' });
-    assert.deepEqual(call[0].request.fields.include, ['id', 'kind', 'fileId', 'path', 'changed', 'baseline', 'fingerprint', 'version']);
-    assert.deepEqual((await drive.diff({ at: alternate })).map(change => change.path), ['/other-fork']);
-});
-
-test('diff pages across the generated ID boundary and queues following writes', async () => {
-    const fixture = fileClient();
-    const drive = await create({ client: fixture.client, name: 'workspace' });
-    await drive.fork({ name: 'research' });
-    const docs = fixture.collections.get('workspace').branches.get('fork-research').docs;
-    const synthetic = Array.from({ length: 1001 }, (_, i) => {
-        const fileId = `00000000-0000-4000-8000-${i.toString(16).padStart(12, '0')}`;
-        return { fileId, id: `file:${fileId}`, kind: 'file', changed: true, fingerprint: '0'.repeat(64), path: `/synthetic/${i}` };
-    });
-    for (const doc of [...synthetic].reverse()) docs.set(doc.id, doc);
-    let entered, release;
-    const active = new Promise(resolve => { entered = resolve; });
-    const pause = new Promise(resolve => { release = resolve; });
-    fixture.diffPage = async request => {
-        if (request.query.bool.length === 2) { entered(); await pause; }
-    };
-    const scanning = drive.diff({ at: research });
-    await active;
-    const queued = drive.write({ at: research, ...request('/queued') });
-    await new Promise(resolve => setImmediate(resolve));
-    assert.equal(fixture.calls.some(call => call.kind === 'upsert'), false);
-    release();
-    const changes = await scanning;
-    await queued;
-    assert.deepEqual(changes, synthetic.map(({ fileId, path }) => ({ op: 'create', fileId, path })));
-    const scans = fixture.calls.filter(call => call.kind === 'query' && call.request.sort);
-    assert.equal(scans.length, 2);
-    assert.equal(scans[1].request.query.bool[2].queryString.query, `{${synthetic[999].id} TO *}`);
-    fixture.diffPage = undefined;
-    assert.equal((await drive.diff({ at: research })).length, 1002);
-});
-
-test('diff rejects invalid records, nonprogress and incomplete pages and recovers after abort', async () => {
-    const fixture = fileClient();
-    const drive = await create({ client: fixture.client, name: 'workspace' });
-    await drive.fork({ name: 'research' });
-    await drive.write({ at: research, ...request('/a') });
-    const records = fixture.collections.get('workspace').branches.get('fork-research').docs;
-    const original = [...records.values()][0];
-    const wrap = (...docs) => ({ isDocsInline: true, total: docs.length, docs: docs.map(doc => ({ collection: 'workspace', doc })) });
-    // Every write of a changed live original persists its fingerprint.
-    const { fingerprint: _fingerprint, ...withoutFingerprint } = original;
-    for (const invalid of [
-        withoutFingerprint,
-        { ...original, fingerprint: 'bad' },
-        { ...original, kind: 'chunk' },
-        { ...original, changed: false },
-        { ...original, id: 'wrong' },
-        { ...original, baseline: { version: 'v1', path: '/before', fingerprint: 'bad' } },
-        { ...original, version: 'v1' },
-        { ...original, baseline: { version: 'v1', path: '/before', fingerprint: '0'.repeat(64) }, fingerprint: '0'.repeat(64) },
-    ]) {
-        fixture.diffPage = () => wrap(invalid);
-        await assert.rejects(drive.diff({ at: research }), { code: 'INVALID_RESULT' });
-    }
-    fixture.diffPage = () => wrap(original, original);
-    await assert.rejects(drive.diff({ at: research }), { code: 'INVALID_RESULT' });
-    fixture.diffPage = () => ({ ...wrap(original), total: 2 });
-    await assert.rejects(drive.diff({ at: research }), { code: 'INVALID_RESULT' });
-    const controller = new AbortController();
-    fixture.diffPage = (_request, options) => {
-        assert.strictEqual(options.signal, controller.signal);
-        controller.abort();
-        return wrap(original);
-    };
-    await assert.rejects(drive.diff({ at: research }, { signal: controller.signal }), { code: 'ABORTED' });
-    fixture.diffPage = undefined;
-    assert.deepEqual(await drive.diff({ at: research }), [{ op: 'create', fileId: original.fileId, path: '/a' }]);
-    await assert.rejects(drive.diff({ at: research, limit: 1 }), { code: 'INVALID_INPUT' });
-});
-
-test('checkpoints are read-only tag views and fork independent working state from fork and checkpoint sources', async () => {
-    const fixture = fileClient();
-    const { client, calls, collections } = fixture;
+    const { client, calls } = fixture;
     const drive = await create({ client, name: 'workspace' });
     const work = fork('saved');
     await drive.fork({ name: 'saved' });
     const [file, deleted] = await drive.write({ at: work, operations: [request('/file.txt', 'before'), request('/removed.txt', 'remove')] });
-    const docs = collections.get('workspace').branches.get('fork-saved').docs;
-    docs.get(`file:${deleted.fileId}`).version = 'baseline-version';
-    delete docs.get(`file:${deleted.fileId}`).changed;
     await drive.write({ at: work, op: 'delete', fileId: deleted.fileId });
     const created = await drive.checkpoint({ at: work, name: 'saved' });
     assert.deepEqual(created, { at: checkpoint('saved') });
@@ -968,11 +883,8 @@ test('checkpoints are read-only tag views and fork independent working state fro
     // The returned at is a plain value; changing it cannot redirect the store.
     created.at.name = 'changed';
     const saved = checkpoint('saved');
-    assert.deepEqual((await drive.status({ at: saved })).at, saved);
     const reopened = await open({ client: { ...client }, name: 'workspace' });
-    assert.notEqual(reopened, drive);
     assert.equal(await reopened.read({ at: saved, fileId: deleted.fileId }), null);
-    assert(calls.some(call => call.kind === 'tag-get' && call.tagName === 'checkpoint-saved'));
 
     await drive.write({ at: work, op: 'update', fileId: file.fileId, content: 'after', newPath: '/after.txt' });
     assert.deepEqual(await reopened.read({ at: saved, fileId: file.fileId }), file);
@@ -995,121 +907,120 @@ test('checkpoints are read-only tag views and fork independent working state fro
     assert.deepEqual(await drive.read({ at: child, fileId: file.fileId }), file);
     assert.equal(await drive.read({ at: child, fileId: deleted.fileId }), null);
     assert.equal((await drive.read({ at: fork('nested'), fileId: file.fileId })).content, 'after');
-    assert.deepEqual((await drive.diff({ at: child })).find(change => change.fileId === deleted.fileId),
-        { op: 'delete', fileId: deleted.fileId, previousPath: deleted.path });
     await drive.write({ at: child, op: 'update', fileId: file.fileId, newPath: '/child.txt' });
-    assert.equal((await drive.diff({ at: child })).find(change => change.fileId === file.fileId).path, '/child.txt');
     assert.equal((await drive.read({ at: work, fileId: file.fileId })).path, '/after.txt');
     assert.equal((await drive.read({ at: saved, fileId: file.fileId })).path, file.path);
-    assert(calls.filter(call => ['tag-create', 'branch-create'].includes(call.kind)).every(call => call.retries.strategy === 'none'));
-    assert(calls.some(call => call.kind === 'branch-create' && call.request.source.kind === 'tag'));
-    assert(calls.some(call => call.kind === 'tag-create' && call.request.source.kind === 'tag'));
+    const creations = calls.filter(call => ['tag-create', 'branch-create'].includes(call.kind));
+    assert(creations.every(call => call.retries.strategy === 'none'));
+    // Main is a branch source; a checkpoint source is its tag. Each creation is one native call.
+    assert.deepEqual(creations.map(call => [call.kind, call.request.source]), [
+        ['branch-create', { kind: 'branch', name: 'main' }],
+        ['tag-create', { kind: 'branch', name: 'fork-saved' }],
+        ['tag-create', { kind: 'tag', name: 'checkpoint-saved' }],
+        ['branch-create', { kind: 'tag', name: 'checkpoint-saved' }],
+        ['branch-create', { kind: 'branch', name: 'fork-saved' }],
+    ]);
 });
 
-test('ref creation accepts version only from a main source and validates locally', async () => {
-    const fixture = fileClient();
-    const drive = await create({ client: fixture.client, name: 'workspace' });
-    await drive.fork({ name: 'research' });
-    await drive.write({ at: research, ...request('/later.txt', 'later') });
-    await drive.checkpoint({ at: research, name: 'saved' });
-    const before = fixture.calls.length;
-    for (const kind of ['fork', 'checkpoint']) {
-        for (const at of [research, checkpoint('saved')])
-            await assert.rejects(drive[kind]({ at, name: 'copy', version: 'v0' }), { code: 'INVALID_INPUT' });
-        for (const input of [{}, { name: 'ab' }, { name: 'copy', version: 'v01' }, { name: 'copy', asOf: '2026-01-01T00:00:00.000Z' },
-            { name: 'copy', at: { kind: 'fork' } }, { name: 'copy', at: research, extra: true }, { at: research }])
-            await assert.rejects(drive[kind](input), { code: 'INVALID_INPUT' });
-    }
-    assert.equal(fixture.calls.length, before);
-    assert.deepEqual(await drive.fork({ name: 'initial', version: 'v0' }), { at: fork('initial') });
-    assert.deepEqual(await drive.checkpoint({ at: { kind: 'main' }, name: 'initial', version: 'v0' }), { at: checkpoint('initial') });
-    for (const at of [fork('initial'), checkpoint('initial')])
-        assert.equal(await drive.read({ at, path: '/later.txt' }), null);
-    assert.equal((await drive.read({ at: checkpoint('saved'), path: '/later.txt' })).content, 'later');
-});
-
-test('checkpoint names are store-scoped and absent or invalid lookups are not cached', async () => {
-    const fixture = fileClient();
-    const { client } = fixture;
-    const drive = await create({ client, name: 'workspace' });
-    await drive.fork({ name: 'research' });
-    const nativeError = Object.assign(new Error('Source is temporarily unavailable'), { statusCode: 400 });
-    fixture.beforeTagCreate = () => { throw nativeError; };
-    await assert.rejects(drive.checkpoint({ at: research, name: 'saved' }), { code: 'DATABASE_ERROR', status: 400, cause: nativeError });
-    assert.equal(fixture.calls.filter(call => call.kind === 'tag-create').length, 1);
-    fixture.beforeTagCreate = undefined;
-    const saved = checkpoint('saved');
-    await assert.rejects(drive.read({ at: { ...saved, fork: 'saved' }, path: '/file.txt' }), { code: 'INVALID_INPUT' });
-    await assert.rejects(drive.read({ at: checkpoint('x'.repeat(42)), path: '/file.txt' }), { code: 'INVALID_INPUT' });
-    await assert.rejects(drive.read({ at: saved, path: '/file.txt' }), { code: 'CHECKPOINT_NOT_FOUND' });
-    fixture.getTag = () => ({ tag: { name: 'checkpoint-unrelated' } });
-    await assert.rejects(drive.read({ at: saved, path: '/file.txt' }), { code: 'INVALID_RESULT' });
-    fixture.getTag = undefined;
-
-    await drive.write({ at: research, ...request('/file.txt') });
-    assert.deepEqual(await drive.checkpoint({ at: research, name: 'saved' }), { at: saved });
-    const lookups = () => fixture.calls.filter(call => call.kind === 'tag-get').length;
-    const lookedUp = lookups();
-    assert.equal((await drive.read({ at: saved, path: '/file.txt' })).path, '/file.txt');
-    assert.equal(lookups(), lookedUp, 'A created checkpoint is already known to this store object');
-    await assert.rejects(drive.checkpoint({ at: research, name: 'saved' }), { code: 'CHECKPOINT_CONFLICT' });
-    await assert.rejects(drive.fork({ at: saved, name: 'research' }), { code: 'BRANCH_CONFLICT' });
-    const another = await create({ client, name: 'another' });
-    await assert.rejects(another.read({ at: saved, path: '/file.txt' }), { code: 'CHECKPOINT_NOT_FOUND' });
-});
-
-test('ref creation queues with writes and diff and protects against retries after a lost acknowledgement', async () => {
+test('ref creation validates locally, rejects version, and passes native outcomes through without fencing', async () => {
     const fixture = fileClient();
     const { client, calls } = fixture;
     const drive = await create({ client, name: 'workspace' });
     await drive.fork({ name: 'research' });
-    let release;
-    const held = new Promise(resolve => { release = resolve; });
-    fixture.beforeUpsert = () => held;
-    const writing = drive.write({ at: research, ...request('/before.txt', 'before') });
-    const scanning = drive.diff({ at: research });
-    const captured = drive.checkpoint({ at: research, name: 'queued' });
-    const child = drive.fork({ at: research, name: 'child' });
-    const later = drive.write({ at: research, ...request('/later.txt', 'after') });
-    await new Promise(resolve => setImmediate(resolve));
-    assert(!calls.some(call => call.kind === 'tag-create' || call.request?.branchName === 'fork-child'));
-    fixture.beforeUpsert = undefined;
-    release();
-    const before = await writing;
-    assert.deepEqual(await scanning, [{ op: 'create', fileId: before.fileId, path: before.path }]);
-    const { at: saved } = await captured;
-    const { at: branch } = await child;
-    await later;
-    assert.deepEqual(await drive.read({ at: saved, fileId: before.fileId }), before);
-    assert.equal(await drive.read({ at: branch, path: '/later.txt' }), null);
+    await drive.write({ at: research, ...request('/file.txt') });
+    const before = calls.length;
+    for (const kind of ['fork', 'checkpoint']) {
+        for (const input of [{}, { name: 'ab' }, { name: 'copy', version: 'v0' }, { name: 'copy', asOf: '2026-01-01T00:00:00.000Z' },
+            { name: 'copy', at: { kind: 'fork' } }, { name: 'copy', at: research, extra: true }, { at: research }])
+            await assert.rejects(drive[kind](input), { code: 'INVALID_INPUT' });
+    }
+    await assert.rejects(drive.fork({ name: 'main' }), { code: 'INVALID_INPUT' });
+    assert.equal(calls.length, before);
 
+    const nativeError = Object.assign(new Error('Source is temporarily unavailable'), { statusCode: 400 });
+    fixture.beforeTagCreate = () => { throw nativeError; };
+    await assert.rejects(drive.checkpoint({ at: research, name: 'saved' }), { code: 'DATABASE_ERROR', status: 400, cause: nativeError });
+    fixture.beforeTagCreate = undefined;
+    const saved = checkpoint('saved');
+    await assert.rejects(drive.read({ at: saved, path: '/file.txt' }), { code: 'CHECKPOINT_NOT_FOUND', status: 404 });
+    await assert.rejects(drive.checkpoint({ at: checkpoint('absent'), name: 'copy' }), { code: 'CHECKPOINT_NOT_FOUND' });
+    await assert.rejects(drive.fork({ at: fork('absent'), name: 'copy' }), { code: 'BRANCH_NOT_FOUND' });
+    assert.deepEqual(await drive.checkpoint({ at: research, name: 'saved' }), { at: saved });
+    assert.equal((await drive.read({ at: saved, path: '/file.txt' })).path, '/file.txt');
+    await assert.rejects(drive.checkpoint({ at: research, name: 'saved' }), { code: 'CHECKPOINT_CONFLICT', status: 409 });
+    await assert.rejects(drive.fork({ at: saved, name: 'research' }), { code: 'BRANCH_CONFLICT', status: 409 });
+    const another = await create({ client, name: 'another' });
+    await assert.rejects(another.read({ at: saved, path: '/file.txt' }), { code: 'CHECKPOINT_NOT_FOUND' });
+
+    // A lost reply is an ordinary error without a status; nothing is fenced and the caller inspects.
     fixture.afterTagCreate = () => { throw new Error('Response lost after acceptance'); };
-    await assert.rejects(drive.checkpoint({ at: research, name: 'lost' }), { code: 'REF_CREATION_UNCONFIRMED' });
+    await assert.rejects(drive.checkpoint({ at: research, name: 'lost' }), error => error.code === 'DATABASE_ERROR' && error.status === undefined);
     fixture.afterTagCreate = undefined;
-    await drive.write({ at: research, ...request('/later-again.txt') });
-    await assert.rejects(drive.checkpoint({ at: research, name: 'lost' }), { code: 'REF_CREATION_UNCONFIRMED' });
-    assert.equal(calls.filter(call => call.request?.tagName === 'checkpoint-lost').length, 1);
-    assert.deepEqual((await drive.listCheckpoints()).checkpoints.map(entry => entry.at.name), ['lost', 'queued']);
-    assert.equal(await drive.read({ at: checkpoint('lost'), path: '/later-again.txt' }), null);
+    assert.deepEqual((await drive.listCheckpoints()).checkpoints.map(entry => entry.at.name), ['lost', 'saved']);
+    await drive.write({ at: research, ...request('/later.txt') });
+    assert.equal(await drive.read({ at: checkpoint('lost'), path: '/later.txt' }), null);
+    await assert.rejects(drive.checkpoint({ at: research, name: 'lost' }), { code: 'CHECKPOINT_CONFLICT' });
 });
 
-test('working ref creation waits for an unconfirmed source mutation to settle', async () => {
+test('rollback sends one native rollback of main or a fork to a checkpoint tag and passes errors through', async () => {
     const fixture = fileClient();
-    const { client, calls, collections } = fixture;
+    const { client, calls } = fixture;
+    const drive = await create({ client, name: 'workspace' });
+    const kept = await drive.write(request('/kept.txt', 'kept'));
+    await drive.fork({ name: 'research' });
+    const { at: saved } = await drive.checkpoint({ name: 'saved' });
+    const later = await drive.write(request('/later.txt', 'later'));
+    await drive.write({ op: 'update', fileId: kept.fileId, content: 'changed' });
+    await drive.write({ at: research, ...request('/fork.txt', 'fork') });
+
+    const before = calls.length;
+    for (const input of [{}, { at: research }, { to: saved }, { at: saved, to: saved }, { at: research, to: research },
+        { at: research, to: { kind: 'main' } }, { at: research, to: saved, extra: true }])
+        await assert.rejects(drive.rollback(input), { code: 'INVALID_INPUT' });
+    assert.equal(calls.length, before);
+
+    assert.deepEqual(await drive.rollback({ at: { kind: 'main' }, to: saved }), { at: { kind: 'main' } });
+    // The rollback, then a move of the branch's latest-checkpoint alias, absent here.
+    assert.deepEqual(calls.slice(before), [{ kind: 'branch-rollback', name: 'main', tag: 'checkpoint-saved', retries: { strategy: 'none' } },
+        { kind: 'alias-retarget', name: 'latest-main', target: { kind: 'tag', name: 'checkpoint-saved' }, retries: { strategy: 'none' } }]);
+    assert.equal((await drive.read({ fileId: kept.fileId })).content, 'kept');
+    assert.equal(await drive.read({ fileId: later.fileId }), null);
+    // The fork is a separate branch: rolling back main leaves it alone, and the fork can roll back too.
+    assert.equal((await drive.read({ at: research, path: '/fork.txt' })).content, 'fork');
+    assert.deepEqual(await drive.rollback({ at: research, to: saved }), { at: research });
+    assert.equal(await drive.read({ at: research, path: '/fork.txt' }), null);
+    assert.equal(calls.filter(call => call.kind === 'branch-rollback').at(-1).name, 'fork-research');
+
+    // A definite rejection keeps its status and is never retried by the SDK.
+    const notPublished = Object.assign(new Error('Rollback requires a tag with a published snapshot'), { statusCode: 400 });
+    fixture.beforeRollback = () => { throw notPublished; };
+    const rollbacks = () => calls.filter(call => call.kind === 'branch-rollback').length;
+    const sent = rollbacks();
+    await assert.rejects(drive.rollback({ at: research, to: saved }), { code: 'DATABASE_ERROR', status: 400, cause: notPublished });
+    fixture.beforeRollback = () => { throw new Error('Connection reset'); };
+    await assert.rejects(drive.rollback({ at: research, to: saved }), error => error.code === 'DATABASE_ERROR' && error.status === undefined);
+    assert.equal(rollbacks(), sent + 2);
+    fixture.beforeRollback = undefined;
+    await assert.rejects(drive.rollback({ at: research, to: checkpoint('absent') }), { code: 'CHECKPOINT_NOT_FOUND', status: 404 });
+    await assert.rejects(drive.rollback({ at: fork('absent'), to: saved }), { code: 'BRANCH_NOT_FOUND', status: 404 });
+});
+
+test('deleted refs and stores report not found on later use', async () => {
+    const fixture = fileClient();
+    const { client } = fixture;
     const drive = await create({ client, name: 'workspace' });
     await drive.fork({ name: 'research' });
-    const docs = collections.get('workspace').branches.get('fork-research').docs;
-    let settle;
-    fixture.beforeUpsert = request => {
-        settle = () => { for (const doc of request.docs) docs.set(doc.id, doc); };
-        throw new Error('Lost before confirmation');
-    };
-    await assert.rejects(drive.write({ at: research, ...request('/uncertain.txt') }), { code: 'WRITE_UNCONFIRMED' });
-    await assert.rejects(drive.checkpoint({ at: research, name: 'saved' }), { code: 'WRITE_UNCONFIRMED' });
-    await assert.rejects(drive.fork({ at: research, name: 'child' }), { code: 'WRITE_UNCONFIRMED' });
-    assert.equal(calls.filter(call => call.kind === 'tag-create' || call.request?.branchName === 'fork-child').length, 0);
-    settle();
-    fixture.beforeUpsert = undefined;
-    const { at: saved } = await drive.checkpoint({ at: research, name: 'saved' });
-    assert.equal((await drive.read({ at: saved, path: '/uncertain.txt' })).content, '');
+    await drive.checkpoint({ name: 'saved' });
+    // The newer checkpoint becomes main's latest, so saved can be deleted.
+    await drive.checkpoint({ name: 'newer' });
+    assert.deepEqual(await drive.deleteFork({ at: research }), { at: research });
+    assert.deepEqual(await drive.deleteCheckpoint({ at: checkpoint('saved') }), { at: checkpoint('saved') });
+    await assert.rejects(drive.read({ at: research, path: '/a' }), { code: 'BRANCH_NOT_FOUND' });
+    await assert.rejects(drive.write({ at: research, ...request('/a') }), { code: 'BRANCH_NOT_FOUND' });
+    await assert.rejects(drive.list({ at: checkpoint('saved') }), { code: 'CHECKPOINT_NOT_FOUND' });
+    await assert.rejects(drive.deleteFork({ at: research }), { code: 'BRANCH_NOT_FOUND', status: 404 });
+    await assert.rejects(drive.deleteCheckpoint({ at: checkpoint('saved') }), { code: 'CHECKPOINT_NOT_FOUND', status: 404 });
+    fixture.collections.delete('workspace');
+    await assert.rejects(drive.read({ path: '/a' }), { code: 'STORE_NOT_FOUND', status: 404 });
+    await assert.rejects(drive.read({ at: research, path: '/a' }), { code: 'STORE_NOT_FOUND', status: 404 });
 });

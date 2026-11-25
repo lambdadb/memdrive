@@ -3,278 +3,213 @@ import test from 'node:test';
 import { MemDrive, MemDriveError, createFileTools, getFileToolDefinitions, fileToolError, fileToolInstructions, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
 import { fileClient } from './helpers/file-client.mjs';
 
-const all = ['guide', 'status', 'history', 'list', 'read', 'search', 'findText', 'fork', 'checkpoint',
-    'listForks', 'listCheckpoints', 'deleteFork', 'deleteCheckpoint', 'diff', 'write', 'merge'];
+const all = ['guide', 'read', 'list', 'search', 'findText', 'write'];
 const draft = { kind: 'fork', name: 'draft' };
-const publication = requestId => ({ at: draft, requestId, summary: `Publish ${requestId}` });
+const mutations = calls => calls.filter(call => !['query', 'fetch', 'list', 'tag-get', 'alias-get', 'tag-list', 'branch-list', 'alias-list'].includes(call.kind));
 async function setup(options = {}) {
     const fixture = fileClient();
     const drive = await MemDrive.create({ client: fixture.client, name: 'tools-fixture', ...options });
-    await drive.fork({ name: 'draft' });
     return { fixture, drive };
 }
 
-test('fixed tool definitions require an explicit mode and selection without a drive', () => {
-    const selected = ['fork', 'checkpoint', 'write', 'search'];
+test('the fixed catalog serves exactly six main-only tools and requires an explicit mode and selection without a drive', () => {
+    const selected = ['write', 'search'];
     const definitions = getFileToolDefinitions({ embeddingMode: 'managed', tools: selected });
     selected.push('read');
-    assert.deepEqual(definitions.map(tool => tool.name), ['fork', 'checkpoint', 'write', 'search']);
-    assert.equal(definitions[0].inputSchema.properties.version.type, 'string');
-    assert.equal(definitions[1].inputSchema.properties.version.type, 'string');
-    assert.deepEqual(definitions[2].inputSchema.required, ['at']);
-    assert.equal(definitions[3].inputSchema.properties.query.type, 'string');
+    assert.deepEqual(definitions.map(tool => tool.name), ['write', 'search']);
+    assert.deepEqual(definitions[0].inputSchema.required, []);
+    assert.equal(definitions[1].inputSchema.properties.query.type, 'string');
     assert(Object.isFrozen(definitions));
-    assert.throws(() => { definitions[0].inputSchema.properties.version.type = 'number'; }, TypeError);
+    assert.throws(() => { definitions[0].inputSchema.properties.path.type = 'number'; }, TypeError);
     const vectors = getFileToolDefinitions({ embeddingMode: 'external', tools: ['write', 'search'] });
     assert.equal(vectors[0].inputSchema.properties.content.type, 'array');
     assert.equal(vectors[1].inputSchema.properties.query.type, 'array');
     assert.deepEqual(getFileToolDefinitions({ embeddingMode: 'managed', tools: [] }), []);
-    const flags = Object.fromEntries(getFileToolDefinitions({ embeddingMode: 'managed', tools: all }).map(tool => [tool.name, tool.readOnly]));
-    assert.deepEqual(Object.keys(flags).filter(name => !flags[name]), ['fork', 'checkpoint', 'deleteFork', 'deleteCheckpoint', 'write', 'merge']);
+    const catalog = getFileToolDefinitions({ embeddingMode: 'managed', tools: all });
+    assert.deepEqual(catalog.map(tool => tool.name), all);
+    assert.deepEqual(catalog.filter(tool => !tool.readOnly).map(tool => tool.name), ['write']);
+    for (const tool of catalog) {
+        assert.equal(tool.inputSchema.properties.at, undefined, `${tool.name} has no at`);
+        assert.equal(tool.inputSchema.properties.checkpoint, undefined, `${tool.name} has no checkpoint`);
+        assert.doesNotMatch(tool.description, /\bat\b selects|fork|rollback/i);
+    }
+    for (const removed of ['fork', 'checkpoint', 'listForks', 'listCheckpoints', 'deleteFork', 'deleteCheckpoint', 'rollback',
+        'merge', 'diff', 'status', 'history', 'configure', 'describe'])
+        assert.throws(() => getFileToolDefinitions({ embeddingMode: 'managed', tools: [removed] }), { code: 'INVALID_INPUT' });
     for (const options of [undefined, null, {}, { tools: ['read'] }, { embeddingMode: 'managed' },
         { embeddingMode: 'text', tools: ['read'] }, { embeddingMode: 'managed', tools: ['read', 'read'] },
-        { embeddingMode: 'managed', tools: ['constructor'] }, { embeddingMode: 'managed', tools: ['recover'] },
-        { embeddingMode: 'managed', tools: ['open'] }, { embeddingMode: 'managed', tools: ['describe'] },
-        { embeddingMode: 'managed', tools: 'read' }, { embeddingMode: 'managed', tools: ['read'], drive: {} }])
+        { embeddingMode: 'managed', tools: ['constructor'] }, { embeddingMode: 'managed', tools: 'read' },
+        { embeddingMode: 'managed', tools: ['read'], drive: {} }])
         assert.throws(() => getFileToolDefinitions(options), { code: 'INVALID_INPUT' });
     assert.throws(() => getFileToolDefinitions({ embeddingMode: 'external', tools: ['findText'] }), { code: 'TOOL_UNAVAILABLE' });
 });
 
-test('each tool forwards its input object unchanged to the SDK method of the same name and returns its result', async () => {
+test('each tool forwards its input object unchanged to the SDK method of the same name and drops view selectors from results', async () => {
     const calls = [];
     const results = new Map();
     // A stand-in drive records the exact arguments each tool forwards.
     const stub = Object.fromEntries(all.filter(name => name !== 'guide').map(name => [name, (...args) => {
         calls.push([name, ...args]);
-        const result = { from: name };
+        const result = { from: name, at: { kind: 'main' }, next: { at: { kind: 'main' }, cursor: 'c' } };
         results.set(name, result);
         return Promise.resolve(result);
     }]));
     const tools = createFileTools({ drive: stub, tools: all });
     const signal = new AbortController().signal;
     for (const name of all.filter(name => name !== 'guide')) {
-        const input = { at: draft, marker: name };
+        const input = { marker: name };
         calls.length = 0;
         const result = await tools.execute(name, input, { signal });
-        assert.equal(result, results.get(name));
-        assert.equal(calls.length, 1);
-        assert.equal(calls[0][0], name);
+        assert.deepEqual(calls, [[name, input, { signal }]]);
         assert.equal(calls[0][1], input);
-        assert.deepEqual(calls[0][2], { signal });
+        // Search and write results carry no view selectors and pass through; read, list and findText drop at.
+        if (name === 'search' || name === 'write') assert.equal(result, results.get(name));
+        else assert.deepEqual(result, { from: name, next: { cursor: 'c' } });
     }
 });
 
-test('drive-bound execution can target any authorized view; edits need an explicit fork', async () => {
-    for (const external of [false, true]) {
-        const { fixture, drive } = await setup(external
-            ? { embedding: { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'fixture-v1' } } : {});
-        const names = all.filter(name => !external || name !== 'findText');
-        const tools = createFileTools({ drive, tools: names });
-        const content = external ? [1, ...Array(63).fill(0)] : 'Original wording.';
-        const before = fixture.calls.length;
-        for (const at of [undefined, { kind: 'main' }, { kind: 'checkpoint', name: 'saved' }]) {
-            const scope = at === undefined ? {} : { at };
-            await assert.rejects(tools.execute('write', { ...scope, op: 'create', path: '/note.txt', content }), { code: 'INVALID_INPUT' });
-            await assert.rejects(tools.execute('diff', scope), { code: 'INVALID_INPUT' });
-            await assert.rejects(tools.execute('merge', { ...scope, requestId: 'one', summary: 'One.' }), { code: 'INVALID_INPUT' });
-        }
-        assert.equal(fixture.calls.length, before);
-        const reader = createFileTools({ drive, tools: ['read'] });
-        await assert.rejects(reader.execute('write', { at: draft, op: 'create', path: '/note.txt', content }), { code: 'TOOL_NOT_ALLOWED' });
-        const file = await tools.execute('write', { at: draft, op: 'create', path: '/note.txt', content });
-        assert.equal(file.path, '/note.txt');
-        assert.equal(await tools.execute('read', { fileId: file.fileId }), null);
-        assert.deepEqual(await tools.execute('read', { at: draft, fileId: file.fileId }), file);
-    }
-});
-
-test('tool execution follows explicit fork targets through retrieval, exact edits, diff and publication', async () => {
-    const { drive } = await setup({ metadataSchema: { topic: { type: 'string' } } });
+test('tools work on main only: inputs with at are rejected before storage and results continue without at', async () => {
+    const { fixture, drive } = await setup({ metadataSchema: { topic: { type: 'string' } } });
+    await drive.fork({ name: 'draft' });
     const tools = createFileTools({ drive, tools: all });
-    const file = await tools.execute('write', { at: draft, op: 'create', path: '/notes/plan.txt', content: 'Meet on Monday.', metadata: { topic: 'plan' } });
-    assert.equal(await drive.read({ fileId: file.fileId }), null);
-    assert.deepEqual(await tools.execute('read', { at: draft, paths: [file.path, '/missing.txt'] }), [file]);
-    assert.deepEqual(await tools.execute('list', { at: draft }), await drive.list({ at: draft }));
-    assert.deepEqual(await tools.execute('search', { at: draft, query: 'Monday', rerank: false }), await drive.search({ at: draft, query: 'Monday', rerank: false }));
-    assert.equal((await tools.execute('findText', { at: draft, query: 'monday' })).hits[0].fileId, file.fileId);
-    const edited = await tools.execute('write', { at: draft, op: 'update', fileId: file.fileId,
-        edits: [{ oldText: 'Monday', newText: 'Tuesday' }] });
+    const before = fixture.calls.length;
+    for (const name of all.filter(name => name !== 'guide'))
+        for (const at of [draft, { kind: 'main' }, { kind: 'checkpoint', name: 'saved' }, undefined])
+            await assert.rejects(tools.execute(name, { at, op: 'create', path: '/x', content: 'x', query: 'x' }), { code: 'INVALID_INPUT' });
+    assert.equal(fixture.calls.length, before);
+    const file = await tools.execute('write', { op: 'create', path: '/notes/plan.txt', content: 'Meet on Monday.', metadata: { topic: 'plan' } });
+    assert.deepEqual(await drive.read({ fileId: file.fileId }), file);
+    assert.equal(await drive.read({ at: draft, fileId: file.fileId }), null);
+    assert.deepEqual(await tools.execute('read', { paths: [file.path, '/missing.txt'] }), [file]);
+    assert.deepEqual(await tools.execute('search', { query: 'Monday', rerank: false }), await drive.search({ query: 'Monday', rerank: false }));
+    assert.equal((await tools.execute('findText', { query: 'monday' })).hits[0].fileId, file.fileId);
+    const edited = await tools.execute('write', { op: 'update', fileId: file.fileId, edits: [{ oldText: 'Monday', newText: 'Tuesday' }] });
     assert.equal(edited.content, 'Meet on Tuesday.');
-    await assert.rejects(tools.execute('write', { at: draft, op: 'update', fileId: file.fileId,
-        edits: [{ oldText: 'Monday', newText: 'Wednesday' }] }), { code: 'EDIT_CONFLICT' });
-    assert.deepEqual(await tools.execute('diff', { at: draft }), await drive.diff({ at: draft }));
-    const published = await tools.execute('merge', publication('first'));
-    assert.equal(published.version, 'v1');
-    assert.deepEqual(await tools.execute('merge', publication('first')), published);
-    assert.deepEqual(await tools.execute('listForks', {}), { forks: [{ at: draft }] });
-    assert.equal((await tools.execute('read', { fileId: file.fileId })).content, edited.content);
-    assert.deepEqual(await tools.execute('status', { at: draft }), { at: draft, mainVersion: 'v1' });
-    assert.deepEqual(await tools.execute('status', {}), { at: { kind: 'main' }, mainVersion: 'v1' });
-    await tools.execute('write', { at: draft, operations: [{ op: 'update', fileId: file.fileId, newPath: '/notes/moved.txt' },
-        { op: 'create', path: '/second.txt', content: 'Second file.' }] });
-    await tools.execute('merge', publication('second'));
-    const page = await tools.execute('history', { limit: 1 });
-    assert.deepEqual(Object.keys(page.next), ['cursor']);
-    await tools.execute('write', { at: draft, op: 'delete', fileId: file.fileId });
-    await tools.execute('merge', publication('third'));
-    const tail = await tools.execute('history', page.next);
-    assert.equal(tail.throughVersion, 'v2');
-    assert.deepEqual(tail.entries.map(entry => entry.version), ['v2']);
-    assert.deepEqual(await tools.execute('history', { sinceVersion: 'v2' }), await drive.history({ sinceVersion: 'v2' }));
-});
-
-test('list and findText continuations forward next unchanged and reject another view', async () => {
-    const { drive } = await setup();
-    const tools = createFileTools({ drive, tools: ['list', 'findText', 'write'] });
-    for (const path of ['/a.txt', '/b.txt', '/c.txt']) await tools.execute('write', { at: draft, op: 'create', path, content: 'needle' });
-    for (const [name, request] of [['list', { at: draft, limit: 1 }], ['findText', { at: draft, query: 'needle', limit: 1 }]]) {
+    await assert.rejects(tools.execute('write', { op: 'update', fileId: file.fileId, edits: [{ oldText: 'Monday', newText: 'Wednesday' }] }),
+        { code: 'EDIT_CONFLICT' });
+    for (const path of ['/a.txt', '/b.txt']) await tools.execute('write', { op: 'create', path, content: 'needle' });
+    for (const [name, request] of [['list', { limit: 1 }], ['findText', { query: 'needle', limit: 1 }]]) {
         const first = await tools.execute(name, request);
-        assert.deepEqual(first.next.at, draft);
-        await assert.rejects(tools.execute(name, { cursor: first.next.cursor }), { code: 'CURSOR_VIEW_MISMATCH' });
-        await assert.rejects(tools.execute(name, { at: { kind: 'main' }, cursor: first.next.cursor }), { code: 'CURSOR_VIEW_MISMATCH' });
+        assert.deepEqual(Object.keys(first.next), ['cursor']);
         const second = await tools.execute(name, first.next);
         assert.equal((second.files ?? second.hits).length, 1);
     }
 });
 
+test('a host checkpoint hook makes every write tool call a checkpointed write and returns the plain write result', async () => {
+    const { fixture, drive } = await setup();
+    let turn = 0;
+    const tools = createFileTools({ drive, tools: ['write', 'read'], checkpoint: async () => ({ name: `turn-${++turn}` }) });
+    const first = await tools.execute('write', { op: 'create', path: '/note.md', content: 'First turn.' });
+    assert.deepEqual(first, await drive.read({ fileId: first.fileId }));
+    assert.equal(Object.hasOwn(first, 'checkpoint'), false);
+    assert.deepEqual((await drive.describe()).latestCheckpoint, { at: { kind: 'checkpoint', name: 'turn-1' } });
+    const second = await tools.execute('write', { operations: [{ op: 'update', fileId: first.fileId, content: 'Second turn.' }] });
+    assert.equal(second[0].content, 'Second turn.');
+    assert.deepEqual((await drive.describe()).latestCheckpoint, { at: { kind: 'checkpoint', name: 'turn-2' } });
+    assert.equal((await drive.read({ at: { kind: 'checkpoint', name: 'turn-1' }, fileId: first.fileId })).content, 'First turn.');
+    // The agent cannot choose or skip a checkpoint.
+    const before = fixture.calls.length;
+    await assert.rejects(tools.execute('write', { op: 'delete', fileId: first.fileId, checkpoint: { name: 'mine' } }), { code: 'INVALID_INPUT' });
+    assert.equal(fixture.calls.length, before);
+    assert.equal(turn, 2);
+    // A failed write leaves main at the latest checkpoint and reports a tool error.
+    fixture.beforeUpsert = () => { throw Object.assign(new Error('Unavailable'), { statusCode: 503 }); };
+    const failure = await tools.execute('write', { op: 'create', path: '/lost.md', content: 'Lost.' }).catch(fileToolError);
+    fixture.beforeUpsert = undefined;
+    assert.equal(failure.error.code, 'CHECKPOINT_WRITE_FAILED');
+    // The agent sees the outcome, never the host's checkpoint names.
+    assert.deepEqual(failure.error.details, { stage: 'write', restored: true,
+        cause: { code: 'WRITE_UNCONFIRMED', details: failure.error.details.cause.details } });
+    assert.deepEqual(failure.error.details.cause.details.completedFileIds, []);
+    assert.doesNotMatch(JSON.stringify(failure), /turn-|checkpoint-|restoredTo|previousCheckpoint|checkpointRemoved/);
+    // A restore failure keeps its code, restore cause status and file IDs.
+    fixture.beforeAliasRetarget = () => { throw Object.assign(new Error('Unavailable'), { statusCode: 503 }); };
+    fixture.beforeRollback = () => { throw Object.assign(new Error('Rollback requires a tag with a published snapshot: checkpoint-turn-2'), { statusCode: 400 }); };
+    const unrestored = await tools.execute('write', { op: 'create', path: '/partial.md', content: 'Partial.' }).catch(fileToolError);
+    fixture.beforeAliasRetarget = fixture.beforeRollback = undefined;
+    assert.deepEqual(unrestored.error.details, { stage: 'alias', restored: false, cause: { code: 'DATABASE_ERROR', status: 503 },
+        restoreCause: { code: 'DATABASE_ERROR', status: 400 } });
+    assert.doesNotMatch(JSON.stringify(unrestored), /turn-|checkpoint-/);
+    await drive.write({ op: 'delete', fileId: (await drive.read({ path: '/partial.md' })).fileId });
+    assert.equal(await drive.read({ path: '/lost.md' }), null);
+    assert.equal((await drive.read({ fileId: first.fileId })).content, 'Second turn.');
+    // A hook result is validated by the SDK before any mutation.
+    const invalid = createFileTools({ drive, tools: ['write'], checkpoint: () => ({ name: 'x' }) });
+    const start = mutations(fixture.calls).length;
+    await assert.rejects(invalid.execute('write', { op: 'create', path: '/x.md', content: 'x' }), { code: 'INVALID_INPUT' });
+    assert.equal(mutations(fixture.calls).length, start);
+    for (const checkpoint of [null, 'turn', { name: 'turn' }])
+        assert.throws(() => createFileTools({ drive, tools: ['write'], checkpoint }), { code: 'INVALID_INPUT' });
+    // Without a hook, write tool calls are plain writes.
+    const plain = createFileTools({ drive, tools: ['write'] });
+    await plain.execute('write', { op: 'create', path: '/plain.md', content: 'Plain.' });
+    assert.deepEqual((await drive.describe()).latestCheckpoint, { at: { kind: 'checkpoint', name: 'turn-2' } });
+});
+
 test('allowlists cannot be expanded by callers or input and invalid requests do not reach storage', async () => {
     const { fixture, drive } = await setup();
-    const selected = ['guide', 'status', 'history', 'list', 'read', 'search', 'findText', 'listForks', 'listCheckpoints'];
+    const selected = ['guide', 'list', 'read', 'search', 'findText'];
     const tools = createFileTools({ drive, tools: selected });
     selected.push('write');
     const before = fixture.calls.length;
-    for (const name of ['write', 'merge', 'diff', 'fork', 'checkpoint', 'deleteFork', 'deleteCheckpoint', 'open', 'recover',
-        'describe', 'configure', 'constructor', '__proto__'])
-        await assert.rejects(tools.execute(name, { at: draft }), { code: 'TOOL_NOT_ALLOWED' });
+    for (const name of ['write', 'rollback', 'merge', 'fork', 'checkpoint', 'listForks', 'listCheckpoints', 'deleteFork', 'deleteCheckpoint',
+        'open', 'recover', 'describe', 'configure', 'constructor', '__proto__'])
+        await assert.rejects(tools.execute(name, {}), { code: 'TOOL_NOT_ALLOWED' });
     for (const [name, input] of [
-        ['status', { at: { fork: 'another' } }], ['status', { at: { kind: 'main', name: 'x' } }], ['status', { recover: true }],
-        ['guide', { drive: 'another' }],
+        ['list', { recover: true }], ['guide', { drive: 'another' }],
         ['read', { path: '/note', fileId: 'other' }], ['read', { path: '/note', name: 'another' }],
-        ['list', { cursor: 'bad', prefix: '/' }], ['history', { cursor: 'bad', sinceVersion: 'v0' }],
-        ['history', { at: draft }], ['listForks', { at: draft }],
-        ['search', { query: 'hello', at: { fork: 'another' } }], ['findText', { query: 'hello', client: {} }],
-        ['guide', null], ['status', []],
+        ['list', { cursor: 'bad', prefix: '/' }], ['findText', { query: 'hello', client: {} }],
+        ['guide', null], ['list', []],
     ]) await assert.rejects(tools.execute(name, input), { code: 'INVALID_INPUT' });
     assert.equal(fixture.calls.length, before);
     assert.deepEqual(await tools.execute('guide', {}), fileToolGuide);
     assert.equal(fixture.calls.length, before);
     assert(Object.isFrozen(tools.definitions));
     assert.throws(() => { tools.definitions[0].inputSchema.properties.drive = {}; }, TypeError);
-    assert.throws(() => createFileTools({ drive, tools: ['status', 'status'] }), { code: 'INVALID_INPUT' });
+    assert.throws(() => createFileTools({ drive, tools: ['list', 'list'] }), { code: 'INVALID_INPUT' });
     assert.throws(() => createFileTools({ drive }), { code: 'INVALID_INPUT' });
-    assert.throws(() => createFileTools({ drive, tools: ['recover'] }), { code: 'INVALID_INPUT' });
+    assert.throws(() => createFileTools({ drive, tools: ['rollback'] }), { code: 'INVALID_INPUT' });
+    assert.throws(() => createFileTools({ drive, tools: ['read'], extra: true }), { code: 'INVALID_INPUT' });
     assert.deepEqual(createFileTools({ drive, tools: [] }).definitions, []);
 });
 
 test('write wrapper validates its envelope, forwards cancellation and preserves SDK error details', async () => {
     const { fixture, drive } = await setup();
-    const tools = createFileTools({ drive, tools: ['write', 'merge', 'status', 'guide', 'deleteFork'] });
+    const tools = createFileTools({ drive, tools: ['write', 'list', 'guide'] });
     const before = fixture.calls.length;
-    await assert.rejects(tools.execute('write', { operations: [], at: { fork: 'other' } }), { code: 'INVALID_INPUT' });
-    await assert.rejects(tools.execute('write', { at: draft, operations: [] }), { code: 'INVALID_INPUT' });
-    await assert.rejects(tools.execute('write', { at: draft, operations: {} }), { code: 'INVALID_INPUT' });
-    await assert.rejects(tools.execute('write', { at: draft, operations: [{ op: 'delete', fileId: 'x' }], op: 'delete' }), { code: 'INVALID_INPUT' });
-    for (const name of ['write', 'merge', 'status', 'guide', 'deleteFork'])
-        await assert.rejects(tools.execute(name, { at: draft }, { signal: AbortSignal.abort() }), { code: 'ABORTED' });
-    await assert.rejects(tools.execute('status', {}, { recover: true }), { code: 'INVALID_INPUT' });
+    await assert.rejects(tools.execute('write', { operations: [] }), { code: 'INVALID_INPUT' });
+    await assert.rejects(tools.execute('write', { operations: {} }), { code: 'INVALID_INPUT' });
+    await assert.rejects(tools.execute('write', { operations: [{ op: 'delete', fileId: 'x' }], op: 'delete' }), { code: 'INVALID_INPUT' });
+    for (const name of ['write', 'list', 'guide'])
+        await assert.rejects(tools.execute(name, {}, { signal: AbortSignal.abort() }), { code: 'ABORTED' });
+    await assert.rejects(tools.execute('list', {}, { recover: true }), { code: 'INVALID_INPUT' });
     assert.equal(fixture.calls.length, before);
-    const failure = new MemDriveError('MERGE_RESUMABLE', 'Resume after exclusive ownership.',
-        { details: { requestId: 'request', publishedVersion: 'v1' }, cause: new Error('private transport detail') });
+    const failure = new MemDriveError('PATH_EXISTS', 'A file already exists at a requested path.',
+        { details: { paths: ['/note'] }, cause: new Error('private transport detail') });
     failure.status = 503;
-    assert.deepEqual(fileToolError(failure), { ok: false, error: { code: 'MERGE_RESUMABLE',
+    assert.deepEqual(fileToolError(failure), { ok: false, error: { code: 'PATH_EXISTS',
         message: failure.message, status: 503, details: failure.details } });
     assert(!JSON.stringify(fileToolError(failure)).includes('private transport detail'));
     assert.deepEqual(fileToolError(new Error('private detail')), { ok: false,
         error: { code: 'TOOL_EXECUTION_FAILED', message: 'The file tool could not complete.' } });
 });
 
-test('external-vector tools use vector schemas and preserve reference results without text tools', async () => {
+test('external-vector tools use vector schemas and preserve reference results without findText', async () => {
     const { drive } = await setup({ embedding: { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'fixture-v1' } });
-    const tools = createFileTools({ drive, tools: all.filter(name => name !== 'findText') });
+    const tools = createFileTools({ drive, tools: all.filter(name => name !== 'findText'), checkpoint: () => ({ name: 'vector-turn' }) });
     const vector = [1, ...Array(63).fill(0)];
-    const file = await tools.execute('write', { at: draft, op: 'create', path: '/vector', content: vector });
+    const file = await tools.execute('write', { op: 'create', path: '/vector', content: vector });
     assert.equal(file.content, undefined);
-    assert.deepEqual(await tools.execute('read', { at: draft, fileId: file.fileId }), file);
-    assert.deepEqual(await tools.execute('search', { at: draft, query: vector }), await drive.search({ at: draft, query: vector }));
-    await assert.rejects(tools.execute('search', { at: draft, query: 'text' }), { code: 'INVALID_INPUT' });
-    await assert.rejects(tools.execute('write', { at: draft, op: 'update', fileId: file.fileId, edits: [{ oldText: 'a', newText: 'b' }] }), { code: 'INVALID_INPUT' });
+    assert.deepEqual(await tools.execute('read', { fileId: file.fileId }), file);
+    assert.deepEqual(await tools.execute('search', { query: vector }), await drive.search({ query: vector }));
+    assert.deepEqual((await drive.describe()).latestCheckpoint, { at: { kind: 'checkpoint', name: 'vector-turn' } });
+    await assert.rejects(tools.execute('search', { query: 'text' }), { code: 'INVALID_INPUT' });
+    await assert.rejects(tools.execute('write', { op: 'update', fileId: file.fileId, edits: [{ oldText: 'a', newText: 'b' }] }), { code: 'INVALID_INPUT' });
     assert.throws(() => createFileTools({ drive, tools: ['findText'] }), { code: 'TOOL_UNAVAILABLE' });
-    await tools.execute('merge', publication('vector'));
-    const { at } = await tools.execute('checkpoint', { name: 'published' });
-    assert.deepEqual(await tools.execute('status', { at }), { at, mainVersion: 'v1' });
-    assert.deepEqual(await tools.execute('read', { at, path: '/vector' }), file);
-    await assert.rejects(tools.execute('write', { at, op: 'delete', fileId: file.fileId }), { code: 'INVALID_INPUT' });
 });
 
-test('ref tools create views from main, forks and checkpoints, return { at } and list or delete them', async () => {
-    for (const mode of ['managed', 'external']) {
-        const external = mode === 'external';
-        const options = external ? { embedding: { mode, dimensions: 64, similarity: 'cosine', identity: 'fixture-v1' } } : {};
-        const { drive } = await setup(options);
-        const tools = createFileTools({ drive, tools: ['fork', 'checkpoint', 'status', 'read', 'listForks', 'listCheckpoints', 'deleteFork', 'deleteCheckpoint'] });
-        const content = external ? [1, ...Array(63).fill(0)] : 'Published original.';
-        const file = await drive.write({ at: draft, op: 'create', path: '/original', content });
-        await drive.merge(publication('first'));
-        await drive.write({ at: draft, op: 'update', fileId: file.fileId, newPath: '/unpublished' });
-        const saved = (await tools.execute('checkpoint', { at: draft, name: 'source-checkpoint' })).at;
-        const copies = [];
-        for (const source of [{ kind: 'main' }, draft, saved]) {
-            const expectedFile = await drive.read({ at: source, fileId: file.fileId });
-            for (const kind of ['fork', 'checkpoint']) {
-                const name = `from-${source.kind}`;
-                const created = await tools.execute(kind, { at: source, name });
-                assert.deepEqual(created, { at: { kind, name } });
-                assert.deepEqual(JSON.parse(JSON.stringify(created)), created);
-                assert.deepEqual(await tools.execute('read', { at: created.at, fileId: file.fileId }), expectedFile);
-                copies.push({ at: created.at, expectedFile });
-            }
-        }
-        await drive.write({ at: draft, op: 'update', fileId: file.fileId, newPath: '/later' });
-        for (const { at, expectedFile } of copies)
-            assert.deepEqual(await drive.read({ at, fileId: file.fileId }), expectedFile);
-        assert.equal((await drive.status()).mainVersion, 'v1');
-        assert.equal((await drive.read({ fileId: file.fileId })).path, '/original');
-        assert.deepEqual((await tools.execute('listForks', {})).forks.map(({ at }) => at.name), ['draft', 'from-checkpoint', 'from-fork', 'from-main']);
-        assert.deepEqual((await tools.execute('listCheckpoints', {})).checkpoints.map(({ at }) => at.name),
-            ['from-checkpoint', 'from-fork', 'from-main', 'source-checkpoint']);
-        const removed = { kind: 'fork', name: 'from-main' };
-        assert.deepEqual(await tools.execute('deleteFork', { at: removed }), { at: removed });
-        assert.deepEqual(await tools.execute('deleteCheckpoint', { at: saved }), { at: saved });
-        await assert.rejects(tools.execute('read', { at: removed, fileId: file.fileId }), { code: 'BRANCH_NOT_FOUND' });
-        await assert.rejects(tools.execute('status', { at: saved }), { code: 'CHECKPOINT_NOT_FOUND' });
-        await assert.rejects(tools.execute('deleteFork', { at: saved }), { code: 'INVALID_INPUT' });
-        await assert.rejects(tools.execute('deleteCheckpoint', { at: { kind: 'main' } }), { code: 'INVALID_INPUT' });
-    }
-});
-
-test('ref tools enforce independent permissions, validate locally and preserve conflict and uncertain-outcome errors', async () => {
-    const { fixture, drive } = await setup();
-    const forkOnly = createFileTools({ drive, tools: ['fork'] });
-    const checkpointOnly = createFileTools({ drive, tools: ['checkpoint'] });
-    const before = fixture.calls.length;
-    await assert.rejects(forkOnly.execute('checkpoint', { name: 'saved' }), { code: 'TOOL_NOT_ALLOWED' });
-    await assert.rejects(checkpointOnly.execute('fork', { name: 'draft' }), { code: 'TOOL_NOT_ALLOWED' });
-    for (const [tools, kind, max] of [[forkOnly, 'fork', 47], [checkpointOnly, 'checkpoint', 41]]) {
-        for (const input of [{}, { name: 'ab' }, { name: 'x'.repeat(max + 1) }, { name: 'bad/path' },
-            { name: 'valid', at: { fork: 'other' } }, { name: 'valid', store: 'other' }, { at: draft, name: 'valid', version: 'v0' }])
-            await assert.rejects(tools.execute(kind, input), { code: 'INVALID_INPUT' });
-        await assert.rejects(tools.execute(kind, { name: 'valid' }, { signal: AbortSignal.abort() }), { code: 'ABORTED' });
-    }
-    await assert.rejects(forkOnly.execute('fork', { name: 'main' }), { code: 'INVALID_INPUT' });
-    assert.equal(fixture.calls.length, before);
-    await forkOnly.execute('fork', { at: draft, name: 'copy' });
-    await checkpointOnly.execute('checkpoint', { at: draft, name: 'saved' });
-    await assert.rejects(forkOnly.execute('fork', { name: 'copy' }), { code: 'BRANCH_CONFLICT' });
-    await assert.rejects(checkpointOnly.execute('checkpoint', { name: 'saved' }), { code: 'CHECKPOINT_CONFLICT' });
-    fixture.afterTagCreate = tag => { if (tag.name === 'checkpoint-uncertain') throw new Error('Lost response'); };
-    await assert.rejects(checkpointOnly.execute('checkpoint', { name: 'uncertain' }),
-        { code: 'REF_CREATION_UNCONFIRMED', details: { checkpoint: 'uncertain' } });
-    const afterUncertain = fixture.calls.length;
-    await assert.rejects(checkpointOnly.execute('checkpoint', { name: 'uncertain' }), { code: 'REF_CREATION_UNCONFIRMED' });
-    assert.equal(fixture.calls.length, afterUncertain);
-});
-
-test('guide index and all topics share immutable content without accessing the drive', async () => {
+test('guide index and both topics share immutable content without accessing the drive', async () => {
     const { fixture, drive } = await setup();
     const tools = createFileTools({ drive, tools: ['guide'] });
     const before = fixture.calls.length;
@@ -283,12 +218,15 @@ test('guide index and all topics share immutable content without accessing the d
     assert(index.content.length < 2500);
     assert(fileToolInstructions.length > 0 && fileToolInstructions.length <= 512);
     assert(index.content.includes(fileToolInstructions));
-    assert.match(index.content, /Reading never authorizes a write/);
-    assert.match(index.content, /Omitting at selects main/);
-    assert.doesNotMatch(JSON.stringify(fileToolGuideTopics), /bound view|binding/);
-    assert.match(fileToolGuideTopics.references.content, /merge never deletes a fork/);
-    assert.match(fileToolGuideTopics.retrieval.content, /CURSOR_VIEW_MISMATCH/);
-    assert.deepEqual(index.topics.map(item => item.topic), ['retrieval', 'references', 'editing', 'publication', 'maintenance']);
+    assert.match(fileToolInstructions, /never treat reading as permission to write/);
+    assert.match(fileToolInstructions, /one write call/);
+    const text = JSON.stringify({ index, fileToolGuideTopics });
+    assert.doesNotMatch(text, /\bfork|rollback|\bmerge\(|\bat\b:|kind: "|listCheckpoints|history\(/i);
+    assert.match(fileToolGuideTopics.editing.content, /preserve the original wording/);
+    assert.match(fileToolGuideTopics.editing.content, /CHECKPOINT_WRITE_FAILED/);
+    assert.match(fileToolGuideTopics.editing.content, /do not claim permanent erasure/);
+    assert.match(fileToolGuideTopics.retrieval.content, /same prefix can appear again/);
+    assert.deepEqual(index.topics.map(item => item.topic), ['retrieval', 'editing']);
     for (const { topic, description } of index.topics) {
         const detail = await tools.execute('guide', { topic });
         assert.equal(detail, fileToolGuideTopics[topic]);
@@ -300,9 +238,9 @@ test('guide index and all topics share immutable content without accessing the d
     assert(Object.isFrozen(index.topics));
     assert(Object.isFrozen(index.topics[0]));
     assert(Object.isFrozen(fileToolGuideTopics));
-    for (const topic of ['unknown', '__proto__', 'constructor', '', null, 1, {}])
+    for (const topic of ['unknown', 'references', '__proto__', 'constructor', '', null, 1, {}])
         await assert.rejects(tools.execute('guide', { topic }), error =>
-            error.code === 'INVALID_INPUT' && error.message.includes('retrieval, references, editing, publication, maintenance'));
+            error.code === 'INVALID_INPUT' && error.message.includes('retrieval, editing'));
     await assert.rejects(tools.execute('guide', { topic: 'editing', version: '5' }), { code: 'INVALID_INPUT' });
     assert.equal(fixture.calls.length, before);
 });

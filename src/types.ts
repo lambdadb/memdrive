@@ -16,12 +16,14 @@ export interface DoclingChunker {
     chunk(file: { path: string; content: string; format: string }, options?: RequestOptions): Promise<Array<{ text: string; contextualized: string }>>;
 }
 
-/** Main, the published view. Omitting `at` selects it. */
+/** The store's main branch. Omitting `at` selects it. */
 export type MainAt = { kind: 'main' };
-/** A named working fork; the only writable target. */
+/** A named fork: a writable branch created from another view. */
 export type ForkAt = { kind: 'fork'; name: string };
-/** A named read-only checkpoint. */
+/** A named read-only checkpoint: a tag of a view at the time it was created. */
 export type CheckpointAt = { kind: 'checkpoint'; name: string };
+/** A writable view: main or a fork. */
+export type WritableAt = MainAt | ForkAt;
 /** One serializable view identity shared by requests, results and continuations. */
 export type FileAt = MainAt | ForkAt | CheckpointAt;
 
@@ -33,8 +35,6 @@ export interface FileAtRequest {
 export type EmbeddingMode = 'managed' | 'external';
 
 export type OpenFileStoreOptions<Mode extends EmbeddingMode = 'managed'> = ConnectionOptions & ModeOption<Mode> & {
-    /** Resume an unfinished main merge as the exclusive host-owned writer. */
-    recover?: boolean | undefined;
     chunker?: DoclingChunker | undefined;
 };
 
@@ -71,6 +71,12 @@ export interface FileCursorRequest {
     cursor: string;
 }
 
+/**
+ * One native listing page in native order, not sorted by path. A page can hold
+ * fewer than `limit` entries, or none, while `next` is present; common prefixes
+ * are computed per page and can repeat on later pages. The listing is complete
+ * only when a page has no `next`, and concurrent writes can be missed or seen twice.
+ */
 export interface ListFilesResult {
     files: FileListEntry[];
     prefixes: string[];
@@ -96,8 +102,6 @@ export interface FileReadPage extends DriveFile {
     at: FileAt;
     /** Fingerprint of the original path, content and metadata, checked on continuation. */
     revision: string;
-    /** Main publication last assigned to this original, when present. */
-    version?: string | undefined;
     totalLines: number;
     /** One-based inclusive line numbers and half-open UTF-16 offsets in the original. */
     range: { startLine: number; endLine: number; start: number; end: number };
@@ -159,103 +163,96 @@ type ViewFile<Mode extends EmbeddingMode> = Mode extends 'external' ? FileListEn
 type ViewSearch<Mode extends EmbeddingMode> = Mode extends 'external' ? SearchExternalFilesRequest : SearchFilesRequest;
 type ViewSearchResult<Mode extends EmbeddingMode> = Mode extends 'external' ? SearchExternalFilesResult : SearchFilesResult;
 
-/** Create a named ref from a source view; omission selects main. */
-export type CreateFileRefRequest = {
-    at?: MainAt | undefined;
+/** Create a named fork or checkpoint from a source view; omission selects main. */
+export interface CreateFileRefRequest {
+    at?: FileAt | undefined;
     name: string;
-    /** A main version such as v3, or the retained initial v0. Only supported from main. */
-    version?: string | undefined;
-} | {
-    at: ForkAt | CheckpointAt;
-    name: string;
-    version?: never;
-};
+}
 
 /** Serializable identity of an existing fork or checkpoint. */
 export interface FileRef<At extends ForkAt | CheckpointAt = ForkAt | CheckpointAt> {
     at: At;
 }
 
-/** User forks sorted by name. */
+/** A listed fork or checkpoint with its native creation time (ISO 8601). */
+export interface FileRefEntry<At extends ForkAt | CheckpointAt = ForkAt | CheckpointAt> extends FileRef<At> {
+    createdAt: string;
+}
+
+/**
+ * One page of forks or checkpoints in LambdaDB's name order. A page can hold
+ * fewer than `limit` entries while `next` is present. The listing is complete
+ * only when a page has no `next`.
+ */
 export interface ForkList {
-    forks: FileRef<ForkAt>[];
-}
-
-/** User checkpoints sorted by name. */
-export interface CheckpointList {
-    checkpoints: FileRef<CheckpointAt>[];
-}
-
-/** Fork and checkpoint listings take no options. */
-export type ListFileRefsRequest = Record<string, never>;
-
-/** Requests that act on one existing working fork. */
-export interface ForkRequest {
-    at: ForkAt;
-}
-
-export type WriteFileOperation<Mode extends EmbeddingMode = 'managed'> = FileMutation<Mode> | DeleteFileRequest;
-export interface WriteFilesRequest<Operation> extends ForkRequest {
-    operations: Operation[];
-}
-
-export type FileChange =
-    | { op: 'create'; fileId: string; path: string }
-    | { op: 'update'; fileId: string; path: string; previousPath?: string | undefined }
-    | { op: 'delete'; fileId: string; previousPath: string };
-
-export interface MergeRequest extends ForkRequest {
-    requestId: string;
-    summary: string;
-}
-
-export interface MergeResult {
-    requestId: string;
-    status: 'published' | 'unchanged';
-    version: string;
-}
-
-export interface FileStoreStatus {
-    at: FileAt;
-    mainVersion: string;
-    /** An observed unfinished main merge. Its writer may still be running. */
-    merge?: { requestId: string; phase: 'publication' | 'bookkeeping' } | undefined;
-}
-
-/** List store-wide main publications after a version, or continue a previous page. */
-export type FileHistoryRequest = {
-    sinceVersion?: string | undefined;
-    limit?: number | undefined;
-    cursor?: never;
-} | {
-    cursor: string;
-    sinceVersion?: never;
-    limit?: never;
-};
-
-export interface FileHistoryEntry {
-    version: string;
-    publishedAt: string;
-    summary: string;
-    fileIds: string[];
-    fileIdsTruncated: boolean;
-}
-
-export interface FileHistoryResult {
-    entries: FileHistoryEntry[];
-    /** The latest published main version observed when the first page was requested. */
-    throughVersion: string;
-    /** Store-wide continuation; forward unchanged. */
+    forks: FileRefEntry<ForkAt>[];
     next?: { cursor: string } | undefined;
 }
 
-/** One store object. Each request selects its view with `at`; omission selects main. */
+/** One page of checkpoints in name order; see {@link ForkList}. */
+export interface CheckpointList {
+    checkpoints: FileRefEntry<CheckpointAt>[];
+    next?: { cursor: string } | undefined;
+}
+
+/** Start a fork or checkpoint listing with an optional page size (1–100, default 100), or continue one with its cursor. */
+export type ListFileRefsRequest = { limit?: number | undefined; cursor?: never } | { cursor: string; limit?: never };
+
+/** Select a writable view; omission selects main. */
+export interface WriteTargetRequest {
+    at?: WritableAt | undefined;
+}
+
+/** Make a write a checkpointed write: the call also creates `checkpoint-<name>` and makes it the branch's latest checkpoint. */
+export interface CheckpointedWriteRequest {
+    checkpoint: { name: string };
+}
+
+/** A plain write: no checkpoint is created. */
+interface PlainWriteRequest {
+    checkpoint?: undefined;
+}
+
+/** The ordinary write result plus the checkpoint that now holds it. */
+export interface CheckpointedWriteResult<Result> {
+    result: Result;
+    checkpoint: FileRef<CheckpointAt>;
+}
+
+export type WriteFileOperation<Mode extends EmbeddingMode = 'managed'> = FileMutation<Mode> | DeleteFileRequest;
+export interface WriteFilesRequest<Operation> extends WriteTargetRequest {
+    operations: Operation[];
+}
+
+/** Restore main or a fork to the contents of a checkpoint. */
+export interface RollbackRequest {
+    at: WritableAt;
+    to: CheckpointAt;
+}
+
+export interface RollbackResult {
+    at: WritableAt;
+}
+
+/** Select the branch whose latest checkpoint `describe` reports; omission selects main. */
+export interface DescribeRequest {
+    at?: WritableAt | undefined;
+}
+
+/** The store's configuration and the selected branch's latest checkpoint, or null when it has none. */
+export type FileDriveDescription<Mode extends EmbeddingMode = 'managed'> = FileStoreDescription<Mode> & {
+    latestCheckpoint: FileRef<CheckpointAt> | null;
+};
+
+/**
+ * One store object. Each request selects its view with `at`; omission selects main.
+ * State-changing calls on one branch run one at a time within this process (see
+ * README "Concurrent calls"); ordering across processes and SDK copies belongs to
+ * the caller.
+ */
 export interface FileDrive<Mode extends EmbeddingMode = 'managed'> {
     readonly name: string;
-    describe(options?: RequestOptions): Promise<FileStoreDescription<Mode>>;
-    configure(request: { retentionInDays: number }, options?: RequestOptions): Promise<FileStoreDescription<Mode>>;
-    status(request?: FileAtRequest, options?: RequestOptions): Promise<FileStoreStatus>;
-    history(request?: FileHistoryRequest, options?: RequestOptions): Promise<FileHistoryResult>;
+    describe(request?: DescribeRequest, options?: RequestOptions): Promise<FileDriveDescription<Mode>>;
     list(request?: ListFilesRequest, options?: RequestOptions): Promise<ListFilesResult>;
     read(request: Mode extends 'external' ? never : ReadFileRangeRequest, options?: RequestOptions): Promise<FileReadPage | null>;
     read(request: ReadFileRequest, options?: RequestOptions): Promise<ViewFile<Mode> | null>;
@@ -269,13 +266,17 @@ export interface FileDrive<Mode extends EmbeddingMode = 'managed'> {
     listCheckpoints(request?: ListFileRefsRequest, options?: RequestOptions): Promise<CheckpointList>;
     deleteFork(request: { at: ForkAt }, options?: RequestOptions): Promise<FileRef<ForkAt>>;
     deleteCheckpoint(request: { at: CheckpointAt }, options?: RequestOptions): Promise<FileRef<CheckpointAt>>;
-    write(request: ForkRequest & FileMutation<Mode>, options?: RequestOptions): Promise<ViewFile<Mode>>;
-    write(request: ForkRequest & DeleteFileRequest, options?: RequestOptions): Promise<DeleteFileResult>;
-    write(request: ForkRequest & WriteFileOperation<Mode>, options?: RequestOptions): Promise<ViewFile<Mode> | DeleteFileResult>;
-    write(request: WriteFilesRequest<FileMutation<Mode>>, options?: RequestOptions): Promise<ViewFile<Mode>[]>;
-    write(request: WriteFilesRequest<WriteFileOperation<Mode>>, options?: RequestOptions): Promise<(ViewFile<Mode> | DeleteFileResult)[]>;
-    diff(request: ForkRequest, options?: RequestOptions): Promise<FileChange[]>;
-    merge(request: MergeRequest, options?: RequestOptions): Promise<MergeResult>;
+    write(request: WriteTargetRequest & FileMutation<Mode> & CheckpointedWriteRequest, options?: RequestOptions): Promise<CheckpointedWriteResult<ViewFile<Mode>>>;
+    write(request: WriteTargetRequest & DeleteFileRequest & CheckpointedWriteRequest, options?: RequestOptions): Promise<CheckpointedWriteResult<DeleteFileResult>>;
+    write(request: WriteTargetRequest & WriteFileOperation<Mode> & CheckpointedWriteRequest, options?: RequestOptions): Promise<CheckpointedWriteResult<ViewFile<Mode> | DeleteFileResult>>;
+    write(request: WriteFilesRequest<FileMutation<Mode>> & CheckpointedWriteRequest, options?: RequestOptions): Promise<CheckpointedWriteResult<ViewFile<Mode>[]>>;
+    write(request: WriteFilesRequest<WriteFileOperation<Mode>> & CheckpointedWriteRequest, options?: RequestOptions): Promise<CheckpointedWriteResult<(ViewFile<Mode> | DeleteFileResult)[]>>;
+    write(request: WriteTargetRequest & FileMutation<Mode> & PlainWriteRequest, options?: RequestOptions): Promise<ViewFile<Mode>>;
+    write(request: WriteTargetRequest & DeleteFileRequest & PlainWriteRequest, options?: RequestOptions): Promise<DeleteFileResult>;
+    write(request: WriteTargetRequest & WriteFileOperation<Mode> & PlainWriteRequest, options?: RequestOptions): Promise<ViewFile<Mode> | DeleteFileResult>;
+    write(request: WriteFilesRequest<FileMutation<Mode>> & PlainWriteRequest, options?: RequestOptions): Promise<ViewFile<Mode>[]>;
+    write(request: WriteFilesRequest<WriteFileOperation<Mode>> & PlainWriteRequest, options?: RequestOptions): Promise<(ViewFile<Mode> | DeleteFileResult)[]>;
+    rollback(request: RollbackRequest, options?: RequestOptions): Promise<RollbackResult>;
 }
 
 export type MetadataType = 'string' | 'number' | 'boolean' | 'datetime';
@@ -292,11 +293,6 @@ export interface ExternalEmbedding {
 type StoreOptions = ConnectionOptions & {
     labels?: Record<string, string> | undefined;
     metadataSchema?: MetadataSchema | undefined;
-    /**
-     * SDK history window, 1–365 days (default 30), for superseded internal main version
-     * tags. Native snapshot retention stays at its one-day minimum.
-     */
-    retentionInDays?: number | undefined;
 };
 
 export type CreateFileStoreOptions = StoreOptions & {
@@ -317,11 +313,6 @@ interface StoreDescription {
     name: string;
     labels: Record<string, string>;
     metadataSchema: MetadataSchema;
-    /**
-     * SDK history window for automatic cleanup of superseded internal versions.
-     * Explicit forks, checkpoints and history summaries do not expire.
-     */
-    retentionInDays: number;
 }
 
 export type FileStoreDescription<Mode extends EmbeddingMode = 'managed'> = StoreDescription & (

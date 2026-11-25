@@ -117,34 +117,26 @@ publication. Source, archive or unexpected `latest` changes fail immediately.
 Reruns validate an existing version and report when its channel has advanced,
 without moving the tag.
 
-The basic live scenario creates an isolated collection and forks main. It writes a few
-short synthetic originals, verifies reads by path and file ID on the fork through a
-freshly opened drive, and checks main isolation and duplicate path rejection. It exercises managed
-embeddings and searches with and without native reranking. Requests have
-60-second limits. Cleanup verifies a native not-found response. Missing settings
-or failed cleanup fail the run. Record the pinned LambdaDB client version and
-test environment. Unit tests, installed-package checks, live integration and
-registry verification establish different facts.
+The basic live scenario creates an isolated collection, checks that native
+snapshot retention is one day and that no other collection was created, and
+forks main. It writes a few short synthetic originals on the fork and on main,
+verifies reads by path and file ID through a freshly opened drive, checks fork
+isolation and duplicate path rejection, follows `list` to completion and
+exercises managed embeddings and searches with and without native reranking.
+Requests have 60-second limits. Cleanup verifies a native not-found response.
+Missing settings or failed cleanup fail the run. Record the pinned LambdaDB
+client version and test environment. Unit tests, installed-package checks, live
+integration and registry verification establish different facts.
 
 The default suite also creates a separate structured-text store using local
-Docling Hybrid and a synthetic tokenizer. It verifies exact originals, rendered
-search previews, publication and a checkpoint of the confirmed published tag
-without a parser on the reopened reader. After a second publication it verifies
-main historical forks/checkpoints using the first publication version and a fork
-from an explicit saved working checkpoint. It also rejects the removed `asOf` input. It then destroys the content store
-and its publication journal. Failure output names the stage and HTTP status without request
-headers or bodies.
-
-That isolated structured scenario verifies that native snapshot retention is
-one day and the default SDK history window of 30 days is read back. It ages only
-its synthetic reservation/completion timestamps by two days. A merge replay
-keeps the superseded first version's tag inside the 30-day window. After
-configuring a one-day window, which leaves native retention at one day, replaying
-the completed merge automatically releases that expired tag; the test verifies tag
-absence, retained history, main and checkpoint reads, and another successful replay. This
-tests the native cleanup path without waiting a real day. Selection timing
-and failure recovery have fixture coverage; neither
-check measures physical GC after tag removal.
+Docling Hybrid and a synthetic tokenizer. It verifies exact originals and
+rendered search previews, checkpoints the fork and reads that checkpoint through
+a reader without a parser, writes on main, rolls the fork back to the checkpoint
+and verifies the restored content, deletes the refs it created and destroys the
+store. With `MEMDRIVE_RUN_LIVE_CHECKPOINT_TESTS=1`, the basic scenario also
+creates checkpoints, reads and forks them, rejects writes to a checkpoint and
+rolls another fork back to a checkpoint. Failure output names the stage and HTTP status without request headers
+or bodies.
 
 ## GitHub and npm configuration
 

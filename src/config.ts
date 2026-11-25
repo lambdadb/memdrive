@@ -8,8 +8,8 @@ export const isObject = (value: unknown): value is Record<string, unknown> => va
 export const keysOnly = (value: unknown, keys: string[]): value is Record<string, unknown> =>
     isObject(value) && Object.keys(value).every(key => keys.includes(key));
 
-export const formatTag = 'memdrive.format';
-export const format = 'files-v0';
+const formatTag = 'memdrive.format';
+export const format = 'files-v1';
 const embeddingTag = 'memdrive.embedding';
 export const managedEmbedding = { mode: 'managed', provider: 'openai', model: 'text-embedding-3-small',
     dimensions: 1536, similarity: 'cosine' } as const;
@@ -20,20 +20,15 @@ const fileIndexes = {
     path: { type: 'keyword' },
     fileName: { type: 'keyword' },
     ancestorPaths: { type: 'keyword' },
-    changed: { type: 'boolean' },
     modifiedAt: { type: 'datetime' },
 } as const;
 const indexTypes = { string: 'keyword', number: 'double', boolean: 'boolean', datetime: 'datetime' } as const;
 const supportedAnalyzers: ReadonlySet<unknown> = new Set(Object.values(Analyzer));
-/** The SDK history window for superseded internal main version tags. */
-export const validRetention = (days: unknown): days is number => typeof days === 'number' && Number.isInteger(days) && days >= 1 && days <= 365;
-export const defaultRetentionInDays = 30;
-/** The SDK keeps LambdaDB's own snapshot retention at its minimum. */
-export const minimumNativeRetention = 1;
+/** New stores keep LambdaDB's native snapshot retention at its one-day minimum. */
+export const snapshotRetentionInDays = 1;
 const configurationPrefix = 'memdrive-config-v1:';
 /** Serialize SDK store settings into the native collection description. */
-export const settingsDescription = ({ chunking, retentionInDays }: { chunking?: ChunkingOptions | undefined; retentionInDays: number }) =>
-    configurationPrefix + JSON.stringify({ ...(chunking ? { chunking } : {}), retentionInDays });
+const settingsDescription = (chunking?: ChunkingOptions) => configurationPrefix + JSON.stringify(chunking ? { chunking } : {});
 
 export const validDate = (value: unknown): value is string => typeof value === 'string'
     && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
@@ -103,8 +98,6 @@ export function metadataValues(value: unknown, schema: MetadataSchema): Metadata
 
 export function storeConfiguration(options: CreateFileStoreOptions | CreateExternalFileStoreOptions) {
     const { name } = options;
-    const retentionInDays: unknown = options.retentionInDays === undefined ? defaultRetentionInDays : options.retentionInDays;
-    requireInput(validRetention(retentionInDays), 'retentionInDays must be an integer from 1 to 365.');
     const metadataSchema = schemaEntries(options.metadataSchema);
     const external = options.embedding?.mode === 'external';
     const labels = labelEntries(options.labels, external ? 3 : 4);
@@ -117,7 +110,7 @@ export function storeConfiguration(options: CreateFileStoreOptions | CreateExter
         requireInput(options.textSearch === undefined && options.chunking === undefined && options.chunker === undefined, 'External embedding does not support text indexes or chunking.');
         indexConfigs.embedding = { type: 'vector', dimensions: embedding.dimensions, similarity: embedding.similarity };
         tags[embeddingTag] = embedding.identity;
-        description = { name, labels, metadataSchema, retentionInDays, embedding };
+        description = { name, labels, metadataSchema, embedding };
     } else {
         requireInput(options.embedding === undefined || keysOnly(options.embedding, ['mode']) && options.embedding.mode === 'managed',
             'Managed embedding accepts only mode.');
@@ -133,25 +126,20 @@ export function storeConfiguration(options: CreateFileStoreOptions | CreateExter
             provider: managedEmbedding.provider, model: managedEmbedding.model, dimensions: managedEmbedding.dimensions,
             similarity: managedEmbedding.similarity, sources: [{ ...embeddingSource }],
         } };
-        description = { name, labels, metadataSchema, retentionInDays, textSearch: { analyzers }, embedding: { ...managedEmbedding }, chunking };
+        description = { name, labels, metadataSchema, textSearch: { analyzers }, embedding: { ...managedEmbedding }, chunking };
     }
     if (Object.keys(metadataSchema).length) indexConfigs.metadata = { type: 'object', objectIndexConfigs:
         Object.fromEntries(Object.entries(metadataSchema).map(([key, value]) => [key, { ...value, type: indexTypes[value.type] }])) };
-    return { indexConfigs, tags, description, collectionDescription: settingsDescription({ chunking, retentionInDays }) };
+    return { indexConfigs, tags, description, collectionDescription: settingsDescription(chunking) };
 }
 
-/** Read SDK settings, which always include the history window, and the observed native snapshot retention. */
-export function storeSettings(collection: { tags?: unknown; description?: unknown; snapshotRetentionInDays?: unknown }) {
+/** Read the SDK settings stored in the native collection description. */
+function storeSettings(collection: { tags?: unknown; description?: unknown }) {
     const external = isObject(collection.tags) && Object.hasOwn(collection.tags, embeddingTag);
     const configuration = typeof collection.description === 'string' && collection.description.startsWith(configurationPrefix)
         ? JSON.parse(collection.description.slice(configurationPrefix.length)) as unknown : undefined;
-    requireInput(keysOnly(configuration, external ? ['retentionInDays'] : ['chunking', 'retentionInDays'])
-        && validRetention(configuration.retentionInDays), 'Invalid file store configuration.');
-    return {
-        chunking: configuration.chunking === undefined ? undefined : chunkingOptions(configuration.chunking),
-        retentionInDays: configuration.retentionInDays,
-        nativeRetentionInDays: collection.snapshotRetentionInDays,
-    };
+    requireInput(keysOnly(configuration, external ? [] : ['chunking']), 'Invalid file store configuration.');
+    return { chunking: configuration.chunking === undefined ? undefined : chunkingOptions(configuration.chunking) };
 }
 
 export function parseStore(collection: unknown, name: string): FileStoreDescription<EmbeddingMode> {
@@ -160,7 +148,7 @@ export function parseStore(collection: unknown, name: string): FileStoreDescript
             && isObject(collection.tags) && collection.tags[formatTag] === format && isObject(collection.indexConfigs),
         'Collection format or main branch is incompatible.');
         const { tags, indexConfigs } = collection;
-        const { chunking, retentionInDays } = storeSettings(collection);
+        const { chunking } = storeSettings(collection);
         const external = Object.hasOwn(tags, embeddingTag);
         const labels = labelEntries(Object.fromEntries(Object.entries(tags).filter(([key]) => key !== formatTag && key !== embeddingTag)),
             external ? 3 : 4);
@@ -181,7 +169,7 @@ export function parseStore(collection: unknown, name: string): FileStoreDescript
             requireInput(isObject(embedding) && embedding.type === 'vector' && embedding.managedEmbedding !== true
                 && embedding.embedding === undefined && content === undefined && body === undefined,
             'External file embedding index is incompatible.');
-            return { name, labels, metadataSchema, retentionInDays, embedding: externalEmbedding({ mode: 'external',
+            return { name, labels, metadataSchema, embedding: externalEmbedding({ mode: 'external',
                 dimensions: embedding.dimensions, similarity: embedding.similarity, identity: tags[embeddingTag] }) };
         }
         requireInput(chunking !== undefined, 'Managed file stores require a chunking configuration.');
@@ -196,7 +184,7 @@ export function parseStore(collection: unknown, name: string): FileStoreDescript
         requireInput(isObject(content) && content.type === 'text', 'Chunk text index is missing.');
         requireInput(body === undefined, 'File originals must not have a text index.');
         const analyzers = textAnalyzers({ analyzers: content.analyzers ?? ['standard'] });
-        return { name, labels, metadataSchema, retentionInDays, textSearch: { analyzers }, embedding: { ...managedEmbedding }, chunking };
+        return { name, labels, metadataSchema, textSearch: { analyzers }, embedding: { ...managedEmbedding }, chunking };
     } catch (cause) {
         throw new MemDriveError('INCOMPATIBLE_STORE', 'The collection is not a compatible MemDrive file store.', { cause });
     }

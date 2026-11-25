@@ -32,7 +32,7 @@ export function credentials(env, databaseRequired = true) {
 }
 
 export function readOnlyRequest(method, projectPath) {
-    return (method === 'GET' && /^collections\/[^/]+(?:\/branches)?$/.test(projectPath))
+    return (method === 'GET' && /^collections\/[^/]+(?:\/branches|\/aliases\/[^/]+)?$/.test(projectPath))
         || (method === 'POST' && /^collections\/[^/]+\/(?:query|docs\/fetch)$/.test(projectPath));
 }
 
@@ -170,7 +170,7 @@ export async function ingest(journal, prepared, entry, profile = storageProfile(
     const options = { signal: journal.signal };
     const main = await MemDrive.create({ client: journal.native(), name: entry.collection, metadataSchema: profile.metadataSchema,
         labels: { 'eval.owner': entry.owner, 'eval.scope': entry.scope }, textSearch: profile.textSearch }, options);
-    validateDescriptor(await main.describe(options), entry, profile);
+    validateDescriptor(await main.describe({}, options), entry, profile);
     const { at } = await main.fork({ name: profile.fork }, options);
     const fileIds = [];
     for (let index = 0; index < prepared.files.length; index += 20) {
@@ -187,7 +187,7 @@ export async function ingest(journal, prepared, entry, profile = storageProfile(
 export async function reuseDrive(journal, entry, sources, profile) {
     const options = { signal: journal.signal };
     const drive = await MemDrive.open({ client: journal.native(), name: entry.collection }, options);
-    validateDescriptor(await drive.describe(options), entry, profile);
+    validateDescriptor(await drive.describe({}, options), entry, profile);
     const corpus = { drive, at: { kind: 'fork', name: profile.fork } };
     await validateOriginals(corpus, journal, sources);
     return corpus;

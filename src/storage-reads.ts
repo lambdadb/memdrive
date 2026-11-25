@@ -6,16 +6,11 @@ export type Handle = ReturnType<ConnectionOptions['client']['collection']>;
 /** A view-local request after the store has resolved its `at`. */
 export type WithoutAt<T> = T extends unknown ? Omit<T, 'at'> : never;
 
+/** A native read ref: main and forks are branches, checkpoints are tags. */
 export type ViewRef = { kind: 'branch'; name: string } | { kind: 'tag'; name: string };
-export type RefSource = ViewRef | {
-    read<T>(operation: (ref: ViewRef) => Promise<T>, signal?: AbortSignal): Promise<T>;
-    pin(signal?: AbortSignal): Promise<ViewRef>;
-};
-export const pinRef = (source: RefSource, signal?: AbortSignal) => 'pin' in source ? source.pin(signal) : source;
-export const readRef = <T>(source: RefSource, operation: (ref: ViewRef) => Promise<T>, signal?: AbortSignal) =>
-    'read' in source ? source.read(operation, signal) : operation(source);
 export const branchRef = (name: string) => ({ kind: 'branch' as const, name });
 
+/** Branch reads are consistent; a tag is an immutable snapshot. */
 export function viewRead(ref: ViewRef, includeVectors = false) {
     return ref.kind === 'branch'
         ? { ref, consistentRead: true as const, includeVectors }
@@ -65,9 +60,8 @@ export async function fetchOriginals(handle: Handle, name: string, ref: ViewRef,
     if (response.isDocsInline !== true || response.total !== docs.length)
         throw new MemDriveError('INVALID_RESULT', 'Read did not confirm the original document count.');
     for (const doc of docs) {
-        if (!validFileId(doc.fileId) || doc.id !== originalId(doc.fileId) || (doc.kind !== 'file' && doc.kind !== 'tombstone')
-            || !validPath(doc.path) || !expected.has(doc.fileId) || originals.has(doc.fileId)
-            || (doc.kind === 'tombstone' && (doc.changed !== true || !validFileId(doc.revision))))
+        if (!validFileId(doc.fileId) || doc.id !== originalId(doc.fileId) || doc.kind !== 'file'
+            || !validPath(doc.path) || !expected.has(doc.fileId) || originals.has(doc.fileId))
             throw new MemDriveError('INVALID_RESULT', 'Read returned unexpected or duplicate file originals.');
         originals.set(doc.fileId, doc);
     }

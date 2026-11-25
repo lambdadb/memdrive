@@ -27,68 +27,42 @@ npm run check:package
 
 The package root, `package.json`, and optional Node-only `docling` subpath are the public entry points. Use the public package name in examples and consumer checks. Keep application-specific conventions, model adapters and answer generation outside the SDK.
 
+The SDK is a thin file abstraction over LambdaDB primitives: a store is one
+collection, main and forks are branches and checkpoints are tags. Expose what
+LambdaDB supports and keep the SDK free of state between calls: no caches,
+locks, registries or internal collections. The one exception is the in-process
+per-branch queue that runs state-changing calls one at a time, because a file is
+several documents and LambdaDB has no multi-document transaction or conditional
+write; its entries exist only while calls are pending. Ordering across processes
+and multi-process ownership belong to the caller; document such limits plainly
+instead of adding coordination. Features LambdaDB lacks, such as merge, history
+or conditional writes, are not emulated in the SDK.
+
 The Docling adapter uses pinned `docling.rs` as an optional peer. Package checks
 first verify core consumers without that peer, then install it explicitly and
 exercise the real Hybrid chunker with a small synthetic tokenizer. The fixture
 checks integration and deterministic behavior, not retrieval quality. Preserve
 exact originals, avoid invented ranges for rendered text, and reuse stored
-chunks and vectors during publication and recovery.
-The default live suite additionally checks Docling writes, checkpoint reads and
-publication against the real backend. It publishes a later revision, then creates
-main refs by exact publication version and forks an explicit saved checkpoint,
-verifying their earlier originals before
-destroying its isolated store and journal.
-It checks that the store keeps native snapshot retention at one day with the
-default 30-day SDK window, then ages timestamps in that isolated synthetic journal.
-The superseded first version's tag inside the window survives merge replay; after
-configuring a one-day window, replay automatically releases it while retained
-history, checkpoint reads and refs created from that version remain. It does not
-wait a real retention period or measure physical GC.
+chunks and vectors when moving files.
 
-The shared file-tool catalog also lives at the package root. Keep tools one-to-one
-with public SDK operations, one fixed schema set per embedding mode and the
-explicit allowlist when adding tools. Each request selects its view with `at`;
-results, including fork/checkpoint creation, come unchanged from the public SDK.
-Schemas describe JSON input while SDK validation enforces semantic constraints.
-Schema tests use Ajv only as a development dependency. Keep guide
+The shared file-tool catalog also lives at the package root. It is deliberately
+minimal: six tools (`guide`, `read`, `list`, `search`, `findText`, `write`) on
+main, without `at` in schemas, inputs or results, one fixed schema set per
+embedding mode and an explicit allowlist. Each tool except `guide` calls the
+public SDK method of the same name; refs, rollback and checkpoint retention stay
+host operations. The optional host `checkpoint` hook makes every `write` call a
+checkpointed write without exposing the checkpoint to the agent. Schemas describe JSON input while SDK validation enforces semantic
+constraints. Schema tests use Ajv only as a development dependency. Keep guide
 text independent of host authentication, product policy and provider adapters.
 Change the shared guide `version` only in release pull requests, not for each
-development change. Development builds are identified by their package version
-and `memdriveSourceCommit`, and evaluations record the exact guide text. The
-first release containing the file-SDK guide resets its version to `1`; until
-that release pull request, the current unreleased value stays unchanged.
-The installed-package check exercises the tool workflow, authorization boundary
-and store/ref lifecycle, including partial deletion recovery, as well as ESM,
-CommonJS, TypeScript and browser imports.
-The installed core package also runs history-retention regressions covering
-protected refs, supersession timing, history kept after release, terminal outcomes and
-uncertain or partial cleanup, the stored cleanup watermark, cancellation and read
-concurrency, and the SDK window kept separate from one-day native retention. Public type checks
-verify that retention needs no separate cleanup API. Historical-ref regressions
-cover exact publication versions, unpublished or expired versions, preserved merge baselines,
-external vectors, uncertain creation and source-dependent version schemas.
-
-The LambdaDB dependency is pinned to an exact release. Update it deliberately with relevant API and regression checks. Tooling versions initially follow the native client's lockfile; updating tooling is separate from adopting a new database API.
-
-The publication journal is read on demand by document ID, with batched
-fetches of at most 1,000 IDs, and never through an index query. Keep per-store
-memory independent of the number of merges: journal regressions assert a hard
-bound on cold-client fetches and that later reads return to the journal. Every
-journal record except the retention watermark is written once: confirm a
-reservation before its request index, and the index before any terminal record. Stores
-are registered weakly and pinned only while they hold state a new object would
-lose; the release regressions enable `gc` inside their own test file.
-
-A merge reads its fork directly and creates no tag but its target version, so
-the fork must not change until the merge is settled. Keep the order fork queue,
-then merge queue, for every operation that needs both, and keep the journal read
-off the write path after a fork's first write. Source bookkeeping must stay
-independent of the hold and must work without the merge plan: it advances an
-original only when the published version holds its current state, as stated by
-the plan of the run that published, without an extra request, or by the
-version's tag when the merge was resumed. The hold regressions in `test/merge-hold.test.mjs`
-interrupt a merge at each step, in process and from a new client, and assert
-the native tag calls and journal fetch counts.
+development change, but keep its text accurate for the current contract.
+Development builds are identified by their package version and
+`memdriveSourceCommit`, and evaluations record the exact guide text. The first
+release containing the file-SDK guide resets its version to `1`; until that
+release pull request, the current unreleased value stays unchanged.
+The installed-package check exercises ESM, CommonJS, TypeScript and browser
+imports, the tool catalog and a subset of the unit suites against the installed
+archive.
 
 ## Validation and evidence
 
@@ -97,35 +71,31 @@ Add focused tests for distinct correctness risks. Public API changes need type-c
 A passing local suite establishes unit and package behavior only. `npm run test:live`
 requires Node.js 24 and `LAMBDADB_BASE_URL`, `LAMBDADB_PROJECT_NAME` and
 `LAMBDADB_PROJECT_API_KEY` in the environment or a local `.env.local`. It creates
-and deletes isolated test collections, including the structured-text store and
-its publication journal. Use a dedicated test project;
-missing settings fail rather than silently skipping. The publication workflow
-runs the live suite against the exact installed tarball. Set
-`MEMDRIVE_RUN_LIVE_MERGE_TESTS=1` to additionally run the opt-in public merge
-scenario, which owns and cleans up its content collection and merge journal.
-The default live smoke also exercises ref listing/deletion and public store
-destruction. The merge scenario verifies retained history after source deletion
-and public destruction of both owned collections. Partial deletion and recovery
-faults are covered by the isolated fixture suite.
-Document unperformed checks accurately.
+and deletes isolated test collections, including a structured-text store. Use a
+dedicated test project; missing settings fail rather than silently skipping. The
+publication workflow runs the live suite against the exact installed tarball.
+The default suite creates stores, forks them, writes on forks and on main,
+reads, lists, searches and matches text, checkpoints a fork and rolls it back to
+that checkpoint, deletes the refs it created (deleting a fork before its latest
+checkpoint), and destroys every store, confirming each collection's deletion
+with a native not-found response.
 
-Set `MEMDRIVE_RUN_LIVE_EXTERNAL_VECTOR_TESTS=1` to also exercise external-vector
-writes, filters, checkpoints, and publication in the dedicated test project.
-This opt-in test creates an isolated file collection and its publication journal
-and verifies cleanup of both resources.
-
-Set `MEMDRIVE_RUN_LIVE_FIND_TEXT_TESTS=1` to also verify literal matching,
-working and checkpoint cursors, and continued scans across multiple native
-query pages. The test creates one isolated collection and verifies its deletion.
-
-Set `MEMDRIVE_RUN_LIVE_STATUS_HISTORY_TESTS=1` to also verify read-only
-publication status, stable history pages, and visibility before merge
-bookkeeping finishes. The test verifies cleanup of its isolated collection
-and publication journal.
+Opt-in flags extend it, each cleaning up what it creates:
+`MEMDRIVE_RUN_LIVE_CHECKPOINT_TESTS=1` adds checkpoint conflicts and reads,
+forking from checkpoints and forks, and another fork rollback to the basic store,
+plus a separate store with checkpointed writes on main: it waits until a rollback
+to the first checkpoint is accepted, reporting the delay, injects an alias
+failure into the second checkpointed write and verifies the restore, and pages
+`listCheckpoints`;
+`MEMDRIVE_RUN_LIVE_EXTERNAL_VECTOR_TESTS=1` exercises external-vector writes,
+filters and checkpoints in an isolated collection;
+`MEMDRIVE_RUN_LIVE_FIND_TEXT_TESTS=1` verifies literal matching, live and
+checkpoint cursors and continued scans across multiple native query pages in an
+isolated collection. Document unperformed checks accurately.
 
 The [model tool-use harness](benchmark/tool-use/README.md) consumes the shared
-SDK tool catalog in an in-process host with explicit allowlists and per-call
-`at` targets. Keep its scenarios, provider transport and scoring outside `src/` and
+SDK tool catalog in an in-process host with explicit allowlists, main-only tools
+and host-checkpointed writes. Keep its scenarios, provider transport and scoring outside `src/` and
 the package archive. Its fixture/scripted tests run in ordinary CI without keys;
 real model calls require explicit model mode and `LLM_API_KEY`. Scripted or
 injected transports must never be reported as model performance, and fixture

@@ -308,22 +308,22 @@ test('findText reads a maximum-sized original and escapes literal syntax', async
     assert.deepEqual(result.hits[0].context.range, { start: start - 81, end: original.body.length });
 });
 
-test('findText keeps a published continuation pinned across a later merge', async () => {
+test('main findText scans the main branch live and continues with or without explicit at', async () => {
     const { drive } = await setup();
-    const file = await drive.write({ at, op: 'create', path: '/note', content: 'Old old' });
-    await drive.merge({ at, requestId: 'first', summary: 'Publish the first original' });
+    const file = await drive.write({ op: 'create', path: '/note', content: 'Old old old' });
     const first = await drive.findText({ query: 'old', limit: 1 });
-    assert.equal(first.consistency, 'snapshot');
+    assert.equal(first.consistency, 'live');
     assert.equal(first.hits[0].content, 'Old');
     assert.deepEqual(first.next.at, { kind: 'main' });
-    await drive.write({ at, op: 'update', fileId: file.fileId, content: 'New' });
-    await drive.merge({ at, requestId: 'second', summary: 'Publish the second original' });
-    assert.deepEqual((await drive.findText({ query: 'old' })).hits, []);
     // Omitted at is main, so the main cursor continues with or without explicit at.
     assert.equal((await drive.findText({ cursor: first.next.cursor })).hits[0].content, 'old');
     assert.equal((await drive.findText(first.next)).hits[0].content, 'old');
+    // Live main scans carry no ref incarnation, and a changed resumed file requires restarting.
+    assert.equal(Object.hasOwn(decoded(first.next.cursor), 'i'), false);
+    await assert.rejects(drive.findText({ cursor: token({ ...decoded(first.next.cursor), i: '0'.repeat(32) }) }), { code: 'FIND_TEXT_CURSOR_UNAVAILABLE' });
+    await drive.write({ op: 'update', fileId: file.fileId, content: 'New old old' });
+    await assert.rejects(drive.findText(first.next), { code: 'FIND_TEXT_CURSOR_UNAVAILABLE' });
 });
-
 
 test('findText cursors are stateless: they continue on another client and never take authority from their contents', async () => {
     const { fixture, name, drive } = await setup();
@@ -342,31 +342,13 @@ test('findText cursors are stateless: they continue on another client and never 
         token({ ...state, p: 'relative' }), token({ ...state, f: { field: 'metadata.unknown', op: 'eq', value: 1 } }),
         token({ ...state, af: 'file:not-an-id' }), token({ ...state, u: '*' }), token({ ...state, r: { ...state.r, o: -1 } }),
         token({ ...state, r: { ...state.r, h: undefined } }), token({ ...state, r: { ...state.r, i: 'file:x' } }),
-        token({ ...state, v: 'v1' }), token({ ...state, a: { kind: 'fork' } }), token({ ...state, extra: true })])
+        token({ ...state, v: 'v1' }), token({ ...state, a: { kind: 'fork' } }), token({ ...state, extra: true }), token({ ...state, i: undefined })])
         await assert.rejects(drive.findText({ at, cursor }), { code: 'FIND_TEXT_CURSOR_UNAVAILABLE' }, cursor);
     // A well-formed token for another view is a mismatch, and its at never selects the read ref.
     await assert.rejects(drive.findText({ at, cursor: token({ ...state, a: { kind: 'fork', name: 'other' } }) }),
         { code: 'CURSOR_VIEW_MISMATCH' });
     // A changed resumed file invalidates a live continuation on every client.
     await drive.write({ at, op: 'update', fileId: first.fileId, content: 'ok ok changed' });
-    await assert.rejects(other.findText(page.next), { code: 'FIND_TEXT_CURSOR_UNAVAILABLE' });
-});
-
-test('main findText cursors verify their pinned publication on every page', async () => {
-    const { fixture, name, drive } = await setup();
-    await drive.write({ at, op: 'create', path: '/note', content: 'old old' });
-    await drive.merge({ at, requestId: 'first', summary: 'Publish' });
-    const page = await drive.findText({ query: 'old', limit: 1 });
-    const state = decoded(page.next.cursor);
-    assert.equal(state.v, 'v1');
-    const other = await MemDrive.open({ client: { ...fixture.client }, name });
-    assert.equal((await other.findText(page.next)).hits[0].content, 'old');
-    // Unpublished, malformed or released versions and a main without a pinned version
-    // are unavailable, never substituted.
-    for (const v of ['v2', 'v01', 3, null])
-        await assert.rejects(drive.findText({ cursor: token({ ...state, v }) }), { code: 'FIND_TEXT_CURSOR_UNAVAILABLE' });
-    await assert.rejects(drive.findText({ cursor: token({ ...state, u: state.af ?? state.r.i }) }), { code: 'FIND_TEXT_CURSOR_UNAVAILABLE' });
-    fixture.collections.get(name).tags.delete('md-main-v1');
     await assert.rejects(other.findText(page.next), { code: 'FIND_TEXT_CURSOR_UNAVAILABLE' });
 });
 
@@ -396,6 +378,8 @@ test('findText cursors never continue on a fork or checkpoint recreated under th
     // The original incarnation still continues, including on another client.
     const other = await MemDrive.open({ client: { ...fixture.client }, name });
     assert.equal((await other.findText(page.next)).hits[0].range.start, 6);
+    // A newer checkpoint of the fork becomes its latest, so saved can be deleted.
+    await drive.checkpoint({ at, name: 'newer' });
     await drive.deleteCheckpoint({ at: saved });
     await assert.rejects(other.findText(page.next), { code: 'FIND_TEXT_CURSOR_UNAVAILABLE' });
     await drive.write({ at, op: 'update', fileId: file.fileId, content: 'saved but replaced' });

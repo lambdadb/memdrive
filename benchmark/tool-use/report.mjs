@@ -5,19 +5,22 @@ import { agentFailureCodes } from './agent.mjs';
 import { summarize } from './run.mjs';
 import { retrievalMetrics } from './scenarios.mjs';
 
-const toolNames = ['guide', 'status', 'history', 'list', 'read', 'search', 'findText',
-    'fork', 'checkpoint', 'listForks', 'listCheckpoints', 'deleteFork', 'deleteCheckpoint', 'diff', 'write', 'merge'];
-// BINDING_CHANGED and REF_DELETED identify errors in protocol-v1 run directories. HISTORY_UNAVAILABLE,
-// MERGE_CAPTURE_UNCONFIRMED, MERGE_SOURCE_CONFLICT and MERGE_SOURCE_NOT_READY are no longer raised; earlier
-// run directories can hold them.
+// Protocol v4 offers guide, list, read, search, findText and write. The ref tools belong to
+// protocol-v3 and earlier run directories; status, history, diff and merge to v1 and v2.
+const toolNames = ['guide', 'list', 'read', 'search', 'findText', 'fork', 'checkpoint', 'listForks', 'listCheckpoints',
+    'deleteFork', 'deleteCheckpoint', 'write', 'rollback', 'status', 'history', 'diff', 'merge'];
+// BINDING_CHANGED and REF_DELETED identify errors in protocol-v1 run directories. The HISTORY_*,
+// MERGE_*, LIST_SCAN_LIMIT, REF_*_UNCONFIRMED, HISTORICAL_VIEW_UNAVAILABLE and VERSION_NOT_FOUND
+// codes are no longer raised; earlier run directories can hold them.
 const toolErrorCodes = [
     'ABORTED', 'BINDING_CHANGED', 'BRANCH_CONFLICT', 'BRANCH_NOT_FOUND', 'CHECKPOINT_CONFLICT', 'CHECKPOINT_NOT_FOUND',
+    'CHECKPOINT_RESTORE_FAILED', 'CHECKPOINT_WRITE_FAILED',
     'CURSOR_VIEW_MISMATCH', 'DATABASE_ERROR', 'EDIT_CONFLICT', 'FILE_NOT_FOUND',
     'FIND_TEXT_CURSOR_UNAVAILABLE', 'HISTORICAL_VIEW_UNAVAILABLE', 'HISTORY_CURSOR_UNAVAILABLE', 'HISTORY_UNAVAILABLE',
     'INVALID_INPUT', 'INVALID_JSON', 'INVALID_RESULT', 'LIST_CURSOR_UNAVAILABLE', 'LIST_SCAN_LIMIT', 'MERGE_BLOCKED',
     'MERGE_CAPTURE_UNCONFIRMED', 'MERGE_CONFLICT', 'MERGE_REQUEST_CONFLICT', 'MERGE_SOURCE_CONFLICT', 'MERGE_SOURCE_NOT_READY',
-    'PATH_EXISTS', 'READ_VERSION_CHANGED', 'REF_CREATION_UNCONFIRMED',
-    'REF_DELETED', 'REF_DELETION_UNCONFIRMED', 'TARGET_NOT_AUTHORIZED', 'TOOL_EXECUTION_FAILED', 'TOOL_NOT_ALLOWED', 'TOOL_UNAVAILABLE',
+    'PATH_AMBIGUOUS', 'PATH_EXISTS', 'READ_VERSION_CHANGED', 'REF_CREATION_UNCONFIRMED',
+    'REF_DELETED', 'REF_DELETION_UNCONFIRMED', 'STORE_NOT_FOUND', 'TARGET_NOT_AUTHORIZED', 'TOOL_EXECUTION_FAILED', 'TOOL_NOT_ALLOWED', 'TOOL_UNAVAILABLE',
     'VERSION_NOT_FOUND', 'WRITE_UNCONFIRMED',
 ];
 const known = (value, choices) => choices.includes(value) ? value : undefined;
@@ -53,8 +56,7 @@ function toolEvent(event) {
     return { kind: 'tool', name: toolName(event.name), at: viewKind(event.args),
         outcome: event.result?.error ? 'error' : 'ok',
         errorCode: event.result?.error && (known(event.result.error.code, toolErrorCodes) ?? 'OTHER_TOOL_ERROR'),
-        truncated: event.delivery?.truncated === true,
-        mergeStatus: event.name === 'merge' ? known(event.result?.status, ['published', 'unchanged']) : undefined };
+        truncated: event.delivery?.truncated === true };
 }
 
 function caseDiagnostic(entry, result, receipts, model) {
@@ -69,7 +71,9 @@ function caseDiagnostic(entry, result, receipts, model) {
             checks: Object.fromEntries(Object.entries(evaluation.checks).filter(([, value]) => typeof value === 'boolean')),
             behavior: { toolCalls: count(behavior.toolCalls), guideCalls: count(behavior.guideCalls),
                 resourceReadsByHost: count(behavior.resourceReadsByHost), exactEdits: count(behavior.exactEdits),
-                readBeforeWrite: behavior.readBeforeWrite, reviewedDiff: behavior.reviewedDiff } },
+                readBeforeWrite: behavior.readBeforeWrite, writeCalls: count(behavior.writeCalls),
+                // Protocol v3 and earlier runs record writes to main and rollback calls.
+                mainWrites: count(behavior.mainWrites), rollbacks: count(behavior.rollbacks) } },
         // Counts and tool names recomputed from the recorded events; no arguments are exported.
         retrieval: Array.isArray(result?.events) ? retrievalMetrics(result.events) : undefined,
         events: (result?.events ?? []).map(toolEvent).filter(Boolean),

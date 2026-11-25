@@ -1,7 +1,7 @@
 import { resolvedChunking, type TextChunker } from './text-chunks.js';
 import { keysOnly, metadataValues, vectorValues } from './config.js';
 import { MemDriveError, requireInput } from './errors.js';
-import { validFileId, validPath, validText, baselineOf, decodeStoredFile, fileOriginal, fileRecords, fingerprintOf, metadataKey, originalId, type StoredFile } from './records.js';
+import { validFileId, validPath, validText, decodeStoredFile, fileOriginal, fileRecords, metadataKey, fingerprintOf, type StoredFile } from './records.js';
 import type { DeleteFileRequest, MetadataSchema, TextEdit, UpdateExternalFileRequest, UpdateFileRequest } from './types.js';
 
 type EditRequest = UpdateFileRequest | UpdateExternalFileRequest | DeleteFileRequest;
@@ -64,20 +64,9 @@ export async function planEdit(request: EditRequest, doc: Record<string, unknown
     schema: MetadataSchema, dimensions?: number, chunker?: TextChunker, options?: { signal?: AbortSignal | undefined }) {
     const { fileId } = request;
     const current = doc?.kind === 'file' ? decodeStoredFile(doc, schema, dimensions) : undefined;
-    const version = typeof doc?.version === 'string' && doc.version ? doc.version : undefined;
-    let baseline = doc && baselineOf(doc);
-    if (!baseline && (doc?.changed === false || doc?.changed === undefined) && current && version)
-        baseline = { version, path: current.path, fingerprint: await fingerprintOf(current) };
-    if (request.op === 'delete') {
-        const path = current?.path ?? (validPath(doc?.path) ? doc.path : undefined);
-        const tombstone = current ? {
-            id: originalId(fileId), kind: 'tombstone' as const, fileId, path: current.path,
-            modifiedAt: new Date().toISOString(), revision: globalThis.crypto.randomUUID(), changed: true,
-            ...(baseline === undefined ? {} : { baseline }),
-        } : undefined;
-        return { op: 'delete' as const, fileId, path, removeOriginal: !!doc && !baseline, tombstone };
-    }
-    if (!current) throw new MemDriveError('FILE_NOT_FOUND', 'No current file with this ID exists on this fork.', { details: { fileId } });
+    // Deleting an absent file still removes any chunks left by an interrupted write or delete.
+    if (request.op === 'delete') return { op: 'delete' as const, fileId, path: current?.path, removeOriginal: !!current };
+    if (!current) throw new MemDriveError('FILE_NOT_FOUND', 'No current file with this ID exists in this view.', { details: { fileId } });
     const path = request.newPath ?? current.path;
     const metadata = request.metadata === undefined ? current.metadata : metadataValues(request.metadata, schema);
     const fields = { fileId, path, modifiedAt: current.modifiedAt, ...(metadata === undefined ? {} : { metadata }) };
@@ -85,9 +74,8 @@ export async function planEdit(request: EditRequest, doc: Record<string, unknown
     if ('embedding' in current) {
         const embedding = request.content !== undefined && typeof request.content !== 'string' ? [...request.content] : current.embedding;
         const file: StoredFile = { ...fields, embedding };
-        const fingerprint = await fingerprintOf(file);
-        if (fingerprint !== await fingerprintOf(current)) file.modifiedAt = new Date().toISOString();
-        const records = await fileRecords(file, { revision, baseline, fingerprint, version });
+        if (await fingerprintOf(file) !== await fingerprintOf(current)) file.modifiedAt = new Date().toISOString();
+        const records = await fileRecords(file, { revision });
         return { op: 'update' as const, file: records.file, generation: undefined, moveOnly: false as const, records };
     }
     const content = request.edits ? replaceExact(current.content, request.edits)
@@ -99,8 +87,7 @@ export async function planEdit(request: EditRequest, doc: Record<string, unknown
     const generation = replace ? revision : generationValue;
     const modifiedAt = !replace && path === current.path ? current.modifiedAt : new Date().toISOString();
     const file = { ...fields, modifiedAt, content };
-    const tracking = { revision, generation, baseline, fingerprint: await fingerprintOf(file), version,
-        chunking: resolvedChunking(doc?.chunking) };
+    const tracking = { revision, generation, chunking: resolvedChunking(doc?.chunking) };
     const base = { op: 'update' as const, file, generation };
     return replace
         ? { ...base, moveOnly: false as const, records: await fileRecords(file, tracking, chunker, options) }

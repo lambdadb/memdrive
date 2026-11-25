@@ -8,7 +8,7 @@ const enabled = process.env.MEMDRIVE_RUN_LIVE_TESTS === '1' && process.env.MEMDR
 const options = () => ({ signal: AbortSignal.timeout(60_000) });
 const statusOf = error => error?.status ?? error?.statusCode;
 
-test('live findText enumerates original occurrences and resumes on branches and checkpoints', {
+test('live findText enumerates original occurrences and resumes on main, forks and checkpoints', {
     skip: enabled ? false : 'Enable MEMDRIVE_RUN_LIVE_TESTS and MEMDRIVE_RUN_LIVE_FIND_TEXT_TESTS for isolated live resources.',
     timeout: 600_000,
 }, async () => {
@@ -28,7 +28,22 @@ test('live findText enumerates original occurrences and resumes on branches and 
     let phase = 'Create store', failure, collision = false;
     try {
         const main = await MemDrive.create({ client, name, metadataSchema: { topic: { type: 'string' } } }, options());
-        assert.deepEqual(await main.findText({ query: 'a.*' }, options()), { hits: [], consistency: 'snapshot' });
+        // Main is a live branch like a fork.
+        assert.deepEqual(await main.findText({ query: 'a.*' }, options()), { hits: [], consistency: 'live' });
+        phase = 'Resume a live scan on main';
+        const mainFile = await main.write({ op: 'create', path: '/main/a.txt', content: 'Needle one\nneedle two' }, options());
+        const mainFirst = await main.findText({ query: 'needle', limit: 1 }, options());
+        assert.equal(mainFirst.consistency, 'live');
+        assert.deepEqual(mainFirst.next?.at, { kind: 'main' });
+        // The create drive's cursor continues on a freshly opened drive of the same store.
+        const opened = await MemDrive.open({ client, name }, options());
+        const mainSecond = await opened.findText(mainFirst.next, options());
+        assert.equal(mainSecond.next, undefined);
+        assert.deepEqual([...mainFirst.hits, ...mainSecond.hits].map(({ fileId, content, range }) => ({ fileId, content, range })), [
+            { fileId: mainFile.fileId, content: 'Needle', range: { startLine: 1, endLine: 1, start: 0, end: 6 } },
+            { fileId: mainFile.fileId, content: 'needle', range: { startLine: 2, endLine: 2, start: 11, end: 17 } },
+        ]);
+        phase = 'Create the fork';
         const { at } = await main.fork({ name: 'literal-scan' }, options());
         const body = 'x'.repeat(797) + '🙂A.*\r\n🙂a.*\r\n';
         const path = '/scan/a.txt';
@@ -67,16 +82,31 @@ test('live findText enumerates original occurrences and resumes on branches and 
         }
         const checkpoint = (await main.checkpoint({ at, name: 'literal-snapshot' }, options())).at;
         const narrowed = { ...query, prefix: path, limit: 1 };
-        const held = await main.findText({ ...narrowed, at: checkpoint }, options());
+        // The checkpoint is read-only.
+        await assert.rejects(main.write({ at: checkpoint, op: 'delete', fileId: file.fileId }, options()), { code: 'INVALID_INPUT' });
+        // A page scans one ID-ordered batch of 16 of the 18 candidates, so the
+        // file can fall in a later batch behind an empty page with next.
+        let held = await main.findText({ ...narrowed, at: checkpoint }, options());
+        while (!held.hits.length && held.next) held = await main.findText(held.next, options());
         assert.equal(held.consistency, 'snapshot');
         assert.equal(held.hits[0]?.content, '🙂A.*\r\n');
         assert.deepEqual(held.next?.at, checkpoint);
         phase = 'Reject a changed working continuation and keep the checkpoint continuation';
-        const live = await main.findText(narrowed, options());
+        // Like the checkpoint scan, the file can sort into a later batch behind empty pages.
+        // The cursor must resume inside the file for the update to invalidate it.
+        let live = await main.findText(narrowed, options());
+        while (!live.hits.length && live.next) live = await main.findText(live.next, options());
+        assert.equal(live.hits[0]?.content, '🙂A.*\r\n');
         assert.deepEqual(live.next?.at, at);
         await main.write({ at, op: 'update', fileId: file.fileId, content: 'Updated' }, options());
         await assert.rejects(main.findText(live.next, options()), { code: 'FIND_TEXT_CURSOR_UNAVAILABLE' });
         assert.deepEqual((await main.findText(held.next, options())).hits, [hits[1]]);
+        phase = 'Reject a fork continuation after the fork is deleted';
+        const pending = await main.findText(narrowed, options());
+        assert(pending.next, 'The fork scan should continue past its first batch.');
+        assert.deepEqual(await main.deleteFork({ at }, options()), { at });
+        await assert.rejects(main.findText(pending.next, options()), { code: 'FIND_TEXT_CURSOR_UNAVAILABLE' });
+        await assert.rejects(main.findText(narrowed, options()), { code: 'BRANCH_NOT_FOUND', status: 404 });
 
         phase = 'Scan a batch larger than the inline response limit';
         // Seed raw originals directly: writing about 7 MiB through the SDK would chunk

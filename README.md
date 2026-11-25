@@ -12,12 +12,18 @@ import { LambdaDBClient } from '@functional-systems/memdrive';
 const client = new LambdaDBClient({ baseUrl, projectName, projectApiKey });
 ```
 
-Checkpoint lookup and checkpoint-sourced forks require LambdaDB with the versioned reference API supported by client 0.14.0. MemDrive also relies on LambdaDB creating a tag on a branch before its first snapshot commits: the first merge of a new store and a checkpoint of a just-written fork tag such branches. An older self-hosted deployment can fail ref response validation if it omits fields required by this client, or reject those tags.
+MemDrive is a thin file abstraction over LambdaDB primitives. A store is one
+LambdaDB collection; main and forks are its branches, and checkpoints are its
+tags. It requires LambdaDB with the versioned reference API supported by client
+0.14.0, including tags on a branch before its first snapshot commits and branch
+rollback to a tag (`branches.rollback`). An older self-hosted deployment can fail
+ref response validation if it omits fields required by this client, or reject
+those requests.
 
 
 ## File stores
 
-Use `@functional-systems/memdrive` to create a text file store and save exact originals on a working fork. These stores use a dedicated layout and require a fresh collection name.
+Use `@functional-systems/memdrive` to create a text file store and save exact originals. These stores use a dedicated layout and require a fresh collection name.
 
 ```ts
 import { MemDrive } from '@functional-systems/memdrive';
@@ -25,40 +31,50 @@ import { MemDrive } from '@functional-systems/memdrive';
 const drive = await MemDrive.create({
     client, name: 'workspace', metadataSchema: { topic: { type: 'string' } },
 });
-const { at: work } = await drive.fork({ name: 'research' }); // { kind: 'fork', name: 'research' }
-const file = await drive.write({
-    at: work,
+const file = await drive.write({ // omitted at writes to main
     op: 'create',
     path: '/notes/context.md',
     content: '# Task context\r\n',
     metadata: { topic: 'planning' },
 });
 
+const { at: work } = await drive.fork({ name: 'research' }); // { kind: 'fork', name: 'research' }
+await drive.write({ at: work, op: 'create', path: '/notes/idea.md', content: 'Only on the fork.' });
+
 const reopened = await MemDrive.open({ client, name: 'workspace' });
-const saved = await reopened.read({ at: work, fileId: file.fileId });
+const saved = await reopened.read({ fileId: file.fileId }); // main
+const onFork = await reopened.read({ at: work, path: '/notes/idea.md' });
+await reopened.read({ path: '/notes/idea.md' }); // null: main does not see the fork's write
 const { hits, reranked } = await reopened.search({ at: work, query: 'Task context', limit: 5 });
-await reopened.read({ fileId: file.fileId }); // null: omitted at reads main
-// The same file is available through { path: '/notes/context.md' }.
 ```
 
-`MemDrive.create` and `MemDrive.open` return one drive object for the store. Each
+`MemDrive.create` and `MemDrive.open` return a drive object for the store. Each
 request selects its view with `at`: `{ kind: 'main' }`, `{ kind: 'fork', name }`
-or `{ kind: 'checkpoint', name }`. Omitting `at` selects main, the published view.
-`write`, `diff` and `merge` require an explicit fork `at`; they never fall back to
-main or create a fork. Results that identify a view, such as `status`, range pages,
-created forks and checkpoints and continuations, always carry an explicit `at`,
-including `{ kind: 'main' }`. The first use of a fork or checkpoint `at` on a client
-verifies that it exists (`BRANCH_NOT_FOUND` or `CHECKPOINT_NOT_FOUND`); later uses
-reuse the cached view. Opening the same store through the same client returns the
-same drive object, which keeps per-fork writer queues and cursors, for as long as
-that object is in use. The SDK holds an idle drive weakly: once the application
-drops it and no operation is running, its memory can be reclaimed and a later
-`open` builds a new object from the stored state. A drive stays registered, and
-is returned again by `open`, while it holds something a new object would lose:
-running or queued operations, an unexpired list cursor, or a fence for an
-unconfirmed configuration change, reference creation or deletion, write or merge.
+or `{ kind: 'checkpoint', name }`. Omitting `at` selects main. Main and forks are
+writable LambdaDB branches; a checkpoint is a read-only LambdaDB tag. `read`,
+`search` and `findText` on main and forks use consistent branch reads, so they
+see a write as soon as it succeeds; `list` is eventual and can lag behind
+writes (see [List files](#list-files)). Results that identify a view, such as range pages, created forks and
+checkpoints and continuations, always carry an explicit `at`, including
+`{ kind: 'main' }`.
 
-`read` returns the original file or `null` when absent. Content can be empty and the SDK preserves whitespace and line endings. Paths are case-sensitive, absolute and slash-separated. Pass `{ at, operations: [...] }` with up to 100 operations to write files in batches. Pass up to 100 distinct paths in `read({ paths })` to read existing files in request order. An existing path in the same fork rejects creation with `PATH_EXISTS`. Main is the published file view and the default source for creating a fork. Working edits are scoped to that fork. A store can declare scalar metadata fields with `metadataSchema` and carry collection labels. File writes attach optional `metadata` and record the modification time.
+The drive object keeps only the store's configuration, read once by `create` or
+`open` and returned by `describe()` together with the latest checkpoint of main
+or a fork (see [Checkpointed writes](#checkpointed-writes)). Every call resolves its `at` and goes to
+LambdaDB, so any number of drive objects, clients and processes can use the same
+store, and a continuation from one works on another. Apart from the per-branch
+queues that order state-changing calls within one process (see
+[Concurrent calls](#concurrent-calls)), the SDK keeps no state between calls: no
+caches, locks or registries. When a request on a view
+fails with a native 404, the SDK checks what is missing and reports
+`STORE_NOT_FOUND`, `BRANCH_NOT_FOUND` or `CHECKPOINT_NOT_FOUND` (status 404).
+
+`read` returns the original file or `null` when absent. Content can be empty and the SDK preserves whitespace and line endings. Paths are case-sensitive, absolute and slash-separated. Pass `{ at, operations: [...] }` with up to 100 operations to write files in batches. Pass up to 100 distinct paths in `read({ paths })` to read existing files in request order. A store can declare scalar metadata fields with `metadataSchema` and carry collection labels. File writes attach optional `metadata` and record the modification time.
+
+`MemDrive.create` sets LambdaDB's native `snapshotRetentionInDays` to its
+one-day minimum; there is no retention option. Forks and checkpoints never
+expire; they stay until you delete them. Untagged snapshots are not a history
+the SDK exposes: keep a version by creating a checkpoint.
 
 Search ranks file chunks with semantic retrieval by default. Choose `mode: 'keyword'` for analyzed terms or `mode: 'hybrid'` for Bayesian lexical and vector fusion. Retrieval never switches modes automatically. The store defaults to LambdaDB's `standard` analyzer and OpenAI's managed `text-embedding-3-small` embeddings. Set `textSearch.analyzers` when creating a store to select other supported analyzers. The default boundary splitter uses paragraph, sentence or whitespace boundaries with an 800-code-point cap; an optional local Docling adapter supports structured text as described below. Each hit carries the stable file ID, path, metadata and a chunk preview. When the chunk's location is verified against the exact original, the hit also includes a UTF-16 `range` that can be passed to JavaScript's `slice`.
 
@@ -77,77 +93,79 @@ An optional `embeddingQuery` supplies separate embedding and enabled reranking i
 
 Earlier SDK versions defaulted to hybrid retrieval with reranking. Pass `mode: 'hybrid', rerank: true` to request that behavior explicitly. The LongMemEval and BEAM benchmarks explicitly select hybrid and retain their configured reranking policy; their historical scores do not measure the new defaults.
 
-Use one writer per fork across runtimes and LambdaDB client instances. The SDK serializes writes to a fork within one client instance. It confirms the original and chunks with a consistent branch read before returning success. Batch writes can apply in parts. A file whose chunks require multiple requests becomes visible when its original is written after the earlier chunk requests are confirmed. If the request may have been accepted but the SDK cannot confirm it, the error code is `WRITE_UNCONFIRMED`. Its details identify the attempted files and any earlier confirmed files so the caller can inspect the fork. The drive blocks another create at that path on that fork until it observes an existing file there. This protection is local to the client instance. A replacement writer must confirm that the earlier request has settled before using that path.
 
+## Concurrent calls
 
+A file is several LambdaDB documents, an original and its chunks, and LambdaDB
+has no multi-document transaction or conditional write. Within one process the
+SDK therefore runs state-changing calls on one branch one at a time, in call
+order:
 
-## Configure retention
+- `write`, as one operation or a batch, on main or that fork; a checkpointed
+  write also creates its checkpoint, moves the branch's latest checkpoint and, on
+  failure, restores the branch in the same turn;
+- `rollback` of that branch;
+- `fork` and `checkpoint` whose source is that branch, so a new fork or
+  checkpoint never captures a half-applied write; a checkpoint also becomes the
+  branch's latest checkpoint in the same turn;
+- `deleteFork` of that fork.
 
-```ts
-const drive = await MemDrive.create({ client, name: 'workspace', retentionInDays: 7 });
-await drive.configure({ retentionInDays: 14 });
-console.log((await drive.describe()).retentionInDays);
-```
+The queues are shared by every drive object of the same store in the process; a
+store recreated under the same name gets new ones. A queue exists only while it
+has pending calls. Calls on different branches run concurrently. Reads (`read`,
+`list`, `search`, `findText`, `listForks`, `listCheckpoints`, `describe`),
+`deleteCheckpoint` and forks or checkpoints taken from a checkpoint never wait. A
+call that fails or is aborted does not hold up the next one; aborting a waiting
+call rejects it with `ABORTED` before it sends anything. `MemDrive.destroy` waits
+for the store's pending state-changing calls in the process before deleting the
+collection. It first reads the collection to identify the store; calls made after
+that read run after the deletion and fail with `STORE_NOT_FOUND`, while a call made
+during the read can still run, succeed and then be deleted with the store.
 
-`retentionInDays` is the SDK history window for MemDrive's superseded internal
-main version tags. It accepts integers from 1 through
-365 and defaults to 30 days when omitted on creation. The window is stored in
-the store's SDK configuration (the native collection description) and applies
-in both embedding modes.
+Separate processes, and separate copies of the SDK in one process (for example
+its ESM and CommonJS builds loaded side by side), are not coordinated. Ordering
+their writers is the caller's job until LambdaDB offers conditional writes; the
+repair paths in [Edit files](#edit-files) cover what racing writers leave behind.
 
-The SDK keeps LambdaDB's native `snapshotRetentionInDays` at its one-day
-minimum and does not expose it. Native retention only bounds how long deleted or
-superseded data stays readable through untagged snapshots. Explicit forks and
-named checkpoints never expire automatically; they stay until you delete them.
-`history()` summaries and request identities also remain available. Expiry
-removes old internal tags, not data directly.
+## What the SDK does not do
 
-`describe()` reports the store's window. `configure` is a store-level drive
-method in both embedding modes. In one native update it writes the SDK window
-and sets native retention to one day. It verifies the store generation and
-confirms both settings with a read; repeated confirmed values do not send an
-update. `open` only reads the configuration, and a collection without a valid
-window is not a compatible store. Other clients should reopen to observe
-configuration changes, although automatic cleanup always reads the current
-window. Coordinate configuration through the same exclusive host ownership used
-for lifecycle operations.
+MemDrive exposes what LambdaDB supports, as files. It does not add features
+LambdaDB lacks; callers build them when they need them.
 
-Configuration updates disable automatic retries. `CONFIGURATION_UNCONFIRMED`
-blocks a different retention value and resource deletion on that client. After
-the host fences outstanding requests, retry the same value to reconcile it.
+- **No merge, diff or history.** There is no publication step, journal or
+  version log. A fork's changes reach main only when you write them to main, or
+  when you roll main back to a checkpoint of the fork. Keep versions you need as
+  checkpoints, and build diffs, merges or change logs in the application.
+- **No coordination across processes or locks.** Only state-changing calls
+  in one process are ordered (see [Concurrent calls](#concurrent-calls)).
+  Writes from separate processes or SDK copies to the same view interleave. The
+  original written last decides a file's path, content and metadata, and exact
+  `edits` apply to the original read at the start of that write call, so a
+  concurrent replacement in between is overwritten. Racing writers to one file
+  can remove each other's chunks: the file stays readable but search may miss it
+  until another update of that file (even with unchanged content or only a new
+  path) chunks it again. Racing creates can leave two files at one path; see
+  below.
+- **No other cross-call state.** The SDK keeps no caches, fences or
+  registries. Retries and the ordering and ownership of a store or view across
+  processes are the caller's responsibility.
+- **Path uniqueness within one process.** `create` and path changes check the
+  destination with a read before writing (`PATH_EXISTS`). Writes on one branch
+  in one process run one at a time, so the check holds there, except right after
+  a write that was aborted or failed with an unknown outcome: a request it already
+  sent can still be applied after the next write's check. Writers in separate
+  processes can both pass it and create two files at the same path.
+- **No hidden retries of unknown outcomes.** A write whose outcome is unknown
+  fails with `WRITE_UNCONFIRMED`; it may or may not have been applied, and the
+  caller inspects the files before retrying. Fork, checkpoint, deletion and
+  rollback requests are sent once; an error without an HTTP status may have
+  taken effect.
+- **Eventual, unordered listing.** `list` returns one native page per call in
+  storage order; see [List files](#list-files).
 
-After a terminal merge result, including a completed-request replay or an
-unchanged merge, the SDK checks retention inside the serialized merge queue.
-It also checks after explicit recovery finishes outstanding work. A superseded
-main version becomes eligible after the window measured from the next
-publication. A merge creates no other internal ref. The current main,
-initial view, fork baselines and unfinished recovery remain protected.
-
-Cleanup is best effort: each pass selects at most 100 expired refs and has a
-five-second abort budget within the caller's deadline. Passes work through
-merges in order from a watermark stored in the journal, which advances only past
-merges whose internal refs are confirmed released, so any client resumes where
-the last pass stopped. A pass stops at the first merge whose outcome is still inside the
-window; later merges wait for it. Failure, cancellation, unavailable
-retention configuration or a busy local client defers work to a later merge without
-changing its durable result. There is no cleanup API, background timer or
-scheduler to configure. No merge activity means cleanup can be delayed; the
-window is not an exact deletion deadline. Raising it does not restore already
-released versions.
-
-The existing exclusive host-owned merge/recovery queue also owns cleanup.
-Keep clocks accurate and fence former owners and their outstanding mutations
-before takeover or lifecycle operations. Other clients can keep reading current
-main or explicit refs; use a checkpoint for work that must retain a selected
-version beyond the window. List cursors expire within five minutes, well before the minimum retention window;
-a main findText cursor becomes unavailable once its pinned version is released. History cursors do not depend on retained versions.
-
-Internally, only refs proven to belong to completed SDK requests are removed.
-A publication's journal records keep its summary and up to 100 affected IDs,
-with no bodies or vectors, so history does not depend on a released ref.
-LambdaDB handles snapshot GC after refs are removed, and
-other refs may still retain the same content. Tag removal does not establish
-immediate physical erasure.
+When LambdaDB adds merge, conditional writes (`if-match`/`if-none-match`),
+consistent ordered listing, substring filters or point-in-time reads (`asOf`),
+the SDK can expose or use them.
 
 ## Structured text chunking
 
@@ -173,8 +191,7 @@ const chunker = await createDoclingChunker({
 const drive = await MemDrive.create({
     client, name: 'structured-workspace', chunking: { strategy: 'auto' }, chunker,
 });
-const { at } = await drive.fork({ name: 'draft' });
-await drive.write({ at, op: 'create', path: '/notes/context.md', content: '# Context\n\nExact original text.' });
+await drive.write({ op: 'create', path: '/notes/context.md', content: '# Context\n\nExact original text.' });
 // Supply the same adapter when reopening for structured writes.
 await MemDrive.open({ client, name: 'structured-workspace', chunker });
 ```
@@ -199,14 +216,13 @@ fall back to exact source chunks if Docling emits no body. This is text-file
 chunking, not a binary PDF or image ingestion API.
 
 Each original records the resolved strategy and adapter identity, including
-tokenizer hash and options. Moving, publishing and recovering files reuse the
-stored chunks and vectors without rerunning the parser. Replacing content or
-updating metadata runs the configured splitter again. Reads, checkpoints and
-publication recovery can reopen without a local adapter. A changed tokenizer
-file requires explicitly creating a new adapter.
-An already cached store keeps its adapter binding. Use a separate LambdaDB
-client instance when opening that store with a different adapter; otherwise
-`CHUNKER_MISMATCH` prevents changing active writers implicitly.
+tokenizer hash and options. Moving a file reuses its stored chunks and vectors
+without rerunning the parser; forks, checkpoints and rollback copy them natively.
+Replacing content or updating metadata runs the configured splitter again.
+Reads, searches, forks, checkpoints and rollback work on a drive opened without
+a local adapter. A changed tokenizer file requires explicitly creating a new
+adapter. Each drive object uses the adapter passed to the `create` or `open`
+call that returned it.
 
 The package root remains browser-compatible without `docling.rs`;
 the `/docling` subpath is Node-only.
@@ -230,9 +246,7 @@ EOF; an end beyond EOF is clamped, while a start beyond EOF is invalid.
 Adding `startLine`, `endLine` or `maxChars` selects a range response with the file
 identity, bounded `content`, `at`, `totalLines`, `revision` and `range`. The range
 contains inclusive line numbers and half-open UTF-16 `start`/`end` offsets into
-the original. `version`, when present, identifies the main publication last
-assigned to that original; it does not claim unpublished fork edits are published.
-`maxChars` bounds content to 2–64000 UTF-16 code units (default 16000 for range
+the original. `maxChars` bounds content to 2–64000 UTF-16 code units (default 16000 for range
 requests). Pages never split a surrogate pair or CRLF and can continue within a
 long line. The bound applies to content, not serialized metadata or JSON overhead.
 
@@ -266,9 +280,9 @@ for (;;) {
 
 Each hit carries the file reference, the original matching text in `content`, and a `range` with half-open UTF-16 `start` and `end` offsets for JavaScript's `slice` plus one-based inclusive `startLine` and `endLine`. Lines are numbered exactly as in ranged `read`, where CRLF, a lone CR and LF each end a line. `endLine` is the line holding the match's last unit, so a match ending with a line break ends on the line that break terminates. Pass `startLine` and `endLine` with the hit's `fileId` to `read` to retrieve the lines containing the match. Its `context` carries an excerpt and the excerpt's corresponding range. The excerpt includes up to 80 UTF-16 units of surrounding text on each side, extending by one unit if needed to avoid splitting a surrogate pair.
 
-Use a nonempty literal of up to 8192 UTF-8 bytes, including whitespace if needed. The optional prefix is a case-sensitive absolute path prefix. Metadata filters use the same `FileFilter` as `search`. The page limit is 1–100 hits and defaults to 20. The SDK scans the original file records in the selected view in file ID order, reading up to 16 originals per page in batches, and emits each file's matches in offset order. Original text has no text index, so the cost scales with the number of originals in scope rather than with the number of matches; `prefix` and metadata `filter` narrow the originals the scan reads. A page can contain fewer hits than requested, including zero. Forward `next` unchanged until it is absent. It contains the scan's `at` and cursor. Passing a cursor with another `at` (omitted means main) fails with `CURSOR_VIEW_MISMATCH` and leaves the cursor usable. The cursor is a self-contained opaque token: it holds no SDK memory, does not expire by time, and continues on any client of the same store. The SDK revalidates every field and derives the read from the request's `at`; for main it verifies that the pinned publication is still a retained version of this store. For a fork or checkpoint it records the ref's identity and rereads it on each page. It becomes unavailable when that publication is released, the store is replaced, the fork or checkpoint was deleted or recreated under the same name, or a resumed live file changed or disappeared. Restart a search if the SDK returns `FIND_TEXT_CURSOR_UNAVAILABLE`.
+Use a nonempty literal of up to 8192 UTF-8 bytes, including whitespace if needed. The optional prefix is a case-sensitive absolute path prefix. Metadata filters use the same `FileFilter` as `search`. The page limit is 1–100 hits and defaults to 20. The SDK scans the original file records in the selected view in file ID order, reading up to 16 originals per page in batches, and emits each file's matches in offset order. Original text has no text index, so the cost scales with the number of originals in scope rather than with the number of matches; `prefix` and metadata `filter` narrow the originals the scan reads. A page can contain fewer hits than requested, including zero. Forward `next` unchanged until it is absent. It contains the scan's `at` and cursor. Passing a cursor with another `at` (omitted means main) fails with `CURSOR_VIEW_MISMATCH` and leaves the cursor usable. The cursor is a self-contained opaque token: it holds no SDK memory, does not expire by time, and continues on any client of the same store. The SDK revalidates every field and derives the read from the request's `at`. The cursor is bound to the store's generation, and for a fork or checkpoint to that ref's identity, which it rereads on each page. It becomes unavailable when the store is replaced, the fork or checkpoint was deleted or recreated under the same name, or a resumed live file changed or disappeared. Restart a search if the SDK returns `FIND_TEXT_CURSOR_UNAVAILABLE`.
 
-Main and checkpoint scans typically return `consistency: 'snapshot'` and keep reading the same published version across pages. Fork scans return `consistency: 'live'`. Each fork page runs in the local writer queue, and the scan excludes file IDs above the initial upper bound. An edit or insertion ahead of the cursor can appear in later pages and a change behind it may be missed. A resumed file that changes or disappears invalidates the cursor.
+Checkpoint scans return `consistency: 'snapshot'` and read the same tag on every page. Main and fork scans return `consistency: 'live'`: they read the branch directly, and the scan excludes file IDs above the upper bound observed on its first page. An edit or insertion ahead of the cursor can appear in later pages and a change behind it may be missed. A resumed file that changes or disappears invalidates the cursor. Pages are not serialized with writes.
 
 ## Filter search by metadata
 
@@ -318,9 +332,9 @@ Pass `mode: 'external'` when opening an external store. MemDrive checks the requ
 
 Each file record stores one supplied vector. The mode has no text index, text payloads, chunks, managed inference, or reranking. Write, read, list, and search return file references with `fileId`, `path`, `modifiedAt`, and optional metadata. Search counts files toward its result limit and returns `reranked: false`. Use paths and metadata that are suitable to store in LambdaDB.
 
-Pass the replacement vector as `content` in `notes.write({ at: draft, op: 'update', fileId, content: replacementVector })`. A path or metadata update preserves the current vector. Vector files share the same fork, checkpoint, diff, merge, and deletion lifecycle as text files. A vector replacement alone counts as a file change.
+Pass the replacement vector as `content` in `notes.write({ at: draft, op: 'update', fileId, content: replacementVector })`. A path or metadata update preserves the current vector. Vector files share the same main, fork, checkpoint, rollback and deletion behavior as text files.
 
-## Edit files on a working fork
+## Edit files
 
 ```ts
 const updated = await drive.write({
@@ -333,17 +347,149 @@ const updated = await drive.write({
 await drive.write({ at: work, op: 'delete', fileId: updated.fileId });
 ```
 
-`write` with an omitted, main or checkpoint `at` fails with `INVALID_INPUT` before
-any storage request.
+`write` targets main (when `at` is omitted or `{ kind: 'main' }`) or a fork. A
+checkpoint `at` fails with `INVALID_INPUT` before any storage request. A write to
+main changes main directly; use a fork when changes should stay separate.
 
-A file keeps its ID across moves and replacements. Pass `content` to replace the entire original, including with an empty string. Exact edits each require a distinct nonempty `oldText` that occurs exactly once in the same original. Their spans must be disjoint and all are resolved before applying replacements. Passing `metadata` replaces the user metadata object, and `{}` clears it. Files without metadata omit the field. A move with only `newPath` preserves both content and metadata and updates the existing chunk metadata without submitting document text for re-embedding. A content or metadata replacement creates a new chunk generation and can re-embed unchanged text.
+A file keeps its ID across moves and replacements. Pass `content` to replace the entire original, including with an empty string. Exact edits each require a distinct nonempty `oldText` that occurs exactly once in the current original. Their spans must be disjoint and all are resolved before applying replacements; a mismatch fails with `EDIT_CONFLICT`. Passing `metadata` replaces the user metadata object, and `{}` clears it. Files without metadata omit the field. A move with only `newPath` preserves both content and metadata and updates the existing chunk metadata without submitting document text for re-embedding. A content or metadata replacement creates a new chunk generation and can re-embed unchanged text.
 
-A batch can mix up to 100 `create`, `update`, and `delete` operations and returns results in input order. Duplicate file targets and destination paths fail before any write. Destinations must be free or already belong to the same file at preflight, so a batch cannot reuse a path vacated by another operation in that batch. Updates to missing files fail with `FILE_NOT_FOUND`. Repeating a delete by the same ID finishes cleanup or acknowledges absence.
+A batch can mix up to 100 `create`, `update`, and `delete` operations and returns results in input order. Duplicate file targets and destination paths fail before any write. Destinations must be free or already belong to the same file when checked, so a batch cannot reuse a path vacated by another operation in that batch. Updates to missing files fail with `FILE_NOT_FOUND`. A delete removes the original, which makes the file disappear, and then its chunks; deleting an absent file ID succeeds and removes any chunks an interrupted write left behind.
 
-A write waits in the fork's queue behind earlier operations on that fork, including a running merge of it. While a merge of the fork is unfinished, every write to that fork fails with `MERGE_BLOCKED` and the blocking `details.requestId` before any storage mutation; see [Publish a working fork](#publish-a-working-fork).
+Within one call, a file becomes visible only after its chunks are written: chunks
+go first and the original last, and each request is confirmed with a consistent
+branch read before the next. Search ignores chunks whose original is missing or
+has another revision. A batch is not a transaction and can apply in parts; error
+details identify the stage, the attempted files, the completed file IDs and any
+files whose chunks were written without their original. If a request may have
+been accepted but the SDK cannot confirm it, the error code is
+`WRITE_UNCONFIRMED`. Read the affected files before retrying.
 
-The SDK confirms the original revision and chunk changes with consistent branch reads. A failed batch may already have applied some files. Error details identify the stage, affected IDs, and any confirmed original changes or completed operations. Check the original before repeating an exact edit after `WRITE_UNCONFIRMED`. The drive fences another operation on that fork that could conflict with an unconfirmed write. Before retrying through another client or runtime, ensure the previous writer has stopped and its outstanding writes have settled. Reissuing an update with the current path and content can finish stale-chunk cleanup. Reissuing a delete can finish removing physically retained chunks and the deleted file's internal record.
+A file counts as completed as soon as its original is written or deleted. After
+that, the SDK reads the original back and removes chunks of other generations; if
+that cleanup fails, the error has stage `cleanup-chunks` and lists the file in
+`completedFileIds`: the change is applied, and only leftover chunks remain, which
+search ignores. Repeating a delete, or any update of the file, removes them
+again. An update that finds no chunks for a nonempty original, for example after
+racing writers in separate processes removed each other's chunks, chunks the
+file again instead of failing, so resending an update repairs search for it.
 
+Racing creates from separate processes can leave several files at one path. Updates and deletes by
+`fileId` keep working for each of them, and an update that keeps its path is not
+checked against other files. Reading that path fails with `PATH_AMBIGUOUS`,
+whose details list `{ path, fileIds }`; move or delete the extra files by
+`fileId`. A create or move to a path that another file holds fails with
+`PATH_EXISTS`.
+
+## Checkpointed writes
+
+A checkpointed write applies a write and records the result as the branch's
+latest checkpoint, or leaves the branch at its previous latest checkpoint. It is
+meant for a host that saves an agent's work once per turn: every such write goes
+through it, so the latest checkpoint is always the last good state.
+
+```ts
+const { result, checkpoint } = await drive.write({
+    operations: [
+        { op: 'create', path: '/notes/handoff.md', content: 'On-call handoff happens at 09:30 KST every Monday.' },
+        { op: 'update', fileId: file.fileId, edits: [{ oldText: 'Tuesday', newText: 'Monday' }] },
+    ],
+    // Host-chosen and unique for the store's lifetime, also across restarts.
+    checkpoint: { name: `turn-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}` },
+});
+// result: the ordinary write result; checkpoint: { at: { kind: 'checkpoint', name: 'turn-…' } }
+const { latestCheckpoint } = await drive.describe(); // the same { at }
+```
+
+Add `checkpoint: { name }` to any single-operation or batch `write` on main or a
+fork. The result is `{ result, checkpoint: { at } }`, where `result` is what the
+same write without `checkpoint` returns. Checkpoint names follow the rules in
+[Save a checkpoint](#save-a-checkpoint) and must be unique for the store's
+lifetime, including across host restarts: a counter that restarts at 1 reuses
+names, every such write then fails tag creation with `CHECKPOINT_CONFLICT` and is
+rolled back. Use a timestamp or random suffix within the 41-character limit.
+
+Each branch has one SDK-reserved LambdaDB alias naming its latest checkpoint:
+`latest-main` for main and `latest-fork-<name>` for a fork. It names the base
+checkpoint of the branch's current state: the most recent checkpoint taken of the
+branch, whether by a checkpointed write or by `checkpoint({ at, name })` with
+that branch as source, or the checkpoint the branch was last rolled back to. The SDK has no alias API, so callers cannot
+create, move or delete it through the SDK, and `listCheckpoints` never lists it.
+`describe({ at? })` reports it as `latestCheckpoint: { at } | null` for main
+(default) or a fork with one alias read; a checkpoint `at` fails with
+`INVALID_INPUT`. `describe` does not check that the fork exists: a missing fork,
+like a fork without checkpoints, reports `null`. `deleteCheckpoint` refuses a
+checkpoint that is some branch's latest with `CHECKPOINT_IN_USE`, whose details
+list `latestOf` (the branches), so retention can never leave the alias dangling;
+delete older checkpoints instead; a 409 from LambdaDB for an alias target is
+reported the same way. `deleteFork` deletes the fork's alias before the branch;
+if the branch deletion then fails, the error keeps its code and status and adds
+`latestCheckpointCleared: true`. `fork` deletes any alias left under the new
+fork's name (for example by a branch deleted outside the SDK) in the new fork's
+queue turn, so a new fork always starts without a latest checkpoint; if that
+fails, it throws `LATEST_CHECKPOINT_NOT_MOVED` with `forkCreated: true`.
+
+One turn of the branch's queue (see [Concurrent calls](#concurrent-calls)) runs
+the whole sequence:
+
+1. Apply the write exactly as `write` without `checkpoint` does.
+2. Create the tag `checkpoint-<name>` from the branch (`tags.create`).
+3. Move the alias to it (`aliases.retarget`). The branch's first checkpoint gets
+   a 404 there and creates the alias instead (`aliases.create`).
+4. Return the write result and the checkpoint.
+
+On success this adds exactly two requests to the write's own requests: one tag
+creation and one alias retarget (plus one alias creation the first time). The
+alias is not read beforehand. A plain `write` sends no tag, alias or rollback
+requests.
+
+Errors raised before the write sends its first mutation, such as
+`INVALID_INPUT`, `PATH_EXISTS`, `EDIT_CONFLICT`, `FILE_NOT_FOUND` or an abort, are
+thrown unchanged and the branch is untouched. Any later failure (a rejected or partial write,
+`WRITE_UNCONFIRMED`, a failed tag creation including `CHECKPOINT_CONFLICT`, or a
+failed alias move) restores the branch, then throws:
+
+- The SDK reads the alias. If the alias move's response was lost but the alias
+  now names the new checkpoint, the call succeeded and returns normally.
+- Otherwise it rolls the branch back to the checkpoint the alias names with one
+  `branches.rollback`, never retried, and deletes the new tag if the call
+  created it. When the tag creation's outcome is unknown, it reads the tag and
+  deletes it only when its creation time is no more than 2 seconds before the
+  client clock reading taken just before the request; otherwise, for example
+  after a lost 409 for an existing checkpoint, the tag stays and the details say
+  `checkpointCreated: 'unknown'`. The tolerance covers clock skew between client
+  and server; a larger skew only leaves a checkpoint behind.
+- Without an alias, on the branch's first checkpointed write, there is nothing to
+  roll back to: the SDK deletes the files this call created, with their chunks.
+  Updates and deletions of files that existed before cannot be undone this way.
+
+The restore runs even when the caller's signal aborted the call. The error is one
+of:
+
+| Code | Meaning | Details |
+| --- | --- | --- |
+| `CHECKPOINT_WRITE_FAILED` | Nothing from the call remains. `stage: 'write'`: the write failed; `'checkpoint'` or `'alias'`: the write was applied but its checkpoint could not be recorded. | `stage`, `restored: true`, `restoredTo` (the checkpoint `at`, or `null` when created files were deleted), `cause` (code, message, status, details of the original error), `checkpointCreated` and `checkpointRemoved` when the call created or may have created its tag |
+| `CHECKPOINT_RESTORE_FAILED` | The restore failed or could not undo everything; the branch may hold part of the write. Read the affected files. | `stage`, `restored: false`, `cause`, `restoreCause` when a restore request failed, `previousCheckpoint` or `restoredTo: null`, `checkpointCreated` (`true`, `false` or `'unknown'`), `unrestoredFileIds` for existing files a first checkpointed write changed, `createdFileIds` when their deletion failed |
+
+LambdaDB can reject a rollback to a checkpoint created moments earlier with
+status 400 (`Rollback requires a tag with a published snapshot`) until its
+snapshot is published, typically for tens of seconds; LambdaDB PR #640 addresses
+this. A checkpointed write that fails within that window after the previous one
+reports `CHECKPOINT_RESTORE_FAILED` with that `restoreCause`; the SDK does not
+wait or retry.
+
+A rollback restores the whole branch to the latest checkpoint, so it is safe only
+when every write to that branch goes through checkpointed writes from one
+process: the queue keeps write, tag and alias move together within the process.
+A plain `write` made after the latest checkpoint is undone too when a later
+checkpointed write fails. Writers in other processes are the host's job, and a
+request whose response was lost can still be applied after the rollback.
+
+There is no option to change this behavior. A checkpointed write is all or
+nothing, restored to the latest checkpoint. To write without a restore, call
+`write` without `checkpoint` and then `checkpoint({ at, name })`. To restore
+another checkpoint, call `rollback({ at, to })`. Checkpoint retention, for
+example deleting checkpoints older than a plan's 7 or 30 days, belongs to the
+host.
 
 ## Save a checkpoint
 
@@ -354,182 +500,150 @@ const original = await drive.read({ at: pinned, fileId: file.fileId });
 const { at: child } = await drive.fork({ at: pinned, name: 'recheck' });
 ```
 
-`fork` and `checkpoint` take an optional source `at`; omitting it copies main.
-`name` names only the new fork or checkpoint, and the result is `{ at }` for that
-new view, not a handle. A named checkpoint pins the source view and serves read,
-search, and list from that pin. Forking any view makes a separate editable branch
-from that source. A fork and a checkpoint may share the same name; `at.kind`
-distinguishes them. Names are scoped to the store. Checkpoint names use 3–41 letters, digits, underscores, or hyphens.
+`fork` and `checkpoint` take an optional source `at` (main, a fork or a
+checkpoint); omitting it copies main. `name` names only the new fork or
+checkpoint, and the result is `{ at }` for that new view. A checkpoint is a
+LambdaDB tag of the source as it is when created; reads, searches, lists and
+findText on it see that fixed state. Forking any view makes a separate writable
+branch from that source. A fork and a checkpoint may share the same name;
+`at.kind` distinguishes them. Names are scoped to the store. Fork names use 3–40
+and checkpoint names 3–41 letters, digits, underscores, or hyphens; fork names
+cannot be `main`. A fork's name leaves room for its reserved alias
+`latest-fork-<name>` within LambdaDB's 52-character reference names.
 
-Checkpoint and child fork creation from a working fork run in its local write queue, behind earlier writes and a running merge of that fork. They stay available while an unfinished merge blocks writes to the fork. If a source write is still unconfirmed, resolve that outcome before capturing the fork. The SDK sends one creation request for each call. A rejected checkpoint request preserves the underlying LambdaDB error and HTTP status. If creation returns `REF_CREATION_UNCONFIRMED`, pause source mutations and check whether it exists with `listForks`/`listCheckpoints` or by using its `at`, which verifies it and clears the local uncertainty. If the exact cutoff matters, compare the contents with your expected state before using the reference. The name alone cannot establish which request won or when it captured the source.
+A checkpoint whose source is main or a fork becomes that branch's latest
+checkpoint (see [Checkpointed writes](#checkpointed-writes)): in the same queue
+turn the SDK moves the branch's alias to it, creating the alias the first time.
+A later failing checkpointed write rolls the branch back to it. A checkpoint of a
+checkpoint, and a fork of any view, leave every alias alone. If the tag is
+created but the alias move fails, the SDK reads the alias back; unless the move
+did happen, it throws `LATEST_CHECKPOINT_NOT_MOVED` with details `at` (the
+branch), `checkpoint`, `checkpointCreated: true`, `latestCheckpoint` (what the
+alias names, `null` or `'unknown'`) and `cause`. The checkpoint exists and no
+files changed; take another checkpoint to retry the move.
 
-Checkpoint search and exact reads use LambdaDB's tag read semantics. Listing retains the eventual preview behavior described below, including on a recently created checkpoint. For live validation of a prepared working view and retained state after source deletion, set `MEMDRIVE_RUN_LIVE_CHECKPOINT_TESTS=1` when running the live suite against a dedicated test project.
+Creating a fork also deletes any alias left under the new fork's name, one more
+request; see [Checkpointed writes](#checkpointed-writes).
 
-## Create a ref from a published version
+Each call sends one native creation request, plus the alias move for a
+checkpoint of a branch. A name already in use fails with
+`BRANCH_CONFLICT` or `CHECKPOINT_CONFLICT`, and a missing source with
+`BRANCH_NOT_FOUND` or `CHECKPOINT_NOT_FOUND`. Other rejections preserve the
+LambdaDB error and HTTP status. If the outcome is unknown, check with
+`listForks`/`listCheckpoints` before retrying. A checkpoint captures whatever its
+source holds when LambdaDB creates it. A fork or checkpoint of
+main or a fork waits for that branch's pending writes in this process; with
+writers in other processes, compare its contents with the state you expect.
+
+## Roll back to a checkpoint
 
 ```ts
-const { entries } = await drive.history();
-const version = entries[0].version; // For example, 'v1'.
-const past = await drive.fork({ name: 'past-work', version });
-const savedPast = await drive.checkpoint({ at: { kind: 'main' }, name: 'past-save', version });
+const { at: before } = await drive.checkpoint({ at: work, name: 'before-import' });
+// ... writes to the fork ...
+await drive.rollback({ at: work, to: before }); // { at: work }
 ```
 
-From a main source (omitted or explicit main `at`), both methods accept optional
-`version` to select that exact completed publication. Omit it for current main. `v0` selects the retained initial view;
-it is unavailable while an interrupted creation has left that view unpinned. An unfinished merge's
-version cannot be selected even if its target tag already exists.
+`rollback({ at, to })` replaces the contents of main or a fork with those of a
+checkpoint: the view's files become exactly the checkpoint's files, so files
+created, changed or deleted in that view since then revert. `at` is required and
+must be main or a fork; `to` must be a checkpoint. The checkpoint can come from
+any view of the store, so rolling main back to a checkpoint taken from a fork
+replaces main with that fork's state at the time. The result is `{ at }`.
 
-An unknown, unpublished or expired version fails with
-`HISTORICAL_VIEW_UNAVAILABLE`, with the requested `version` in error details.
-The SDK does not substitute another version. History summaries may outlive their
-content, so a history entry does not guarantee that version is still retained.
-Creation retains the name-conflict and uncertain-outcome behavior described above.
+Rollback is one native `branches.rollback` call and is never retried, by the SDK
+or the LambdaDB client. Resending a rollback also undoes writes made after the
+first one, so after an error without a status, or a lost result, read the view
+before deciding to send it again. A missing view or checkpoint fails with
+`BRANCH_NOT_FOUND` or `CHECKPOINT_NOT_FOUND`; other errors pass through with
+their HTTP status. LambdaDB can reject a checkpoint created moments earlier with
+status 400 (`Rollback requires a tag with a published snapshot`) until its
+snapshot is published (LambdaDB PR #640 addresses this). The SDK does not wait or
+retry; try again later.
 
-A fork or checkpoint source rejects `version` and copies its current state.
-To preserve a working intermediate state, explicitly create a checkpoint, then
-read or fork that checkpoint when needed. `asOf` is not accepted for any source; MemDrive does not expose native snapshot time selection. `publishedAt`
-remains descriptive history metadata, not a ref selector.
-
-Once created, explicit forks and checkpoints do not automatically expire.
-A fork from an old main version preserves its merge baseline, so publishing edits
-from it can conflict with later main changes. Ref creation does not roll back
-main or change the source view.
+When the branch has a latest checkpoint, the rollback also moves it to `to`, so
+a later failing checkpointed write restores the state the branch was rolled back
+to. A branch without one keeps none. If that alias move fails after the rollback
+succeeded, including a 404 because `to` was deleted meanwhile while the alias
+still names another checkpoint, the SDK throws `LATEST_CHECKPOINT_NOT_MOVED`
+with `rolledBack: true`; the files are rolled back.
 
 ## List and delete refs or destroy a store
 
 ```ts
-const { forks } = await drive.listForks();             // [{ at: { kind: 'fork', name: 'research' } }]
-const { checkpoints } = await drive.listCheckpoints(); // [{ at: { kind: 'checkpoint', name: 'before-cleanup' } }]
-await drive.deleteCheckpoint({ at: pinned }); // { at: pinned }; only this checkpoint.
-await drive.deleteFork({ at: work });         // { at: work }; only this working fork.
+const { forks } = await drive.listForks();
+// [{ at: { kind: 'fork', name: 'research' }, createdAt: '2026-11-26T01:02:03.004Z' }]
+let page = await drive.listCheckpoints({ limit: 50 });
+for (;;) {
+    // page.checkpoints: [{ at: { kind: 'checkpoint', name }, createdAt }]
+    if (!page.next) break;
+    page = await drive.listCheckpoints(page.next); // { cursor }
+}
+await drive.deleteCheckpoint({ at: older });  // { at: older }; only this checkpoint.
+await drive.deleteFork({ at: work });         // { at: work }; only this fork.
 await MemDrive.destroy({ client, name: 'workspace' }); // The entire store.
 ```
 
-Both listing methods take no options and return all user forks or checkpoints in
-the store as `{ at }` entries, sorted by name. They follow all native reference
-pages and exclude internal publication branches and tags. They are a live
-inventory, not a snapshot spanning concurrent changes.
+`listForks` and `listCheckpoints` return one native page per call (`limit`
+1–100, default 100) as `{ at, createdAt }` entries, where `createdAt` is the
+native creation time as an ISO 8601 string. Pass the returned `next`
+(`{ cursor }`) unchanged to continue; the cursor wraps LambdaDB's page token, is
+bound to the store and the listing kind (`LIST_CURSOR_UNAVAILABLE` otherwise)
+and works on any drive object of that store. Entries come in LambdaDB's name
+order. LambdaDB has no time-ordered or reverse listing yet; the latest
+checkpoint of a branch is available from `describe({ at })`. A fork page can
+hold fewer entries than `limit`, even none, while `next` is present, because
+main and other branches are not forks. The listing is complete when a page has
+no `next`, and is a live inventory, not a snapshot spanning concurrent changes.
 
 `deleteFork` and `deleteCheckpoint` require the `at` of an existing fork or
-checkpoint and return `{ at }`. Deleting a fork discards its unpublished edits. Both
-preserve main, other forks and checkpoints and retained publication history; main
-cannot be deleted. After deletion, using that `at` reports `BRANCH_NOT_FOUND` or
-`CHECKPOINT_NOT_FOUND`, its list cursors are discarded and its findText cursors can no longer be continued. A new fork
-or checkpoint with the same name is a separate view.
+checkpoint. They return `{ at }`. `deleteFork` deletes the fork's reserved alias
+(absent is fine) and then the branch. `deleteCheckpoint` first lists the store's
+aliases and refuses a checkpoint that is a branch's latest checkpoint with
+`CHECKPOINT_IN_USE`, then sends one native deletion. Deleting a fork
+discards edits that no other view holds; main, other forks and checkpoints remain.
+Main cannot be deleted. After deletion, using that `at` reports
+`BRANCH_NOT_FOUND` or `CHECKPOINT_NOT_FOUND`, and its findText cursors can no
+longer be continued. A new fork or checkpoint with the same name is a separate
+view.
 
 `MemDrive.destroy({ client, name })` (also exported as `destroy`) deletes the
-content collection, all its refs and the owned publication journal. It verifies
-journal ownership before changing anything. Destruction marks the content
-collection as deleting, removes the journal, then removes the content collection.
-The marker uses the existing format tag, preserving labels and the native tag
-budget. Once marked, a fresh `open` fails with `STORE_DELETING`; destruction must
-finish. A missing store is treated as already destroyed. Old drive objects sharing
-the client reject operations with `STORE_DELETED`; open or create a new drive
-after a successful destroy.
+store's collection, which removes all its forks and checkpoints. A store has no
+other collections. It inspects the collection first: a missing store is treated
+as already destroyed, and a collection that is not a compatible file store fails
+with `INCOMPATIBLE_STORE` without deletion. View requests through drive objects
+of a destroyed store then fail with `STORE_NOT_FOUND`. In one process, `destroy`
+first waits for the store's pending state-changing calls (see
+[Concurrent calls](#concurrent-calls)). The host must stop users of the store in
+other processes before destroying it or reusing its name; the SDK does not
+coordinate them.
 
-The host must stop store operations across **all clients and processes**, fence
-outstanding requests, and hold exclusive ownership through deletion and name
-reuse. The SDK rejects deletion with `STORE_BUSY` while operations on the same
-client are active, blocks new operations during deletion, and rejects observed
-unfinished merges with `MERGE_BLOCKED`. Complete or recover those merges first.
-Unconfirmed writes or ref creation must also settle first. These local checks
-are not a distributed lock; discard drive objects held by other clients after deletion.
-
-Native deletion and marker updates disable automatic retries. After
-`REF_DELETION_UNCONFIRMED`, every use of that `at`, including creating a new view
-with its name, stays fenced on that client. After the host has settled outstanding
-requests, retry `deleteFork` or `deleteCheckpoint` with the same `at`. `STORE_DELETION_UNCONFIRMED` means the marker
-or cleanup may have succeeded. After settling requests, retry `MemDrive.destroy`
-with the same store name, using the original or a fresh client. The durable marker
-allows a fresh process to finish cleanup after a crash; the content collection
-remains the cleanup anchor until its journal is confirmed absent. Do not recreate
-the store until cleanup and outstanding requests have finished.
-
-## Review working changes
-
-```ts
-const changes = await drive.diff({ at: work });
-for (const change of changes) {
-    console.log(change.op, change.fileId, change.op === 'delete' ? change.previousPath : change.path);
-}
-```
-
-`diff()` reports one net change per file on a working fork. A create uses the current path and a delete reports the original baseline path as `previousPath`. An update uses the current path and includes `previousPath` when the path changed. Files created and deleted in the fork, and files restored to their original state, are omitted.
-
-Diff uses consistent reads and runs in the same queue as writes and merges of that fork on the drive. Completed writes through that drive are visible to the scan, and later writes wait until the scan finishes. A diff requested while a merge of the fork is running waits for it; while that merge is published but its source bookkeeping is unfinished, diff can still list files it already published. Use one active writer per fork. A previously unconfirmed request can still settle, and writes through another client or runtime can change the branch between pages. The result is an inspection of the working fork. It carries no durable snapshot or merge token.
-
-## Publish a working fork
-
-```ts
-const result = await drive.merge({
-    at: work,
-    requestId: 'research-2026-11-22',
-    summary: 'Add the task context and supporting notes',
-});
-
-const published = await drive.read({ path: '/notes/context.md' }); // main
-await drive.deleteFork({ at: work }); // Optional and separate; merge keeps the fork.
-```
-
-`merge` publishes the fork's net changes to main. It never
-deletes the fork; delete it explicitly when it is no longer needed. It returns the request ID, status (`published` or `unchanged`), and main version (for example, `v2`). Versions increase when a new view is published and can have gaps. A request ID is scoped to the store. Pass the same fork `at`, ID, and summary to resume or retrieve its original result. Use a new ID to submit a revised change set.
-
-Merges queue against the latest published view. A conflicting file baseline or destination rejects the request with `MERGE_CONFLICT` and the affected file IDs and paths. Independent changes on main can coexist.
-
-A merge reads the fork itself, so the fork is held still until its merge is settled: a terminal outcome and, for a publication, confirmed source bookkeeping.
-
-- While the merge runs, a write, `diff`, fork or checkpoint creation from that fork, and another merge of it wait in the fork's queue and run after it, in the order they were requested. A `findText` page on that fork waits in the same queue. `read`, `search` and `list` on the fork do not wait. A write made after the merge is a change for the next merge.
-- If the merge ends without settling (`MERGE_RESUMABLE`, or `MERGE_BLOCKED` after a mutation of unknown outcome), every write to that fork fails with `MERGE_BLOCKED` and that request's `details.requestId` until the same request is retried to completion or recovery settles it. Reads, `diff` and creating a fork or checkpoint from it stay available, so work can continue on another fork. A new process learns this from the journal before its first write to a fork.
-- A merge that fails before it reserves anything, such as one rejected while another merge is unfinished or while a write to the fork is still unconfirmed, holds nothing. A conflicting or unchanged merge is terminal and leaves the fork writable.
-
-After a publication the fork remains and its published files take the new version as their baseline, so later edits are the next merge's only changes. That bookkeeping advances a file only if the published version contains exactly its current path, metadata and content or vector. A change that reached the fork in spite of the hold, for example through another runtime, is not marked as published: it stays a change for the next `diff` and merge, which publishes it or reports a conflict. An unfinished merge needs its fork to finish: `deleteFork` refuses while one is unfinished, and the fork branch must not be removed by other means.
-
-Main reads, searches, lists, forks, and checkpoints select one published version. A completed merge becomes visible to existing drive objects and new SDK clients after the journal records publication. Working views and named checkpoints keep their own contents. Direct LambdaDB reads of the writable `main` branch can observe writes during application.
-
-- `MERGE_RESUMABLE` identifies a paused request. Retry with its original ID and summary. If its main version is already published, the error includes `details.publishedVersion` and the retry completes the source bookkeeping.
-- `MERGE_BLOCKED` identifies the unfinished request that prevents other publications and writes to its own fork. If a mutable native write has an unknown outcome, the host must fence the old writer and settle its in-flight operations before a replacement owner resumes it; the fenced client keeps rejecting merges and writes to that fork.
-- The SDK retries a definite rejection when pinning a merge's target version tag for up to two minutes. Cold collections can take longer to accept their first tag. That deadline is resumable. Pass a request `signal` to bound your wait.
-
-Run main publication and recovery through one exclusive host-owned writer per store across runtimes and client instances. Continue to enforce one writer per working fork, including its post-merge bookkeeping. Merge a fork from the runtime that writes to it: the SDK holds the fork still through that runtime's queue and its own record of the unfinished merge, and another runtime reads the journal only before its first write to a fork. Once the previous owner and its in-flight mutations have settled, the replacement owner can call `MemDrive.open({ client, name: 'workspace', recover: true })`. A normal `open` never resumes the merge. A paused merge continues to serve the previous published version until publication, and recovery continues from the journal and the held fork. Recovery does not automatically roll back the writable branch.
-
-MemDrive keeps its initial view and published versions in reserved refs and creates an internal collection on the first merge. Give the writer permission to provision that collection and readers permission to inspect its records. Keep the journal while the store is in use; completed merges automatically attempt retention cleanup. A store whose creation was interrupted before its initial view was pinned is initialized on the first operation that needs a frozen main view. Native tag availability also applies to named checkpoints on an empty or cold view.
-
-## Inspect publication status and history
-
-```ts
-const status = await drive.status({ at: work }); // { at: work, mainVersion, merge? }
-const page = await drive.history({ sinceVersion: 'v0', limit: 20 });
-if (page.next) {
-    const next = await drive.history(page.next); // { cursor }
-}
-```
-
-`status({ at })` returns the selected view in `at` (`{ kind: 'main' }` when omitted) and the store's current published main version in `mainVersion`. Before the first publication, main is `v0`. An observed unfinished merge includes its `requestId` and `phase`. The `publication` phase keeps main on its previous published version. The `bookkeeping` phase means main already exposes the new version and the source baselines still need to be confirmed. The writer may still be running in either phase. Use the exclusive writer rules above for recovery.
-
-`history()` reports store-wide main publications in managed and external embedding modes and takes no `at`. Entries are ordered by version, oldest first, and include the publication time, merge summary, and up to the first 100 affected file IDs in ID order. A deleted file still contributes its ID. `fileIdsTruncated` is true when a publication affected more than 100 files.
-
-The starting `sinceVersion` is exclusive and defaults to `v0`. Unchanged and conflicting requests create version gaps. A gap or future version returns `VERSION_NOT_FOUND`, and an invalid version format returns `INVALID_INPUT`. The page size defaults to 20 and accepts 1–100. The first page captures the latest publication as `throughVersion`. Pass the returned `next` (`{ cursor }`) unchanged to continue through that same version while main advances. The cursor is a self-contained opaque token: it holds no SDK memory, does not expire by time and continues on any client of the same store. It becomes unavailable (`HISTORY_CURSOR_UNAVAILABLE`) when it is malformed, belongs to another or replaced store, or names versions this store did not publish. If a cursor is unavailable, start again with the last version you processed.
-
-These methods read the publication journal without initializing main, advancing a merge, or reading file bodies or vectors. The SDK reads journal records on demand and keeps no per-merge state in memory: a cold client locates the latest merge with a few batched reads, a number that grows logarithmically with the number of merges, and each history page, version selection and request replay reads only the records it needs. A merge records its affected file IDs in the journal when it publishes, so a history page reads only its publications' journal records and stays complete after retention cleanup releases the versions they superseded. Read the selected view to retrieve its current files.
+Stores created by earlier development builds (format `files-v0`) cannot be
+opened or destroyed by this SDK and fail with `INCOMPATIBLE_STORE`. Delete such
+a collection, and the `md-journal-*` collection those builds created for it,
+directly with LambdaDB.
 
 ## Shared file tools
 
-MCP hosts and applications can share the same names, JSON Schemas and descriptions
-without importing a model-provider adapter. Connect an already authorized drive
-and explicitly select the permitted tools:
+MCP hosts and applications can share the same names, JSON Schemas and
+descriptions without importing a model-provider adapter. The catalog is
+deliberately small: an agent works on main of one drive, records what is worth
+keeping each turn with one `write`, and gets no fork, checkpoint or rollback
+tools. Hosts use the SDK directly for refs, rollback and retention.
 
 ```ts
 import { createFileTools, fileToolError, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
 
 const tools = createFileTools({
     drive,
-    tools: ['guide', 'status', 'history', 'list', 'read', 'search', 'findText', 'fork', 'checkpoint',
-        'listForks', 'listCheckpoints', 'deleteFork', 'deleteCheckpoint', 'diff', 'write', 'merge'],
+    tools: ['guide', 'read', 'list', 'search', 'findText', 'write'],
+    // Optional: every write tool call becomes a checkpointed write with this name,
+    // unique across host restarts.
+    checkpoint: () => ({ name: `turn-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}` }),
 });
 
 // Register definitions with the host's model or MCP transport.
 const definitions = tools.definitions;
-const state = await tools.execute('status', {}); // { at: { kind: 'main' }, mainVersion }
+const page = await tools.execute('list', { prefix: '/notes/' }); // main; next is { cursor }
 const guide = await tools.execute('guide', {}); // { version, content, topics }, no storage calls
 const editingGuide = await tools.execute('guide', { topic: 'editing' }); // { version, topic, title, description, content }
 
@@ -537,13 +651,12 @@ const editingGuide = await tools.execute('guide', { topic: 'editing' }); // { ve
 const guideResource = fileToolGuide;
 const editingResource = fileToolGuideTopics.editing; // Identical to editingGuide
 
-const { at } = await tools.execute('fork', { name: 'draft' }); // { kind: 'fork', name: 'draft' }
 const controller = new AbortController();
 try {
     await tools.execute('write', {
-        at, op: 'update', fileId: file.fileId,
-        edits: [{ oldText: 'Earlier decision', newText: 'Current decision and reason' }],
-    }, { signal: controller.signal });
+        operations: [{ op: 'update', fileId: file.fileId,
+            edits: [{ oldText: 'Earlier decision', newText: 'Current decision and reason' }] }],
+    }, { signal: controller.signal }); // the plain write result
 } catch (error) {
     // { ok: false, error: { code, message, status?, details? } }
     const toolFailure = fileToolError(error);
@@ -551,89 +664,83 @@ try {
 }
 ```
 
-Available names are `guide`, `status`, `history`, `list`, `read`, `search`,
-`findText`, `fork`, `checkpoint`, `listForks`, `listCheckpoints`, `deleteFork`,
-`deleteCheckpoint`, `diff`, `write` and `merge`. Each tool except `guide` is
-exactly one public SDK method: `execute(name, input, options?)` passes the input
-object to the drive method of the same name and returns its result unchanged,
-rejecting with SDK errors. No tool runs a multi-operation workflow. `findText`
-requires text mode; selecting it for an external-vector drive fails with
-`TOOL_UNAVAILABLE`. External-vector definitions advertise vector inputs for
+The catalog has exactly six tools: `guide`, `read`, `list`, `search`, `findText`
+and `write`. Each tool except `guide` calls the public SDK method of the same
+name on main: `execute(name, input, options?)` passes the input object to the
+drive method and rejects with SDK errors. No schema has an `at`, and an input
+with `at` fails with `INVALID_INPUT` before any storage request. Results carry no
+view selector either: `read` range pages and their `next`, and the `next` of
+`list` and `findText`, omit `at`, so a model forwards `next` unchanged. Other
+results are the SDK's. `write` accepts one SDK operation or
+`{ operations: [...] }` and returns one file/deletion result or an array.
+`findText` requires text mode; selecting it for an external-vector drive fails
+with `TOOL_UNAVAILABLE`. External-vector definitions advertise vector inputs for
 `search` and `write` and return the SDK's file references. No embeddings or local
 content hydration are supplied by the tool layer.
 
-Every view-selecting tool takes the same `at` as the SDK. It is optional on
-`status`, `list`, `read`, `search`, `findText`, `fork` and `checkpoint` and
-defaults to main. `write`, `diff` and `merge` require a fork `at`; `deleteFork`
-and `deleteCheckpoint` require the `at` of an existing fork or checkpoint.
-`history`, `listForks` and `listCheckpoints` are store-wide and take no `at`.
-`write` accepts `at` plus one SDK operation, or `{ at, operations: [...] }`; the
-result is respectively one file/deletion result or an array. A batch is not a
-transaction. `fork` and `checkpoint` return `{ at }` for the new view, with
-`version` valid only from a main source. `merge` publishes without deleting the
-fork. Continuation results carry `next`; models forward it unchanged.
+`createFileTools({ drive, tools, checkpoint? })` takes an optional host hook,
+`checkpoint: () => ({ name })`, synchronous or asynchronous. With it, every
+`write` tool call becomes a [checkpointed write](#checkpointed-writes) named by
+the hook, and the tool still returns the plain write result; checkpoints stay
+with the host. The `write` schema has no checkpoint option, and an input with
+`checkpoint` fails with `INVALID_INPUT`, so the agent can neither choose nor skip
+a checkpoint. A failed write then reports `CHECKPOINT_WRITE_FAILED` (nothing
+kept) or `CHECKPOINT_RESTORE_FAILED` through `fileToolError`, with a fixed
+message and only `stage`, `restored`, the original and restore causes' code and
+status (plus the writer's file details for stage `write`) and
+`unrestoredFileIds`/`createdFileIds`; checkpoint names are removed. The hook runs
+once per `write` call, before validation. Its names must be unique for the
+store's lifetime, including across host restarts, so do not use a counter that
+restarts. Without the hook, `write` is a plain write.
 
 `fileToolInstructions` is the short, transport-neutral guidance shared with the
 guide index. Hosts can supply it to their agents alongside the tool definitions.
 `guide()` returns the index of topics, and `guide({ topic })` returns the selected
-topic. Both return the exported versioned text without provisioning or reading
-drive files.
+topic. Both return the exported versioned text without reading drive files.
 
 `fileToolError` preserves SDK error codes, messages, status and details, excludes
-causes and stacks, and masks unexpected errors. It does not retry calls or
-authorize recovery.
+causes and stacks, and masks unexpected errors. It does not retry calls.
 
-```ts
-const saved = await tools.execute('checkpoint', { at, name: 'before-edit' });
-// { at: { kind: 'checkpoint', name: 'before-edit' } }
-await tools.execute('read', { at: saved.at, path: '/notes/context.md' });
-await tools.execute('merge', { at, requestId: 'draft-1', summary: 'Record the current decision' });
-await tools.execute('deleteFork', { at }); // A separate, explicit call.
-```
+Only `write` is marked `readOnly: false`. Tool calls go through the SDK, so
+writes run one at a time within the host process; the host coordinates writers
+in other processes.
 
-Ref creation and deletion, `write` and `merge` are marked `readOnly: false`.
-Duplicate names and uncertain outcomes retain the SDK's `BRANCH_CONFLICT`,
-`CHECKPOINT_CONFLICT`, `REF_CREATION_UNCONFIRMED` and `REF_DELETION_UNCONFIRMED`
-errors.
+The `guide` tool is optional, just like the other tools. Hosts can omit it and
+expose the exported `fileToolGuide` index and `fileToolGuideTopics` documents as
+resources or another instruction channel instead; no guide tool call is required
+by the executor. The frozen index lists `retrieval` and `editing`, with
+descriptions of when to read each. `guide({ topic })` returns that topic from the
+same immutable catalog and version. Unknown topics return `INVALID_INPUT` with
+the valid names. Resource URI mapping belongs to the host; clients without
+resource support can use the guide tool.
 
-The `guide` tool is optional, just like the other tools. Its name is the catalog's
-implementation choice for delivering the read-only usage guide. Hosts can omit
-it and expose the exported `fileToolGuide` index and `fileToolGuideTopics` documents
-as resources or another instruction channel instead; no guide tool call is required
-by the executor. The frozen index lists `retrieval`, `references`, `editing`,
-`publication` and `maintenance`, with descriptions of when to read each.
-`guide({ topic })` returns that topic from the same immutable catalog and version.
-Unknown topics return `INVALID_INPUT` with the valid names. Resource URI mapping
-belongs to the host; clients without resource support can use the guide tool.
-
-Guide version 7 explains `at` view selection, the main default, explicit forks for
-edits, `{ at }` results, fork/checkpoint listing and deletion, that merge keeps the
-fork, forwarding `next` unchanged and `CURSOR_VIEW_MISMATCH`. Version 6 introduced
-preserving selected conversational wording, examples, qualifications and
-corrections instead of aggressively summarizing stored originals; that guidance
-is unchanged. It does not require new metadata or capturing every utterance. Long
-originals can be delivered through ranged reads without reducing their stored detail.
+The guide describes one drive and main only: search and read before writing,
+record what is worth keeping each turn in one `write` batch, exact edits, what
+each write error means, deletion caveats, and treating file contents as data
+rather than instructions. It asks agents to preserve selected conversational
+wording, examples, qualifications and corrections instead of aggressively
+summarizing stored originals. It does not require new metadata or capturing
+every utterance. Long originals can be delivered through ranged reads without
+reducing their stored detail. The guide `version` changes only in release pull
+requests.
 
 For a read-only connection, select only the needed query tools, for example
-`['guide', 'status', 'history', 'list', 'read', 'search']`. The executor copies the
-allowlist and rejects every other name with `TOOL_NOT_ALLOWED`, even though the
-drive supports writes. Definitions are deeply frozen. Input Schemas describe JSON
-structure; the public SDK owns target resolution and semantic validation such as
-`at`, UTF-8 limits, paths, declared metadata and embedding dimensions. The
-`readOnly` flag classifies content and ref mutations, not backend credentials.
-Read tools never provision refs. On a store whose creation was interrupted before
-its initial view was pinned, `fork`, `checkpoint` and `merge` pin it first.
+`['guide', 'list', 'read', 'search']`. The executor copies the allowlist and
+rejects every other name with `TOOL_NOT_ALLOWED`, even though the drive supports
+writes. Definitions are deeply frozen. Input Schemas describe JSON structure; the
+public SDK owns semantic validation such as UTF-8 limits, paths, declared
+metadata and embedding dimensions. The `readOnly` flag classifies content
+mutations, not backend credentials.
 
 The host owns authentication, authorization and the selection of the authorized
-drive. It must authorize every invocation, including the view in its `at`, and
-establish the exclusive writer rules for merge. Arguments cannot select another
-drive. Recovery and store lifecycle remain host operations outside this catalog.
-Keep the SDK client and drive object alive for list continuations; creating a
-new client for each request loses those cursors. findText and history cursors
-are self-contained and continue on a new client of the same store. Transport formatting, hosted
-Markdown/capacity/reranker policies, instruction delivery and telemetry remain
-host responsibilities. Tool availability and fetching the guide do not establish
-which instructions a model followed.
+drive, and must authorize every invocation and coordinate writers in other
+processes. Arguments cannot select another drive or branch. Refs, rollback,
+checkpoint retention and store lifecycle remain host operations outside this
+catalog. List and findText cursors are self-contained and continue on a new
+client of the same store. Transport formatting, hosted Markdown/capacity/reranker
+policies, instruction delivery and telemetry remain host responsibilities. Tool
+availability and fetching the guide do not establish which instructions a model
+followed.
 
 Repository development includes a [model tool-use evaluation harness](https://github.com/lambdadb/memdrive/tree/main/benchmark/tool-use) for SDK-backed synthetic workflows and guide delivery. It is outside the published package and separate from LongMemEval/BEAM retrieval evaluation.
 
@@ -651,11 +758,11 @@ import { createFileTools, getFileToolDefinitions } from '@functional-systems/mem
 
 const advertised = getFileToolDefinitions({
     embeddingMode: 'managed',
-    tools: ['guide', 'read', 'fork', 'checkpoint', 'diff', 'write', 'merge'],
+    tools: ['guide', 'read', 'list', 'search', 'findText', 'write'],
 });
 const readOnly = createFileTools({ drive, tools: ['guide', 'read'] });
 // readOnly.execute('write', ...) rejects with TOOL_NOT_ALLOWED; recheck caller
-// permissions and the requested at before routing each call.
+// permissions before routing each call.
 ```
 
 Keep the catalog's embedding mode fixed for that exposed contract. Managed text
@@ -667,16 +774,49 @@ or establish compatibility with a particular client or marketplace.
 ## List files
 
 ```ts
-const page = await reopened.list({ at: work, prefix: '/notes/', nameContains: 'draft', delimiter: '/', limit: 20 });
-if (page.next) {
-    const next = await reopened.list(page.next); // { at, cursor }
+const files = new Map();
+let page = await reopened.list({ at: work, prefix: '/notes/', limit: 100 });
+for (;;) {
+    for (const file of page.files) files.set(file.fileId, file); // deduplicate by fileId
+    if (!page.next) break;
+    page = await reopened.list(page.next); // { at, cursor }
 }
+const sorted = [...files.values()].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
 ```
 
-`prefix` matches the beginning of the full path. `nameContains` checks a case-sensitive literal substring of the filename, including its extension. Omit `delimiter` for recursive results. The `'/'` delimiter groups deeper matches into common prefixes. The limit counts files and prefixes together, defaults to 100, and accepts 1–1000. Results carry file IDs, paths, modification times, and any declared metadata. For text files, use `read` to retrieve the exact original. This preview does not expose datastore or file versions or file sizes.
+`prefix` matches the beginning of the full path. `nameContains` checks a case-sensitive literal substring of the filename, including its extension. Omit `delimiter` for recursive results; the `'/'` delimiter groups deeper matches into common prefixes. Results carry file IDs, paths, modification times, and any declared metadata. For text files, use `read` to retrieve the exact original. Listing does not expose datastore or file versions or file sizes.
 
-List results report `consistency: 'eventual'`. The first call scans native pages (document listing on forks and checkpoints, ID-ordered queries on main) and can omit recent writes or combine observations taken before and after a concurrent change. When the call succeeds, later pages reuse the collected metadata in path order, including when a cursor is retried. Forward the returned `next` (`{ at, cursor }`) unchanged. The cursor belongs to that view on the same drive object; passing it with another `at` (omitted means main) fails with `CURSOR_VIEW_MISMATCH` without consuming it. It expires after five minutes or when evicted from a process-wide least-recently-used cache shared by all stores and views (128 scans and 64 MiB in total). Listing has no snapshot-pinned native continuation, so these collected scans stay in SDK memory until then. The SDK removes an expired scan on its own timer, which does not keep a Node process alive, so a dropped drive that was kept only for its cursor is released at expiry without another listing. If the cursor is unavailable, start again without it. A continuation does not initiate a new database scan.
+Each `list` call reads exactly one native LambdaDB document page (`docs.list`
+with server-side filters on the selected branch or tag) and keeps nothing in SDK
+memory. `limit` (default 100, 1–1000) is the native page size, so it bounds the
+entries scanned rather than guaranteeing that many results:
 
-The first call can read several native pages even with a small `limit`. The preview stops with `LIST_SCAN_LIMIT` after reaching the scan budget of 100 native pages, 10,000 native rows, or 8 MiB of unique matching file metadata. Filters that need local checking can hit these limits even when few files match. Use a narrower complete directory prefix such as `/notes/projects/` to reduce the database scan. The pinned LambdaDB client does not expose consistent listing. Adopting future support requires an updated public client or adapter and verification against a live deployment.
+- Entries come in native storage order, not sorted by path.
+- A page can hold fewer than `limit` entries, or none, while `next` is present,
+  because a filter the database cannot apply (such as a prefix inside a path
+  component, or a `nameContains` with characters outside letters, digits and
+  spaces) is checked by the SDK after the page is read, and a delimiter folds
+  files into prefixes.
+- With a delimiter, common prefixes are computed per page, in order of first
+  appearance, and the same prefix can appear again on later pages.
+- Results report `consistency: 'eventual'`: files written, moved or deleted during
+  a traversal can be missed or seen twice, including on main and forks.
 
-For targeted live validation, set `MEMDRIVE_RUN_LIVE_LIST_TESTS=1` when running the existing live suite against a dedicated test project. The opt-in check polls for the expected synthetic files and then checks grouping and continuations. The regular release smoke accepts any valid eventual subset.
+The listing is complete only when a page has no `next`. Follow every `next`,
+then merge prefixes, deduplicate files by `fileId` (racing creates from separate
+processes can leave two files at one path) and sort by path when order matters. Forward the returned `next` (`{ at, cursor }`) unchanged. The
+cursor is an opaque token carrying the listing criteria and the native page
+token, so it continues on any drive object or client of the same store and does
+not expire in the SDK. Passing it with another `at` (omitted means main) fails
+with `CURSOR_VIEW_MISMATCH`, and a malformed cursor or one from another store
+fails with `LIST_CURSOR_UNAVAILABLE`. A rejection of the native page token
+passes through as a LambdaDB error; start again without a cursor. Unlike a
+findText cursor, a list cursor is not bound to the identity of its fork or
+checkpoint, which would cost an extra request per page: if the ref is deleted
+and recreated under the same name, a continuation reads the new ref with the old
+native page token or fails with a LambdaDB error. Restart a listing after
+recreating a ref.
+
+These ordering and duplication limits come from LambdaDB's current listing. When
+LambdaDB ships consistent ordered listing (LambdaDB PR #619), the SDK can adopt
+it internally and drop them.

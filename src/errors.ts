@@ -54,3 +54,10 @@ export async function nativeRequest<T>(operation: () => Promise<T>, signal?: Abo
 export const nativeOptions = (signal?: AbortSignal) => signal === undefined ? {} : { signal };
 
 export const mutationOptions = (signal?: AbortSignal) => ({ ...nativeOptions(signal), retries: { strategy: 'none' as const } });
+
+export interface ErrorSummary { code: string; message: string; status?: number; details?: Record<string, unknown> }
+
+/** A serializable summary of an SDK error, without stacks or causes. */
+export const errorSummary = (error: MemDriveError): ErrorSummary => ({ code: error.code, message: error.message,
+    ...(error.status === undefined ? {} : { status: error.status }),
+    ...(error.details === undefined ? {} : { details: error.details }) });
