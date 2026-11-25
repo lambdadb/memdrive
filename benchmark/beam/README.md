@@ -308,6 +308,11 @@ the fixture `list` is always current, so a miss is expected only on LambdaDB.
 
 Totals of the end-of-session fork states count a fork once for every session
 it was still present in; the `final*` fields give the last observation.
+Republication is a per-session count: a file revised in a later session is the
+drive growing, not a publication being redone. The conversation total,
+`republishedWithinSessions`, is the sum of the per-session counts, so a file
+republished within two sessions counts in both and one published once in each
+counts in neither.
 
 `manifest.json` freezes the source hashes, runner and SDK build hashes, source
 commit, backend, model, budgets, instruction text, tool definitions and

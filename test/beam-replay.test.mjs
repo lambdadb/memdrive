@@ -163,7 +163,7 @@ test('a scripted replay records fork, publication, republication, leftovers and 
         sessionsWithoutWrite: 1, turnsWithWrite: 4, turnsWithPublication: 3,
         // Three utterances came after their session's last publication or in a session without one.
         utteranceToPublication: { utterances: 8, followed: 5, afterLast: 3, sameTurn: 3, meanTurns: 0.4, maxTurns: 1 },
-        publications: 3, republishedFiles: 1, republishedFilesIsLowerBound: false,
+        publications: 3, republishedWithinSessions: 1, republishedFilesIsLowerBound: false,
         sessionsEndingWithUnpublishedForks: 3, finalForksRemaining: 2, finalUnpublishedForks: 1, finalUnpublishedChanges: 1, finalPublishedForksLeft: 1,
         listCheck: { ...noList, calls: 1, checked: 1 } });
     assert.deepEqual(summary.smoke, conversationMetrics(results.map(result => result.metrics)));
@@ -371,7 +371,7 @@ test('metrics separate unchanged and failed merges, truncated history and unobse
         unobserved.unpublishedForks, unobserved.unobservedForks], [null, null, null, null, null, null, null]);
     assert.deepEqual(unobserved.utteranceToPublication, { utterances: 1, followed: 0, afterLast: 1, sameTurn: 0, meanTurns: null, maxTurns: null });
     const totals = conversationMetrics([metrics, unobserved]);
-    assert.deepEqual([totals.sessions, totals.sessionsWithoutWrite, totals.publications, totals.republishedFiles, totals.sessionsEndingWithUnpublishedForks,
+    assert.deepEqual([totals.sessions, totals.sessionsWithoutWrite, totals.publications, totals.republishedWithinSessions, totals.sessionsEndingWithUnpublishedForks,
         totals.finalForksRemaining], [2, 1, null, null, null, null]);
     assert.deepEqual(totals.utteranceToPublication, { utterances: 5, followed: 3, afterLast: 2, sameTurn: 1, meanTurns: 1, maxTurns: 2 });
     assert.deepEqual(conversationMetrics([]).publicationLag, { writes: 0, merged: 0, neverMerged: 0, sameTurn: 0, meanTurns: null, maxTurns: null });
@@ -400,6 +400,13 @@ test('a merge that replays an earlier published result is not a new publication'
     assert.deepEqual(unobserved.merges, { published: 2, replayed: 1, unchanged: 0, failed: 0 });
     assert.deepEqual(unobserved.utteranceToPublicationLags, [0, 1, 0]);
     assert.deepEqual(conversationMetrics([observed, unobserved]).merges, { failed: 0, published: 3, replayed: 3, unchanged: 0 });
+    // A file published once in each of two sessions was republished in neither; one published twice in both counts in both.
+    const session = fileIds => sessionMetrics({ userTurns: 1, requests: [], events: [],
+        observation: { publications: fileIds.map((ids, index) => ({ version: `v${index}`, fileIds: ids, fileIdsTruncated: false })), forks: [] } });
+    assert.deepEqual([[['x']], [['x']]].map(session).map(metrics => metrics.republishedFiles), [0, 0]);
+    assert.equal(conversationMetrics([session([['x']]), session([['x']])]).republishedWithinSessions, 0);
+    assert.equal(conversationMetrics([session([['x'], ['x']]), session([['x'], ['x']])]).republishedWithinSessions, 2);
+    assert.equal('republishedFiles' in conversationMetrics([session([['x']])]), false);
 });
 
 test('the Responses transport sends one bounded request and reports only an HTTP status on failure', async () => {

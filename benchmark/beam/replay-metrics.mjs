@@ -146,7 +146,9 @@ export function conversationMetrics(sessions) {
         sessionsWithoutWrite: sessions.filter(session => session.noSuccessfulWrite).length,
         turnsWithWrite: sum('turnsWithWrite'), turnsWithPublication: sum('turnsWithPublication'),
         utteranceToPublication: utteranceSummary(utteranceLags),
-        publications: nullableSum('publications'), republishedFiles: nullableSum('republishedFiles'),
+        // Republication is counted within a session: revising a file in a later session is the drive
+        // growing, not a publication being redone. This is the sum of the per-session counts.
+        publications: nullableSum('publications'), republishedWithinSessions: nullableSum('republishedFiles'),
         republishedFilesIsLowerBound: sessions.some(session => session.republishedFilesIsLowerBound === null) ? null
             : sessions.some(session => session.republishedFilesIsLowerBound),
         sessionsEndingWithUnpublishedForks: sessions.some(session => session.unpublishedForks === null) ? null
