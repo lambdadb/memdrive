@@ -350,8 +350,9 @@ per-session values. A turn is one user utterance.
 `toolUse` describes one model conversation: here a session, and in the
 question stage one question. It is computed from the recorded tool events in
 call order. Every call counts whatever its outcome, except that a call whose
-arguments were not valid JSON has no arguments and is left out of every split
-by argument (it still counts in `toolCallsByName` and in the failure tallies).
+arguments are not a JSON object (invalid JSON, `null`, an array or a scalar,
+which the host or SDK rejects) is left out of every split by argument (it
+still counts in `toolCallsByName` and in the failure tallies).
 `tree` and `list` treat `/` as the whole drive, and `list` also `''`, so a
 prefix like that does not count as narrowing. Per conversation:
 

@@ -43,12 +43,13 @@ const contentChars = result => [result].flat().reduce((sum, file) => sum + (type
 /**
  * How one model conversation (a replay session or one question) explored and read the
  * drive, from its tool events in call order. Calls count whatever their outcome; calls
- * whose arguments were not valid JSON have no arguments and are left out of every split
- * by argument. Characters count only results that reached the model.
+ * whose arguments are not a JSON object (invalid JSON, `null`, an array or a scalar,
+ * all rejected by the host or SDK) are left out of every split by argument.
+ * Characters count only results that reached the model.
  */
 export function toolUse(events) {
     const named = name => events.filter(event => event.name === name);
-    const parsed = list => list.filter(event => event.args !== undefined);
+    const parsed = list => list.filter(event => event.args !== null && typeof event.args === 'object' && !Array.isArray(event.args));
     const trees = parsed(named('tree')), lists = named('list'), reads = parsed(named('read'));
     const listings = parsed(lists).filter(event => event.args.cursor === undefined);
     const firstTree = events.findIndex(event => event.name === 'tree');

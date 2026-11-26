@@ -347,7 +347,7 @@ test('budget, transport and model-response failures stop the conversation and ke
 test('malformed arguments, rejected calls and oversized results reach the model as explicit errors', async t => {
     const files = await prepared(t);
     const script = [['write', '{"op":'], ['merge', {}], ['write', { at: { kind: 'main' }, op: 'create', path: '/a.md', content: 'x' }], ['guide', {}],
-        ['write', { op: 'create', path: '/a.md', content: 'x' }]];
+        ['write', { op: 'create', path: '/a.md', content: 'x' }], ['tree', 'null'], ['list', 'null'], ['read', 'null']];
     const outputs = [];
     const { results, summary } = await runReplay({ manifest: files.manifest, conversation: '7', output: files.output, mode: 'model', instructions: 'none',
         sessions: 1, turns: 1, budget: { ...limits, resultBytes: 300 },
@@ -363,11 +363,16 @@ test('malformed arguments, rejected calls and oversized results reach the model 
     assert.deepEqual(events.map(event => [event.name, event.ok, event.delivered, event.error?.code, typeof event.checkpoint]), [
         ['write', false, true, 'INVALID_JSON', 'undefined'], ['merge', false, true, 'TOOL_NOT_ALLOWED', 'undefined'],
         // A write rejected before it reaches the SDK never asks the host for a checkpoint.
-        ['write', false, true, 'INVALID_INPUT', 'undefined'], ['guide', true, false, undefined, 'undefined'], ['write', true, true, undefined, 'string']]);
+        ['write', false, true, 'INVALID_INPUT', 'undefined'], ['guide', true, false, undefined, 'undefined'], ['write', true, true, undefined, 'string'],
+        ['tree', false, true, 'INVALID_INPUT', 'undefined'], ['list', false, true, 'INVALID_INPUT', 'undefined'], ['read', false, true, 'INVALID_INPUT', 'undefined']]);
     assert.equal(events[0].rawArguments, '{"op":');
     assert.equal('args' in events[0], false);
     assert.equal(typeof events[3].result.content, 'string', 'The undelivered result stays in the record');
-    assert.deepEqual(results[0].metrics.toolErrorsByCode, { INVALID_INPUT: 1, INVALID_JSON: 1, TOOL_NOT_ALLOWED: 1 });
+    assert.deepEqual(results[0].metrics.toolErrorsByCode, { INVALID_INPUT: 4, INVALID_JSON: 1, TOOL_NOT_ALLOWED: 1 });
+    // JSON null arguments are rejected by the SDK and recorded; the tool-use splits skip them instead of failing.
+    assert.deepEqual([outputs.slice(5).map(output => output.error.code), results[0].metrics.toolUse.failedTreesByCode, results[0].metrics.toolUse.list,
+        results[0].metrics.toolUse.read.whole + results[0].metrics.toolUse.read.ranged], [Array(3).fill('INVALID_INPUT'), { INVALID_INPUT: 1 },
+        { listings: 0, continuations: 0, afterTree: 0, withPrefix: 0, withNameContains: 0, withDelimiter: 0, stoppedBeforeEnd: 0 }, 0]);
     assert.deepEqual(results[0].metrics.failedWritesByCode, { INVALID_INPUT: 1, INVALID_JSON: 1 });
     assert.deepEqual([results[0].metrics.writeCalls, results[0].metrics.turnsWithMultipleWriteCalls, results[0].metrics.filesAfter,
         results[0].metrics.latestCheckpointAsExpected], [3, 1, 1, true]);
@@ -579,6 +584,8 @@ test('tool use records first tools, tree and list narrowing, partial listings, r
         call('list', { prefix: '/notes/', nameContains: '', limit: 1 }, { delivered: false, result: page(['/notes/a.md'], 'c3') }),
         call('list', { nameContains: 'decision' }, { result: page([]) }),
         { name: 'list', rawArguments: '{', ok: false, delivered: true, error: { code: 'INVALID_JSON' } },
+        // Valid JSON that is not an object is rejected by the SDK and has no arguments to split by.
+        failed('list', null, 'INVALID_INPUT'), failed('tree', [], 'INVALID_INPUT'), failed('read', 5, 'INVALID_INPUT'),
         call('read', { path: '/a.md' }, { result: { content: 'abc' } }),
         call('read', { paths: ['/a.md', '/b.md'] }, { result: [{ content: 'abc' }, { content: 'de' }] }),
         call('read', { path: '/gone.md' }, { result: null }),
@@ -590,12 +597,12 @@ test('tool use records first tools, tree and list narrowing, partial listings, r
     ];
     const used = toolUse(events);
     assert.deepEqual(used, { firstTool: 'guide', firstNonGuideTool: 'list', tree: { withPrefix: 1, withoutPrefix: 1 },
-        // Four new listings, three after the first tree, and one continuation; the unparseable call is in neither.
+        // Four new listings, three after the first tree, and one continuation; calls without an argument object are in neither.
         list: { listings: 4, continuations: 1, afterTree: 3, withPrefix: 1, withNameContains: 1, withDelimiter: 1, stoppedBeforeEnd: 1 },
         search: 2, findText: 1,
         // Characters of delivered successful results only.
         read: { whole: 3, ranged: 4, wholeChars: 'abc'.length + 'abcde'.length, rangedChars: 'line'.length + 'more'.length },
-        failedTreesByCode: { DATABASE_ERROR: 1 }, failedListsByCode: { INVALID_JSON: 1, LIST_TOO_MANY_FILES: 1 } });
+        failedTreesByCode: { DATABASE_ERROR: 1, INVALID_INPUT: 1 }, failedListsByCode: { INVALID_INPUT: 1, INVALID_JSON: 1, LIST_TOO_MANY_FILES: 1 } });
     assert.deepEqual(toolUseTotals([used, toolUse([]), toolUse([call('guide', {})])]), { conversations: 3,
         firstTool: { guide: 2, none: 1 }, firstNonGuideTool: { list: 1, none: 2 }, tree: used.tree, list: used.list,
         search: { calls: 2, mean: 2 / 3, max: 2 }, findText: { calls: 1, mean: 1 / 3, max: 1 }, withoutSearchOrFindText: 2,
