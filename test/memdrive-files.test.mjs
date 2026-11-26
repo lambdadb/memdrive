@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createRequire } from 'node:module';
-import { create, open } from '@functional-systems/memdrive';
+import { create, fileToolError, open } from '@functional-systems/memdrive';
 import { fileClient } from './helpers/file-client.mjs';
 
 // The CommonJS build is a separate SDK copy with its own branch queues, so it
@@ -405,7 +405,10 @@ test('a large file publishes its original only after all chunk requests succeed'
     assert.equal((await drive.read({ at, fileId: retried.fileId })).content, content);
 });
 
-test('list returns one native page per call in native order, with prefixes computed per page', async () => {
+const queries = calls => calls.filter(call => call.kind === 'query');
+const paths = page => page.files.map(file => file.path);
+
+test('list returns files and folders in one path-ordered sequence, one consistent query per page', async () => {
     const fixture = fileClient();
     const drive = await create({ client: fixture.client, name: 'workspace', metadataSchema: { topic: { type: 'string' } } });
     await drive.fork({ name: 'research' });
@@ -418,54 +421,130 @@ test('list returns one native page per call in native order, with prefixes compu
         request('/notes/Alpha.txt'),
         request('/notes/archive/B [x]*?.txt'),
         request('/notesish/B [x]*?.txt'),
+        request('/notes.md'),
     ] });
     await drive.write({ at: alternate, ...request('/alternate.txt') });
-    assert.deepEqual(await drive.list(), { files: [], prefixes: [], consistency: 'eventual' });
-    assert.deepEqual((await drive.list({ at: alternate })).files.map(file => file.path), ['/alternate.txt']);
+    assert.deepEqual(await drive.list(), { files: [], prefixes: [] });
+    // A file written immediately before is listed: branch listings are consistent reads.
+    const written = await drive.write(request('/just-written.txt'));
+    assert.deepEqual((await drive.list()).files, [{ fileId: written.fileId, path: written.path, modifiedAt: written.modifiedAt }]);
+    // Unicode code point order, not UTF-16 order: U+FF5E sorts before U+1F600, a surrogate pair.
+    await drive.write({ at: alternate, operations: [request('/\u{1F600}.md'), request('/\uFF5E.md')] });
+    assert.deepEqual(paths(await drive.list({ at: alternate })), ['/alternate.txt', '/\uFF5E.md', '/\u{1F600}.md']);
 
-    // Each call is one native page of `limit` documents; a prefix repeats on later pages.
+    // Code point order: '.' < '/' < uppercase < lowercase. Each folder appears once, in
+    // place of its first file, although its files are spread over many records.
+    const before = queries(fixture.calls).length;
     const pages = [];
-    for (let page = await drive.list({ at: research, delimiter: '/', limit: 2 }); ; page = await drive.list(page.next)) {
+    for (let page = await drive.list({ at: research, delimiter: '/', limit: 3 }); ; page = await drive.list(page.next)) {
         pages.push(page);
         if (!page.next) break;
         assert.deepEqual(Object.keys(page.next), ['at', 'cursor']);
         assert.deepEqual(page.next.at, research);
     }
-    assert.deepEqual(pages.map(page => [page.files.map(file => file.path), page.prefixes]), [
-        [['/Root.txt'], ['/notes/']],
-        [[], ['/notes/']],
-        [[], ['/notes/']],
+    assert.deepEqual(pages.map(page => [paths(page), page.prefixes]), [
+        [['/Root.txt', '/notes.md'], ['/notes/']],
         [[], ['/notesish/']],
     ]);
-    assert.deepEqual(pages[0].files, [{ fileId: root.fileId, path: root.path, modifiedAt: root.modifiedAt }]);
-    // Files keep native order rather than path order.
-    assert.deepEqual((await drive.list({ at: research, prefix: '/notes/' })).files.map(file => file.path), [
-        '/notes/B [x]*?.md', '/notes/archive/alpha.txt', '/notes/archive/"quoted"/sample.txt', '/notes/Alpha.txt', '/notes/archive/B [x]*?.txt',
+    assert.deepEqual(pages[0].files[0], { fileId: root.fileId, path: root.path, modifiedAt: root.modifiedAt });
+    // One native query per page.
+    assert.equal(queries(fixture.calls).length - before, pages.length);
+    assert.deepEqual(paths(await drive.list({ at: research, prefix: '/notes/' })), [
+        '/notes/Alpha.txt', '/notes/B [x]*?.md', '/notes/archive/"quoted"/sample.txt', '/notes/archive/B [x]*?.txt', '/notes/archive/alpha.txt',
     ]);
-    assert.deepEqual((await drive.list({ at: research, prefix: '/notes/', delimiter: '/' })).prefixes, ['/notes/archive/']);
+    const grouped = await drive.list({ at: research, prefix: '/notes/', delimiter: '/' });
+    assert.deepEqual([paths(grouped), grouped.prefixes], [['/notes/Alpha.txt', '/notes/B [x]*?.md'], ['/notes/archive/']]);
 
     const filtered = await drive.list({ at: research, prefix: '/notes/', nameContains: 'B [x]*?', delimiter: '/' });
     assert.deepEqual(filtered, { files: [{ fileId: direct.fileId, path: direct.path, modifiedAt: direct.modifiedAt,
-        metadata: { topic: 'synthetic' } }], prefixes: ['/notes/archive/'], consistency: 'eventual' });
-    assert.deepEqual((await drive.list({ at: research, prefix: '/notes/Al', nameContains: 'txt' })).files.map(file => file.path), ['/notes/Alpha.txt']);
-    assert.deepEqual((await drive.list({ at: research, prefix: '/notes/archive/"quoted"/' })).files.map(file => file.path),
-        ['/notes/archive/"quoted"/sample.txt']);
-    const quotedListing = fixture.calls.findLast(call => call.kind === 'list').request;
-    assert.equal(quotedListing.filter.bool[1].queryString.query, '"/notes/archive/"');
+        metadata: { topic: 'synthetic' } }], prefixes: ['/notes/archive/'] });
+    assert.deepEqual(paths(await drive.list({ at: research, prefix: '/notes/Al', nameContains: 'txt' })), ['/notes/Alpha.txt']);
+    assert.deepEqual(paths(await drive.list({ at: research, prefix: '/notes/archive/"quoted"/' })), ['/notes/archive/"quoted"/sample.txt']);
+    // Folder filters are exact, also for names with double quotes.
+    assert.equal(queries(fixture.calls).at(-1).request.query.bool[1].queryString.query, '"/notes/archive/\\"quoted\\"/"');
     assert.deepEqual((await drive.list({ at: research, prefix: '/notes/arch', nameContains: 'archive' })).files, []);
-    assert.deepEqual((await drive.list({ at: research, prefix: '/notes/', nameContains: 'alpha' })).files.map(file => file.path), ['/notes/archive/alpha.txt']);
+    assert.deepEqual(paths(await drive.list({ at: research, prefix: '/notes/', nameContains: 'alpha' })), ['/notes/archive/alpha.txt']);
+    assert.equal(queries(fixture.calls).at(-1).request.query.bool[2].queryString.query, '/.*alpha.*/');
+    // The longest run of letters, digits and spaces narrows the native match; the SDK checks the rest.
+    await drive.list({ at: research, nameContains: '"x":*? Bx [' });
+    assert.equal(queries(fixture.calls).at(-1).request.query.bool[1].queryString.query, '/.* Bx .*/');
 
-    const lists = fixture.calls.filter(call => call.kind === 'list');
-    assert(lists.some(({ request }) => request.pageToken !== undefined));
-    for (const { request } of lists) {
-        assert.equal('consistentRead' in request, false);
-        assert.equal(request.includeVectors, false);
-        assert.deepEqual(request.fields.include, ['id', 'kind', 'fileId', 'path', 'modifiedAt', 'metadata']);
-        assert.equal(request.filter.bool[0].queryString.query, '"file"');
+    for (const { request } of queries(fixture.calls).slice(before)) {
+        assert.deepEqual({ ...request, query: undefined }, { ref: { kind: 'branch', name: 'fork-research' }, consistentRead: true,
+            includeVectors: false, size: 1000, sort: [{ path: 'asc' }, { id: 'asc' }], query: undefined,
+            fields: { include: ['id', 'kind', 'fileId', 'path', 'modifiedAt', 'metadata'] }, facets: { kind: { size: 1 } } });
+        assert.deepEqual(request.query.bool[0], { queryString: { query: '"file"', defaultField: 'kind' }, occur: 'filter' });
     }
 });
 
-test('list cursors are stateless tokens that continue on a fresh drive object and stay bound to their view and store', async t => {
+test('list pages continue from their position: changes between pages never repeat returned entries', async () => {
+    const fixture = fileClient();
+    const drive = await create({ client: fixture.client, name: 'workspace' });
+    const [, , c] = await drive.write({ operations: ['/a.txt', '/b.txt', '/c.txt', '/d.txt'].map(path => request(path)) });
+    const first = await drive.list({ limit: 2 });
+    assert.deepEqual(paths(first), ['/a.txt', '/b.txt']);
+    // Behind the cursor (/aa.txt) is not seen; ahead of it (/bb.txt) is; a deleted file is gone.
+    await drive.write({ operations: [request('/aa.txt'), request('/bb.txt'), { op: 'delete', fileId: c.fileId }] });
+    const second = await drive.list(first.next);
+    assert.deepEqual([paths(second), second.next], [['/bb.txt', '/d.txt'], undefined]);
+    // Deleting the last returned file does not move the position back.
+    const resumed = await drive.list({ limit: 1 });
+    await drive.write({ op: 'delete', fileId: resumed.files[0].fileId });
+    assert.deepEqual(paths(await drive.list(resumed.next)), ['/aa.txt']);
+
+    // A folder position: a file added to a returned folder does not bring it back.
+    await drive.write({ operations: [request('/dir/one.txt'), request('/dir/two.txt'), request('/dz.txt'), request('/e.txt')] });
+    const folders = await drive.list({ prefix: '/d', delimiter: '/', limit: 1 });
+    assert.deepEqual([paths(folders), folders.prefixes], [['/d.txt'], []]);
+    const folder = await drive.list(folders.next);
+    assert.deepEqual([paths(folder), folder.prefixes], [[], ['/dir/']]);
+    await drive.write(request('/dir/zero.txt'));
+    const rest = await drive.list(folder.next);
+    assert.deepEqual([paths(rest), rest.prefixes, rest.next], [['/dz.txt'], [], undefined]);
+
+    // Files sharing a path, as racing creates in separate processes leave them, follow in fileId order.
+    const twins = fixture.seedFiles('workspace', 'main', ['/twin.txt', '/twin.txt']).sort((x, y) => x.fileId < y.fileId ? -1 : 1);
+    const one = await drive.list({ prefix: '/twin', limit: 1 });
+    assert.deepEqual(one.files.map(file => file.fileId), [twins[0].fileId]);
+    assert.deepEqual((await drive.list(one.next)).files.map(file => file.fileId), [twins[1].fileId]);
+});
+
+test('list works on at most 1000 files in its server-side scope and reports more as LIST_TOO_MANY_FILES', async () => {
+    const fixture = fileClient();
+    const drive = await create({ client: fixture.client, name: 'workspace' });
+    const names = Array.from({ length: 1000 }, (_, index) => `/notes/file-${String(index).padStart(4, '0')}.md`);
+    fixture.seedFiles('workspace', 'main', names);
+    const all = await drive.list({ limit: 1000 });
+    assert.deepEqual([all.files.length, all.files.at(-1).path, all.next], [1000, '/notes/file-0999.md', undefined]);
+    fixture.seedFiles('workspace', 'main', ['/notes/decision.md']);
+    const error = await drive.list().catch(cause => cause);
+    assert.equal(error.code, 'LIST_TOO_MANY_FILES');
+    assert.deepEqual(error.details, { maximum: 1000 });
+    assert.match(fileToolError(error).error.message, /More than 1000 files are in this listing's scope: the folder of prefix up to its last "\/".*deeper folder.*search/);
+    // nameContains narrows the scope through its longest run of letters, digits and spaces.
+    assert.deepEqual(paths(await drive.list({ prefix: '/notes/', nameContains: 'decision.md' })), ['/notes/decision.md']);
+    assert.equal(queries(fixture.calls).at(-1).request.query.bool[2].queryString.query, '/.*decision.*/');
+    assert.deepEqual(paths(await drive.list({ nameContains: 'decision' })), ['/notes/decision.md']);
+    // A run that every file name contains, or a prefix ending inside a name, does not narrow it.
+    await assert.rejects(drive.list({ nameContains: '.md' }), { code: 'LIST_TOO_MANY_FILES' });
+    await assert.rejects(drive.list({ prefix: '/notes/dec' }), { code: 'LIST_TOO_MANY_FILES', message: /up to its last "\/"/ });
+    fixture.seedFiles('workspace', 'main', ['/other/keep.md']);
+    assert.deepEqual(paths(await drive.list({ prefix: '/other/' })), ['/other/keep.md']);
+});
+
+test('list orders the native response itself, whatever order it arrives in', async () => {
+    const fixture = fileClient();
+    const drive = await create({ client: fixture.client, name: 'workspace' });
+    await drive.write({ operations: ['/b.txt', '/a/z.txt', '/a.txt', '/c/d.txt'].map(path => request(path)) });
+    const stored = [...fixture.collections.get('workspace').branches.get('main').docs.values()].filter(doc => doc.kind === 'file');
+    const docs = stored.sort((a, b) => a.path < b.path ? 1 : -1).map(doc => ({ collection: 'workspace', doc }));
+    fixture.facetQuery = () => ({ isDocsInline: true, total: docs.length, docs, facets: { kind: { buckets: [{ value: 'file', count: docs.length }] } } });
+    assert.deepEqual(paths(await drive.list()), ['/a.txt', '/a/z.txt', '/b.txt', '/c/d.txt']);
+    const grouped = await drive.list({ delimiter: '/' });
+    assert.deepEqual([paths(grouped), grouped.prefixes], [['/a.txt', '/b.txt'], ['/a/', '/c/']]);
+});
+
+test('list cursors are stateless tokens that continue on a fresh drive object and stay bound to their view, store and criteria', async t => {
     const fixture = fileClient();
     const { client, calls } = fixture;
     const drive = await create({ client, name: 'workspace', metadataSchema: { note: { type: 'string' } } });
@@ -474,41 +553,48 @@ test('list cursors are stateless tokens that continue on a fresh drive object an
         { ...request('/a.txt'), metadata: { note: 'a' } }, request('/b.txt'), request('/c.txt'),
     ] });
     const page = await drive.list({ at: research, limit: 1 });
-    assert.deepEqual(page.files.map(file => file.path), ['/a.txt']);
+    assert.deepEqual(paths(page), ['/a.txt']);
     // No time-based expiry and no process state: a new client continues the same cursor.
     t.mock.method(Date, 'now', () => Date.UTC(2100, 0, 1));
     const fresh = await open({ client: { ...client }, name: 'workspace' });
     const second = await fresh.list(page.next);
-    assert.deepEqual(second.files.map(file => file.path), ['/b.txt']);
+    assert.deepEqual(paths(second), ['/b.txt']);
     assert.deepEqual(await drive.list(page.next), second);
-    assert.equal(calls.findLast(call => call.kind === 'list').request.pageToken, '1');
-    assert.deepEqual((await fresh.list(second.next)).files.map(file => file.path), ['/c.txt']);
+    assert.deepEqual(paths(await fresh.list(second.next)), ['/c.txt']);
 
     const { cursor } = page.next;
+    const decoded = JSON.parse(Buffer.from(cursor.slice(3), 'base64url'));
+    const encode = value => `l2.${Buffer.from(JSON.stringify(value)).toString('base64url')}`;
     await assert.rejects(drive.list({ ...page.next, limit: 2 }), { code: 'INVALID_INPUT' });
     await assert.rejects(drive.list({ cursor }), { code: 'CURSOR_VIEW_MISMATCH' });
     await assert.rejects(drive.list({ at: { kind: 'main' }, cursor }), { code: 'CURSOR_VIEW_MISMATCH' });
     await assert.rejects(drive.list({ at: checkpoint('research'), cursor }), { code: 'CURSOR_VIEW_MISMATCH' });
     await assert.rejects(drive.list({ at: research, cursor: 'invalid' }), { code: 'LIST_CURSOR_UNAVAILABLE' });
-    const tampered = `l1.${Buffer.from(JSON.stringify({ ...JSON.parse(Buffer.from(cursor.slice(3), 'base64url')), l: 5000 })).toString('base64url')}`;
-    await assert.rejects(drive.list({ at: research, cursor: tampered }), { code: 'LIST_CURSOR_UNAVAILABLE' });
+    // Changed criteria or positions, and cursors of the earlier native-page format, are refused.
+    for (const value of [{ ...decoded, l: 5000 }, { ...decoded, p: 'relative' }, { ...decoded, i: undefined }, { ...decoded, k: 'a.txt' },
+        { ...decoded, i: 'file:other' }, { ...decoded, dl: '/', i: undefined, k: '/a.txt' }, { ...decoded, i: undefined, k: '/a/' },
+        { ...decoded, extra: 1 }])
+        await assert.rejects(drive.list({ at: research, cursor: encode(value) }), { code: 'LIST_CURSOR_UNAVAILABLE' }, JSON.stringify(value));
+    await assert.rejects(drive.list({ at: research, cursor: `l1.${cursor.slice(3)}` }), { code: 'LIST_CURSOR_UNAVAILABLE' });
     const other = await create({ client, name: 'other-store' });
     await other.fork({ name: 'research' });
     await assert.rejects(other.list(page.next), { code: 'LIST_CURSOR_UNAVAILABLE' });
 
-    // Checkpoints list their tag snapshot with the same cursors.
+    // Checkpoints list their tag snapshot with the same cursors, without consistent reads.
     const { at: saved } = await drive.checkpoint({ at: research, name: 'saved' });
     await drive.write({ at: research, ...request('/d.txt') });
     const first = await drive.list({ at: saved, limit: 2 });
-    assert.deepEqual(calls.findLast(call => call.kind === 'list').request.ref, { kind: 'tag', name: 'checkpoint-saved' });
-    assert.deepEqual([...first.files, ...(await drive.list(first.next)).files].map(file => file.path), ['/a.txt', '/b.txt', '/c.txt']);
+    assert.deepEqual([queries(calls).at(-1).request.ref, queries(calls).at(-1).request.consistentRead],
+        [{ kind: 'tag', name: 'checkpoint-saved' }, false]);
+    assert.deepEqual([...paths(first), ...paths(await drive.list(first.next))], ['/a.txt', '/b.txt', '/c.txt']);
 });
 
-test('listing fails closed for invalid input, aborts and nonprogress, and passes short pages through', async () => {
+test('listing fails closed for invalid input, aborts and incomplete or uncounted results', async () => {
     const fixture = fileClient();
     const drive = await create({ client: fixture.client, name: 'workspace' });
     await drive.fork({ name: 'research' });
     const [file] = await drive.write({ at: research, operations: [request('/foo/a.txt')] });
+    const before = queries(fixture.calls).length;
     for (const options of [{ prefix: 'relative' }, { prefix: '/foo//bar' }, { prefix: '/foo/../bar' },
         { nameContains: '\uD800' }, { delimiter: '!' }, { limit: 0 }, { limit: 1001 }]) {
         await assert.rejects(drive.list({ at: research, ...options }), { code: 'INVALID_INPUT' });
@@ -517,27 +603,135 @@ test('listing fails closed for invalid input, aborts and nonprogress, and passes
     const ctrl = new AbortController();
     ctrl.abort();
     await assert.rejects(drive.list({ at: research }, { signal: ctrl.signal }), { code: 'ABORTED' });
-    assert.equal(fixture.calls.filter(call => call.kind === 'list').length, 0);
+    assert.equal(queries(fixture.calls).length, before);
 
     const rows = [{ collection: 'workspace', doc: { ...file, kind: 'file', id: `file:${file.fileId}` } }];
-    fixture.listPage = ({ pageToken }) => ({ isDocsInline: true, docs: rows, nextPageToken: pageToken ?? 'first' });
-    const first = await drive.list({ at: research });
-    await assert.rejects(drive.list(first.next), { code: 'INVALID_RESULT' });
-    // An empty native page with a token is returned as an empty page with next.
-    fixture.listPage = ({ pageToken }) => pageToken === undefined
-        ? { isDocsInline: true, docs: [], nextPageToken: 'empty' }
-        : { isDocsInline: true, docs: rows };
-    const empty = await drive.list({ at: research });
-    assert.deepEqual([empty.files, empty.prefixes], [[], []]);
-    assert.deepEqual((await drive.list(empty.next)).files.map(item => item.fileId), [file.fileId]);
+    const counted = count => ({ kind: { buckets: count ? [{ value: 'file', count }] : [] } });
+    for (const result of [
+        { isDocsInline: true, total: 1, docs: rows },
+        { isDocsInline: true, total: 1, docs: rows, facets: counted(2) },
+        { isDocsInline: true, total: 1, docs: rows, facets: counted(0) },
+        { isDocsInline: true, total: 2, docs: [...rows, ...rows], facets: counted(2) },
+        { isDocsInline: true, total: 1, docs: rows, facets: { kind: { buckets: [{ value: 'chunk', count: 1 }] } } },
+    ]) {
+        fixture.facetQuery = () => result;
+        await assert.rejects(drive.list({ at: research }), { code: 'INVALID_RESULT' }, JSON.stringify(result));
+    }
+    fixture.facetQuery = () => ({ isDocsInline: true, total: 1, docs: rows, facets: counted(1) });
+    assert.deepEqual((await drive.list({ at: research })).files.map(item => item.fileId), [file.fileId]);
 
     const background = new AbortController();
-    fixture.listPage = () => {
+    fixture.facetQuery = () => {
         background.abort();
-        return { isDocsInline: true, docs: [] };
+        return { isDocsInline: true, total: 0, docs: [], facets: counted(0) };
     };
     await assert.rejects(drive.list({ at: research }, { signal: background.signal }), { code: 'ABORTED' });
-    assert.strictEqual(fixture.calls.at(-1).signal, background.signal);
+});
+
+test('tree counts files per folder at any depth with one facet query, in path order', async () => {
+    const fixture = fileClient();
+    const drive = await create({ client: fixture.client, name: 'workspace' });
+    await drive.write({ operations: ['/preferences.md', '/projects/a.md', '/projects/b.md', '/projects/alpha/c.md',
+        '/projects/alpha/deep/d.md', '/archive/x.md'].map(path => request(path)) });
+    const before = queries(fixture.calls).length;
+    assert.deepEqual(await drive.tree(), { fileCount: 6, truncated: false, folders: [
+        { path: '/archive/', fileCount: 1 }, { path: '/projects/', fileCount: 4 },
+        { path: '/projects/alpha/', fileCount: 2 }, { path: '/projects/alpha/deep/', fileCount: 1 },
+    ] });
+    assert.deepEqual(queries(fixture.calls).slice(before).map(call => call.request), [{
+        ref: { kind: 'branch', name: 'main' }, consistentRead: true, includeVectors: false, size: 0,
+        query: { bool: [{ queryString: { query: '"file"', defaultField: 'kind' }, occur: 'filter' }] },
+        facets: { ancestorPaths: { size: 100 }, kind: { size: 1 } },
+    }]);
+    // A prefix excludes itself and its ancestors, which the facet counts too.
+    assert.deepEqual(await drive.tree({ prefix: '/projects/' }), { fileCount: 4, truncated: false,
+        folders: [{ path: '/projects/alpha/', fileCount: 2 }, { path: '/projects/alpha/deep/', fileCount: 1 }] });
+    assert.deepEqual(queries(fixture.calls).at(-1).request.query.bool[1],
+        { queryString: { query: '"/projects/"', defaultField: 'ancestorPaths' }, occur: 'filter' });
+    assert.deepEqual(await drive.tree({ at: { kind: 'main' }, prefix: '/projects/alpha/deep/' }), { fileCount: 1, folders: [], truncated: false });
+    assert.deepEqual(await drive.tree({ prefix: '/missing/' }), { fileCount: 0, folders: [], truncated: false });
+    assert.equal(queries(fixture.calls).length - before, 4);
+
+    const calls = fixture.calls.length;
+    for (const invalid of [{ prefix: '/projects' }, { prefix: 'projects/' }, { prefix: '' }, { prefix: '//' }, { prefix: '/a//' },
+        { prefix: '/a/../' }, { prefix: 1 }, { limit: 1 }, { cursor: 'x' }]) {
+        await assert.rejects(drive.tree(invalid), { code: 'INVALID_INPUT' }, JSON.stringify(invalid));
+    }
+    await assert.rejects(drive.tree({}, { signal: AbortSignal.abort() }), { code: 'ABORTED' });
+    assert.equal(fixture.calls.length, calls);
+});
+
+test('tree reports truncation at the bucket limit, reads checkpoints and external stores, and passes budget failures through', async () => {
+    const fixture = fileClient();
+    const drive = await create({ client: fixture.client, name: 'workspace' });
+    // "/" and 101 folders: LambdaDB returns the 100 largest buckets, "/" first, then folders by path.
+    fixture.seedFiles('workspace', 'main', Array.from({ length: 101 }, (_, index) => `/f${String(index).padStart(3, '0')}/x.md`));
+    const wide = await drive.tree();
+    assert.deepEqual([wide.fileCount, wide.folders.length, wide.truncated, wide.folders.at(-1).path], [101, 99, true, '/f098/']);
+
+    const small = await create({ client: fixture.client, name: 'small' });
+    await small.write({ operations: [request('/kept/a.md'), request('/kept/b.md')] });
+    const { at: saved } = await small.checkpoint({ name: 'saved' });
+    await small.write(request('/later/c.md'));
+    assert.deepEqual(await small.tree({ at: saved }), { fileCount: 2, folders: [{ path: '/kept/', fileCount: 2 }], truncated: false });
+    assert.deepEqual([queries(fixture.calls).at(-1).request.ref, queries(fixture.calls).at(-1).request.consistentRead],
+        [{ kind: 'tag', name: 'checkpoint-saved' }, false]);
+    assert.equal((await small.tree()).fileCount, 3);
+    await assert.rejects(small.tree({ at: checkpoint('absent') }), { code: 'CHECKPOINT_NOT_FOUND', status: 404 });
+
+    // LambdaDB rejects an aggregation over too many distinct folders with HTTP 400.
+    fixture.facetBudget = { buckets: 2 };
+    const error = await small.tree().catch(cause => cause);
+    assert.deepEqual([error.code, error.status], ['DATABASE_ERROR', 400]);
+    assert.match(fileToolError(error).error.message, /^LambdaDB rejected the drive tree request\. If the drive has very many or very deep folders, pass a narrower prefix; folders of search hit paths are candidates\.$/);
+    // List counts with a single kind bucket, so the folder budget does not affect it.
+    assert.equal((await small.list()).files.length, 3);
+    fixture.facetBudget = undefined;
+
+    const vectors = await create({ client: fixture.client, name: 'vectors', embedding: { mode: 'external', dimensions: 64, similarity: 'cosine', identity: 'fixture' } });
+    await vectors.write({ op: 'create', path: '/refs/one', content: [1, ...Array(63).fill(0)] });
+    assert.deepEqual(await vectors.tree(), { fileCount: 1, folders: [{ path: '/refs/', fileCount: 1 }], truncated: false });
+
+    fixture.facetQuery = () => ({ isDocsInline: true, total: 0, docs: [], facets: { ancestorPaths: { buckets: [{ value: '/', count: 0 }] } } });
+    await assert.rejects(small.tree(), { code: 'INVALID_RESULT' });
+});
+
+test('tree counts the prefix exactly when its own bucket does not fit, below quoted and very deep prefixes', async () => {
+    const fixture = fileClient();
+    const drive = await create({ client: fixture.client, name: 'workspace' });
+    // 120 sibling folders with more files than the quoted folder.
+    fixture.seedFiles('workspace', 'main', Array.from({ length: 120 }, (_, index) => [1, 2, 3].map(file => `/a/s${index}/${file}.md`)).flat());
+    fixture.seedFiles('workspace', 'main', ['/a/"q"/one.md', '/a/"q"/sub/two.md']);
+    assert.deepEqual(await drive.tree({ prefix: '/a/"q"/' }), { fileCount: 2, folders: [{ path: '/a/"q"/sub/', fileCount: 1 }], truncated: false });
+    assert.equal(queries(fixture.calls).at(-1).request.query.bool[1].queryString.query, JSON.stringify('/a/"q"/'));
+    // 100 folders deep: "/" and the ancestors use every bucket, so folders is empty while the count stays exact.
+    const deep = `/${'d/'.repeat(100)}`;
+    fixture.seedFiles('workspace', 'main', [`${deep}x.md`, `${deep}y.md`]);
+    assert.deepEqual(await drive.tree({ prefix: deep }), { fileCount: 2, folders: [], truncated: true });
+    assert.deepEqual(await drive.tree({ prefix: deep.slice(0, -2) }), { fileCount: 2, folders: [], truncated: true });
+    // Folders in Unicode code point order: U+FF5E before U+1F600, a surrogate pair.
+    const small = await create({ client: fixture.client, name: 'small' });
+    await small.write({ operations: [request('/\u{1F600}/a.md'), request('/\uFF5E/b.md')] });
+    assert.deepEqual((await small.tree()).folders.map(folder => folder.path), ['/\uFF5E/', '/\u{1F600}/']);
+});
+
+test('tree rejects folder counts that exceed the bucket limit, repeat a folder or lack the file count', async () => {
+    const fixture = fileClient();
+    const drive = await create({ client: fixture.client, name: 'workspace' });
+    const result = (buckets, kind = [{ value: 'file', count: 3 }]) => ({ isDocsInline: true, total: 0, docs: [],
+        facets: { ancestorPaths: { buckets }, kind: { buckets: kind } } });
+    fixture.facetQuery = () => result([{ value: '/', count: 3 }, { value: '/a/', count: 2 }]);
+    assert.deepEqual(await drive.tree(), { fileCount: 3, folders: [{ path: '/a/', fileCount: 2 }], truncated: false });
+    for (const invalid of [
+        result(Array.from({ length: 101 }, (_, index) => ({ value: `/f${index}/`, count: 1 }))),
+        result([{ value: '/', count: 3 }, { value: '/a/', count: 2 }, { value: '/a/', count: 1 }]),
+        result([{ value: '/', count: 3 }], []), result([{ value: '/', count: 3 }], [{ value: 'chunk', count: 3 }]),
+        { ...result([{ value: '/', count: 3 }]), facets: { ancestorPaths: { buckets: [] } } },
+        result([{ value: 'a/', count: 1 }]), result([{ value: '/', count: 0 }]), result([{ value: '/', count: 4 }]),
+    ]) {
+        fixture.facetQuery = () => invalid;
+        await assert.rejects(drive.tree(), { code: 'INVALID_RESULT' }, JSON.stringify(invalid.facets));
+    }
 });
 
 test('working edits preserve identity, resolve substitutions against the original, and replace metadata', async () => {
@@ -894,7 +1088,6 @@ test('checkpoints are read-only tag views and forks copy independent state from 
     assert.deepEqual((await reopened.search({ at: saved, query: 'before', rerank: false })).hits,
         [{ ...file, range: { start: 0, end: file.content.length } }]);
     const tagReads = calls.filter(call => call.request?.ref?.kind === 'tag');
-    assert(tagReads.some(call => call.kind === 'list' && !('consistentRead' in call.request)));
     assert(tagReads.some(call => call.kind === 'fetch' && call.request.consistentRead === false));
     assert(tagReads.some(call => call.kind === 'query' && call.request.consistentRead === false));
     assert(tagReads.every(call => call.request.ref.name === 'checkpoint-saved'));

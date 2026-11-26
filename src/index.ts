@@ -1,5 +1,5 @@
 import type { CheckpointAt, CheckpointedWriteResult, ConnectionOptions, CreateExternalFileStoreOptions, CreateFileStoreOptions, EmbeddingMode, FileAt, FileDrive, FileListEntry, FileSearchHit,
-    FileStoreDescription, FindTextRequest, ForkAt, ListFilesRequest, OpenFileStoreOptions, ReadFileRequest, ReadFilesRequest, RequestOptions, SearchExternalFilesRequest,
+    FileStoreDescription, FindTextRequest, ForkAt, ListFilesRequest, TreeRequest, OpenFileStoreOptions, ReadFileRequest, ReadFilesRequest, RequestOptions, SearchExternalFilesRequest,
     SearchFilesRequest, WritableAt, CreateExternalFileRequest, UpdateExternalFileRequest, WriteFileRequest } from './types.js';
 import { checkAbort, databaseError, errorSummary, MemDriveError, mutationOptions, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
 import { isObject, keysOnly, parseStore, snapshotRetentionInDays, storeConfiguration } from './config.js';
@@ -8,6 +8,7 @@ import { branchRef, fetchOriginals, pathQuery, viewRead, type Handle, type ViewR
 import { fileWriter, writeBatchLimit, type WriteTrack } from './writes.js';
 import { searchQuery, validateReranking, vectorSearchQuery } from './search.js';
 import { fileLister } from './list.js';
+import { fileTree } from './tree.js';
 import { fileTextFinder } from './find-text.js';
 import { textChunker } from './text-chunks.js';
 import type { DoclingChunker } from './types.js';
@@ -125,6 +126,7 @@ function store(handle: Handle, description: FileStoreDescription<EmbeddingMode>,
     const decodeRead = dimensions === undefined ? decodeFile : decodeFileEntry;
     const writer = fileWriter(handle, name, metadataSchema, dimensions, chunker);
     const lister = fileLister(handle, name, metadataSchema, cursorStore);
+    const treeReader = fileTree(handle, name);
     const finder = dimensions === undefined ? fileTextFinder(handle, name, metadataSchema, cursorStore, refIncarnation) : undefined;
 
     /** Whether a native GET reports 404. Other failures leave the original error in place. */
@@ -597,6 +599,8 @@ function store(handle: Handle, description: FileStoreDescription<EmbeddingMode>,
             const latest = await latestCheckpoint(branchOf(at), signal);
             return { ...structuredClone(description), latestCheckpoint: latest === null ? null : { at: { kind: 'checkpoint' as const, name: latest } } };
         },
+        tree: (request: unknown = {}, options?: RequestOptions) => onView(request, 'tree accepts only an optional at and prefix.', options,
+            (_at, ref, rest, signal) => treeReader(ref, rest as WithoutAt<TreeRequest>, { signal })),
         list: (request: unknown = {}, options?: RequestOptions) => onView(request, 'Invalid list options.', options,
             (at, ref, rest, signal) => lister(at, ref, rest as WithoutAt<ListFilesRequest>, { signal })),
         read: (request: unknown, options?: RequestOptions) => onView(request, 'Read requires exactly one of fileId, path or paths.', options,

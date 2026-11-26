@@ -20,6 +20,7 @@ export function scriptedAgent(scenario, guide) {
         add('search', { query: 'on-call handoff', mode: 'keyword' });
         add('write', { op: 'create', path: '/notes/on-call-handoff.md', content: `# On-call handoff\n\nAs stated by the user:\n\n> ${handoff}\n` });
     } else if (scenario.id === 'cleanup') {
+        add('tree', {});
         add('list', { prefix: '/import/' });
         add('read', { paths: Object.keys(junk) });
         add('write', previous => ({ operations: previous.map(file => ({ op: 'delete', fileId: file.fileId })) }));

@@ -4,6 +4,23 @@ let lastCreated = 0;
 const createdAt = () => new Date(lastCreated = Math.max(Date.now(), lastCreated + 1));
 // Collection creation times are unique in a process, so every fixture store is a separate generation.
 let generation = 0;
+// Keyword order of LambdaDB: Unicode code points, so surrogate pairs sort after U+E000–U+FFFF.
+const codePoints = (a, b) => {
+    const [x, y] = [a, b].map(value => [...value].map(char => char.codePointAt(0)));
+    for (let index = 0; index < Math.min(x.length, y.length); index++) if (x[index] !== y[index]) return x[index] - y[index];
+    return x.length - y.length;
+};
+// The filter clauses the SDK sends to listing and tree queries.
+function matches(doc, { bool, queryString }) {
+    if (bool) return bool[0]?.occur === 'should' ? bool.some(clause => matches(doc, clause)) : bool.every(clause => matches(doc, clause));
+    const { query, defaultField, skipSyntax } = queryString;
+    if (defaultField === 'kind') return doc.kind === JSON.parse(query);
+    if (defaultField === 'id') return skipSyntax ? doc.id === query : doc.id > /^\{(.+) TO \*\}$/.exec(query)[1];
+    if (defaultField === 'ancestorPaths') return doc.ancestorPaths?.includes(JSON.parse(query));
+    if (defaultField === 'fileName') return doc.fileName?.includes(/^\/\.\*(.*)\.\*\/$/.exec(query)[1]);
+    if (defaultField === 'path') return doc.path === JSON.parse(query);
+    throw new Error('Unexpected faceted or path-sorted query filter');
+}
 
 export function fileClient() {
     const collections = new Map();
@@ -185,6 +202,41 @@ export function fileClient() {
                 async query(request, options) {
                     calls.push({ kind: 'query', request: structuredClone(request) });
                     const source = [...sourceDocs(request.ref).values()];
+                    // Listing and tree queries: keyword sort and facets with LambdaDB's semantics.
+                    if (request.facets !== undefined || request.sort?.some(key => Object.hasOwn(key, 'path'))) {
+                        const facets = Object.entries(request.facets ?? {});
+                        if (!Number.isInteger(request.size) || request.size < 0 || request.size > 1000 || (request.size === 0 && !facets.length)
+                            || facets.length > 5 || facets.some(([, facet]) => facet.size !== undefined && (facet.size < 1 || facet.size > 100)))
+                            fail(400, 'Invalid query size or facets');
+                        if (request.consistentRead && request.ref?.kind === 'tag') fail(400, 'consistentRead requires a branch');
+                        const override = await fixture.facetQuery?.(request, options);
+                        if (override !== undefined) return override;
+                        const selected = source.filter(doc => matches(doc, request.query)).sort((a, b) => {
+                            for (const key of request.sort ?? []) {
+                                const [[field, direction]] = Object.entries(key);
+                                const order = codePoints(a[field], b[field]);
+                                if (order) return direction === 'asc' ? order : -order;
+                            }
+                            return 0;
+                        });
+                        const native = response(selected.slice(0, request.size), request.fields);
+                        if (!facets.length) return native;
+                        // A document counts once per distinct value of an array field. The budget
+                        // covers distinct (field, value) pairs and their bytes across all fields.
+                        const budget = { buckets: 10_000, bytes: 256 * 1024, ...fixture.facetBudget };
+                        let buckets = 0, bytes = 0;
+                        native.facets = Object.fromEntries(facets.map(([field, { size = 10 }]) => {
+                            const counts = new Map();
+                            for (const doc of selected) for (const value of new Set([doc[field]].flat().filter(value => typeof value === 'string')))
+                                counts.set(value, (counts.get(value) ?? 0) + 1);
+                            buckets += counts.size;
+                            for (const value of counts.keys()) bytes += new TextEncoder().encode(value).length;
+                            return [field, { buckets: [...counts].map(([value, count]) => ({ value, count }))
+                                .sort((a, b) => b.count - a.count || codePoints(a.value, b.value)).slice(0, size) }];
+                        }));
+                        if (buckets > budget.buckets || bytes > budget.bytes) fail(400, 'Facet aggregation budget exceeded');
+                        return native;
+                    }
                     if (request.query.bayesian || request.query.knn?.queryText !== undefined
                         || request.query.bool?.some(clause => clause.queryString?.defaultField === 'content')) {
                         const candidates = source.filter(doc => doc.kind === 'chunk');
@@ -259,21 +311,6 @@ export function fileClient() {
                     return response(docs, request.fields);
                 },
                 docs: {
-                    async list(request, options) {
-                        calls.push({ kind: 'list', request: structuredClone(request), signal: options?.signal });
-                        if (fixture.listPage) return fixture.listPage(request);
-                        const filters = request.filter.bool;
-                        const docs = [...sourceDocs(request.ref).values()].filter(doc => filters.every(({ queryString }) => {
-                            const { query, defaultField } = queryString;
-                            if (defaultField === 'fileName') return doc.fileName.includes(query.slice(3, -3));
-                            const expected = JSON.parse(query);
-                            return defaultField === 'ancestorPaths' ? doc.ancestorPaths.includes(expected) : doc.kind === expected;
-                        }));
-                        const start = Number(request.pageToken ?? 0);
-                        const end = Math.min(docs.length, start + (fixture.listPageSize ?? request.size));
-                        return { ...response(docs.slice(start, end), request.fields),
-                            ...(end < docs.length ? { nextPageToken: String(end) } : {}) };
-                    },
                     async fetch(request) {
                         calls.push({ kind: 'fetch', request: structuredClone(request) });
                         const docs = sourceDocs(request.ref);
@@ -305,6 +342,19 @@ export function fileClient() {
                 },
             };
         },
+    };
+    // Store file originals directly, without chunks or SDK calls: for listings of many files.
+    fixture.seedFiles = (collection, branch, paths) => {
+        const docs = collections.get(collection).branches.get(branch).docs;
+        return paths.map(path => {
+            const fileId = globalThis.crypto.randomUUID();
+            const parts = path.slice(1).split('/');
+            const fileName = parts.pop();
+            const ancestorPaths = parts.reduce((list, part) => [...list, `${list.at(-1)}${part}/`], ['/']);
+            const doc = { id: `file:${fileId}`, kind: 'file', fileId, path, fileName, ancestorPaths, modifiedAt: new Date().toISOString(), body: '' };
+            docs.set(doc.id, doc);
+            return { fileId, path, modifiedAt: doc.modifiedAt };
+        });
     };
     return Object.assign(fixture, { client });
 }
