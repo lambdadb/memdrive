@@ -178,7 +178,7 @@ export async function evaluate(context, host, finalText) {
         const added = Object.keys(current).filter(path => !(path in initial.main));
         checks.verbatimRecorded = added.some(path => current[path].includes(handoff));
         checks.existingFilesUnchanged = Object.entries(initial.main).every(([path, content]) => current[path] === content);
-        // The guide asks for one write per turn.
+        // The write description asks for one write call per turn.
         checks.singleWrite = writes.length === 1;
         checks.checkpointedWrites = await checkpointed();
     } else if (id === 'conflict') {

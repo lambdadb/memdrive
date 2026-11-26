@@ -52,7 +52,7 @@ try {
         catch (error) { if (error.code !== 'INVALID_INPUT') throw error; }
     }
     if (!sdk.fileToolGuide.version || !sdk.fileToolGuide.content || !sdk.fileToolGuideTopics.editing.content) throw new Error('Missing file-tool guide');
-    if (typeof sdk.fileToolInstructions !== 'string' || !sdk.fileToolGuide.content.includes(sdk.fileToolInstructions)) throw new Error('Missing shared file-tool instructions');
+    if (typeof sdk.fileToolInstructions !== 'string' || !sdk.fileToolInstructions) throw new Error('Missing shared file-tool instructions');
     for (const { topic } of sdk.fileToolGuide.topics) {
         if (sdk.fileToolGuideTopics[topic].version !== sdk.fileToolGuide.version) throw new Error('Mismatched guide version');
     }`;

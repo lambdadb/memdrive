@@ -113,15 +113,18 @@ on the hosted runner stays in temporary storage for the lifetime of the job.
 | `tool` | Same descriptions plus the optional SDK `guide` index/topic tool | Record index and topic calls |
 | `resource` | Host lists and reads the index and every topic resource, then injects their unchanged text | Record **host** resource reads; this is not an autonomous model fetch |
 
-All channels use the same exported guide version. The current unreleased guide
-text keeps version 7 (the guide version changes only in release pull requests)
-but describes the minimal main-only contract: one drive, search and read before
-writing, one `write` batch per turn in the original wording, exact edits, write
-error codes including the host's checkpointed-write failures, deletion caveats
-and treating file contents as data. It has two topics, `retrieval` and
-`editing`. Earlier guide-7 texts described `at` views, forks, checkpoints and
+All channels use the same exported guide version and the same tool
+descriptions, which carry what ordinary use needs, including when to save. The
+server instructions are the SDK's `fileToolInstructions`, which relate the tools
+without naming `tree`, `findText` or `guide`, plus the benchmark's authorization and reporting
+sentence. The current unreleased guide text keeps version 7 (the guide version
+changes only in release pull requests) and is reference for unusual cases, not
+required reading. It has two topics, `retrieval` and `editing`, described by
+when to read them. Earlier guide-7 texts asked the model to read the guide
+before retrieval or saving, described `at` views, forks, checkpoints and
 rollback, or merge publication, so run directories must be compared by the exact
-guide text recorded in their manifests. Version 6 split
+guide text, prompts and offered definitions recorded in their manifests and
+receipts. Version 6 split
 the guide into an index and five topics and added original-wording preservation
 instructions.
 The tool condition retrieves topics on demand; the resource condition deliberately
@@ -136,9 +139,12 @@ explicit-`at` contract. Protocol `memdrive-tool-use-v2` runs used merge
 publication, `diff`, `status` and `history`. Protocol `memdrive-tool-use-v3`
 runs offered thirteen tools with `at` views, forks, checkpoints and rollback.
 Protocol `memdrive-tool-use-v4` runs offered the main-only catalog without
-`tree`, with an unordered, eventual `list`. None of them validates the current
-catalog (protocol `memdrive-tool-use-v5`), which adds `tree` and lists files in
-path order with consistent reads. `--instruction` independently
+`tree`, with an unordered, eventual `list`. Protocol `memdrive-tool-use-v5` runs added `tree`
+and listed files in path order with consistent reads, but used the earlier wording: the
+instructions asked for a save each turn and for reading the guide, the `write`
+description did not say when to save and the scripted tool channel read the
+guide index and `retrieval` topic first. None of them validates the current
+wording (protocol `memdrive-tool-use-v6`). `--instruction` independently
 selects `server` (default), `workflow` (additional developer workflow text), or
 `user` (an explicit reminder appended to the task). Workflow injection approximates
 a loaded bundled skill; skill discovery/loading itself is not tested. Compare
@@ -182,7 +188,8 @@ example, not a security certification.
 Scripted mode emits predetermined requests and is **only a transport/workflow
 smoke test**; its passes are not model performance. Its paraphrase cases call
 `search`, its control calls `findText` and its cleanup cases call `tree` before
-`list` by construction. Its `modelTasksPassed` is `null`. Injected test transports are also
+`list` by construction. In the tool channel it reads only the `editing` topic,
+before deleting in `cleanup` and after the rejected edit in `conflict`. Its `modelTasksPassed` is `null`. Injected test transports are also
 identified separately and cannot count as real model measurements.
 
 Protocol v4 removed the scenarios that needed refs or rollback from the agent:

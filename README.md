@@ -696,10 +696,18 @@ once per `write` call, before validation. Its names must be unique for the
 store's lifetime, including across host restarts, so do not use a counter that
 restarts. Without the hook, `write` is a plain write.
 
-`fileToolInstructions` is the short, transport-neutral guidance shared with the
-guide index. Hosts can supply it to their agents alongside the tool definitions.
-`guide()` returns the index of topics, and `guide({ topic })` returns the selected
-topic. Both return the exported versioned text without reading drive files.
+Tool names, descriptions and schemas are the only text every client delivers to
+a model, so the descriptions carry everything ordinary use needs, including when
+to use each tool: `write`, for example, says what to save and not to wait to be
+asked. `fileToolInstructions` is an optional, short, transport-neutral supplement
+for server instructions, which clients may drop or shorten. It says what the
+drive is and how the tools relate (search and read before writing, update rather
+than duplicate). It mentions only searching and reading before writing and names
+no tool that only some hosts offer, such as `tree`, `findText` or `guide`, so a
+host can send it with any subset that can search and read. A host that writes or
+extends its own instructions should name only the tools it offers. `guide()` returns the
+index of topics, and `guide({ topic })` returns the selected topic. Both return
+the exported versioned text without reading drive files.
 
 `fileToolError` preserves SDK error codes, messages, status and details, excludes
 causes and stacks, and masks unexpected errors. It does not retry calls.
@@ -708,29 +716,36 @@ Only `write` is marked `readOnly: false`. Tool calls go through the SDK, so
 writes run one at a time within the host process; the host coordinates writers
 in other processes.
 
-The `guide` tool is optional, just like the other tools. Hosts can omit it and
-expose the exported `fileToolGuide` index and `fileToolGuideTopics` documents as
-resources or another instruction channel instead; no guide tool call is required
-by the executor. The frozen index lists `retrieval` and `editing`, with
-descriptions of when to read each. `guide({ topic })` returns that topic from the
-same immutable catalog and version. Unknown topics return `INVALID_INPUT` with
-the valid names. Resource URI mapping belongs to the host; clients without
-resource support can use the guide tool.
+The `guide` tool is optional, just like the other tools. The guide is reference
+for unusual cases, and ordinary searching, reading and saving do not need it.
+Hosts can omit the tool and expose the exported `fileToolGuide` index and
+`fileToolGuideTopics` documents as resources, skills or another instruction
+channel instead; no guide tool call is required by the executor. The frozen
+index lists `retrieval` and `editing`, each described by the situations in which
+to read it, which also suit a skill description. The `guide` tool description
+repeats those conditions, so a model can choose a topic without reading the
+index first. `guide({ topic })` returns that topic from the same immutable
+catalog and version. Unknown topics return `INVALID_INPUT` with the valid names.
+Resource URI mapping belongs to the host; clients without resource support can
+use the guide tool.
 
-The guide describes one drive and main only: search and read before writing,
-record what is worth keeping each turn in one `write` batch, exact edits, what
-each write error means, deletion caveats, and treating file contents as data
-rather than instructions. It asks agents to preserve selected conversational
+The guide describes one drive and main only. Its topics hold procedures and
+explanations the tool descriptions leave out: choosing a search mode, what to do
+when results are missing or too many, folder and listing limits, ranged-read
+pages and cursors (`retrieval`); what counts as a duplicate, keeping both
+statements when new information conflicts with what is saved (the later one is
+current when it updates the earlier one), preserving selected conversational
 wording, examples, qualifications and corrections instead of aggressively
-summarizing stored originals. It does not require new metadata or capturing
-every utterance. Long originals can be delivered through ranged reads without
-reducing their stored detail. The guide `version` changes only in release pull
-requests.
+summarizing them, what each write error means, moves and deletion caveats
+(`editing`). It does not require new metadata or capturing every utterance. Long
+originals can be delivered through ranged reads without reducing their stored
+detail. The guide `version` changes only in release pull requests.
 
 For a read-only connection, select only the needed query tools, for example
 `['guide', 'tree', 'list', 'read', 'search']`. The executor copies the allowlist and
 rejects every other name with `TOOL_NOT_ALLOWED`, even though the drive supports
-writes. Definitions are deeply frozen. Input Schemas describe JSON structure; the
+writes. Descriptions keep their references to related tools in any subset; for
+example, `search` mentions `findText`, `tree` and `list`. Definitions are deeply frozen. Input Schemas describe JSON structure; the
 public SDK owns semantic validation such as UTF-8 limits, paths, declared
 metadata and embedding dimensions. The `readOnly` flag classifies content
 mutations, not backend credentials.
@@ -741,7 +756,8 @@ processes. Arguments cannot select another drive or branch. Refs, rollback,
 checkpoint retention and store lifecycle remain host operations outside this
 catalog. List and findText cursors are self-contained and continue on a new
 client of the same store. Transport formatting, hosted Markdown/capacity/reranker
-policies, instruction delivery and telemetry remain host responsibilities. Tool
+policies, instruction delivery and telemetry remain host responsibilities;
+instructions a host sends should name only the tools it offers. Tool
 availability and fetching the guide do not establish which instructions a model
 followed.
 

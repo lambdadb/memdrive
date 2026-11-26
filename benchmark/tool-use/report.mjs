@@ -5,7 +5,7 @@ import { agentFailureCodes } from './agent.mjs';
 import { summarize } from './run.mjs';
 import { retrievalMetrics } from './scenarios.mjs';
 
-// Protocol v5 offers guide, tree, list, read, search, findText and write; v4 had no tree.
+// Protocols v5 and v6 offer guide, tree, list, read, search, findText and write; v4 had no tree.
 // The ref tools belong to protocol-v3 and earlier run directories; status, history,
 // diff and merge to v1 and v2.
 const toolNames = ['guide', 'tree', 'list', 'read', 'search', 'findText', 'fork', 'checkpoint', 'listForks', 'listCheckpoints',
