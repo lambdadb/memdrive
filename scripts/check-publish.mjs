@@ -3,8 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { appendFileSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { readVersion, parseVersion, PUBLISHED_VERSION } from './version.mjs';
-import { originTag } from './select-release-mode.mjs';
+import { readVersion, parseVersion, originTag, PUBLISHED_VERSION } from './version.mjs';
 
 const git = (root, args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
@@ -26,20 +25,28 @@ export function checkPublish(root, context) {
     const { channel } = parseVersion(version);
     assert(/^[a-f0-9]{40}$/.test(context.sha ?? ''), 'Require the exact event SHA');
     assert.equal(git(root, ['rev-parse', 'HEAD']), context.sha, 'Source SHA must match HEAD');
-    if (context.mode === 'dev' || context.mode === 'verify') {
+    const derived = context.mode === 'dev' || context.mode === 'dev-verify';
+    const verification = context.mode === 'verify' || context.mode === 'dev-verify';
+    if (verification) {
         assert.equal(context.event, 'push', 'Main builds require a push event');
         assert.equal(context.ref, 'refs/heads/main', 'Main builds require the main ref');
-        if (context.mode === 'dev') {
-            assert.equal(channel, 'dev', 'Development publication requires a dev version');
+        if (derived) {
+            assert.equal(channel, 'dev', 'Development verification requires a dev version');
             assert.equal(pkg.memdriveSourceCommit, context.sha, 'Prepared source SHA must match the push');
         } else assert.notEqual(channel, 'dev', 'Verification requires a committed RC or stable version');
     } else {
-        assert.equal(context.mode, 'release', 'Unsupported release mode');
-        assert.equal(context.event, 'release', 'RC/stable publication requires a published GitHub Release');
-        assert.notEqual(channel, 'dev', 'Development versions cannot publish through GitHub Releases');
+        assert(context.mode === 'dev' || context.mode === 'release', 'Unsupported release mode');
+        if (derived) {
+            assert.equal(context.event, 'release', 'Development publication requires a published GitHub prerelease');
+            assert.equal(channel, 'dev', 'Development publication requires a dev version');
+            assert.equal(pkg.memdriveSourceCommit, context.sha, 'Prepared source SHA must match the release');
+        } else {
+            assert.equal(context.event, 'release', 'RC/stable publication requires a published GitHub Release');
+            assert.notEqual(channel, 'dev', 'Development versions cannot publish as RC/stable releases');
+        }
         assert.equal(context.tag, `v${version}`, 'Release tag must match package version');
         assert.equal(context.ref, `refs/tags/${context.tag}`, 'Release ref must match the release tag');
-        assert.equal(context.prerelease, channel === 'rc', 'GitHub prerelease flag must match the version channel');
+        assert.equal(context.prerelease, channel !== 'stable', 'GitHub prerelease flag must match the version channel');
         assert.equal(originTag(root, context.tag), context.sha, 'Origin release tag must identify the exact event SHA');
         assert.equal(git(root, ['rev-parse', `${context.tag}^{commit}`]), context.sha, 'Local release tag must identify HEAD');
     }
@@ -51,7 +58,7 @@ export function checkPublish(root, context) {
     for (const file of ['package.json', 'package-lock.json']) {
         const original = JSON.parse(git(root, ['show', `HEAD:${file}`]));
         const current = JSON.parse(readFileSync(join(root, file), 'utf8'));
-        if (context.mode === 'dev') {
+        if (derived) {
             delete original.version; delete current.version;
             if (file === 'package-lock.json') { delete original.packages[''].version; delete current.packages[''].version; }
         }
@@ -60,8 +67,9 @@ export function checkPublish(root, context) {
     }
     git(root, ['fetch', '--quiet', 'origin', 'main']);
     git(root, ['merge-base', '--is-ancestor', 'HEAD', 'origin/main']);
-    return { pkg, distTag: context.mode === 'verify' ? '' : channel === 'stable' ? 'latest' : channel,
-        smokePrefix: context.mode === 'dev' ? 'LAMBDADB_DEV_' : 'LAMBDADB_PROD_' };
+    // Main pushes only verify; dev, RC and stable versions publish only from authorized GitHub Releases.
+    return { pkg, distTag: verification ? '' : channel === 'stable' ? 'latest' : channel,
+        smokePrefix: derived ? 'LAMBDADB_DEV_' : 'LAMBDADB_PROD_' };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

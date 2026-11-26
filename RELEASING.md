@@ -1,24 +1,27 @@
 # Releasing MemDrive
 
-`@functional-systems/memdrive` follows the LambdaDB TypeScript SDK release flow.
-All packages come from reviewed commits on `main`. The publication workflow uses
-npm Trusted Publishing; ordinary pull request CI has no credentials and cannot
-publish.
+`@functional-systems/memdrive` uses a release flow derived from the LambdaDB
+TypeScript SDK flow, with manually created dev prereleases instead of automatic
+dev builds on every main push. All packages come from reviewed commits on `main`.
+The publication workflow uses npm Trusted Publishing; ordinary pull request CI
+has no credentials and cannot publish.
 
 ## Channels and triggers
 
 | Trigger | Mode | Live environment | npm channel |
 | --- | --- | --- | --- |
-| Main push, committed version tagged on origin | Development build | `dev` | `dev` |
+| Main push, committed version tagged on origin | Development verification | `dev` | None |
 | Main push, committed version not tagged on origin | Release verification | `prod` | None |
+| Published prerelease `vX.Y.Z-dev.N` | Development build | `dev` | `dev` |
 | Published prerelease `vX.Y.Z-rc.N` | Release candidate | `prod` | `rc` |
 | Published release `vX.Y.Z` | Stable release | `prod` | `latest` |
 
 The workflow reads origin tags rather than assuming local tags are current.
-An untagged committed version is verified but not published. Reviewed merges
-whose version is already tagged authorize the configured automatic dev build.
-RC/stable tags and GitHub Releases require explicit authorization. There are no
-development Git tags or GitHub Releases.
+Main pushes never publish: development verification prepares the dev version of
+the pushed commit and validates its installed archive against dev, and release
+verification validates the committed version against production. Dev, RC and
+stable packages publish only from GitHub Releases. Creating any release tag or
+GitHub Release, including a dev prerelease, requires explicit authorization.
 
 ## Versions
 
@@ -38,18 +41,32 @@ commit development versions; CI derives them only in its disposable checkout:
 - After stable `X.Y.Z`, the version is `X.Y.(Z+1)-dev.N`.
 - After `X.Y.Z-rc.M`, the version is `X.Y.Z-dev.N`.
 
-N counts first-parent commits since the newest reachable stable release tag, or
-from the root when there is no stable tag. It restarts after a stable release and
-continues across RCs. A stable release commit itself has N = 0: rerunning its main
-push after tagging skips development validation and publication. If the committed
-version tag appeared after checkout, preparation fetches it before numbering.
-The dev core must be newer than the newest reachable stable release.
+N counts first-parent commits since the newest stable release tag on origin that
+is reachable from the commit, or from the root when there is no stable tag. It
+restarts after a stable release and continues across RCs. Numbering reads origin
+tags, so missing, stale or local-only tags in a checkout do not change it. A stable
+release commit itself has N = 0 and no dev version: rerunning its main push after
+tagging skips development verification, and a dev prerelease of it is rejected.
+The dev core must be newer than the newest reachable stable release, and the
+committed version must be tagged on origin and reachable from the commit.
+
+Print the dev tag of a main commit (default `HEAD`) with the same derivation the
+workflow uses. The helper fetches origin `main` and rejects commits that are not
+on its first-parent history, where each dev number names exactly one commit:
+
+```sh
+node scripts/version.mjs dev
+node scripts/version.mjs dev <commit>
+```
 
 Every published package includes `memdriveSourceCommit`. Development versions
-are deterministic for a source commit. Publication skips a superseded main SHA,
-an identical previously published archive, or a dev version below the current
-`dev` tag. A version collision with a different source or archive fails. Versions
-and release tags are immutable; fixes require a new dev, RC or stable version.
+are deterministic for a source commit. Publication skips an identical previously
+published archive or a dev version below the current `dev` tag. A dev prerelease
+may name any first-parent commit of `main`, not only its tip, provided the commit
+includes this manual dev prerelease workflow; a release runs the workflow of the
+tagged commit, and earlier commits reject dev tags. A version collision
+with a different source or archive fails. Versions and release tags are immutable;
+fixes require a new dev, RC or stable version.
 Prerelease publication preserves the existing `latest` pointer.
 
 The shared tool guide `version` changes only in release pull requests, not for
@@ -69,8 +86,8 @@ the current unreleased value stays until that release pull request.
    must not. Avoid unrelated merges until tagging, or explicitly select the
    verified release commit.
 4. The Release workflow repeats validation against production and publishes the
-   tested archive with `--tag rc` or `--tag latest`. Later main pushes derive dev
-   builds from the tagged version and test against dev.
+   tested archive with `--tag rc` or `--tag latest`. Later main pushes verify the
+   derived dev version against dev without publishing.
 5. Verify npm metadata and install the exact published version independently:
 
    ```sh
@@ -84,13 +101,45 @@ An unqualified install follows `latest`; consumers can explicitly select `@dev`,
 requires explicit authorization. Never overwrite a published version or move its
 release tag.
 
+## Dev prereleases
+
+A dev build publishes only when a maintainer, with authorization, creates a GitHub
+prerelease for a reviewed `main` commit whose committed version is tagged on origin.
+
+1. Pick a commit on `main`, normally one whose main push passed development
+   verification. Its log names the prepared dev version.
+2. Run `node scripts/version.mjs dev <commit>` in an up-to-date clone. It prints the
+   only accepted tag, such as `v0.1.1-dev.3`.
+3. Tag that exact commit with the printed name, push the tag and publish a GitHub
+   Release for it with the prerelease flag set. Dev prereleases share one
+   concurrency group, so their publications are serialized; GitHub may cancel a
+   pending dev prerelease run when a newer one is queued.
+4. The workflow rejects a tag that differs from the derived name, a release without
+   the prerelease flag, a commit off the first-parent history of `main`, a commit
+   whose committed version is untagged on origin and a tagged stable release
+   commit (N = 0). It validates the
+   installed archive against dev and publishes it with `--tag dev`. A dev version
+   below the current `dev` tag is not published; `latest` is never changed.
+5. Verify the registry and install the exact version independently:
+
+   ```sh
+   npm view @functional-systems/memdrive dist-tags --json
+   npm view @functional-systems/memdrive@0.1.1-dev.3 memdriveSourceCommit
+   npm install @functional-systems/memdrive@0.1.1-dev.3
+   ```
+
+Dev tags and their GitHub prereleases are immutable like RC and stable releases.
+
 ## Validation and archive identity
 
 Every mode validates the exact event SHA, package/lock agreement and containment
-in origin's `main`. Release validation also checks the tag on origin and locally,
-its package version and its GitHub prerelease flag. Only generated version/source
-metadata may differ from the reviewed checkout. Verification mode has no npm
-channel and cannot publish.
+in origin's `main`. Release validation, including dev prereleases, also checks the
+tag on origin and locally, its package version and its GitHub prerelease flag.
+Mode selection rejects a dev prerelease with the wrong tag name, prerelease flag
+or a commit off the first-parent history of `main` before the job enters an
+environment. Only generated version/source metadata may
+differ from the reviewed checkout. Verification modes have no npm channel and
+cannot publish.
 
 ```sh
 npm ci
@@ -153,8 +202,17 @@ Each GitHub Environment stores its own `LAMBDADB_PROJECT_API_KEY` secret:
 
 | Environment | Allowed deployment refs |
 | --- | --- |
-| `dev` | Branch `main` |
+| `dev` | Branch `main`, tags `v*-dev.*` |
 | `prod` | Branch `main`, tags `v*` |
+
+The `prod` tag pattern `v*` also matches dev tags. Mode selection therefore never
+selects `prod` for a dev tag: it selects `dev` for every canonical `vX.Y.Z-dev.N`
+tag, and `prod` only for the committed version's own tag, which can never be a dev
+version. Any other tag fails before an environment is used. These checks run from
+the tagged commit, so they hold only for reviewed `main` code: a tag on an
+unreviewed commit runs that commit's workflow and can reach either environment.
+The effective boundary is who can create `v*` tags and publish GitHub Releases;
+restrict `v*` tag creation to authorized maintainers with a tag ruleset.
 
 Use dedicated test projects and project keys, not administrator keys or user
 memory data. Keys are passed only to the live-test step. Local smoke runs read
@@ -170,9 +228,10 @@ The workflow runs on GitHub-hosted Ubuntu with Node.js 24, npm 11.5.1+ and
 provenance. No long-lived npm token is stored in the workflow.
 
 Main pushes share one concurrency group; GitHub may replace a pending push with a
-newer one. Release jobs are grouped by immutable tag. A successful workflow start
-or artifact upload is not publication completion: verify the registry and report
-unperformed checks explicitly.
+newer one. Dev prereleases share one group; RC and stable releases are grouped by
+immutable tag.
+A successful workflow start or artifact upload is not publication completion:
+verify the registry and report unperformed checks explicitly.
 
 ## References
 

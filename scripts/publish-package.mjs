@@ -80,12 +80,6 @@ export async function publishPackage(root, manifestPath, context) {
     assert(distTag, 'Verification mode cannot publish');
     assert.equal(pkg.memdriveSourceCommit, context.sha, 'Prepared source SHA is required');
     const { tarball, integrity } = checkArchive(manifestPath, pkg);
-    const remote = execFileSync('git', ['ls-remote', '--exit-code', 'origin', 'refs/heads/main'],
-        { cwd: root, encoding: 'utf8' }).trim().split(/\s+/)[0];
-    if (context.mode === 'dev' && remote !== pkg.memdriveSourceCommit) {
-        console.log('Skipping superseded main commit');
-        return;
-    }
     const before = await registryPackage(pkg.name);
     const decision = publicationDecision(pkg, before, distTag, integrity);
     if (decision === 'superseded-version') {
