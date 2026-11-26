@@ -4,11 +4,16 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { prepareDevPackage } from '../scripts/prepare-dev-package.mjs';
 import { checkPublish } from '../scripts/check-publish.mjs';
 import { selectReleaseMode } from '../scripts/select-release-mode.mjs';
 import { publicationDecision, checkArchive, publishPackage, waitForPublication } from '../scripts/publish-package.mjs';
 import { setVersion, compareVersions, latestStableTag } from '../scripts/version.mjs';
+
+const versionScript = fileURLToPath(new URL('../scripts/version.mjs', import.meta.url));
+const devTag = (root, ...ref) => execFileSync(process.execPath, [versionScript, 'dev', ...ref],
+    { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
 function fixture(t, version = '0.1.0') {
     const base = mkdtempSync(join(tmpdir(), 'memdrive-release-'));
@@ -37,13 +42,13 @@ function fixture(t, version = '0.1.0') {
     return { root, origin, git, commit, tag, context };
 }
 
-test('main mode selection uses origin tags, rejects other refs, and fails closed on lookup errors', t => {
+test('main pushes only verify, against dev once the committed version is tagged on origin, and fail closed on lookup errors', t => {
     const f = fixture(t);
     assert.deepEqual(selectReleaseMode(f.root, f.context()), { mode: 'verify', environment: 'prod' });
     f.git('tag', 'v0.1.0');
     assert.equal(selectReleaseMode(f.root, f.context()).mode, 'verify');
     f.git('push', 'origin', 'refs/tags/v0.1.0');
-    assert.deepEqual(selectReleaseMode(f.root, f.context()), { mode: 'dev', environment: 'dev' });
+    assert.deepEqual(selectReleaseMode(f.root, f.context()), { mode: 'dev-verify', environment: 'dev' });
     assert.throws(() => selectReleaseMode(f.root, f.context(undefined, { ref: 'refs/heads/feature' })), /requires main/);
     f.git('remote', 'set-url', 'origin', join(f.root, 'missing.git'));
     assert.throws(() => selectReleaseMode(f.root, f.context()), /Could not query origin/);
@@ -53,9 +58,9 @@ test('dev versions count since the reachable stable release and preserve depende
     const f = fixture(t); f.tag('v0.1.0');
     const sha = f.commit('next');
     assert.equal(prepareDevPackage(f.root, sha), '0.1.1-dev.1');
-    const { pkg, distTag, smokePrefix } = checkPublish(f.root, f.context('dev'));
+    const { pkg, distTag, smokePrefix } = checkPublish(f.root, f.context('dev-verify'));
     const lock = JSON.parse(readFileSync(join(f.root, 'package-lock.json')));
-    assert.equal(pkg.memdriveSourceCommit, sha); assert.equal(distTag, 'dev'); assert.equal(smokePrefix, 'LAMBDADB_DEV_');
+    assert.equal(pkg.memdriveSourceCommit, sha); assert.equal(distTag, ''); assert.equal(smokePrefix, 'LAMBDADB_DEV_');
     assert.equal(pkg.version, lock.version); assert.equal(pkg.version, lock.packages[''].version);
     assert.equal(lock.packages['node_modules/pinned'].version, '1.2.3');
     assert.equal(pkg.dependencies.pinned, '1.2.3');
@@ -71,18 +76,71 @@ test('tagged stable reruns skip without changes, and missing tags or incorrect s
     assert.equal(f.git('status', '--porcelain'), '');
 });
 
-test('RC numbering continues across RC tags, starts from root without a stable release, and fetches late tags', t => {
+test('RC numbering continues across RC tags, starts from root without a stable release, and reads origin rather than local tags', t => {
     const f = fixture(t); f.tag('v0.1.0');
     setVersion(f.root, '0.2.0-rc.1'); f.commit('rc1'); f.tag('v0.2.0-rc.1');
     setVersion(f.root, '0.2.0-rc.2'); f.commit('rc2'); f.tag('v0.2.0-rc.2');
     const sha = f.commit('next');
-    f.git('tag', '-d', 'v0.2.0-rc.2');
+    // A missing committed tag and a local-only stable tag must not change numbering.
+    f.git('tag', '-d', 'v0.2.0-rc.2'); f.git('tag', 'v0.1.5', `${sha}~1`);
+    assert.equal(devTag(f.root), 'v0.2.0-dev.3');
     assert.equal(prepareDevPackage(f.root, sha), '0.2.0-dev.3');
-    assert.equal(f.git('tag', '--list', 'v0.2.0-rc.2'), 'v0.2.0-rc.2');
     const noStable = fixture(t, '0.1.0-rc.1'); noStable.tag('v0.1.0-rc.1');
     assert.equal(prepareDevPackage(noStable.root, noStable.commit('next')), '0.1.0-dev.2');
     const rollback = fixture(t); rollback.tag('v0.2.0'); rollback.tag('v0.1.0');
     assert.throws(() => prepareDevPackage(rollback.root, rollback.commit('next')), /newer than/);
+});
+
+const devRelease = (f, tag, extra = {}) => f.context('dev', { event: 'release', ref: `refs/tags/${tag}`, tag, prerelease: true, ...extra });
+
+test('dev prereleases select the dev environment only for the derived tag of a commit with a tagged committed version', t => {
+    const f = fixture(t), stableSha = f.context().sha;
+    f.commit('next'); const sha = f.commit('next2');
+    // Without the committed version tag on origin there is no dev version.
+    assert.throws(() => selectReleaseMode(f.root, devRelease(f, 'v0.1.1-dev.2')), /must exist on origin/);
+    // Annotated tags resolve to their commits.
+    f.git('-c', 'tag.gpgsign=false', 'tag', '-a', '-m', 'v0.1.0', 'v0.1.0', stableSha); f.git('push', 'origin', 'refs/tags/v0.1.0');
+    assert.equal(devTag(f.root), 'v0.1.1-dev.2');
+    assert.equal(devTag(f.root, `${sha}~1`), 'v0.1.1-dev.1');
+    assert.deepEqual(selectReleaseMode(f.root, devRelease(f, 'v0.1.1-dev.2')), { mode: 'dev', environment: 'dev' });
+    assert.throws(() => selectReleaseMode(f.root, devRelease(f, 'v0.1.1-dev.1')), /must be v0\.1\.1-dev\.2/);
+    assert.throws(() => selectReleaseMode(f.root, devRelease(f, 'v0.1.0-dev.2')), /must be v0\.1\.1-dev\.2/);
+    assert.throws(() => selectReleaseMode(f.root, devRelease(f, 'v0.1.1-dev.2', { prerelease: false })), /must be a GitHub prerelease/);
+    // Noncanonical dev-like tags are not dev releases and never match the committed version.
+    assert.throws(() => selectReleaseMode(f.root, devRelease(f, 'v0.1.1-dev.02')), /match the committed version/);
+    // The tagged stable release commit itself has N = 0 and no dev version.
+    f.git('switch', '--detach', stableSha);
+    assert.throws(() => selectReleaseMode(f.root, devRelease(f, 'v0.1.1-dev.0')), /match the committed version/);
+    assert.throws(() => selectReleaseMode(f.root, devRelease(f, 'v0.1.0-dev.1')), /no development version/);
+    assert.throws(() => devTag(f.root), /no development version/);
+});
+
+test('dev prerelease publication requires the exact origin tag, prerelease flag and main containment', async t => {
+    const f = fixture(t); f.tag('v0.1.0'); const sha = f.commit('next');
+    assert.equal(devTag(f.root), 'v0.1.1-dev.1');
+    f.tag('v0.1.1-dev.1');
+    const context = devRelease(f, 'v0.1.1-dev.1');
+    assert.equal(prepareDevPackage(f.root, sha), '0.1.1-dev.1');
+    const { pkg, distTag, smokePrefix } = checkPublish(f.root, context);
+    assert.equal(pkg.memdriveSourceCommit, sha); assert.equal(distTag, 'dev'); assert.equal(smokePrefix, 'LAMBDADB_DEV_');
+    assert.throws(() => checkPublish(f.root, { ...context, prerelease: false }), /prerelease flag/);
+    assert.throws(() => checkPublish(f.root, { ...context, tag: 'v0.1.1-dev.2', ref: 'refs/tags/v0.1.1-dev.2' }), /tag must match/);
+    assert.throws(() => checkPublish(f.root, { ...context, event: 'push' }), /published GitHub prerelease/);
+    assert.throws(() => checkPublish(f.root, { ...context, mode: 'release' }), /cannot publish as RC\/stable/);
+    await assert.rejects(publishPackage(f.root, 'absent-manifest', f.context('dev-verify')), /cannot publish/);
+    const outside = fixture(t); outside.tag('v0.1.0'); outside.git('switch', '-c', 'outside');
+    writeFileSync(join(outside.root, 'unreviewed'), 'unreviewed');
+    outside.git('add', '.'); outside.git('-c', 'commit.gpgsign=false', 'commit', '-m', 'outside');
+    const outsideSha = outside.git('rev-parse', 'HEAD');
+    assert.throws(() => devTag(outside.root), /not a first-parent commit of origin\/main/);
+    assert.throws(() => selectReleaseMode(outside.root, devRelease(outside, 'v0.1.1-dev.1')), /not a first-parent commit of origin\/main/);
+    outside.tag('v0.1.1-dev.1'); prepareDevPackage(outside.root, outsideSha);
+    assert.throws(() => checkPublish(outside.root, devRelease(outside, 'v0.1.1-dev.1')), /merge-base --is-ancestor HEAD origin\/main/);
+    // A commit merged through a second parent would share a dev number with a first-parent commit.
+    outside.git('switch', 'main');
+    outside.git('-c', 'commit.gpgsign=false', 'merge', '--no-ff', '-m', 'merge', 'outside'); outside.git('push', 'origin', 'main');
+    assert.throws(() => devTag(outside.root, outsideSha), /not a first-parent commit/);
+    assert.equal(devTag(outside.root), 'v0.1.1-dev.1');
 });
 
 test('verification has no publication channel and releases require exact tags, refs and prerelease flags', async t => {
@@ -116,9 +174,9 @@ test('release checks reject commits outside main, moved tags and modifications b
     prepareDevPackage(f.root, f.context().sha);
     const pkgFile = join(f.root, 'package.json'), pkg = JSON.parse(readFileSync(pkgFile));
     pkg.dependencies.pinned = '9.9.9'; writeFileSync(pkgFile, JSON.stringify(pkg));
-    assert.throws(() => checkPublish(f.root, f.context('dev')), /beyond generated release metadata/);
+    assert.throws(() => checkPublish(f.root, f.context('dev-verify')), /beyond generated release metadata/);
     writeFileSync(join(f.root, 'LICENSE'), 'modified');
-    assert.throws(() => checkPublish(f.root, f.context('dev')), /Tracked release sources/);
+    assert.throws(() => checkPublish(f.root, f.context('dev-verify')), /Tracked release sources/);
 });
 
 test('publication reruns require the same source and archive, and only dev can skip backwards channel moves', () => {

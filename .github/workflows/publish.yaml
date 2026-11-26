@@ -9,8 +9,9 @@ on:
 permissions:
   contents: read
 
+# Dev prereleases share one group so the dev dist-tag check and publication are serialized.
 concurrency:
-  group: npm-memdrive-${{ github.event_name == 'push' && 'main' || github.event.release.tag_name }}
+  group: npm-memdrive-${{ github.event_name == 'push' && 'main' || contains(github.event.release.tag_name, '-dev.') && 'dev' || github.event.release.tag_name }}
   cancel-in-progress: false
 
 jobs:
@@ -20,14 +21,18 @@ jobs:
       mode: ${{ steps.mode.outputs.mode }}
       environment: ${{ steps.mode.outputs.environment }}
     steps:
+      # Full history lets a dev prerelease be checked against its derived version before any environment is used.
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
-      - name: Select mode from the committed version and origin tags
+      - name: Select mode from the event, the committed version and origin tags
         id: mode
+        env:
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
         run: node scripts/select-release-mode.mjs
 
   publish:
@@ -51,10 +56,10 @@ jobs:
           node-version: '24'
           registry-url: https://registry.npmjs.org
           cache: npm
-      # A rerun of a tagged stable release commit has no next dev build (N = 0).
-      - name: Prepare automatic development version
+      # A main push of a tagged stable release commit has no dev version (N = 0) and is skipped.
+      - name: Prepare development version
         id: dev
-        if: needs.mode.outputs.mode == 'dev'
+        if: needs.mode.outputs.mode == 'dev' || needs.mode.outputs.mode == 'dev-verify'
         run: node scripts/prepare-dev-package.mjs
       - name: Validate channel, source commit and release metadata
         id: release
@@ -91,6 +96,7 @@ jobs:
           name: npm-${{ steps.release.outputs.version }}-${{ github.sha }}
           path: artifacts/release/*
           if-no-files-found: error
+      # Main pushes (verify and dev-verify) never publish.
       - name: Publish tested archive through npm Trusted Publishing
-        if: needs.mode.outputs.mode != 'verify' && steps.dev.outputs.ready != 'false'
+        if: (needs.mode.outputs.mode == 'dev' || needs.mode.outputs.mode == 'release') && steps.dev.outputs.ready != 'false'
         run: node scripts/publish-package.mjs artifacts/release/npm-pack.json
