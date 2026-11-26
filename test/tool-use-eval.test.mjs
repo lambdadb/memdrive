@@ -29,7 +29,8 @@ test('scripted smoke exercises actual SDK state across eight scenarios, three gu
             const result = await runAgent({ host, scenario, guide, instruction, ask: scriptedAgent(scenario, guide) });
             const scored = await evaluate(context, host, result.finalText);
             assert(scored.passed, JSON.stringify({ scenario: scenario.id, guide, instruction, checks: scored.checks }));
-            assert.equal(scored.behavior.guideCalls, guide === 'tool' ? 2 : 0);
+            // Scripted tool-channel runs read the editing topic only before deleting and after a rejected edit.
+            assert.equal(scored.behavior.guideCalls, guide === 'tool' && ['cleanup', 'conflict'].includes(scenario.id) ? 1 : 0);
             assert.equal(scored.behavior.resourceReadsByHost, guide === 'resource' ? 1 + Object.keys(fileToolGuideTopics).length : 0);
             // Scripted paraphrase recall uses ranked search; the literal control uses findText.
             const { firstTool, usedSearch } = retrievalMetrics(host.events);
