@@ -73,7 +73,7 @@ export function summarize(manifest, results, cleanup) {
 
 /**
  * Replay one conversation. `guide: 'off'` leaves the `guide` tool out of the catalog;
- * the instruction text stays the SDK's, which asks for the guide only when it is available.
+ * the instruction text stays the SDK's, which names no tool.
  * Every `write` call is a checkpointed write named by `checkpointName`.
  */
 export async function runReplay({ manifest: manifestFile, conversation, output, mode = 'model', model = 'gpt-6.1-sol', instructions = 'sdk',

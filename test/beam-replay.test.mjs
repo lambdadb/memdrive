@@ -273,14 +273,14 @@ test('the model request holds only utterances, SDK tool definitions and the sele
     assert.deepEqual(policyOnly.requests[0].request.input[0], { role: 'developer', content: policy });
 
     // Without the guide tool the catalog drops it and the SDK instruction text stays as it is:
-    // that text asks for the guide only when it is available.
+    // that text does not mention the guide.
     const unguided = await run('unguided', { instructions: 'sdk', guide: 'off', sessions: 1, turns: 1 });
     const withoutGuide = getFileToolDefinitions({ embeddingMode: 'managed', tools: ['read', 'tree', 'list', 'search', 'findText', 'write'] });
     assert.deepEqual([unguided.manifest.guide, unguided.manifest.tools, unguided.manifest.toolDefinitions, unguided.summary.guide],
         ['off', ['read', 'tree', 'list', 'search', 'findText', 'write'], withoutGuide, 'off']);
     assert.deepEqual(unguided.requests[0].request.tools.map(tool => tool.name), ['read', 'tree', 'list', 'search', 'findText', 'write']);
     assert.deepEqual(unguided.requests[0].request.input[0], { role: 'developer', content: fileToolInstructions });
-    assert.match(fileToolInstructions, /When guide is available/);
+    assert.doesNotMatch(fileToolInstructions, /guide/i);
     await assert.rejects(run('guide', { guide: 'none' }), /--guide on or off/);
     assert.equal(await exists(path.join(files.root, 'guide')), false);
 

@@ -174,9 +174,8 @@ is sent with either setting.
 `--guide on` (default) offers the `guide` tool; `--guide off` leaves it out of
 the allowlist and the definitions, as the `none` guide channel of the
 [tool-use benchmark](../tool-use/README.md) does. The instruction text stays
-the same: `fileToolInstructions` asks for the guide only "when guide is
-available", so it never tells the model to call a tool it lacks. The manifest
-and summary record the setting.
+the same: `fileToolInstructions` names no tool, so it never tells the model to
+call one it lacks. The manifest and summary record the setting.
 
 The runner acts as the host. It connects the tools with `createFileTools` and a
 `checkpoint` hook, so every `write` call is a
