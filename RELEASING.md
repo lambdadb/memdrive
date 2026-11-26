@@ -170,7 +170,8 @@ The basic live scenario creates an isolated collection, checks that native
 snapshot retention is one day and that no other collection was created, and
 forks main. It writes a few short synthetic originals on the fork and on main,
 verifies reads by path and file ID through a freshly opened drive, checks fork
-isolation and duplicate path rejection, follows `list` to completion and
+isolation and duplicate path rejection, follows `list` to completion, checks
+that `tree` and `list` see files written just before and
 exercises managed embeddings and searches with and without native reranking.
 Requests have 60-second limits. Cleanup verifies a native not-found response.
 Missing settings or failed cleanup fail the run. Record the pinned LambdaDB

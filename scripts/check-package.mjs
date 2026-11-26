@@ -43,9 +43,9 @@ try {
     }
     if (sdk.MemDrive.create !== sdk.create || sdk.MemDrive.open !== sdk.open || sdk.MemDrive.destroy !== sdk.destroy) throw new Error('Missing static factory');
     if (Object.keys(sdk.MemDrive).sort().join() !== 'create,destroy,open') throw new Error('Unexpected static factory members');
-    const catalog = sdk.getFileToolDefinitions({ embeddingMode: 'managed', tools: ['guide', 'read', 'list', 'search', 'findText', 'write'] });
-    if (!Object.isFrozen(catalog) || catalog.length !== 6 || catalog.some(tool => tool.inputSchema.properties.at || tool.inputSchema.properties.checkpoint)
-        || catalog[5].name !== 'write' || catalog[5].readOnly !== false || catalog.slice(0, 5).some(tool => !tool.readOnly))
+    const catalog = sdk.getFileToolDefinitions({ embeddingMode: 'managed', tools: ['guide', 'read', 'tree', 'list', 'search', 'findText', 'write'] });
+    if (!Object.isFrozen(catalog) || catalog.length !== 7 || catalog.some(tool => tool.inputSchema.properties.at || tool.inputSchema.properties.checkpoint)
+        || catalog[6].name !== 'write' || catalog[6].readOnly !== false || catalog.slice(0, 6).some(tool => !tool.readOnly))
         throw new Error('Invalid fixed tool catalog');
     for (const removed of ['merge', 'diff', 'status', 'history', 'fork', 'checkpoint', 'listForks', 'listCheckpoints', 'deleteFork', 'deleteCheckpoint', 'rollback']) {
         try { sdk.getFileToolDefinitions({ embeddingMode: 'managed', tools: [removed] }); throw new Error('Removed tool is still listed: ' + removed); }

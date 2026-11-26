@@ -5,9 +5,10 @@ import { agentFailureCodes } from './agent.mjs';
 import { summarize } from './run.mjs';
 import { retrievalMetrics } from './scenarios.mjs';
 
-// Protocol v4 offers guide, list, read, search, findText and write. The ref tools belong to
-// protocol-v3 and earlier run directories; status, history, diff and merge to v1 and v2.
-const toolNames = ['guide', 'list', 'read', 'search', 'findText', 'fork', 'checkpoint', 'listForks', 'listCheckpoints',
+// Protocol v5 offers guide, tree, list, read, search, findText and write; v4 had no tree.
+// The ref tools belong to protocol-v3 and earlier run directories; status, history,
+// diff and merge to v1 and v2.
+const toolNames = ['guide', 'tree', 'list', 'read', 'search', 'findText', 'fork', 'checkpoint', 'listForks', 'listCheckpoints',
     'deleteFork', 'deleteCheckpoint', 'write', 'rollback', 'status', 'history', 'diff', 'merge'];
 // BINDING_CHANGED and REF_DELETED identify errors in protocol-v1 run directories. The HISTORY_*,
 // MERGE_*, LIST_SCAN_LIMIT, REF_*_UNCONFIRMED, HISTORICAL_VIEW_UNAVAILABLE and VERSION_NOT_FOUND
@@ -17,7 +18,7 @@ const toolErrorCodes = [
     'CHECKPOINT_RESTORE_FAILED', 'CHECKPOINT_WRITE_FAILED',
     'CURSOR_VIEW_MISMATCH', 'DATABASE_ERROR', 'EDIT_CONFLICT', 'FILE_NOT_FOUND',
     'FIND_TEXT_CURSOR_UNAVAILABLE', 'HISTORICAL_VIEW_UNAVAILABLE', 'HISTORY_CURSOR_UNAVAILABLE', 'HISTORY_UNAVAILABLE',
-    'INVALID_INPUT', 'INVALID_JSON', 'INVALID_RESULT', 'LIST_CURSOR_UNAVAILABLE', 'LIST_SCAN_LIMIT', 'MERGE_BLOCKED',
+    'INVALID_INPUT', 'INVALID_JSON', 'INVALID_RESULT', 'LIST_CURSOR_UNAVAILABLE', 'LIST_SCAN_LIMIT', 'LIST_TOO_MANY_FILES', 'MERGE_BLOCKED',
     'MERGE_CAPTURE_UNCONFIRMED', 'MERGE_CONFLICT', 'MERGE_REQUEST_CONFLICT', 'MERGE_SOURCE_CONFLICT', 'MERGE_SOURCE_NOT_READY',
     'PATH_AMBIGUOUS', 'PATH_EXISTS', 'READ_VERSION_CHANGED', 'REF_CREATION_UNCONFIRMED',
     'REF_DELETED', 'REF_DELETION_UNCONFIRMED', 'STORE_NOT_FOUND', 'TARGET_NOT_AUTHORIZED', 'TOOL_EXECUTION_FAILED', 'TOOL_NOT_ALLOWED', 'TOOL_UNAVAILABLE',

@@ -4,7 +4,7 @@ import Ajv from 'ajv';
 import { MemDrive, createFileTools, getFileToolDefinitions } from '@functional-systems/memdrive';
 import { fileClient } from './helpers/file-client.mjs';
 
-const names = ['guide', 'read', 'list', 'search', 'findText', 'write'];
+const names = ['guide', 'read', 'tree', 'list', 'search', 'findText', 'write'];
 const fork = { kind: 'fork', name: 'draft' };
 
 test('advertised tool schemas accept main-only SDK inputs and reject view selectors, checkpoints and mode mismatches', () => {
@@ -15,7 +15,7 @@ test('advertised tool schemas accept main-only SDK inputs and reject view select
         const validators = Object.fromEntries(definitions.map(tool => [tool.name, ajv.compile(tool.inputSchema)]));
         const content = external ? [1, ...Array(63).fill(0)] : 'Original';
         const valid = [
-            ['guide', {}], ['guide', { topic: 'editing' }], ['guide', { topic: 'retrieval' }], ['list', {}],
+            ['guide', {}], ['guide', { topic: 'editing' }], ['guide', { topic: 'retrieval' }], ['tree', {}], ['tree', { prefix: '/projects/' }], ['list', {}],
             ['list', { prefix: '/notes/', nameContains: 'plan', delimiter: '/', limit: 1000 }], ['list', { cursor: 'opaque' }],
             ['read', { path: '/plan' }], ['read', { fileId: 'returned-id' }], ['read', { paths: ['/one', '/two'] }],
             ['search', { query: content, limit: 10, filter: { and: [
@@ -44,6 +44,7 @@ test('advertised tool schemas accept main-only SDK inputs and reject view select
             assert(validators[name](input), `${external ? 'vector' : 'text'} ${name}: ${JSON.stringify(validators[name].errors)}`);
         const invalid = [
             ['guide', { topic: 'unknown' }], ['guide', { topic: 'references' }], ['guide', { topic: null }], ['guide', { topic: 'editing', version: '6' }],
+            ['tree', { at: { kind: 'main' } }], ['tree', { prefix: '/', limit: 10 }], ['tree', { cursor: 'opaque' }], ['tree', { prefix: 1 }],
             ['list', { recover: true }], ['list', { at: { kind: 'main' } }], ['list', { at: fork }], ['list', { at: fork, cursor: 'opaque' }],
             ['read', { path: '/one', fileId: 'id' }], ['read', {}], ['read', { at: fork, path: '/one' }], ['read', { at: { kind: 'main' }, path: '/one' }],
             ['read', { paths: ['/one'], maxChars: 20 }], ['read', { path: '/one', offset: 0 }],

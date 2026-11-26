@@ -2,7 +2,7 @@ import { createFileTools, getFileToolDefinitions, fileToolError, fileToolInstruc
 import type { FileToolCheckpoint, FileToolGuideTopic, FileDrive, FileToolDefinition, FileToolErrorResult, FileToolName, FileTools } from '@functional-systems/memdrive';
 
 export async function toolConsumer(drive: FileDrive, external: FileDrive<'external'>, name: string, input: unknown) {
-    const names: readonly FileToolName[] = ['guide', 'read', 'list', 'search', 'findText', 'write'];
+    const names: readonly FileToolName[] = ['guide', 'read', 'tree', 'list', 'search', 'findText', 'write'];
     // @ts-expect-error Publication tools are removed.
     const removed: FileToolName = 'merge';
     // @ts-expect-error Ref and rollback tools are removed; hosts use the SDK directly.

@@ -6,7 +6,6 @@ import { HTTPClient, LambdaDBClient, MemDrive } from '@functional-systems/memdri
 
 const enabled = process.env.MEMDRIVE_RUN_LIVE_TESTS === '1';
 const verifyCheckpoints = process.env.MEMDRIVE_RUN_LIVE_CHECKPOINT_TESTS === '1';
-const verifyListConvergence = process.env.MEMDRIVE_RUN_LIVE_LIST_TESTS === '1';
 const required = ['LAMBDADB_BASE_URL', 'LAMBDADB_PROJECT_NAME', 'LAMBDADB_PROJECT_API_KEY'];
 const options = () => ({ signal: AbortSignal.timeout(60_000) });
 const statusOf = error => error?.status ?? error?.statusCode;
@@ -52,16 +51,16 @@ test('live file store writes main and forks, searches, lists, checkpoints and ro
     const client = new LambdaDBClient(connection);
     const name = `memdrive-smoke-files-${randomUUID().replaceAll('-', '').slice(0, 16)}`;
     let failure, collision = false;
-    // Follow every next and deduplicate by fileId: pages come in native order and can repeat entries.
+    // Follow every next: pages continue the path-ordered sequence without repeats.
     const listAll = async (drive, request) => {
-        const files = new Map(), prefixes = new Set();
+        const files = [], prefixes = [];
         for (let page = await drive.list(request, options()); ; page = await drive.list(page.next, options())) {
-            assert.equal(page.consistency, 'eventual');
-            for (const file of page.files) files.set(file.fileId, file);
-            for (const prefix of page.prefixes) prefixes.add(prefix);
+            files.push(...page.files);
+            prefixes.push(...page.prefixes);
             if (!page.next) break;
         }
-        return { files: [...files.values()].sort((a, b) => a.path < b.path ? -1 : 1), prefixes: [...prefixes].sort() };
+        assert.equal(new Set(files.map(file => file.fileId)).size, files.length, 'A listing repeated a file.');
+        return { files, prefixes };
     };
     try {
         const main = await MemDrive.create({ client, name, metadataSchema: { topic: { type: 'string' } } }, options());
@@ -75,7 +74,8 @@ test('live file store writes main and forks, searches, lists, checkpoints and ro
         // Checkpoints are read-only; the SDK rejects the target before any storage call.
         await assert.rejects(main.write({ at: { kind: 'checkpoint', name: 'never-created' }, op: 'create', path: '/x', content: '' }, options()),
             { code: 'INVALID_INPUT' });
-        assert.deepEqual(await main.list({}, options()), { files: [], prefixes: [], consistency: 'eventual' });
+        assert.deepEqual(await main.list({}, options()), { files: [], prefixes: [] });
+        assert.deepEqual(await main.tree({}, options()), { fileCount: 0, folders: [], truncated: false });
         const research = { kind: 'fork', name: 'research' };
         assert.deepEqual(await main.fork({ name: 'research' }, options()), { at: research });
         const at = research;
@@ -104,55 +104,44 @@ test('live file store writes main and forks, searches, lists, checkpoints and ro
         const nextRange = await reopened.read(firstRange.next, options());
         assert.equal(nextRange.content, content.slice(nextRange.range.start, nextRange.range.end));
         assert.equal(nextRange.revision, firstRange.revision);
-        const listStartedAt = Date.now();
         const reference = ({ fileId, path, modifiedAt, metadata }) => ({
             fileId, path, modifiedAt, ...(metadata === undefined ? {} : { metadata }),
         });
+        // Listings are consistent branch reads in Unicode code point order: 's' sorts before '한'.
         const expected = [reference(nested), reference(original)];
-        let listed = await listAll(reopened, { at, prefix: '/notes/' });
-        t.diagnostic(`Initial list observed ${listed.files.length} file(s).`);
-        assert.deepEqual(listed.files, expected.filter(file => listed.files.some(row => row.fileId === file.fileId)));
-        assert.deepEqual(listed.prefixes, []);
+        assert.deepEqual(await listAll(reopened, { at, prefix: '/notes/' }), { files: expected, prefixes: [] });
         assert.equal((await listAll(main, { prefix: '/notes/' })).files.length, 0);
         // A cursor from the drive returned by create continues on a drive returned by
         // open: both derive the store identity from the same collection creation time.
-        for (const deadline = Date.now() + 120_000; ;) {
-            const page = await main.list({ at, limit: 1 }, options());
-            if (page.next) {
-                await reopened.list(page.next, options());
-                break;
-            }
-            assert(Date.now() < deadline, 'The fork listing never returned a second page.');
-            await sleep(5_000);
-        }
+        const firstPage = await main.list({ at, limit: 1 }, options());
+        assert.deepEqual(firstPage.files, [reference(empty)]);
+        assert.deepEqual(firstPage.next?.at, at);
+        await assert.rejects(reopened.list({ cursor: firstPage.next.cursor }, options()), { code: 'CURSOR_VIEW_MISMATCH' });
+        assert.deepEqual((await reopened.list(firstPage.next, options())).files, [reference(nested)]);
+        // With a delimiter a folder takes one entry; limit 1 puts the file and the folder on separate pages.
+        const grouped = await listAll(reopened, { at, prefix: '/notes/', delimiter: '/', limit: 1 });
+        assert.deepEqual(grouped, { files: [reference(original)], prefixes: ['/notes/sub/'] });
+        assert.deepEqual((await listAll(reopened, { at, prefix: '/notes/', nameContains: 'also' })).files, [reference(nested)]);
+        assert.deepEqual(await reopened.tree({ at }, options()), { fileCount: 3, truncated: false,
+            folders: [{ path: '/notes/', fileCount: 2 }, { path: '/notes/sub/', fileCount: 1 }] });
 
-        // The release smoke checks the eventual contract without a freshness
-        // deadline. The opt-in diagnostic observes convergence in this run.
-        if (verifyListConvergence) {
-            const deadline = listStartedAt + 150_000;
-            while (listed.files.length < expected.length && Date.now() < deadline) {
-                await sleep(Math.min(5_000, Math.max(0, deadline - Date.now())));
-                listed = await listAll(reopened, { at, prefix: '/notes/' });
-            }
-            t.diagnostic(`Expected file set checked ${Date.now() - listStartedAt} ms after the first list request started.`);
-            assert.deepEqual(listed.files, expected);
-            // One native page per call: limit 1 forces several pages, possibly empty ones.
-            const first = await reopened.list({ at, prefix: '/notes/', nameContains: '"draft":*?', delimiter: '/', limit: 1 }, options());
-            assert(first.files.length + first.prefixes.length <= 1);
-            assert.deepEqual(first.next?.at, at);
-            await assert.rejects(reopened.list({ cursor: first.next.cursor }, options()), { code: 'CURSOR_VIEW_MISMATCH' });
-            // The cursor is self-contained and continues on a fresh drive object.
-            const fresh = await MemDrive.open({ client: new LambdaDBClient(connection), name }, options());
-            const files = new Map(first.files.map(file => [file.fileId, file])), prefixes = new Set(first.prefixes);
-            for (let page = await fresh.list(first.next, options()); ; page = await fresh.list(page.next, options())) {
-                for (const file of page.files) files.set(file.fileId, file);
-                for (const prefix of page.prefixes) prefixes.add(prefix);
-                if (!page.next) break;
-            }
-            assert.deepEqual([...files.values()], [reference(original)]);
-            assert.deepEqual([...prefixes], ['/notes/sub/']);
-            assert.deepEqual((await listAll(reopened, { at, prefix: '/notes/', nameContains: 'also' })).files, [reference(nested)]);
-        }
+        // Files written into two folders are counted and listed by the very next calls.
+        await main.write({ operations: [
+            { op: 'create', path: '/projects/b.md', content: 'Second project note.' },
+            { op: 'create', path: '/people/c.md', content: 'A person note.' },
+            { op: 'create', path: '/projects/a.md', content: 'First project note.' },
+        ] }, options());
+        let startedAt = Date.now();
+        const tree = await main.tree({}, options());
+        t.diagnostic(`tree answered ${Date.now() - startedAt} ms after the write returned.`);
+        assert.deepEqual(tree, { fileCount: 4, truncated: false,
+            folders: [{ path: '/people/', fileCount: 1 }, { path: '/projects/', fileCount: 2 }] });
+        startedAt = Date.now();
+        const listedMain = await main.list({}, options());
+        t.diagnostic(`list answered ${Date.now() - startedAt} ms after tree.`);
+        assert.deepEqual(listedMain.files.map(file => file.path), ['/main.txt', '/people/c.md', '/projects/a.md', '/projects/b.md']);
+        assert.deepEqual((await main.list({ delimiter: '/' }, options())), { files: [reference(mainFile)], prefixes: ['/people/', '/projects/'] });
+        assert.deepEqual((await main.tree({ prefix: '/projects/' }, options())), { fileCount: 2, folders: [], truncated: false });
 
         assert.deepEqual(await reopened.read({ at, path }, options()), original);
         assert.equal(original.content, content);
@@ -240,17 +229,8 @@ test('live file store writes main and forks, searches, lists, checkpoints and ro
             }, options());
             await reopened.write({ at, op: 'delete', fileId: nested.fileId }, options());
 
-            // The setup waits for observable file state before calling checkpoint once.
-            const deadline = Date.now() + 150_000;
-            let prepared = false;
-            for (let remaining = deadline - Date.now(); remaining > 0; remaining = deadline - Date.now()) {
-                const listed = await listAll(reopened, { at });
-                prepared = listed.files.some(file => file.fileId === sample.fileId)
-                    && !listed.files.some(file => file.fileId === nested.fileId);
-                if (prepared) break;
-                await sleep(Math.min(5_000, Math.max(0, deadline - Date.now())));
-            }
-            assert(prepared, 'Checkpoint fixture did not reach the expected list state.');
+            const listed = await listAll(reopened, { at });
+            assert(listed.files.some(file => file.fileId === sample.fileId) && !listed.files.some(file => file.fileId === nested.fileId));
             const retained = { kind: 'checkpoint', name: 'retained' };
             assert.deepEqual(await reopened.checkpoint({ at, name: 'retained' }, options()), { at: retained });
             await assert.rejects(reopened.checkpoint({ at, name: 'retained' }, options()), { code: 'CHECKPOINT_CONFLICT' });
@@ -269,7 +249,8 @@ test('live file store writes main and forks, searches, lists, checkpoints and ro
 
             const pinned = await MemDrive.open({ client: new LambdaDBClient(connection), name }, options());
             assert.deepEqual(await pinned.read({ at: retained, fileId: sample.fileId }, options()), sample);
-            assert.equal((await pinned.list({ at: retained }, options())).consistency, 'eventual');
+            assert.deepEqual((await pinned.list({ at: retained }, options())).files.map(file => file.fileId), [sample.fileId, empty.fileId]);
+            assert.equal((await pinned.tree({ at: retained }, options())).fileCount, 2);
             const child = (await pinned.fork({ at: retained, name: 'from-checkpoint' }, options())).at;
             assert.deepEqual(child, { kind: 'fork', name: 'from-checkpoint' });
             assert.deepEqual(await pinned.read({ at: child, fileId: sample.fileId }, options()), sample);

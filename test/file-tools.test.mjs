@@ -3,7 +3,7 @@ import test from 'node:test';
 import { MemDrive, MemDriveError, createFileTools, getFileToolDefinitions, fileToolError, fileToolInstructions, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
 import { fileClient } from './helpers/file-client.mjs';
 
-const all = ['guide', 'read', 'list', 'search', 'findText', 'write'];
+const all = ['guide', 'read', 'tree', 'list', 'search', 'findText', 'write'];
 const draft = { kind: 'fork', name: 'draft' };
 const mutations = calls => calls.filter(call => !['query', 'fetch', 'list', 'tag-get', 'alias-get', 'tag-list', 'branch-list', 'alias-list'].includes(call.kind));
 async function setup(options = {}) {
@@ -12,7 +12,7 @@ async function setup(options = {}) {
     return { fixture, drive };
 }
 
-test('the fixed catalog serves exactly six main-only tools and requires an explicit mode and selection without a drive', () => {
+test('the fixed catalog serves exactly seven main-only tools and requires an explicit mode and selection without a drive', () => {
     const selected = ['write', 'search'];
     const definitions = getFileToolDefinitions({ embeddingMode: 'managed', tools: selected });
     selected.push('read');
@@ -42,6 +42,20 @@ test('the fixed catalog serves exactly six main-only tools and requires an expli
         { embeddingMode: 'managed', tools: ['read'], drive: {} }])
         assert.throws(() => getFileToolDefinitions(options), { code: 'INVALID_INPUT' });
     assert.throws(() => getFileToolDefinitions({ embeddingMode: 'external', tools: ['findText'] }), { code: 'TOOL_UNAVAILABLE' });
+    // tree and list say what they return and when to use them, in both modes.
+    for (const embeddingMode of ['managed', 'external']) {
+        const [tree, list] = getFileToolDefinitions({ embeddingMode, tools: ['tree', 'list'] });
+        assert.match(tree.description, /tree -d, folders only, each with its file count \(including files in its subfolders\)\. It returns no files\./);
+        assert.match(tree.description, /start of a conversation/);
+        assert.match(tree.description, /At most 100 folders/);
+        assert.match(tree.description, /Use list for the files in a folder/);
+        assert.deepEqual(tree.inputSchema.required, []);
+        assert.deepEqual(Object.keys(tree.inputSchema.properties), ['prefix']);
+        assert.match(list.description, /in path order/);
+        assert.match(list.description, /LIST_TOO_MANY_FILES/);
+        assert.doesNotMatch(list.description, /eventual|storage order|deduplicat/i);
+        assert.equal(tree.readOnly, true);
+    }
 });
 
 test('each tool forwards its input object unchanged to the SDK method of the same name and drops view selectors from results', async () => {
@@ -62,7 +76,7 @@ test('each tool forwards its input object unchanged to the SDK method of the sam
         const result = await tools.execute(name, input, { signal });
         assert.deepEqual(calls, [[name, input, { signal }]]);
         assert.equal(calls[0][1], input);
-        // Search and write results carry no view selectors and pass through; read, list and findText drop at.
+        // Search and write results carry no view selectors and pass through; read, tree, list and findText drop at.
         if (name === 'search' || name === 'write') assert.equal(result, results.get(name));
         else assert.deepEqual(result, { from: name, next: { cursor: 'c' } });
     }
@@ -88,6 +102,9 @@ test('tools work on main only: inputs with at are rejected before storage and re
     await assert.rejects(tools.execute('write', { op: 'update', fileId: file.fileId, edits: [{ oldText: 'Monday', newText: 'Wednesday' }] }),
         { code: 'EDIT_CONFLICT' });
     for (const path of ['/a.txt', '/b.txt']) await tools.execute('write', { op: 'create', path, content: 'needle' });
+    assert.deepEqual(await tools.execute('tree', {}), { fileCount: 3, folders: [{ path: '/notes/', fileCount: 1 }], truncated: false });
+    assert.deepEqual(await tools.execute('tree', { prefix: '/notes/' }), { fileCount: 1, folders: [], truncated: false });
+    assert.equal((await tools.execute('tree', { prefix: '/notes' }).catch(fileToolError)).error.code, 'INVALID_INPUT');
     for (const [name, request] of [['list', { limit: 1 }], ['findText', { query: 'needle', limit: 1 }]]) {
         const first = await tools.execute(name, request);
         assert.deepEqual(Object.keys(first.next), ['cursor']);
@@ -225,7 +242,9 @@ test('guide index and both topics share immutable content without accessing the 
     assert.match(fileToolGuideTopics.editing.content, /preserve the original wording/);
     assert.match(fileToolGuideTopics.editing.content, /CHECKPOINT_WRITE_FAILED/);
     assert.match(fileToolGuideTopics.editing.content, /do not claim permanent erasure/);
-    assert.match(fileToolGuideTopics.retrieval.content, /same prefix can appear again/);
+    assert.match(fileToolGuideTopics.retrieval.content, /Call tree to see the folders/);
+    assert.match(fileToolGuideTopics.retrieval.content, /LIST_TOO_MANY_FILES/);
+    assert.doesNotMatch(text, /eventual|storage order|same prefix can appear again|deduplicat/i);
     assert.deepEqual(index.topics.map(item => item.topic), ['retrieval', 'editing']);
     for (const { topic, description } of index.topics) {
         const detail = await tools.execute('guide', { topic });

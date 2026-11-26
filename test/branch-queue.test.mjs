@@ -118,6 +118,7 @@ test('writes on different branches run concurrently and reads never wait', async
     assert.equal((await other.write({ at: fork, ...fileCreate('/fork.txt', 'fork') })).path, '/fork.txt');
     assert.deepEqual(await other.read({ path: '/existing.txt' }), existing);
     assert.equal((await other.list()).files.length, 1);
+    assert.equal((await other.tree()).fileCount, 1);
     assert.equal((await other.search({ query: 'existing', rerank: false })).hits.length, 1);
     assert.equal((await other.findText({ query: 'existing' })).hits.length, 1);
     assert.deepEqual((await other.listForks()).forks.map(entry => entry.at), [fork]);

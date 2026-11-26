@@ -1,6 +1,6 @@
 import type { CheckpointedWriteResult, LambdaDBClient, RollbackResult, WritableAt } from '@functional-systems/memdrive';
 import { create, open, type DriveFile, type FileAt, type ForkAt, type CheckpointAt, type FileFilter, type FindTextResult, type DeleteFileResult,
-    type SearchFilesResult, type ListFilesResult, type FileDrive, type EmbeddingMode, type OpenFileStoreOptions, type FileRef } from '@functional-systems/memdrive';
+    type SearchFilesResult, type ListFilesResult, type TreeFolder, type TreeRequest, type TreeResult, type FileDrive, type EmbeddingMode, type OpenFileStoreOptions, type FileRef } from '@functional-systems/memdrive';
 
 export async function fileConsumer(client: LambdaDBClient, options: OpenFileStoreOptions) {
     const drive: FileDrive = await create({ client, name: 'workspace', metadataSchema: { topic: { type: 'string' } } });
@@ -45,6 +45,20 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     listed.files[0]?.content;
     // @ts-expect-error Continuations are returned as next, not a bare cursor.
     listed.cursor;
+    // @ts-expect-error Listings are path-ordered and consistent on branches; there is no consistency marker.
+    listed.consistency;
+    const treeRequest: TreeRequest = { at, prefix: '/notes/' };
+    const tree: TreeResult = await reopened.tree(treeRequest);
+    const folder: TreeFolder | undefined = tree.folders[0];
+    const counted: number = tree.fileCount + (folder?.fileCount ?? 0);
+    const truncated: boolean = tree.truncated;
+    void counted; void truncated;
+    await reopened.tree();
+    await reopened.tree({ at: { kind: 'checkpoint', name: 'saved' } });
+    // @ts-expect-error A tree is one call; it has no limit or cursor.
+    await reopened.tree({ prefix: '/', limit: 10 });
+    // @ts-expect-error A tree folder carries no files.
+    folder?.files;
     const ranked: SearchFilesResult = await reopened.search({ at, query: 'Task context', filter: topicFilter, rerank: { onFailure: 'returnOriginal' } });
     ranked.hits[0]?.range?.start;
     for (const mode of ['semantic', 'keyword', 'hybrid'] as const) {
@@ -117,6 +131,8 @@ export async function externalFileConsumer(client: LambdaDBClient, options: Open
     const [file] = await drive.write({ at, operations: [{ op: 'create', path: '/note', content: vector }] });
     const reopened: FileDrive<'external'> = await open({ client, name: 'workspace', mode: 'external' });
     const reference = await reopened.read({ at, fileId: file!.fileId });
+    const vectorTree: TreeResult = await reopened.tree({ at });
+    void vectorTree;
     await reopened.write({ at, op: 'update', fileId: file!.fileId, content: vector, newPath: '/updated' });
     const hits = await drive.search({ query: vector, filter: topicFilter });
     const results: false = hits.reranked;
