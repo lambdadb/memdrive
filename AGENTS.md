@@ -11,6 +11,6 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before changes and [RELEASING.md](RELEAS
 - Keep the LambdaDB dependency pinned and use its public API. Adapt the SDK deliberately when the native client changes.
 - Keep credentials and personal memory content out of source, logs, fixtures and package archives.
 - Validate changed behavior, public types and the installed package. Distinguish unit tests, package checks and live integration; one does not establish the others.
-- Follow the native SDK release flow in RELEASING.md: tagged-version main pushes publish dev builds, untagged-version pushes verify against production, and authorized GitHub Releases publish RC/stable versions. Keep committed versions stable or RC; derive dev versions only in disposable publication checkouts. Never publish prereleases to `latest`.
+- Follow the release flow in RELEASING.md: main pushes only verify (against dev when the committed version is tagged, otherwise against production), and authorized GitHub prereleases or Releases publish dev, RC and stable versions. Keep committed versions stable or RC; derive dev versions only in disposable publication checkouts. Never publish prereleases to `latest`.
 
 Before submission, inspect all changed files against the base and run the applicable commands in CONTRIBUTING.md. Do not commit generated distributions, tarballs, local reports or scratch scripts.

@@ -51,10 +51,9 @@ const { hits, reranked } = await reopened.search({ at: work, query: 'Task contex
 `MemDrive.create` and `MemDrive.open` return a drive object for the store. Each
 request selects its view with `at`: `{ kind: 'main' }`, `{ kind: 'fork', name }`
 or `{ kind: 'checkpoint', name }`. Omitting `at` selects main. Main and forks are
-writable LambdaDB branches; a checkpoint is a read-only LambdaDB tag. `read`,
-`search` and `findText` on main and forks use consistent branch reads, so they
-see a write as soon as it succeeds; `list` is eventual and can lag behind
-writes (see [List files](#list-files)). Results that identify a view, such as range pages, created forks and
+writable LambdaDB branches; a checkpoint is a read-only LambdaDB tag. `tree`,
+`list`, `read`, `search` and `findText` on main and forks use consistent branch
+reads, so they see a write as soon as it succeeds. Results that identify a view, such as range pages, created forks and
 checkpoints and continuations, always carry an explicit `at`, including
 `{ kind: 'main' }`.
 
@@ -113,7 +112,7 @@ order:
 The queues are shared by every drive object of the same store in the process; a
 store recreated under the same name gets new ones. A queue exists only while it
 has pending calls. Calls on different branches run concurrently. Reads (`read`,
-`list`, `search`, `findText`, `listForks`, `listCheckpoints`, `describe`),
+`tree`, `list`, `search`, `findText`, `listForks`, `listCheckpoints`, `describe`),
 `deleteCheckpoint` and forks or checkpoints taken from a checkpoint never wait. A
 call that fails or is aborted does not hold up the next one; aborting a waiting
 call rejects it with `ABORTED` before it sends anything. `MemDrive.destroy` waits
@@ -160,12 +159,15 @@ LambdaDB lacks; callers build them when they need them.
   caller inspects the files before retrying. Fork, checkpoint, deletion and
   rollback requests are sent once; an error without an HTTP status may have
   taken effect.
-- **Eventual, unordered listing.** `list` returns one native page per call in
-  storage order; see [List files](#list-files).
+- **Listings of at most 1,000 files.** `list` reads every matching file in one
+  query, so a listing that matches more fails with `LIST_TOO_MANY_FILES`; see
+  [List files](#list-files). `tree` returns at most 100 folder buckets per call, including the prefix and
+  its ancestors.
 
 When LambdaDB adds merge, conditional writes (`if-match`/`if-none-match`),
-consistent ordered listing, substring filters or point-in-time reads (`asOf`),
-the SDK can expose or use them.
+consistent ordered listing (which lifts the 1,000-file listing limit), more facet
+buckets, substring filters or point-in-time reads (`asOf`), the SDK can expose or
+use them.
 
 ## Structured text chunking
 
@@ -635,7 +637,7 @@ import { createFileTools, fileToolError, fileToolGuide, fileToolGuideTopics } fr
 
 const tools = createFileTools({
     drive,
-    tools: ['guide', 'read', 'list', 'search', 'findText', 'write'],
+    tools: ['guide', 'read', 'tree', 'list', 'search', 'findText', 'write'],
     // Optional: every write tool call becomes a checkpointed write with this name,
     // unique across host restarts.
     checkpoint: () => ({ name: `turn-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}` }),
@@ -643,6 +645,7 @@ const tools = createFileTools({
 
 // Register definitions with the host's model or MCP transport.
 const definitions = tools.definitions;
+const folders = await tools.execute('tree', {}); // { fileCount, folders, truncated } of main
 const page = await tools.execute('list', { prefix: '/notes/' }); // main; next is { cursor }
 const guide = await tools.execute('guide', {}); // { version, content, topics }, no storage calls
 const editingGuide = await tools.execute('guide', { topic: 'editing' }); // { version, topic, title, description, content }
@@ -664,8 +667,8 @@ try {
 }
 ```
 
-The catalog has exactly six tools: `guide`, `read`, `list`, `search`, `findText`
-and `write`. Each tool except `guide` calls the public SDK method of the same
+The catalog has exactly seven tools: `guide`, `read`, `tree`, `list`, `search`,
+`findText` and `write`. Each tool except `guide` calls the public SDK method of the same
 name on main: `execute(name, input, options?)` passes the input object to the
 drive method and rejects with SDK errors. No schema has an `at`, and an input
 with `at` fails with `INVALID_INPUT` before any storage request. Results carry no
@@ -725,7 +728,7 @@ reducing their stored detail. The guide `version` changes only in release pull
 requests.
 
 For a read-only connection, select only the needed query tools, for example
-`['guide', 'list', 'read', 'search']`. The executor copies the allowlist and
+`['guide', 'tree', 'list', 'read', 'search']`. The executor copies the allowlist and
 rejects every other name with `TOOL_NOT_ALLOWED`, even though the drive supports
 writes. Definitions are deeply frozen. Input Schemas describe JSON structure; the
 public SDK owns semantic validation such as UTF-8 limits, paths, declared
@@ -758,7 +761,7 @@ import { createFileTools, getFileToolDefinitions } from '@functional-systems/mem
 
 const advertised = getFileToolDefinitions({
     embeddingMode: 'managed',
-    tools: ['guide', 'read', 'list', 'search', 'findText', 'write'],
+    tools: ['guide', 'read', 'tree', 'list', 'search', 'findText', 'write'],
 });
 const readOnly = createFileTools({ drive, tools: ['guide', 'read'] });
 // readOnly.execute('write', ...) rejects with TOOL_NOT_ALLOWED; recheck caller
@@ -771,52 +774,93 @@ mode rejects `findText`. Transport registration, catalog caching and changing a
 published contract belong to the host. This API does not implement MCP transport
 or establish compatibility with a particular client or marketplace.
 
+## Explore folders with tree
+
+```ts
+const tree = await reopened.tree(); // main, the whole drive
+// { fileCount: 5, truncated: false, folders: [{ path: '/projects/', fileCount: 4 },
+//   { path: '/projects/alpha/', fileCount: 1 }] }
+await reopened.tree({ at: work, prefix: '/projects/' }); // one folder of a fork
+```
+
+`tree` is like the shell's `tree -d`: it returns folders only, each with its file
+count, and no files. A folder's `fileCount` includes the files in its subfolders,
+and the top-level `fileCount` counts every file under `prefix`. `prefix` is an
+absolute folder path ending in `/` and defaults to `/`; anything else fails with
+`INVALID_INPUT`. `folders` holds the folders below `prefix` at any depth, in path
+order, without `prefix` itself or its ancestors.
+
+Each call is one LambdaDB query with facets on the `ancestorPaths` and `kind`
+fields of file records (`size: 0`, so no file record or content is read), with a
+consistent read on main and forks. It works in managed and external embedding
+modes. The `kind` facet counts the files under `prefix` exactly. LambdaDB returns
+at most 100 `ancestorPaths` buckets, the most populated first, and the prefix and
+its ancestors use buckets too. `truncated` is `true` when all 100 were used, so
+less populated folders may be missing; call `tree` with a subfolder as prefix to
+see them. Below a prefix about 100 folders deep the ancestors use every bucket,
+so `folders` is empty with `truncated: true` while `fileCount` stays exact. The
+counts in `folders` are exact. A prefix, including one with double quotes, is
+matched exactly.
+
+LambdaDB rejects an aggregation over more than 10,000 distinct folders or 256 KiB
+of folder paths with HTTP 400. `tree` reports any HTTP 400 as `DATABASE_ERROR`
+with status 400 and a message suggesting a narrower prefix; LambdaDB's response
+does not identify the budget case reliably, so it has no code of its own. On such
+a drive, `list` with a delimiter can also exceed its 1,000-file limit, so neither
+names a folder to narrow to: take candidate folders from the paths of `search`
+hits and call `tree` with one as prefix.
+
 ## List files
 
 ```ts
-const files = new Map();
+const files = [];
 let page = await reopened.list({ at: work, prefix: '/notes/', limit: 100 });
 for (;;) {
-    for (const file of page.files) files.set(file.fileId, file); // deduplicate by fileId
+    files.push(...page.files); // in path order
     if (!page.next) break;
     page = await reopened.list(page.next); // { at, cursor }
 }
-const sorted = [...files.values()].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
 ```
 
-`prefix` matches the beginning of the full path. `nameContains` checks a case-sensitive literal substring of the filename, including its extension. Omit `delimiter` for recursive results; the `'/'` delimiter groups deeper matches into common prefixes. Results carry file IDs, paths, modification times, and any declared metadata. For text files, use `read` to retrieve the exact original. Listing does not expose datastore or file versions or file sizes.
+`prefix` matches the beginning of the full path. `nameContains` checks a case-sensitive literal substring of the filename, including its extension. Omit `delimiter` for recursive results; the `'/'` delimiter shows each immediate subfolder once in `prefixes` instead of its files. Results carry file IDs, paths, modification times, and any declared metadata. For text files, use `read` to retrieve the exact original. Listing does not expose datastore or file versions or file sizes. Use `tree` for folder structure and file counts; `list` has no total count.
 
-Each `list` call reads exactly one native LambdaDB document page (`docs.list`
-with server-side filters on the selected branch or tag) and keeps nothing in SDK
-memory. `limit` (default 100, 1–1000) is the native page size, so it bounds the
-entries scanned rather than guaranteeing that many results:
+Each call is one LambdaDB query that reads the listing fields of every matching
+file record, sorted by path, with a consistent read on main and forks, so a file
+written just before is listed. LambdaDB selects the files below the folder of
+`prefix` up to its last `/` whose names contain the longest run of letters,
+digits and spaces in `nameContains`; the SDK then checks the exact prefix and
+substring:
 
-- Entries come in native storage order, not sorted by path.
-- A page can hold fewer than `limit` entries, or none, while `next` is present,
-  because a filter the database cannot apply (such as a prefix inside a path
-  component, or a `nameContains` with characters outside letters, digits and
-  spaces) is checked by the SDK after the page is read, and a delimiter folds
-  files into prefixes.
-- With a delimiter, common prefixes are computed per page, in order of first
-  appearance, and the same prefix can appear again on later pages.
-- Results report `consistency: 'eventual'`: files written, moved or deleted during
-  a traversal can be missed or seen twice, including on main and forks.
+- Files and folder prefixes form one sequence in Unicode code point order of their
+  paths, the order LambdaDB sorts keywords in. A folder takes the place of its
+  first file. Files that share a path, which racing creates in separate
+  processes can leave, follow in `fileId` order.
+- `limit` (default 100, 1–1000) counts files and prefixes together. Every page
+  but the last is full, and `next` is present exactly when more entries follow.
+- One listing works on at most 1,000 file records selected by LambdaDB. The same
+  query counts them with a `kind` facet, so more fail with `LIST_TOO_MANY_FILES`
+  (details `{ maximum: 1000 }`) instead of returning a partial result. Pass a
+  prefix ending at a deeper folder, or use `search` or `findText` to find
+  content. A prefix narrows the count only at a `/` boundary and `nameContains`
+  only through its letters, digits and spaces: `{ prefix: '/notes/dec' }`
+  counts every file below `/notes/`, while `{ prefix: '/notes/', nameContains:
+  'decision.md' }` counts the files whose names contain `decision`.
 
-The listing is complete only when a page has no `next`. Follow every `next`,
-then merge prefixes, deduplicate files by `fileId` (racing creates from separate
-processes can leave two files at one path) and sort by path when order matters. Forward the returned `next` (`{ at, cursor }`) unchanged. The
-cursor is an opaque token carrying the listing criteria and the native page
-token, so it continues on any drive object or client of the same store and does
-not expire in the SDK. Passing it with another `at` (omitted means main) fails
-with `CURSOR_VIEW_MISMATCH`, and a malformed cursor or one from another store
-fails with `LIST_CURSOR_UNAVAILABLE`. A rejection of the native page token
-passes through as a LambdaDB error; start again without a cursor. Unlike a
-findText cursor, a list cursor is not bound to the identity of its fork or
-checkpoint, which would cost an extra request per page: if the ref is deleted
-and recreated under the same name, a continuation reads the new ref with the old
-native page token or fails with a LambdaDB error. Restart a listing after
-recreating a ref.
+Forward the returned `next` (`{ at, cursor }`) unchanged. The cursor is an opaque
+token carrying the listing criteria and the last returned path (with its file ID,
+or as a folder prefix), so it continues on any drive object or client of the
+same store and does not expire. Each page re-runs the query and returns the
+entries after that position, so it reflects the view at the time of that call:
+files written or deleted between pages appear or disappear on later pages, and
+an entry already returned is not repeated, except that a file moved past the
+position appears again at its new path. On a checkpoint the view is immutable.
+A continuation can fail with `LIST_TOO_MANY_FILES` when files were added
+meanwhile. Passing a cursor with another `at` (omitted means main) fails with
+`CURSOR_VIEW_MISMATCH`, and a malformed cursor, one from another store or one
+from an earlier SDK version fails with `LIST_CURSOR_UNAVAILABLE`. A list cursor
+is not bound to the identity of its fork or checkpoint: after a ref is deleted
+and recreated under the same name, a continuation lists the new ref from the
+same position.
 
-These ordering and duplication limits come from LambdaDB's current listing. When
-LambdaDB ships consistent ordered listing (LambdaDB PR #619), the SDK can adopt
-it internally and drop them.
+When LambdaDB ships consistent ordered listing, the SDK can use it internally
+without changing this contract, and lift the 1,000-file limit.

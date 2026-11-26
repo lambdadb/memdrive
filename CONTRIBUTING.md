@@ -46,7 +46,7 @@ exact originals, avoid invented ranges for rendered text, and reuse stored
 chunks and vectors when moving files.
 
 The shared file-tool catalog also lives at the package root. It is deliberately
-minimal: six tools (`guide`, `read`, `list`, `search`, `findText`, `write`) on
+minimal: seven tools (`guide`, `read`, `tree`, `list`, `search`, `findText`, `write`) on
 main, without `at` in schemas, inputs or results, one fixed schema set per
 embedding mode and an explicit allowlist. Each tool except `guide` calls the
 public SDK method of the same name; refs, rollback and checkpoint retention stay
@@ -75,7 +75,7 @@ and deletes isolated test collections, including a structured-text store. Use a
 dedicated test project; missing settings fail rather than silently skipping. The
 publication workflow runs the live suite against the exact installed tarball.
 The default suite creates stores, forks them, writes on forks and on main,
-reads, lists, searches and matches text, checkpoints a fork and rolls it back to
+reads, lists files and counts folders with `tree` right after writing, searches and matches text, checkpoints a fork and rolls it back to
 that checkpoint, deletes the refs it created (deleting a fork before its latest
 checkpoint), and destroys every store, confirming each collection's deletion
 with a native not-found response.
@@ -108,4 +108,4 @@ in the local workspace or on the ephemeral runner.
 
 ## Versions and releases
 
-See [RELEASING.md](RELEASING.md). Main pushes publish dev builds when the committed version is tagged on origin; otherwise they verify the intended release against production. Authorized GitHub Releases publish RC or stable versions. A local build or package check is not release authorization.
+See [RELEASING.md](RELEASING.md). Main pushes never publish: they verify the derived dev version against dev when the committed version is tagged on origin, and otherwise verify the intended release against production. Authorized GitHub prereleases publish dev or RC versions, and authorized GitHub Releases publish stable versions. A local build or package check is not release authorization.

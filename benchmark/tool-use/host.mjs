@@ -6,7 +6,7 @@ const guideResources = [
     ...Object.entries(fileToolGuideTopics).map(([topic, document]) =>
         ({ uri: `memdrive://docs/${topic}`, name: document.title, document })),
 ];
-const reads = ['read', 'list', 'search', 'findText'];
+const reads = ['read', 'tree', 'list', 'search', 'findText'];
 
 // A protocol-shaped, in-process host. It is not an MCP server or wire implementation.
 // It connects main of one authorized drive with a fixed allowlist. In writable

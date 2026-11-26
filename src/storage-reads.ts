@@ -30,13 +30,14 @@ export function pathQuery(paths: string[], { literal = false } = {}) {
     ] };
 }
 
+/**
+ * Match files below an ancestor folder exactly. Paths hold no backslashes or
+ * control characters, so JSON quoting escapes only embedded double quotes, which
+ * LambdaDB matches exactly inside a phrase (checked on the live service).
+ */
 export function ancestorFilter(ancestor: string) {
-    // Scope to the closest complete ancestor that can be quoted without
-    // escaping embedded quotes. Callers check the full prefix literally.
-    const quote = ancestor.indexOf('"');
-    const nativeAncestor = quote === -1 ? ancestor : ancestor.slice(0, ancestor.lastIndexOf('/', quote) + 1);
-    return nativeAncestor.length <= 1 ? [] : [{
-        queryString: { query: JSON.stringify(nativeAncestor), defaultField: 'ancestorPaths' }, occur: 'filter',
+    return ancestor.length <= 1 ? [] : [{
+        queryString: { query: JSON.stringify(ancestor), defaultField: 'ancestorPaths' }, occur: 'filter',
     }];
 }
 

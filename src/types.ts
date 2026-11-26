@@ -72,16 +72,46 @@ export interface FileCursorRequest {
 }
 
 /**
- * One native listing page in native order, not sorted by path. A page can hold
- * fewer than `limit` entries, or none, while `next` is present; common prefixes
- * are computed per page and can repeat on later pages. The listing is complete
- * only when a page has no `next`, and concurrent writes can be missed or seen twice.
+ * One page of a path-ordered listing. Files and, with the `'/'` delimiter, folder
+ * prefixes form one sequence in Unicode code point order of their paths (files
+ * that share a path follow in fileId order); a folder takes the place of its
+ * first file. A page holds the next `limit` entries of that sequence, counting
+ * files and prefixes together, so only the last page is shorter. `next` is
+ * present exactly when more entries follow. Each page reflects the view at the
+ * time of that call: entries already returned are not repeated, but a file moved
+ * meanwhile can appear again at its new path.
  */
 export interface ListFilesResult {
     files: FileListEntry[];
     prefixes: string[];
-    consistency: 'eventual';
     next?: FileCursorRequest | undefined;
+}
+
+/** Describe the folders under `prefix` (an absolute folder path ending in `/`, default `/`). */
+export interface TreeRequest extends FileAtRequest {
+    prefix?: string | undefined;
+}
+
+/** A folder below the tree's prefix and the number of files in it, including its subfolders. */
+export interface TreeFolder {
+    /** Absolute folder path ending in `/`. */
+    path: string;
+    fileCount: number;
+}
+
+/**
+ * Folders below the prefix at any depth, in path order, without the prefix
+ * itself or its ancestors. LambdaDB returns at most 100 folder buckets per call,
+ * the most populated first, and the prefix and its ancestors use buckets too;
+ * `truncated` is true when all of them were used, so less populated folders may
+ * be missing. Below a very deep prefix the ancestors can use every bucket, and
+ * `folders` is then empty with `truncated: true`.
+ */
+export interface TreeResult {
+    /** Files under the prefix at any depth, counted exactly whatever `truncated` says. */
+    fileCount: number;
+    folders: TreeFolder[];
+    truncated: boolean;
 }
 
 export type ReadFileRequest = FileAtRequest & ({ fileId: string; path?: never } | { path: string; fileId?: never });
@@ -253,6 +283,7 @@ export type FileDriveDescription<Mode extends EmbeddingMode = 'managed'> = FileS
 export interface FileDrive<Mode extends EmbeddingMode = 'managed'> {
     readonly name: string;
     describe(request?: DescribeRequest, options?: RequestOptions): Promise<FileDriveDescription<Mode>>;
+    tree(request?: TreeRequest, options?: RequestOptions): Promise<TreeResult>;
     list(request?: ListFilesRequest, options?: RequestOptions): Promise<ListFilesResult>;
     read(request: Mode extends 'external' ? never : ReadFileRangeRequest, options?: RequestOptions): Promise<FileReadPage | null>;
     read(request: ReadFileRequest, options?: RequestOptions): Promise<ViewFile<Mode> | null>;

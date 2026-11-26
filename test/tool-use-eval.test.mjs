@@ -46,10 +46,10 @@ test('recall sees consistent current retention on main while preserving the date
     });
 });
 
-test('the host offers the six main-only tools, read-only tasks get no write and every write is checkpointed by the host', async () => {
+test('the host offers the seven main-only tools, read-only tasks get no write and every write is checkpointed by the host', async () => {
     await usingScenario('recall', 'tool', async (context, host) => {
         const offered = host.toolsList().tools.map(tool => tool.name);
-        assert.deepEqual(offered, ['guide', 'read', 'list', 'search', 'findText']);
+        assert.deepEqual(offered, ['guide', 'read', 'tree', 'list', 'search', 'findText']);
         assert.equal((await host.toolsCall('write', { op: 'delete', fileId: context.ids['/faq.md'] })).error.code, 'TOOL_NOT_ALLOWED');
         for (const name of ['fork', 'checkpoint', 'rollback', 'listCheckpoints'])
             assert.equal((await host.toolsCall(name, { name: 'escape' })).error.code, 'TOOL_NOT_ALLOWED', name);
@@ -57,7 +57,7 @@ test('the host offers the six main-only tools, read-only tasks get no write and 
     });
     await usingScenario('maintain', 'none', async (context, host) => {
         const before = JSON.stringify(host.toolsList());
-        assert.deepEqual(host.toolsList().tools.map(tool => tool.name), ['read', 'list', 'search', 'findText', 'write']);
+        assert.deepEqual(host.toolsList().tools.map(tool => tool.name), ['read', 'tree', 'list', 'search', 'findText', 'write']);
         assert(host.toolsList().tools.every(tool => !JSON.stringify(tool.inputSchema).includes('"at"')));
         assert.deepEqual((await context.main.describe()).latestCheckpoint, { at: { kind: 'checkpoint', name: 'setup' } });
         const file = await host.toolsCall('write', { op: 'create', path: '/late.md', content: 'draft' });
@@ -144,6 +144,7 @@ test('record scoring requires the user\'s wording in one checkpointed write', as
 
 test('cleanup scoring requires the junk deleted after reading it, with other files unchanged', async () => {
     await usingScenario('cleanup', 'none', async (context, host) => {
+        assert.deepEqual((await host.toolsCall('tree', {})).folders.find(folder => folder.path === '/import/'), { path: '/import/', fileCount: 2 });
         // Deleting without reading the originals does not earn read-before-write credit.
         const listed = await host.toolsCall('list', { prefix: '/import/' });
         await host.toolsCall('write', { operations: listed.files.map(file => ({ op: 'delete', fileId: file.fileId })) });

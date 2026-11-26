@@ -19,7 +19,7 @@ and synthetic request/tool traces belong under ignored `artifacts/`.
 
 ```sh
 # No model calls: validate the host, SDK workflows and scoring machinery.
-# Ten tasks and three guide channels: 30 scripted cases per instruction profile.
+# Eight tasks and three guide channels: 24 scripted cases per instruction profile.
 npm run benchmark:tools -- --mode scripted --output artifacts/tool-use/smoke
 
 # Provide LLM_API_KEY through the environment or ignored .env.local.
@@ -135,8 +135,10 @@ announced binding changes. They do not validate guide 7 or the current
 explicit-`at` contract. Protocol `memdrive-tool-use-v2` runs used merge
 publication, `diff`, `status` and `history`. Protocol `memdrive-tool-use-v3`
 runs offered thirteen tools with `at` views, forks, checkpoints and rollback.
-Neither validates the current main-only catalog (protocol
-`memdrive-tool-use-v4`). `--instruction` independently
+Protocol `memdrive-tool-use-v4` runs offered the main-only catalog without
+`tree`, with an unordered, eventual `list`. None of them validates the current
+catalog (protocol `memdrive-tool-use-v5`), which adds `tree` and lists files in
+path order with consistent reads. `--instruction` independently
 selects `server` (default), `workflow` (additional developer workflow text), or
 `user` (an explicit reminder appended to the task). Workflow injection approximates
 a loaded bundled skill; skill discovery/loading itself is not tested. Compare
@@ -144,8 +146,8 @@ one factor at a time. Fixed case/channel ordering, small samples and synthetic
 inputs limit any quality inference; use repetitions and inspect individual traces.
 
 The host connects main of one authorized drive with a fixed explicit allowlist
-of the SDK's six tools. Tool definitions never change during a conversation.
-Read-only cases offer `read`, `list`, `search` and `findText` (plus `guide` in
+of the SDK's seven tools. Tool definitions never change during a conversation.
+Read-only cases offer `read`, `tree`, `list`, `search` and `findText` (plus `guide` in
 the tool channel) and never `write`. No tool takes `at`, so the model cannot
 select a fork or checkpoint, and there are no ref or rollback tools. In writable
 cases the host takes a `setup` checkpoint before the conversation and passes the
@@ -179,7 +181,8 @@ example, not a security certification.
 
 Scripted mode emits predetermined requests and is **only a transport/workflow
 smoke test**; its passes are not model performance. Its paraphrase cases call
-`search` and its control calls `findText` by construction. Its `modelTasksPassed` is `null`. Injected test transports are also
+`search`, its control calls `findText` and its cleanup cases call `tree` before
+`list` by construction. Its `modelTasksPassed` is `null`. Injected test transports are also
 identified separately and cannot count as real model measurements.
 
 Protocol v4 removed the scenarios that needed refs or rollback from the agent:
@@ -226,7 +229,7 @@ calls count whatever their outcome, and no argument or model text is kept:
 | Field | Meaning |
 | --- | --- |
 | `search`, `findText`, `read`, `list` | Calls of that tool. |
-| `firstTool` | The first of those four tools called, or `none`. |
+| `firstTool` | The first of those four tools called, or `none`. `tree` and `guide` calls are not counted here. |
 | `usedSearch` | Whether `search` was called at all. |
 | `findTextBeforeSearch` | `findText` calls before the first `search` call, or all of them when `search` was never called. |
 | `findTextUnscoped` | New `findText` scans without `filter` and without a `prefix` narrower than `/`. A count, not the arguments. |
