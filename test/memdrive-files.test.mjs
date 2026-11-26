@@ -460,10 +460,14 @@ test('list returns files and folders in one path-ordered sequence, one consisten
         metadata: { topic: 'synthetic' } }], prefixes: ['/notes/archive/'] });
     assert.deepEqual(paths(await drive.list({ at: research, prefix: '/notes/Al', nameContains: 'txt' })), ['/notes/Alpha.txt']);
     assert.deepEqual(paths(await drive.list({ at: research, prefix: '/notes/archive/"quoted"/' })), ['/notes/archive/"quoted"/sample.txt']);
-    assert.equal(queries(fixture.calls).at(-1).request.query.bool[1].queryString.query, '"/notes/archive/"');
+    // Folder filters are exact, also for names with double quotes.
+    assert.equal(queries(fixture.calls).at(-1).request.query.bool[1].queryString.query, '"/notes/archive/\\"quoted\\"/"');
     assert.deepEqual((await drive.list({ at: research, prefix: '/notes/arch', nameContains: 'archive' })).files, []);
     assert.deepEqual(paths(await drive.list({ at: research, prefix: '/notes/', nameContains: 'alpha' })), ['/notes/archive/alpha.txt']);
     assert.equal(queries(fixture.calls).at(-1).request.query.bool[2].queryString.query, '/.*alpha.*/');
+    // The longest run of letters, digits and spaces narrows the native match; the SDK checks the rest.
+    await drive.list({ at: research, nameContains: '"x":*? Bx [' });
+    assert.equal(queries(fixture.calls).at(-1).request.query.bool[1].queryString.query, '/.* Bx .*/');
 
     for (const { request } of queries(fixture.calls).slice(before)) {
         assert.deepEqual({ ...request, query: undefined }, { ref: { kind: 'branch', name: 'fork-research' }, consistentRead: true,
@@ -505,23 +509,39 @@ test('list pages continue from their position: changes between pages never repea
     assert.deepEqual((await drive.list(one.next)).files.map(file => file.fileId), [twins[1].fileId]);
 });
 
-test('list matches at most 1000 files and reports more as LIST_TOO_MANY_FILES, counted after server-side filters', async () => {
+test('list works on at most 1000 files in its server-side scope and reports more as LIST_TOO_MANY_FILES', async () => {
     const fixture = fileClient();
     const drive = await create({ client: fixture.client, name: 'workspace' });
-    const names = Array.from({ length: 1000 }, (_, index) => `/bulk/file-${String(index).padStart(4, '0')}.md`);
+    const names = Array.from({ length: 1000 }, (_, index) => `/notes/file-${String(index).padStart(4, '0')}.md`);
     fixture.seedFiles('workspace', 'main', names);
     const all = await drive.list({ limit: 1000 });
-    assert.deepEqual([all.files.length, all.files.at(-1).path, all.next], [1000, '/bulk/file-0999.md', undefined]);
-    fixture.seedFiles('workspace', 'main', ['/other/keep.md']);
+    assert.deepEqual([all.files.length, all.files.at(-1).path, all.next], [1000, '/notes/file-0999.md', undefined]);
+    fixture.seedFiles('workspace', 'main', ['/notes/decision.md']);
     const error = await drive.list().catch(cause => cause);
     assert.equal(error.code, 'LIST_TOO_MANY_FILES');
     assert.deepEqual(error.details, { maximum: 1000 });
-    assert.match(fileToolError(error).error.message, /More than 1000 files match.*prefix.*search/);
-    // A narrower prefix, or a filename filter LambdaDB applies, counts fewer matches.
+    assert.match(fileToolError(error).error.message, /More than 1000 files are in this listing's scope: the folder of prefix up to its last "\/".*deeper folder.*search/);
+    // nameContains narrows the scope through its longest run of letters, digits and spaces.
+    assert.deepEqual(paths(await drive.list({ prefix: '/notes/', nameContains: 'decision.md' })), ['/notes/decision.md']);
+    assert.equal(queries(fixture.calls).at(-1).request.query.bool[2].queryString.query, '/.*decision.*/');
+    assert.deepEqual(paths(await drive.list({ nameContains: 'decision' })), ['/notes/decision.md']);
+    // A run that every file name contains, or a prefix ending inside a name, does not narrow it.
+    await assert.rejects(drive.list({ nameContains: '.md' }), { code: 'LIST_TOO_MANY_FILES' });
+    await assert.rejects(drive.list({ prefix: '/notes/dec' }), { code: 'LIST_TOO_MANY_FILES', message: /up to its last "\/"/ });
+    fixture.seedFiles('workspace', 'main', ['/other/keep.md']);
     assert.deepEqual(paths(await drive.list({ prefix: '/other/' })), ['/other/keep.md']);
-    assert.deepEqual(paths(await drive.list({ nameContains: 'keep' })), ['/other/keep.md']);
-    // A substring the SDK checks itself (here because of the dot) is counted after the 1000-file check.
-    await assert.rejects(drive.list({ nameContains: 'keep.md' }), { code: 'LIST_TOO_MANY_FILES' });
+});
+
+test('list orders the native response itself, whatever order it arrives in', async () => {
+    const fixture = fileClient();
+    const drive = await create({ client: fixture.client, name: 'workspace' });
+    await drive.write({ operations: ['/b.txt', '/a/z.txt', '/a.txt', '/c/d.txt'].map(path => request(path)) });
+    const stored = [...fixture.collections.get('workspace').branches.get('main').docs.values()].filter(doc => doc.kind === 'file');
+    const docs = stored.sort((a, b) => a.path < b.path ? 1 : -1).map(doc => ({ collection: 'workspace', doc }));
+    fixture.facetQuery = () => ({ isDocsInline: true, total: docs.length, docs, facets: { kind: { buckets: [{ value: 'file', count: docs.length }] } } });
+    assert.deepEqual(paths(await drive.list()), ['/a.txt', '/a/z.txt', '/b.txt', '/c/d.txt']);
+    const grouped = await drive.list({ delimiter: '/' });
+    assert.deepEqual([paths(grouped), grouped.prefixes], [['/a.txt', '/b.txt'], ['/a/', '/c/']]);
 });
 
 test('list cursors are stateless tokens that continue on a fresh drive object and stay bound to their view, store and criteria', async t => {
@@ -552,7 +572,8 @@ test('list cursors are stateless tokens that continue on a fresh drive object an
     await assert.rejects(drive.list({ at: research, cursor: 'invalid' }), { code: 'LIST_CURSOR_UNAVAILABLE' });
     // Changed criteria or positions, and cursors of the earlier native-page format, are refused.
     for (const value of [{ ...decoded, l: 5000 }, { ...decoded, p: 'relative' }, { ...decoded, i: undefined }, { ...decoded, k: 'a.txt' },
-        { ...decoded, i: 'file:other' }, { ...decoded, dl: '/', i: undefined, k: '/a.txt' }, { ...decoded, extra: 1 }])
+        { ...decoded, i: 'file:other' }, { ...decoded, dl: '/', i: undefined, k: '/a.txt' }, { ...decoded, i: undefined, k: '/a/' },
+        { ...decoded, extra: 1 }])
         await assert.rejects(drive.list({ at: research, cursor: encode(value) }), { code: 'LIST_CURSOR_UNAVAILABLE' }, JSON.stringify(value));
     await assert.rejects(drive.list({ at: research, cursor: `l1.${cursor.slice(3)}` }), { code: 'LIST_CURSOR_UNAVAILABLE' });
     const other = await create({ client, name: 'other-store' });
@@ -620,7 +641,7 @@ test('tree counts files per folder at any depth with one facet query, in path or
     assert.deepEqual(queries(fixture.calls).slice(before).map(call => call.request), [{
         ref: { kind: 'branch', name: 'main' }, consistentRead: true, includeVectors: false, size: 0,
         query: { bool: [{ queryString: { query: '"file"', defaultField: 'kind' }, occur: 'filter' }] },
-        facets: { ancestorPaths: { size: 100 } },
+        facets: { ancestorPaths: { size: 100 }, kind: { size: 1 } },
     }]);
     // A prefix excludes itself and its ancestors, which the facet counts too.
     assert.deepEqual(await drive.tree({ prefix: '/projects/' }), { fileCount: 4, truncated: false,
@@ -662,7 +683,7 @@ test('tree reports truncation at the bucket limit, reads checkpoints and externa
     fixture.facetBudget = { buckets: 2 };
     const error = await small.tree().catch(cause => cause);
     assert.deepEqual([error.code, error.status], ['DATABASE_ERROR', 400]);
-    assert.match(fileToolError(error).error.message, /narrower prefix/);
+    assert.match(fileToolError(error).error.message, /^LambdaDB rejected the drive tree request\. If the drive has very many or very deep folders, pass a narrower prefix; folders of search hit paths are candidates\.$/);
     // List counts with a single kind bucket, so the folder budget does not affect it.
     assert.equal((await small.list()).files.length, 3);
     fixture.facetBudget = undefined;
@@ -673,6 +694,44 @@ test('tree reports truncation at the bucket limit, reads checkpoints and externa
 
     fixture.facetQuery = () => ({ isDocsInline: true, total: 0, docs: [], facets: { ancestorPaths: { buckets: [{ value: '/', count: 0 }] } } });
     await assert.rejects(small.tree(), { code: 'INVALID_RESULT' });
+});
+
+test('tree counts the prefix exactly when its own bucket does not fit, below quoted and very deep prefixes', async () => {
+    const fixture = fileClient();
+    const drive = await create({ client: fixture.client, name: 'workspace' });
+    // 120 sibling folders with more files than the quoted folder.
+    fixture.seedFiles('workspace', 'main', Array.from({ length: 120 }, (_, index) => [1, 2, 3].map(file => `/a/s${index}/${file}.md`)).flat());
+    fixture.seedFiles('workspace', 'main', ['/a/"q"/one.md', '/a/"q"/sub/two.md']);
+    assert.deepEqual(await drive.tree({ prefix: '/a/"q"/' }), { fileCount: 2, folders: [{ path: '/a/"q"/sub/', fileCount: 1 }], truncated: false });
+    assert.equal(queries(fixture.calls).at(-1).request.query.bool[1].queryString.query, JSON.stringify('/a/"q"/'));
+    // 100 folders deep: "/" and the ancestors use every bucket, so folders is empty while the count stays exact.
+    const deep = `/${'d/'.repeat(100)}`;
+    fixture.seedFiles('workspace', 'main', [`${deep}x.md`, `${deep}y.md`]);
+    assert.deepEqual(await drive.tree({ prefix: deep }), { fileCount: 2, folders: [], truncated: true });
+    assert.deepEqual(await drive.tree({ prefix: deep.slice(0, -2) }), { fileCount: 2, folders: [], truncated: true });
+    // Folders in Unicode code point order: U+FF5E before U+1F600, a surrogate pair.
+    const small = await create({ client: fixture.client, name: 'small' });
+    await small.write({ operations: [request('/\u{1F600}/a.md'), request('/\uFF5E/b.md')] });
+    assert.deepEqual((await small.tree()).folders.map(folder => folder.path), ['/\uFF5E/', '/\u{1F600}/']);
+});
+
+test('tree rejects folder counts that exceed the bucket limit, repeat a folder or lack the file count', async () => {
+    const fixture = fileClient();
+    const drive = await create({ client: fixture.client, name: 'workspace' });
+    const result = (buckets, kind = [{ value: 'file', count: 3 }]) => ({ isDocsInline: true, total: 0, docs: [],
+        facets: { ancestorPaths: { buckets }, kind: { buckets: kind } } });
+    fixture.facetQuery = () => result([{ value: '/', count: 3 }, { value: '/a/', count: 2 }]);
+    assert.deepEqual(await drive.tree(), { fileCount: 3, folders: [{ path: '/a/', fileCount: 2 }], truncated: false });
+    for (const invalid of [
+        result(Array.from({ length: 101 }, (_, index) => ({ value: `/f${index}/`, count: 1 }))),
+        result([{ value: '/', count: 3 }, { value: '/a/', count: 2 }, { value: '/a/', count: 1 }]),
+        result([{ value: '/', count: 3 }], []), result([{ value: '/', count: 3 }], [{ value: 'chunk', count: 3 }]),
+        { ...result([{ value: '/', count: 3 }]), facets: { ancestorPaths: { buckets: [] } } },
+        result([{ value: 'a/', count: 1 }]), result([{ value: '/', count: 0 }]), result([{ value: '/', count: 4 }]),
+    ]) {
+        fixture.facetQuery = () => invalid;
+        await assert.rejects(drive.tree(), { code: 'INVALID_RESULT' }, JSON.stringify(invalid.facets));
+    }
 });
 
 test('working edits preserve identity, resolve substitutions against the original, and replace metadata', async () => {

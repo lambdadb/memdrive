@@ -47,7 +47,8 @@ test('the fixed catalog serves exactly seven main-only tools and requires an exp
         const [tree, list] = getFileToolDefinitions({ embeddingMode, tools: ['tree', 'list'] });
         assert.match(tree.description, /tree -d, folders only, each with its file count \(including files in its subfolders\)\. It returns no files\./);
         assert.match(tree.description, /start of a conversation/);
-        assert.match(tree.description, /At most 100 folders/);
+        assert.match(tree.description, /LambdaDB counts at most 100 folders, the most populated first, including the prefix and its ancestors/);
+        assert.match(list.description, /prefix up to its last \//);
         assert.match(tree.description, /Use list for the files in a folder/);
         assert.deepEqual(tree.inputSchema.required, []);
         assert.deepEqual(Object.keys(tree.inputSchema.properties), ['prefix']);
@@ -56,6 +57,7 @@ test('the fixed catalog serves exactly seven main-only tools and requires an exp
         assert.doesNotMatch(list.description, /eventual|storage order|deduplicat/i);
         assert.equal(tree.readOnly, true);
     }
+    assert.match(getFileToolDefinitions({ embeddingMode: 'managed', tools: ['search'] })[0].description, /use tree for the folders and list to enumerate/);
 });
 
 test('each tool forwards its input object unchanged to the SDK method of the same name and drops view selectors from results', async () => {
@@ -244,6 +246,7 @@ test('guide index and both topics share immutable content without accessing the 
     assert.match(fileToolGuideTopics.editing.content, /do not claim permanent erasure/);
     assert.match(fileToolGuideTopics.retrieval.content, /Call tree to see the folders/);
     assert.match(fileToolGuideTopics.retrieval.content, /LIST_TOO_MANY_FILES/);
+    assert.match(fileToolGuideTopics.retrieval.content, /candidate folders from the paths of search hits/);
     assert.doesNotMatch(text, /eventual|storage order|same prefix can appear again|deduplicat/i);
     assert.deepEqual(index.topics.map(item => item.topic), ['retrieval', 'editing']);
     for (const { topic, description } of index.topics) {

@@ -122,6 +122,10 @@ test('live file store writes main and forks, searches, lists, checkpoints and ro
         const grouped = await listAll(reopened, { at, prefix: '/notes/', delimiter: '/', limit: 1 });
         assert.deepEqual(grouped, { files: [reference(original)], prefixes: ['/notes/sub/'] });
         assert.deepEqual((await listAll(reopened, { at, prefix: '/notes/', nameContains: 'also' })).files, [reference(nested)]);
+        // A parser-sensitive substring: LambdaDB narrows by its run "draft", the SDK checks the rest.
+        assert.deepEqual(await listAll(reopened, { at, prefix: '/notes/', nameContains: '"draft":*?', delimiter: '/', limit: 1 }),
+            { files: [reference(original)], prefixes: ['/notes/sub/'] });
+        assert.deepEqual((await listAll(reopened, { at, nameContains: '"draft":*?.md' })).files, [reference(original)]);
         assert.deepEqual(await reopened.tree({ at }, options()), { fileCount: 3, truncated: false,
             folders: [{ path: '/notes/', fileCount: 2 }, { path: '/notes/sub/', fileCount: 1 }] });
 
@@ -129,19 +133,23 @@ test('live file store writes main and forks, searches, lists, checkpoints and ro
         await main.write({ operations: [
             { op: 'create', path: '/projects/b.md', content: 'Second project note.' },
             { op: 'create', path: '/people/c.md', content: 'A person note.' },
+            { op: 'create', path: '/people/"q"/d.md', content: 'A note in a quoted folder.' },
             { op: 'create', path: '/projects/a.md', content: 'First project note.' },
         ] }, options());
         let startedAt = Date.now();
         const tree = await main.tree({}, options());
         t.diagnostic(`tree answered ${Date.now() - startedAt} ms after the write returned.`);
-        assert.deepEqual(tree, { fileCount: 4, truncated: false,
-            folders: [{ path: '/people/', fileCount: 1 }, { path: '/projects/', fileCount: 2 }] });
+        assert.deepEqual(tree, { fileCount: 5, truncated: false, folders: [{ path: '/people/', fileCount: 2 },
+            { path: '/people/"q"/', fileCount: 1 }, { path: '/projects/', fileCount: 2 }] });
         startedAt = Date.now();
         const listedMain = await main.list({}, options());
         t.diagnostic(`list answered ${Date.now() - startedAt} ms after tree.`);
-        assert.deepEqual(listedMain.files.map(file => file.path), ['/main.txt', '/people/c.md', '/projects/a.md', '/projects/b.md']);
+        assert.deepEqual(listedMain.files.map(file => file.path), ['/main.txt', '/people/"q"/d.md', '/people/c.md', '/projects/a.md', '/projects/b.md']);
         assert.deepEqual((await main.list({ delimiter: '/' }, options())), { files: [reference(mainFile)], prefixes: ['/people/', '/projects/'] });
         assert.deepEqual((await main.tree({ prefix: '/projects/' }, options())), { fileCount: 2, folders: [], truncated: false });
+        // A folder name with double quotes is matched exactly, not widened to its parent.
+        assert.deepEqual((await main.tree({ prefix: '/people/"q"/' }, options())), { fileCount: 1, folders: [], truncated: false });
+        assert.deepEqual((await main.list({ prefix: '/people/"q"/' }, options())).files.map(file => file.path), ['/people/"q"/d.md']);
 
         assert.deepEqual(await reopened.read({ at, path }, options()), original);
         assert.equal(original.content, content);

@@ -101,12 +101,14 @@ export interface TreeFolder {
 
 /**
  * Folders below the prefix at any depth, in path order, without the prefix
- * itself or its ancestors. LambdaDB counts at most 100 folders per call, the
- * most populated first, including the prefix and its ancestors; `truncated` is
- * true when that limit was reached and less populated folders may be missing.
+ * itself or its ancestors. LambdaDB returns at most 100 folder buckets per call,
+ * the most populated first, and the prefix and its ancestors use buckets too;
+ * `truncated` is true when all of them were used, so less populated folders may
+ * be missing. Below a very deep prefix the ancestors can use every bucket, and
+ * `folders` is then empty with `truncated: true`.
  */
 export interface TreeResult {
-    /** Files under the prefix at any depth. */
+    /** Files under the prefix at any depth, counted exactly whatever `truncated` says. */
     fileCount: number;
     folders: TreeFolder[];
     truncated: boolean;

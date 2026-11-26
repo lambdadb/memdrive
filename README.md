@@ -161,7 +161,8 @@ LambdaDB lacks; callers build them when they need them.
   taken effect.
 - **Listings of at most 1,000 files.** `list` reads every matching file in one
   query, so a listing that matches more fails with `LIST_TOO_MANY_FILES`; see
-  [List files](#list-files). `tree` counts at most 100 folders per call.
+  [List files](#list-files). `tree` returns at most 100 folder buckets per call, including the prefix and
+  its ancestors.
 
 When LambdaDB adds merge, conditional writes (`if-match`/`if-none-match`),
 consistent ordered listing (which lifts the 1,000-file listing limit), more facet
@@ -789,19 +790,25 @@ absolute folder path ending in `/` and defaults to `/`; anything else fails with
 `INVALID_INPUT`. `folders` holds the folders below `prefix` at any depth, in path
 order, without `prefix` itself or its ancestors.
 
-Each call is one LambdaDB facet query over the `ancestorPaths` field of file
-records (`size: 0`, so no file record or content is read), with a consistent read
-on main and forks. It works in managed and external embedding modes. LambdaDB
-returns at most 100 buckets per facet, the most populated first, and the prefix
-and its ancestors take buckets too. `truncated` is `true` when LambdaDB returned
-all 100, so less populated folders may be missing; call `tree` with a narrower
-prefix to see them. Counts are exact. LambdaDB rejects an aggregation over more
-than 10,000 distinct folders or 256 KiB of folder paths with HTTP 400, which
-`tree` reports as `DATABASE_ERROR` with status 400 and a hint to narrow the
-prefix; LambdaDB's response does not identify that case reliably, so it has no
-code of its own. A prefix containing a double quote is filtered on its closest
-ancestor without one, as `list` and `findText` do; its counts stay exact, but
-sibling folders also compete for the 100 buckets.
+Each call is one LambdaDB query with facets on the `ancestorPaths` and `kind`
+fields of file records (`size: 0`, so no file record or content is read), with a
+consistent read on main and forks. It works in managed and external embedding
+modes. The `kind` facet counts the files under `prefix` exactly. LambdaDB returns
+at most 100 `ancestorPaths` buckets, the most populated first, and the prefix and
+its ancestors use buckets too. `truncated` is `true` when all 100 were used, so
+less populated folders may be missing; call `tree` with a subfolder as prefix to
+see them. Below a prefix about 100 folders deep the ancestors use every bucket,
+so `folders` is empty with `truncated: true` while `fileCount` stays exact. The
+counts in `folders` are exact. A prefix, including one with double quotes, is
+matched exactly.
+
+LambdaDB rejects an aggregation over more than 10,000 distinct folders or 256 KiB
+of folder paths with HTTP 400. `tree` reports any HTTP 400 as `DATABASE_ERROR`
+with status 400 and a message suggesting a narrower prefix; LambdaDB's response
+does not identify the budget case reliably, so it has no code of its own. On such
+a drive, `list` with a delimiter can also exceed its 1,000-file limit, so neither
+names a folder to narrow to: take candidate folders from the paths of `search`
+hits and call `tree` with one as prefix.
 
 ## List files
 
@@ -819,8 +826,10 @@ for (;;) {
 
 Each call is one LambdaDB query that reads the listing fields of every matching
 file record, sorted by path, with a consistent read on main and forks, so a file
-written just before is listed. LambdaDB applies the file, folder and simple
-`nameContains` filters; the SDK then checks the exact prefix and substring:
+written just before is listed. LambdaDB selects the files below the folder of
+`prefix` up to its last `/` whose names contain the longest run of letters,
+digits and spaces in `nameContains`; the SDK then checks the exact prefix and
+substring:
 
 - Files and folder prefixes form one sequence in Unicode code point order of their
   paths, the order LambdaDB sorts keywords in. A folder takes the place of its
@@ -828,13 +837,14 @@ written just before is listed. LambdaDB applies the file, folder and simple
   processes can leave, follow in `fileId` order.
 - `limit` (default 100, 1–1000) counts files and prefixes together. Every page
   but the last is full, and `next` is present exactly when more entries follow.
-- One listing matches at most 1,000 file records. The same query counts the
-  matches with a facet, so more fail with `LIST_TOO_MANY_FILES` (details
-  `{ maximum: 1000 }`) instead of returning a partial result: narrow `prefix`, or
-  use `search` or `findText` to find content. LambdaDB counts after its own filters, so a
-  `nameContains` of letters, digits and spaces narrows the count, while other
-  substrings and a prefix that ends inside a folder name are checked by the SDK
-  after the count.
+- One listing works on at most 1,000 file records selected by LambdaDB. The same
+  query counts them with a `kind` facet, so more fail with `LIST_TOO_MANY_FILES`
+  (details `{ maximum: 1000 }`) instead of returning a partial result. Pass a
+  prefix ending at a deeper folder, or use `search` or `findText` to find
+  content. A prefix narrows the count only at a `/` boundary and `nameContains`
+  only through its letters, digits and spaces: `{ prefix: '/notes/dec' }`
+  counts every file below `/notes/`, while `{ prefix: '/notes/', nameContains:
+  'decision.md' }` counts the files whose names contain `decision`.
 
 Forward the returned `next` (`{ at, cursor }`) unchanged. The cursor is an opaque
 token carrying the listing criteria and the last returned path (with its file ID,

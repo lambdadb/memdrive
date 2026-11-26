@@ -1,6 +1,6 @@
 import { isObject, keysOnly } from './config.js';
 import { checkAbort, databaseError, MemDriveError, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
-import { codePointOrder } from './list.js';
+import { codePointOrder, matchedCount } from './list.js';
 import { resultDocs, validPath } from './records.js';
 import { ancestorFilter, viewRead, type Handle, type ViewRef, type WithoutAt } from './storage-reads.js';
 import type { RequestOptions, TreeRequest, TreeResult } from './types.js';
@@ -14,8 +14,10 @@ const kind = { queryString: { query: '"file"', defaultField: 'kind' }, occur: 'f
 
 /**
  * Describe the folders under a prefix with one facet query over `ancestorPaths`,
- * which holds `/` and every ancestor folder of each file. No file record or
- * content is read, so this works in managed and external embedding modes.
+ * which holds `/` and every ancestor folder of each file. A `kind` facet in the
+ * same request counts the files under the prefix, independently of which folder
+ * buckets fit. No file record or content is read, so this works in managed and
+ * external embedding modes.
  */
 export function fileTree(handle: Handle, name: string) {
     return async function tree(ref: ViewRef, request: WithoutAt<TreeRequest> = {}, options?: RequestOptions): Promise<TreeResult> {
@@ -28,28 +30,30 @@ export function fileTree(handle: Handle, name: string) {
         let response;
         try {
             response = await nativeRequest(() => handle.query({ ...viewRead(ref), size: 0, query: { bool: [kind, ...ancestorFilter(prefix)] },
-                facets: { ancestorPaths: { size: treeBucketLimit } } }, nativeOptions(signal)), signal);
+                facets: { ancestorPaths: { size: treeBucketLimit }, kind: { size: 1 } } }, nativeOptions(signal)), signal);
         } catch (cause) {
             const error = databaseError(cause, 'Could not read the drive tree.');
             // LambdaDB answers 400 when the distinct folders exceed its facet budget; the
-            // response does not identify that case reliably, so only the message hints at it.
+            // response does not identify that case reliably, so the message only suggests it.
             if (error.status === 400 && error.code === 'DATABASE_ERROR')
-                error.message = 'Could not read the drive tree. LambdaDB rejected the folder count; a drive with very many or very deep folders can exceed its limit. Pass a narrower prefix.';
+                error.message = 'LambdaDB rejected the drive tree request. If the drive has very many or very deep folders, pass a narrower prefix; folders of search hit paths are candidates.';
             throw error;
         }
         checkAbort(signal);
         resultDocs(response, name, 0);
         const buckets: unknown = isObject(response.facets) && isObject(response.facets.ancestorPaths) ? response.facets.ancestorPaths.buckets : undefined;
+        const fileCount = matchedCount(response);
         const seen = new Set<string>();
-        if (!Array.isArray(buckets) || buckets.length > treeBucketLimit || !buckets.every(bucket => {
+        // The prefix and its ancestors count every matched file; no folder counts more.
+        if (fileCount === undefined || !Array.isArray(buckets) || buckets.length > treeBucketLimit || !buckets.every(bucket => {
             if (!isObject(bucket) || typeof bucket.value !== 'string' || !bucket.value.startsWith('/') || seen.has(bucket.value)
-                || !Number.isSafeInteger(bucket.count) || (bucket.count as number) < 1) return false;
+                || !Number.isSafeInteger(bucket.count) || (bucket.count as number) < 1 || (bucket.count as number) > fileCount) return false;
             seen.add(bucket.value);
             return true;
         })) throw new MemDriveError('INVALID_RESULT', 'Tree returned invalid folder counts.');
         const counted = buckets as { value: string; count: number }[];
         return {
-            fileCount: counted.find(bucket => bucket.value === prefix)?.count ?? 0,
+            fileCount,
             // The query also counts the prefix itself and its ancestors; only descendants are folders of the tree.
             folders: counted.filter(bucket => bucket.value !== prefix && bucket.value.startsWith(prefix))
                 .map(bucket => ({ path: bucket.value, fileCount: bucket.count }))

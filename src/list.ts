@@ -59,8 +59,8 @@ function after(entry: Entry, position: Position) {
     return entry.id !== undefined && position.id !== undefined && entry.id > position.id;
 }
 
-/** The number of file records the query matched, from its `kind` facet. */
-function matchedCount(response: unknown) {
+/** The number of file records a query matched, from its `kind` facet: every file record has kind "file". */
+export function matchedCount(response: unknown) {
     const buckets: unknown = isObject(response) && isObject(response.facets) && isObject(response.facets.kind)
         ? response.facets.kind.buckets : undefined;
     if (!Array.isArray(buckets) || buckets.length > 1) return undefined;
@@ -107,14 +107,13 @@ export function fileLister(handle: Handle, name: string, schema: MetadataSchema,
         const { prefix, nameContains, delimiter, limit } = criteria;
         const clauses = [{ queryString: { query: '"file"', defaultField: 'kind' }, occur: 'filter' },
             ...ancestorFilter(prefixAncestor(prefix))];
-        // Keep parser-sensitive text out of the native regex. The literal
-        // comparison below applies to all inputs.
-        if (/^[A-Za-z0-9 ]{1,128}$/.test(nameContains)) clauses.push({
-            queryString: { query: `/.*${nameContains}.*/`, defaultField: 'fileName' }, occur: 'filter',
-        });
+        // The longest run of letters, digits and spaces narrows the native match;
+        // parser-sensitive text stays out of the regex, and the literal comparison
+        // below applies the whole substring.
+        const run = (nameContains.match(/[A-Za-z0-9 ]+/g) ?? []).reduce((longest, part) => part.length > longest.length ? part : longest, '').slice(0, 128);
+        if (run) clauses.push({ queryString: { query: `/.*${run}.*/`, defaultField: 'fileName' }, occur: 'filter' });
         let response;
         try {
-            // Every file record has kind "file", so the one kind bucket counts all matches exactly.
             response = await nativeRequest(() => handle.query({ ...viewRead(ref), size: listMaximum,
                 sort: [{ path: 'asc' }, { id: 'asc' }], fields, query: { bool: clauses }, facets: { kind: { size: 1 } } },
             nativeOptions(signal)), signal);
@@ -127,7 +126,7 @@ export function fileLister(handle: Handle, name: string, schema: MetadataSchema,
         if (response.isDocsInline !== true || response.total !== docs.length || matched === undefined)
             throw new MemDriveError('INVALID_RESULT', 'Listing returned an incomplete or uncounted result.');
         if (matched > listMaximum)
-            throw new MemDriveError('LIST_TOO_MANY_FILES', `More than ${listMaximum} files match this listing. Narrow it with a longer prefix or nameContains, or use search to find content.`,
+            throw new MemDriveError('LIST_TOO_MANY_FILES', `More than ${listMaximum} files are in this listing's scope: the folder of prefix up to its last "/", narrowed only by the longest run of letters, digits and spaces in nameContains. Pass a prefix ending at a deeper folder (see tree), or use search to find content.`,
                 { details: { maximum: listMaximum } });
         if (matched !== docs.length) throw new MemDriveError('INVALID_RESULT', 'Listing did not return every matching file.');
 
@@ -140,7 +139,7 @@ export function fileLister(handle: Handle, name: string, schema: MetadataSchema,
             if (file.path.startsWith(prefix) && file.path.slice(file.path.lastIndexOf('/') + 1).includes(nameContains))
                 files.push({ ...file, id: originalId(file.fileId) });
         }
-        // The query returned every match, so order them here with LambdaDB's keyword order.
+        // The query returned every match; order them here with LambdaDB's keyword order rather than trust the response order.
         files.sort((a, b) => codePointOrder(a.path, b.path) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
         // One path-ordered sequence. A folder takes the place of its first file: every
         // path between a folder prefix and its first file starts with that prefix.
