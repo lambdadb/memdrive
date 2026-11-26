@@ -6,10 +6,9 @@ const retention = [{ oldText: 'Retention is 30 days.', newText: 'Retention is 42
 export function scriptedAgent(scenario, guide) {
     const steps = [];
     const add = (name, args) => steps.push({ name, args });
-    if (guide === 'tool') {
-        add('guide', {});
-        add('guide', { topic: 'retrieval' });
-    }
+    // The guide is reference for unusual cases: in the tool channel, the script
+    // reads the editing topic only before deleting and after a rejected edit.
+    const editingGuide = () => { if (guide === 'tool') add('guide', { topic: 'editing' }); };
     if (scenario.id === 'enumerate') {
         // The literal control: an exact identifier across every directory.
         add('findText', { query: enumeratedCode });
@@ -20,6 +19,7 @@ export function scriptedAgent(scenario, guide) {
         add('search', { query: 'on-call handoff', mode: 'keyword' });
         add('write', { op: 'create', path: '/notes/on-call-handoff.md', content: `# On-call handoff\n\nAs stated by the user:\n\n> ${handoff}\n` });
     } else if (scenario.id === 'cleanup') {
+        editingGuide();
         add('tree', {});
         add('list', { prefix: '/import/' });
         add('read', { paths: Object.keys(junk) });
@@ -32,7 +32,10 @@ export function scriptedAgent(scenario, guide) {
         } else {
             add('read', { path: '/faq.md' });
             // In the conflict task, the FAQ changes after this read; the exact edit is rejected.
-            if (scenario.id === 'conflict') add('write', previous => ({ op: 'update', fileId: previous.fileId, edits: retention }));
+            if (scenario.id === 'conflict') {
+                add('write', previous => ({ op: 'update', fileId: previous.fileId, edits: retention }));
+                editingGuide();
+            }
         }
     }
     let index = 0;
