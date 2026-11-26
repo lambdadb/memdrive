@@ -1,7 +1,7 @@
-// Process metrics for a replayed session. Pure functions over the recorded model
-// tool events, request receipts, the harness's `list` checks and its observation
-// after the session; no model or SDK calls. Durations are recorded separately so
-// these metrics stay deterministic.
+// Process metrics for a replayed session or an asked question. Pure functions over the
+// recorded model tool events, request receipts and the harness's observation after the
+// session; no model or SDK calls. Durations are recorded separately so these metrics
+// stay deterministic.
 
 const tally = (items, key) => {
     const result = {};
@@ -14,6 +14,7 @@ const sumMaps = maps => {
     return Object.fromEntries(Object.entries(result).sort(([a], [b]) => a.localeCompare(b)));
 };
 const validUsage = usage => ['input_tokens', 'output_tokens'].every(key => Number.isSafeInteger(usage?.[key]) && usage[key] >= 0);
+// `tree` returns folders and counts but no files, so it is not a lookup before a create.
 const lookups = new Set(['search', 'findText', 'list', 'read']);
 const operationKinds = ['create', 'updateEdits', 'updateContent', 'updateOther', 'delete'];
 
@@ -33,23 +34,76 @@ const fileOf = ({ operation, result }) => operation?.op === 'create' ? result?.f
 const perTurn = counts => ({ mean: counts.length ? counts.reduce((sum, count) => sum + count, 0) / counts.length : null,
     max: counts.length ? Math.max(...counts) : null });
 
-// One record per traversal of the model's `list` calls: { checked, reason?, missed?, stale? }.
-function listCheckSummary(checks) {
-    const checked = checks.filter(check => check.checked);
-    return { traversals: checks.length, checked: checked.length,
-        uncheckedByReason: tally(checks.filter(check => !check.checked), check => check.reason),
-        withMissedFiles: checked.filter(check => check.missed.length > 0).length,
-        missedFiles: checked.reduce((sum, check) => sum + check.missed.length, 0),
-        withStaleFiles: checked.filter(check => check.stale.length > 0).length,
-        staleFiles: checked.reduce((sum, check) => sum + check.stale.length, 0) };
+const rangeOptions = ['startLine', 'endLine', 'maxChars', 'offset', 'revision'];
+/** Whether a given prefix narrows below the whole drive, whose prefixes are `whole`. */
+const narrows = (prefix, whole) => prefix !== undefined && !whole.includes(prefix);
+/** UTF-16 units of the original text in a read result: one file, null, a range page or a batch. */
+const contentChars = result => [result].flat().reduce((sum, file) => sum + (typeof file?.content === 'string' ? file.content.length : 0), 0);
+
+/**
+ * How one model conversation (a replay session or one question) explored and read the
+ * drive, from its tool events in call order. Calls count whatever their outcome; calls
+ * whose arguments were not valid JSON have no arguments and are left out of every split
+ * by argument. Characters count only results that reached the model.
+ */
+export function toolUse(events) {
+    const named = name => events.filter(event => event.name === name);
+    const parsed = list => list.filter(event => event.args !== undefined);
+    const trees = parsed(named('tree')), lists = named('list'), reads = parsed(named('read'));
+    const listings = parsed(lists).filter(event => event.args.cursor === undefined);
+    const firstTree = events.findIndex(event => event.name === 'tree');
+    const continued = new Set(parsed(lists).map(event => event.args.cursor).filter(cursor => typeof cursor === 'string'));
+    const ranged = event => rangeOptions.some(key => event.args[key] !== undefined);
+    const delivered = list => list.filter(event => event.ok && event.delivered);
+    const failed = list => tally(list.filter(event => !event.ok), event => event.error?.code ?? 'UNKNOWN');
+    return {
+        firstTool: events[0]?.name ?? 'none',
+        firstNonGuideTool: events.find(event => event.name !== 'guide')?.name ?? 'none',
+        tree: { withPrefix: trees.filter(event => narrows(event.args.prefix, ['/'])).length,
+            withoutPrefix: trees.filter(event => !narrows(event.args.prefix, ['/'])).length },
+        list: { listings: listings.length, continuations: parsed(lists).length - listings.length,
+            afterTree: listings.filter(event => firstTree >= 0 && events.indexOf(event) > firstTree).length,
+            withPrefix: listings.filter(event => narrows(event.args.prefix, ['', '/'])).length,
+            withNameContains: listings.filter(event => narrows(event.args.nameContains, [''])).length,
+            withDelimiter: listings.filter(event => event.args.delimiter !== undefined).length,
+            // A delivered page whose next no later call forwarded: the model saw only part of that listing.
+            stoppedBeforeEnd: delivered(lists).filter(event => typeof event.result?.next?.cursor === 'string' && !continued.has(event.result.next.cursor)).length },
+        search: named('search').length,
+        findText: named('findText').length,
+        read: { whole: reads.filter(event => !ranged(event)).length, ranged: reads.filter(ranged).length,
+            wholeChars: delivered(reads.filter(event => !ranged(event))).reduce((sum, event) => sum + contentChars(event.result), 0),
+            rangedChars: delivered(reads.filter(ranged)).reduce((sum, event) => sum + contentChars(event.result), 0) },
+        failedTreesByCode: failed(named('tree')),
+        failedListsByCode: failed(lists),
+    };
+}
+
+/** Totals of `toolUse` over conversations: first tools tallied by name, counts summed. */
+export function toolUseTotals(conversations) {
+    const total = pick => conversations.reduce((sum, item) => sum + pick(item), 0);
+    const fields = (key, names) => Object.fromEntries(names.map(name => [name, total(item => item[key][name])]));
+    const perConversation = key => ({ calls: total(item => item[key]), mean: conversations.length ? total(item => item[key]) / conversations.length : null,
+        max: conversations.length ? Math.max(...conversations.map(item => item[key])) : null });
+    return {
+        conversations: conversations.length,
+        firstTool: tally(conversations, item => item.firstTool),
+        firstNonGuideTool: tally(conversations, item => item.firstNonGuideTool),
+        tree: fields('tree', ['withPrefix', 'withoutPrefix']),
+        list: fields('list', ['listings', 'continuations', 'afterTree', 'withPrefix', 'withNameContains', 'withDelimiter', 'stoppedBeforeEnd']),
+        search: perConversation('search'),
+        findText: perConversation('findText'),
+        withoutSearchOrFindText: conversations.filter(item => item.search === 0 && item.findText === 0).length,
+        read: fields('read', ['whole', 'ranged', 'wholeChars', 'rangedChars']),
+        failedTreesByCode: sumMaps(conversations.map(item => item.failedTreesByCode)),
+        failedListsByCode: sumMaps(conversations.map(item => item.failedListsByCode)),
+    };
 }
 
 /**
  * `events` are the model's tool calls in call order: { turn, round, name, args, ok, result | error, checkpoint? }.
  * `observation` holds the harness reads after the session (see `observe` in replay.mjs); a failed read is null.
- * `listChecks` are the harness's checks of the model's `list` traversals.
  */
-export function sessionMetrics({ userTurns, requests, events, observation = null, listChecks = [] }) {
+export function sessionMetrics({ userTurns, requests, events, observation = null }) {
     const turns = Array.from({ length: userTurns }, (_, turn) => events.filter(event => event.turn === turn));
     const writes = events.filter(event => event.name === 'write');
     const saved = writes.filter(event => event.ok);
@@ -97,7 +151,7 @@ export function sessionMetrics({ userTurns, requests, events, observation = null
         filesAfter: Array.isArray(observation?.inventory) ? observation.inventory.length : null,
         latestCheckpointAsExpected: observed
             ? observation.latestCheckpointAfter === (lastSave ? lastSave.checkpoint : observation.latestCheckpointBefore) : null,
-        listCheck: listCheckSummary(listChecks),
+        toolUse: toolUse(events),
     };
 }
 
@@ -108,7 +162,6 @@ export function sessionMetrics({ userTurns, requests, events, observation = null
  */
 export function conversationMetrics(sessions) {
     const sum = key => sessions.reduce((total, session) => total + session[key], 0);
-    const listSum = key => sessions.reduce((total, session) => total + session.listCheck[key], 0);
     const turns = sum('userTurns');
     const maxOf = key => sessions.some(session => session[key].max !== null) ? Math.max(...sessions.map(session => session[key].max ?? 0)) : null;
     return {
@@ -131,9 +184,6 @@ export function conversationMetrics(sessions) {
         createsAfterLookup: sum('createsAfterLookup'), createsWithoutLookup: sum('createsWithoutLookup'),
         finalFiles: sessions.at(-1)?.filesAfter ?? null,
         sessionsWithUnexpectedLatestCheckpoint: sessions.filter(session => session.latestCheckpointAsExpected === false).length,
-        listCheck: { traversals: listSum('traversals'), checked: listSum('checked'),
-            uncheckedByReason: sumMaps(sessions.map(session => session.listCheck.uncheckedByReason)),
-            withMissedFiles: listSum('withMissedFiles'), missedFiles: listSum('missedFiles'),
-            withStaleFiles: listSum('withStaleFiles'), staleFiles: listSum('staleFiles') },
+        toolUse: toolUseTotals(sessions.map(session => session.toolUse)),
     };
 }

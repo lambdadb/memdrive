@@ -10,14 +10,14 @@ import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs, parseEnv } from 'node:util';
-import { MemDrive, fileToolError, fileToolInstructions } from '@functional-systems/memdrive';
+import { MemDrive, fileToolInstructions } from '@functional-systems/memdrive';
 import { fileClient } from '../../test/helpers/file-client.mjs';
 import { checkpointName, createToolHost, failureCodes, limits, openAI, protocol, ReplayFailure, runSession, scriptedTransport, toolDefinitions, toolNames,
     withGuide } from './replay-agent.mjs';
 import { conversationMetrics, sessionMetrics } from './replay-metrics.mjs';
 import { dateOf, fingerprint, hash, loadSessions } from './replay-sessions.mjs';
 import { questionsSucceeded, runQuestions, runRejudge } from './replay-questions.mjs';
-import { cleanupStore, lambdadbConnection, ledgerFile, listAll, newStoreName, readFiles, storeLabels, storeProtocol, writeLedger } from './replay-store.mjs';
+import { cleanupStore, lambdadbConnection, ledgerFile, newStoreName, observeStore, storeLabels, storeProtocol, writeLedger } from './replay-store.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const json = value => JSON.stringify(value, null, 2) + '\n';
@@ -27,111 +27,12 @@ const backends = { fixture: 'native-client-fixture', lambdadb: 'lambdadb' };
 const sorted = map => Object.fromEntries(Object.entries(map).sort(([a], [b]) => a.localeCompare(b)));
 
 /**
- * IDs of the files a write call wrote or may have written, as the SDK reported them: every
- * result of a successful call, and the file IDs in a failed call's details. A model's own
- * arguments are not trusted: a failed call may name a file that never existed.
+ * Read-only harness observation after a session (see `observeStore`): main's latest
+ * checkpoint before the session and now, `tree` of the whole drive and the inventory.
  */
-export function writtenFileIds(event) {
-    const ids = new Set();
-    const add = value => { if (typeof value === 'string' && value) ids.add(value); };
-    if (event.ok) for (const file of [event.result].flat()) add(file?.fileId);
-    // A partly applied or unrestored write lists file IDs under keys ending in FileIds.
-    const visit = value => {
-        if (value === null || typeof value !== 'object') return;
-        for (const [key, nested] of Object.entries(value))
-            if (key.endsWith('FileIds') && Array.isArray(nested)) nested.forEach(add);
-            else visit(nested);
-    };
-    if (!event.ok) visit(event.error?.details);
-    return ids;
-}
-
-const byPath = (a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : a.fileId < b.fileId ? -1 : 1;
-/** Paths of listed entries that no longer exist at the listed path. */
-const staleEntries = (listed, files) => [...listed.values()].filter(entry => files.get(entry.fileId)?.path !== entry.path).map(entry => entry.path).sort();
-
-/**
- * Read-only harness observation after a session. `list` is eventual, so the inventory
- * is not the listing: it reads by file ID, consistently, every file the listing
- * returned and every file the run is known to have written (`known`), and keeps
- * those that exist. Only the model writes, so that is all of main except a file a
- * failed write created without reporting its ID and the listing missed. A failed
- * read is recorded and leaves its value null.
- */
-export async function observe(drive, { latestCheckpointBefore, known }) {
-    const observation = { latestCheckpointBefore, latestCheckpointAfter: null, inventory: null, unlisted: null, stale: null, errors: [] };
-    const attempt = async (step, read) => {
-        try { return await read(); }
-        catch (error) { observation.errors.push({ step, code: fileToolError(error).error.code }); return null; }
-    };
-    observation.latestCheckpointAfter = await attempt('describe', async () => (await drive.describe()).latestCheckpoint?.at.name ?? null);
-    const listed = await attempt('list', () => listAll(drive));
-    const files = await attempt('read', () => readFiles(drive, new Set([...known, ...(listed?.keys() ?? [])])));
-    if (files) {
-        observation.inventory = [...files.values()].filter(Boolean).sort(byPath);
-        if (listed) {
-            // The harness's own listing against the reads: files it missed, and entries that are gone or moved.
-            observation.unlisted = observation.inventory.filter(file => !listed.has(file.fileId)).map(file => file.path);
-            observation.stale = staleEntries(listed, files);
-        }
-    }
-    return observation;
-}
-
-/**
- * Check the model's `list` traversals of main against consistent reads. A traversal
- * is a call without `cursor` followed by the calls that forward each returned
- * `next.cursor`; it is judged once a page returns no `next`, before the model's next
- * call. Expected files are those that exist, read by file ID, among the files the
- * run is known to have written and the files the traversal returned, filtered by
- * `prefix` and `nameContains` as the SDK applies them. A traversal is left unchecked
- * when it groups with `delimiter`, a successful write came between its pages, its
- * cursor continues no traversal the harness saw, the harness read fails, or it is
- * not followed to the end within the session (`delimiter`, `write_during`,
- * `unknown_cursor`, `read_failed`, `unfinished`). Observation only: the model
- * receives every `list` result unchanged.
- */
-export function listChecker(drive, known) {
-    const open = [];
-    const base = traversal => ({ turn: traversal.first.turn, round: traversal.first.round, pages: traversal.pages, delivered: traversal.delivered });
-    async function judge(traversal) {
-        const { prefix = '', nameContains = '', delimiter } = traversal.first.args;
-        if (delimiter !== undefined) return { ...base(traversal), checked: false, reason: 'delimiter' };
-        if (traversal.writeDuring) return { ...base(traversal), checked: false, reason: 'write_during' };
-        let files;
-        try { files = await readFiles(drive, new Set([...known, ...traversal.files.keys()])); }
-        catch (error) { return { ...base(traversal), checked: false, reason: 'read_failed', code: fileToolError(error).error.code }; }
-        const selected = file => file.path.startsWith(prefix) && file.path.slice(file.path.lastIndexOf('/') + 1).includes(nameContains);
-        const expected = [...files.values()].filter(file => file && selected(file));
-        const current = new Map([...files].filter(([, file]) => file && selected(file)));
-        return { ...base(traversal), checked: true, expected: expected.length, listed: traversal.files.size,
-            missed: expected.filter(file => !traversal.files.has(file.fileId)).map(file => file.path).sort(),
-            stale: staleEntries(traversal.files, current) };
-    }
-    return {
-        /** Feed every recorded tool event in order; returns the checks it completed. */
-        async onEvent(event) {
-            if (event.name === 'write' && event.ok) for (const traversal of open) traversal.writeDuring = true;
-            if (event.name !== 'list' || !event.ok) return [];
-            let traversal;
-            if (event.args.cursor === undefined) open.push(traversal = { first: event, pages: 0, delivered: true, files: new Map(), writeDuring: false });
-            else {
-                traversal = open.find(item => item.next === event.args.cursor);
-                if (!traversal) return [{ turn: event.turn, round: event.round, pages: 1, delivered: event.delivered, checked: false, reason: 'unknown_cursor' }];
-            }
-            traversal.pages++;
-            traversal.delivered &&= event.delivered;
-            for (const file of event.result.files) traversal.files.set(file.fileId, file);
-            traversal.next = event.result.next?.cursor;
-            if (traversal.next !== undefined) return [];
-            open.splice(open.indexOf(traversal), 1);
-            return [await judge(traversal)];
-        },
-        /** Traversals still open when the session ends. */
-        finish() {
-            return open.splice(0).map(traversal => ({ ...base(traversal), checked: false, reason: 'unfinished' }));
-        },
-    };
+export async function observe(drive, { latestCheckpointBefore }) {
+    const { latestCheckpoint, tree, files, errors } = await observeStore(drive);
+    return { latestCheckpointBefore, latestCheckpointAfter: latestCheckpoint, tree, inventory: files, errors };
 }
 
 /** Durations from the injected clock, kept apart from the deterministic metrics. */
@@ -146,7 +47,7 @@ function sessionTiming(wallMs, userTurns, requests, events) {
 }
 
 const backendLimitations = {
-    'native-client-fixture': 'Real public SDK on the native-client fixture: ranked search ignores the query, list is always current, and there is no latency or cost.',
+    'native-client-fixture': 'Real public SDK on the native-client fixture: ranked search ignores the query, and there is no latency or cost.',
     lambdadb: 'Real public SDK on one live LambdaDB store; timings include network and service variance from a single run.',
 };
 
@@ -227,8 +128,7 @@ export async function runReplay({ manifest: manifestFile, conversation, output, 
     await writeFile(path.join(output, 'manifest.json'), json(manifest), privateFile);
 
     const fixture = connection ? null : fileClient(), client = connection?.client ?? fixture.client;
-    // Every file the run is known to have written, pruned to the inventory after each session.
-    const results = [], known = new Set();
+    const results = [];
     let cleanup = 'not_started';
     try {
         // A live create can succeed even when its response is lost: record ownership first.
@@ -241,36 +141,22 @@ export async function runReplay({ manifest: manifestFile, conversation, output, 
             const directory = path.join(output, `session-${String(entry.index + 1).padStart(3, '0')}-${entry.id}`);
             await mkdir(directory);
             const append = file => value => appendFile(path.join(directory, file), JSON.stringify(value) + '\n', privateFile);
-            const state = { input: [], requests: [], events: [], userTurns: 0 }, listChecks = [];
+            const state = { input: [], requests: [], events: [], userTurns: 0 };
             const result = { ...entry, status: 'failed' };
             const latestCheckpointBefore = (await drive.describe()).latestCheckpoint?.at.name ?? null;
-            const logEvent = append('events.jsonl'), logCheck = append('list-checks.jsonl');
-            const checker = listChecker(drive, known);
-            const check = async records => { for (const record of records) { listChecks.push(record); await logCheck(record); } };
-            // Runs before the next model call, so the harness sees the state the model listed.
-            const event = async recorded => {
-                await logEvent(recorded);
-                if (recorded.name === 'write') for (const fileId of writtenFileIds(recorded)) known.add(fileId);
-                await check(await checker.onEvent(recorded));
-            };
             const started = clock();
             try {
                 await runSession({ session: source.sessions[entry.index], turns: entry.plannedTurns, call, ask: transport, model,
                     instructions: text, definitions, budget, signal: AbortSignal.timeout(budget.sessionSeconds * 1000), state, clock, date: entry.date,
-                    hooks: { item: append('transcript.jsonl'), receipt: append('requests.jsonl'), event } });
+                    hooks: { item: append('transcript.jsonl'), receipt: append('requests.jsonl'), event: append('events.jsonl') } });
                 result.status = 'completed';
             } catch (error) {
                 result.error = { code: error instanceof ReplayFailure && failureCodes.includes(error.code) ? error.code : 'REPLAY_ERROR',
                     message: 'Inspect the request receipts and tool events; no automatic retry was attempted.' };
             }
             const wallMs = clock() - started;
-            await check(checker.finish());
-            const observation = await observe(drive, { latestCheckpointBefore, known });
-            if (observation.inventory) {
-                known.clear();
-                for (const file of observation.inventory) known.add(file.fileId);
-            }
-            result.metrics = sessionMetrics({ userTurns: state.userTurns, requests: state.requests, events: state.events, observation, listChecks });
+            const observation = await observe(drive, { latestCheckpointBefore });
+            result.metrics = sessionMetrics({ userTurns: state.userTurns, requests: state.requests, events: state.events, observation });
             result.timing = sessionTiming(wallMs, state.userTurns, state.requests, state.events);
             await writeFile(path.join(directory, 'observation.json'), json(observation), privateFile);
             await writeFile(path.join(directory, 'result.json'), json(result), privateFile);

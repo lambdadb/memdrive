@@ -151,9 +151,10 @@ could deliver:
   dataset's trailing generation marker (`->-> 1,11`, `->-> 5,14)`,
   `->-> 2,N/A`), which 2,155 of the 2,866 utterances in the 100K split end
   with and which no user said; the plan records how many each session lost;
-- the SDK's agent catalog from `getFileToolDefinitions`: `guide`, `read`,
-  `list`, `search`, `findText` and `write`, all on main of one drive and
-  unchanged for the whole run. `--guide off` leaves out `guide`;
+- the SDK's agent catalog from `getFileToolDefinitions`: the seven tools
+  `guide`, `read`, `tree`, `list`, `search`, `findText` and `write`, all on
+  main of one drive and unchanged for the whole run. `--guide off` leaves out
+  `guide`;
 - each tool result as the SDK returned it, the SDK's normalized error, or an
   explicit delivery-limit error when a result exceeds 64,000 bytes;
 - optionally one developer message standing in for server instructions;
@@ -186,9 +187,8 @@ README advises, so names stay unique across sessions and across any later
 run or restart on the same store. The model never sees a name; each `write`
 event in `events.jsonl` records it. There is no switch for this. The runner
 never writes or deletes for the model. Before each session it reads main's
-latest checkpoint with `describe`; when a model `list` traversal ends and
-after each session it reads as described under the `list` check and the
-observation below.
+latest checkpoint with `describe`, and after each session it reads as
+described under the observation below.
 
 ```sh
 npm ci
@@ -205,11 +205,13 @@ node benchmark/beam/replay.mjs --manifest artifacts/beam-original-100k/manifest.
 ```
 
 Scripted mode follows a fixed script. Session 1 reads the guide index and the
-`editing` topic, searches, creates a note and lists main in its first turn; in
-its second it reads the note, edits it with an exact edit and tries to create
-it again, which fails with `PATH_EXISTS` and changes nothing. Session 2 creates
-a file without looking first, finds the note with `findText` and deletes it.
-Every other turn only replies. With `--guide off` the guide calls are skipped.
+`editing` topic, calls `tree` for the whole drive, searches, creates a note and
+lists its folder with `prefix: '/notes/'` in its first turn; in its second it
+reads the note, edits it with an exact edit and tries to create it again,
+which fails with `PATH_EXISTS` and changes nothing. Session 2 calls `tree`
+with `prefix: '/notes/'`, creates a file without a lookup (a `tree` call is
+none), finds the note with `findText` and deletes it. Every other turn only
+replies. With `--guide off` the guide calls are skipped.
 
 Model mode uses OpenAI Responses with the explicit model ID (`gpt-6.1-sol` by
 default, or `--model`), low reasoning, `store: false`, sequential tool calls
@@ -237,10 +239,10 @@ There is no resume: later sessions depend on that drive.
 
 `--backend fixture` (default) runs the real public SDK on the in-memory
 native-client fixture used by the unit tests and destroys the store at the
-end. For this runner it differs from LambdaDB in three ways: ranked search
+end. For this runner it differs from LambdaDB in two ways: ranked search
 ignores the query and returns the same candidates with a fixed score for every
-query, `list` is always current, and there is no latency or cost. `read`,
-`search` and `findText` on main use consistent reads on both backends.
+query, and there is no latency or cost. `tree`, `list`, `read`, `search` and
+`findText` on main use consistent reads on both backends.
 
 `--backend lambdadb` creates the store in a LambdaDB project. Use a dedicated
 test project: the run makes paid requests (managed embeddings on every write,
@@ -285,20 +287,20 @@ directly.
 
 ### Observation after each session
 
-`list` is eventual on LambdaDB, so the runner does not take its inventory from
-a listing alone. After each session it reads main's latest checkpoint with
-`describe`, lists main to the end (every `next`, deduplicated by file ID),
-and reads by file ID, with consistent reads, every listed file and every file
-the run is known to have written: the files of the previous inventory and the
-file IDs in this session's write results, operations and failure details.
-The inventory is the files those reads return, each with `fileId`, `path`,
-`modifiedAt` and `chars` (UTF-16 length of the original). Only the model
-writes, so this is all of main except a file that a failed write created
-without reporting its ID and that the listing also missed. `observation.json`
-records `latestCheckpointBefore`, `latestCheckpointAfter`, the `inventory`,
-`unlisted` (inventory paths the runner's own listing missed), `stale` (listed
-paths that no longer exist there) and `errors`. A failed read is recorded by
-step and code (`describe`, `list`, `read`) and leaves its value null.
+After each session the runner reads main's latest checkpoint with `describe`,
+calls `tree()` for the whole drive and lists main to the end (every `next`).
+`list` is path-ordered and sees every write that succeeded before it, and only
+the model writes, so the listing is all of main. It then reads each listed
+file once by file ID, only for its length, which no listing reports. The
+inventory has each file's `fileId`, `path`, `modifiedAt` and `chars` (UTF-16
+length of the original; null if that read finds no file), in path order.
+`observation.json` records `latestCheckpointBefore`, `latestCheckpointAfter`,
+`tree` (the SDK result: `fileCount`, `folders` with their file counts, and
+`truncated`), the `inventory` and `errors`. A failed step is recorded by step
+and code (`describe`, `tree`, `list`, `read`) and leaves its value null.
+Nothing works around a failure: on a drive with more than 1,000 files the
+listing fails with `LIST_TOO_MANY_FILES`, which is recorded, and the
+inventory stays null while `tree` still reports the exact file count.
 
 ### Metrics
 
@@ -343,27 +345,57 @@ per-session values. A turn is one user utterance.
   the one before the session when no write succeeded. A failed checkpointed
   write must leave it unchanged. Null when `describe` failed;
   `sessionsWithUnexpectedLatestCheckpoint` counts sessions where it is false;
-- `listCheck`: the `list` check below: `traversals`, `checked`,
-  `uncheckedByReason`, `withMissedFiles`, `missedFiles`, `withStaleFiles` and
-  `staleFiles`.
+- `toolUse`: how the model explored and read the drive, below.
 
-The `list` check observes the model's own listings. A traversal is a `list`
-call without `cursor` followed by the calls that forward each returned
-`next.cursor`. Once a page returns no `next`, before the model's next call,
-the runner reads by file ID every file the run is known to have written and
-every file the traversal returned, and keeps the existing ones whose path
-starts with `prefix` and whose last path component contains `nameContains`,
-as the SDK applies them. An expected file whose ID no page returned is
-missed; a returned entry whose file is gone or now has another path, or no
-longer matches the criteria, is stale. A traversal is unchecked when it
-groups with `delimiter`, a successful `write` came between its pages, its
-cursor continues no traversal the runner saw, the runner's read failed, or
-the model did not follow it to the end within the session (`delimiter`,
-`write_during`, `unknown_cursor`, `read_failed`, `unfinished`). The model
-receives every `list` result unchanged and the runner's reads are not model
-tool calls. Only the model writes, so a file is missed from this check only
-when the runner does not know it. On the fixture `list` is always current, so
-misses are expected only on LambdaDB.
+`toolUse` describes one model conversation: here a session, and in the
+question stage one question. It is computed from the recorded tool events in
+call order. Every call counts whatever its outcome, except that a call whose
+arguments were not valid JSON has no arguments and is left out of every split
+by argument (it still counts in `toolCallsByName` and in the failure tallies).
+`tree` and `list` treat `/` as the whole drive, and `list` also `''`, so a
+prefix like that does not count as narrowing. Per conversation:
+
+- `firstTool`: the name of the first tool called, or `none`;
+  `firstNonGuideTool`: the first tool other than `guide`, or `none`;
+- `tree.withPrefix`, `tree.withoutPrefix`: `tree` calls with a `prefix` other
+  than `/`, and calls without one or with `/`;
+- `list.listings`: `list` calls without `cursor` (new listings);
+  `list.continuations`: calls with `cursor`. Of the new listings:
+  `list.afterTree` came after a `tree` call of the same conversation (any
+  outcome), `list.withPrefix` gave a `prefix` other than `''` or `/`,
+  `list.withNameContains` a nonempty `nameContains`, and `list.withDelimiter`
+  a `delimiter`;
+- `list.stoppedBeforeEnd`: successful `list` pages that reached the model with
+  a `next` whose cursor no later `list` call of the conversation forwarded:
+  the model saw only part of that listing;
+- `search`, `findText`: calls of each;
+- `read.whole`: `read` calls by `fileId`, `path` or `paths` without range
+  options; `read.ranged`: calls with any of `startLine`, `endLine`, `maxChars`,
+  `offset` or `revision` (a range page or its continuation);
+- `read.wholeChars`, `read.rangedChars`: UTF-16 units of `content` in the
+  successful read results of each kind that reached the model (every file of
+  a `paths` batch; a missing file adds nothing). Results withheld for the
+  delivery limit are not counted;
+- `failedTreesByCode`, `failedListsByCode`: failed `tree` and `list` calls by
+  error code, such as `LIST_TOO_MANY_FILES` when more than 1,000 files fall in
+  a listing's folder scope. These codes are also in `toolErrorsByCode`.
+
+Over several conversations (the replay's conversation totals and the question
+stage's summary), `toolUse` has `conversations`; `firstTool` and
+`firstNonGuideTool` tallied by name; the `tree`, `list` and `read` counts and
+the failure tallies summed; `search` and `findText` as `calls` with their
+`mean` and `max` per conversation (null without conversations); and
+`withoutSearchOrFindText`, the conversations that called neither.
+
+`tree` is not a lookup for `createsAfterLookup`: it returns folders and counts
+but no files.
+
+Earlier protocols also checked each model `list` traversal against the
+runner's reads by file ID, because `list` was eventual and could miss recent
+writes or return stale entries. `list` now uses consistent reads, and only the
+model writes, so such a check could not find a miss; it was removed. The one
+partial view it could still see, a listing the model stopped following, is
+`list.stoppedBeforeEnd`, computed from the events alone.
 
 `manifest.json` freezes the source hashes, runner and SDK build hashes, source
 commit, backend, model, budgets, instruction text, guide setting, tool names
@@ -371,24 +403,26 @@ and definitions, the checkpoint naming and planned sessions. Each session
 directory holds `transcript.jsonl` (every input item in order),
 `requests.jsonl` (a pending and an outcome receipt per request, with the
 number of transcript items it sent), `events.jsonl` (the model's tool calls
-and results, with each write's checkpoint name), `list-checks.jsonl` (the
-runner's `list` checks), `observation.json` and `result.json`. Receipts can
+and results, with each write's checkpoint name), `observation.json` and
+`result.json`. Receipts can
 contain provider response IDs and opaque reasoning. Keep runs under ignored
 `artifacts/`.
 
 Durations are kept out of the metrics. Each outcome receipt and each tool
 event carries `elapsedMs`, and `result.json` and each session in
 `summary.json` carry `timing`: the session's wall time (model requests, tool
-calls, the runner's `list` checks, token estimation and local recording), the
+calls, token estimation and local recording), the
 total model request time, the total model tool-call time and that time by
 tool name, and `perTurn`, the model request time and tool-call time of each
 turn, in milliseconds. Wall time per turn is not recorded. Fixture timings
 show only local overhead.
 
-Runs of the earlier protocol, `memdrive-beam-session-replay-v1`, used 16 tools
-with an `at` view selector and published forks with `merge`. Their metrics
-(forks, merges, publication lag) are not comparable with these, and the
-question stage refuses those runs.
+This is protocol `memdrive-beam-session-replay-v3`. Runs of
+`memdrive-beam-session-replay-v2` offered six tools without `tree`, with a
+`list` that was unordered, paginated per storage page and eventual; runs of
+`memdrive-beam-session-replay-v1` used 16 tools with an `at` view selector and
+published forks with `merge`. Their metrics are not comparable with these,
+and the question stage refuses those runs.
 
 ### Limits of this measurement
 
@@ -398,11 +432,10 @@ question stage refuses those runs.
 - A direct model request is not an agent application. Real agents add their
   own system prompt and memory features and decide whether server instructions
   reach the model. Results describe the model with this catalog only.
-- On the fixture, search ignores the query, `list` is always current and
-  there is no latency or cost, so fixture runs do not show whether a model
-  finds the right file among several, how long a save takes or how listings
-  lag. A LambdaDB run is one measurement on one store; its timings include
-  network and service variance.
+- On the fixture, search ignores the query and there is no latency or cost,
+  so fixture runs do not show whether a model finds the right file among
+  several or how long a save takes. A LambdaDB run is one measurement on one
+  store; its timings include network and service variance.
 - Scripted mode and injected test transports report their totals under
   `smoke`, and `modelBehavior` stays null. The maintained tests use synthetic
   conversations and establish the harness, not model behavior.
@@ -421,7 +454,7 @@ node benchmark/beam/replay.mjs --questions --run artifacts/beam-replay/live-1 \
 
 The run must use the current replay protocol and `--backend lambdadb`, have
 finished (`summary.json` reports `cleanup: "retained"`) and still hold its
-store (`store.json` status `ready`). A run of the earlier protocol is rejected
+store (`store.json` status `ready`). A run of an earlier protocol is rejected
 with its protocol named, and a fixture run because its store is gone. The run does not record
 where its prepared data lives, so `--manifest` names it; the stage checks the
 SHA-256 of that manifest and of the runtime file against the run's manifest,
@@ -464,7 +497,7 @@ conversation. The manifest records that text and that it differs from the
 run's; a deployment has one text for saving and answering. There is no
 "answer only from the drive" instruction, so the model can also answer from
 its general knowledge. The tool catalog is read-only: `guide`, `read`,
-`list`, `search` and `findText` on main, from `getFileToolDefinitions` and
+`tree`, `list`, `search` and `findText` on main, from `getFileToolDefinitions` and
 executed through `createFileTools` with the same allowlist, so any other call,
 `write` included, returns `TOOL_NOT_ALLOWED`. `--guide off` leaves out
 `guide`, with the instruction text unchanged as in the replay. It defaults to
@@ -474,9 +507,11 @@ overrides it). Requests, budgets and failure handling are those of a replay
 session with one utterance; a failed question keeps its failure code, is not
 judged, and the stage continues. The answer is the final response's assistant
 text. The harness only reads the store: before and after the questions it
-takes main's latest checkpoint and an inventory as the replay's observation
-does (the listed files and the run's final inventory, read by file ID), and
-reports both and whether they are equal in `summary.json`.
+observes main as the replay does after a session (`latestCheckpoint`, `tree`,
+the listed `files` and `errors`), and reports both and whether they are equal
+in `summary.json` (`store.unchanged`). When a step failed in either, for
+example with `LIST_TOO_MANY_FILES`, `unchanged` is null rather than a
+comparison of partial reads.
 
 Judging follows upstream BEAM's `evaluate_*` functions: one Chat Completions
 request per rubric item with `unified_llm_judge_base_prompt`, replacing
@@ -504,8 +539,11 @@ revision, and the classification. Each asked question has a directory with
 `transcript.jsonl`, `requests.jsonl`, `events.jsonl` (with `elapsedMs`),
 `judge.jsonl` (one record per rubric item: score, reason, judge text, usage,
 `elapsedMs` or a failure code) and `result.json` (answer, tool calls by name,
-whether `search`, `read` or `findText` was called, tokens and timing).
-`summary.json` is rewritten after every question. It counts every question by
+whether `search`, `read` or `findText` was called, the question's `toolUse`,
+tokens and timing). `summary.json` is rewritten after every question. Its
+`retrieval` holds the questions with such a call, the tool calls by name and
+`toolUse` totals over the asked questions, with the definitions of the
+[replay metrics](#metrics). It counts every question by
 class and by category, and reports judge scores for the asked questions
 overall, per class and per category. Each mean is over judged questions only
 and comes with its counts: asked, answered, failed (not answered), judged and
@@ -518,8 +556,9 @@ Injected test transports report `measured: false`.
 [--judge-model ID] [--judge-effort low|medium|high] [--repeats N]` judges the answers a question stage already
 stored, without asking anything and without a store. It needs only
 `LLM_API_KEY`. It reads only stored answers and judgments, so it also accepts
-the output of the earlier question protocol
-(`memdrive-beam-replay-questions-v1`), whose files have the same format. Each rubric item of each answered question is judged
+the output of the earlier question protocols
+(`memdrive-beam-replay-questions-v1` and `-v2`), whose files have the same
+format. The current stage protocol is `memdrive-beam-replay-questions-v3`. Each rubric item of each answered question is judged
 `--repeats` times (1 to 10, default 1) with the same upstream prompt and
 request as the stage, and any judge model. Use it to see whether the judge
 repeats its own scores and whether another judge model agrees.

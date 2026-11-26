@@ -139,7 +139,7 @@ test('each question is a fresh read-only conversation with the run instructions 
         return context.session === 0 && context.round === 0 ? toolCall(request, 'search-1', 'search', { query: 'note' }) : message(request, `Answer ${context.session}`);
     } });
     const definitions = getFileToolDefinitions({ embeddingMode: 'managed', tools: readToolNames });
-    assert.deepEqual([...readToolNames], ['guide', 'read', 'list', 'search', 'findText']);
+    assert.deepEqual([[...readToolNames], manifest.protocol], [['guide', 'read', 'tree', 'list', 'search', 'findText'], 'memdrive-beam-replay-questions-v3']);
     assert.deepEqual([manifest.tools, manifest.toolDefinitions, manifest.model, manifest.judgeModel], [readToolNames, definitions, 'gpt-6.1-sol', defaultJudgeModel]);
     assert.deepEqual([manifest.guide, manifest.run.guide, summary.guide], ['on', 'on', 'on']);
     assert.equal(manifest.instructions.sha256, hash(fileToolInstructions));
@@ -161,7 +161,12 @@ test('each question is a fresh read-only conversation with the run instructions 
     assert.equal(requests[1].request.input.at(-1).type, 'function_call_output');
     assert.deepEqual(results.map(result => result.answer), ['Answer 0', 'Answer 1', 'Answer 2', 'Answer 3', 'Answer 4']);
     assert.deepEqual([results[0].metrics.toolCallsByName, results[0].metrics.retrievalCall, results[1].metrics.retrievalCall], [{ search: 1 }, true, false]);
-    assert.deepEqual([summary.retrieval, summary.measured], [{ questionsWithRetrievalCall: 1, toolCallsByName: { search: 1 } }, false]);
+    assert.deepEqual([results[0].metrics.toolUse.firstTool, results[1].metrics.toolUse.firstTool], ['search', 'none']);
+    // The same tool-use vocabulary as the replay, over one conversation per question.
+    const { toolUse, ...retrieval } = summary.retrieval;
+    assert.deepEqual([retrieval, summary.measured], [{ questionsWithRetrievalCall: 1, toolCallsByName: { search: 1 } }, false]);
+    assert.deepEqual([toolUse.conversations, toolUse.firstTool, toolUse.firstNonGuideTool, toolUse.search, toolUse.withoutSearchOrFindText],
+        [5, { none: 4, search: 1 }, { none: 4, search: 1 }, { calls: 1, mean: 0.2, max: 1 }, 4]);
     const directory = path.join(files.root, 'requests', `question-001-${ids[0]}`);
     assert.deepEqual((await jsonl(path.join(directory, 'events.jsonl'))).map(event => [event.name, event.ok, typeof event.elapsedMs]), [['search', true, 'number']]);
     assert.deepEqual(await jsonl(path.join(directory, 'transcript.jsonl')), requests[1].request.input.concat(message(requests[1].request, 'Answer 0').output));
@@ -181,9 +186,9 @@ test('each question is a fresh read-only conversation with the run instructions 
     const unguidedRequests = [];
     const unguided = await files.stage('unguided', { limit: 1, guide: 'off', ask: async request => { unguidedRequests.push(request); return message(request, 'a'); } });
     assert.deepEqual([unguided.manifest.tools, unguided.manifest.toolDefinitions, unguided.manifest.guide],
-        [['read', 'list', 'search', 'findText'], getFileToolDefinitions({ embeddingMode: 'managed', tools: ['read', 'list', 'search', 'findText'] }), 'off']);
+        [['read', 'tree', 'list', 'search', 'findText'], getFileToolDefinitions({ embeddingMode: 'managed', tools: ['read', 'tree', 'list', 'search', 'findText'] }), 'off']);
     assert.deepEqual([unguidedRequests[0].tools.map(tool => tool.name), unguidedRequests[0].input[0]],
-        [['read', 'list', 'search', 'findText'], { role: 'developer', content: fileToolInstructions }]);
+        [['read', 'tree', 'list', 'search', 'findText'], { role: 'developer', content: fileToolInstructions }]);
     assert(unguided.summary.limitations.some(text => text.includes('guide tool off while the run saved with it on')));
     await assert.rejects(files.stage('bad-guide', { guide: 'maybe' }), /--guide on or off/);
     assert.equal(await exists(path.join(files.root, 'bad-guide')), false);
@@ -226,7 +231,7 @@ test('the stage leaves the store byte-for-byte unchanged, also when the model ca
     assert(JSON.parse(before.sdk).note.content.includes('Synthetic note.'));
     assert.equal(JSON.parse(before.sdk).checkpoints.length, 1, 'The run checkpointed its one write');
     const script = [['write', { op: 'create', path: '/x.md', content: 'x' }], ['merge', {}], ['fork', { name: 'other' }], ['checkpoint', { name: 'c' }],
-        ['rollback', {}], ['list', {}], ['read', { path: '/notes.md' }], ['findText', { query: 'note' }], ['search', { query: 'note' }], ['guide', {}]];
+        ['rollback', {}], ['tree', {}], ['list', {}], ['read', { path: '/notes.md' }], ['findText', { query: 'note' }], ['search', { query: 'note' }], ['guide', {}]];
     const outputs = [];
     const { results, summary } = await files.stage('unchanged', { limit: 1, ask: async (request, { round }) => {
         const last = request.input.at(-1);
@@ -243,12 +248,14 @@ test('the stage leaves the store byte-for-byte unchanged, also when the model ca
     assert.deepEqual(files.fixture.calls.slice(before.calls).filter(call => writes.has(call.kind)), []);
     assert(files.fixture.calls.length > before.calls, 'The stage did read the store');
     assert.equal(summary.store.unchanged, true);
-    assert.deepEqual([summary.store.before.files.map(file => file.path), summary.store.before.latestCheckpoint],
-        [['/notes.md'], JSON.parse(before.sdk).latest.at.name]);
-    // A listing that still lags behind the run's writes cannot hide a file: the run's final inventory is read by file ID.
-    files.fixture.listPage = () => ({ isDocsInline: true, total: 0, docs: [] });
-    const lagging = await files.stage('lagging', { limit: 1 });
-    assert.deepEqual([lagging.summary.store.unchanged, lagging.summary.store.after.files.map(file => file.path)], [true, ['/notes.md']]);
+    assert.deepEqual([summary.store.before.files.map(file => [file.path, file.chars]), summary.store.before.latestCheckpoint, summary.store.before.tree,
+        summary.store.before.errors], [[['/notes.md', 'Synthetic note.\n'.length]], JSON.parse(before.sdk).latest.at.name,
+        { fileCount: 1, folders: [], truncated: false }, []]);
+    // Over 1,000 files the harness listing fails; it is recorded, not worked around, and the comparison is unknown.
+    files.fixture.seedFiles(files.replay.manifest.store.name, 'main', Array.from({ length: 1001 }, (_, index) => `/archive/${index}.md`));
+    const crowded = await files.stage('crowded', { limit: 1 });
+    assert.deepEqual([crowded.summary.store.unchanged, crowded.summary.store.before.files, crowded.summary.store.before.errors, crowded.summary.store.after.tree.fileCount],
+        [null, null, [{ step: 'list', code: 'LIST_TOO_MANY_FILES' }], 1002]);
 });
 
 test('judging follows the upstream per-rubric-item prompt and reports means with their counts', async t => {
@@ -393,11 +400,14 @@ test('stored answers are judged again without asking, and agreement is counted p
     assert.deepEqual([reasoned.manifest.judgeRequest, reasoned.summary.judgeRequest],
         [{ reasoning_effort: 'high', perRubricItem: true, retries: 0 }, { reasoning_effort: 'high', perRubricItem: true, retries: 0 }]);
     await reject({ output: path.join(files.root, 'again') }, { code: 'EEXIST' });
-    // Stored answers of the earlier question protocol share this format and are judged the same way.
+    // Stored answers of the earlier question protocols share this format and are judged the same way.
     const stage = await json(path.join(files.root, 'first', 'manifest.json'));
-    await writeFile(path.join(files.root, 'first', 'manifest.json'), JSON.stringify({ ...stage, protocol: 'memdrive-beam-replay-questions-v1' }));
-    const earlier = await runRejudge({ answers: path.join(files.root, 'first'), manifest: files.manifest, output: path.join(files.root, 'earlier'), judge: scored(1) });
-    assert.deepEqual(earlier.summary.questions, { stored: 4, judged: 4, complete: true });
+    assert.equal(stage.protocol, 'memdrive-beam-replay-questions-v3');
+    for (const protocol of ['memdrive-beam-replay-questions-v1', 'memdrive-beam-replay-questions-v2']) {
+        await writeFile(path.join(files.root, 'first', 'manifest.json'), JSON.stringify({ ...stage, protocol }));
+        const earlier = await runRejudge({ answers: path.join(files.root, 'first'), manifest: files.manifest, output: path.join(files.root, protocol), judge: scored(1) });
+        assert.deepEqual(earlier.summary.questions, { stored: 4, judged: 4, complete: true });
+    }
     await writeFile(path.join(files.root, 'first', 'manifest.json'), JSON.stringify({ ...stage, protocol: 'memdrive-beam-replay-questions-v0' }));
     await reject({}, /question-stage output/);
     await writeFile(path.join(files.root, 'first', 'manifest.json'), JSON.stringify(stage));
@@ -446,10 +456,12 @@ test('runs without a retained store, ledgers from elsewhere and existing outputs
     files.fixture.collections.get(ledger.name).metadata.tags['beam.owner'] = ledger.labels['beam.owner'];
     await writeFile(path.join(files.run, 'store.json'), JSON.stringify({ ...ledger, status: 'cleaned' }));
     await rejected('cleaned', {}, /not ready or was cleaned up/);
-    // A run of the earlier protocol used another store layout and tools: it is refused by name.
+    // Runs of earlier protocols used another store layout or tool catalog: they are refused by name.
     const runManifest = await json(path.join(files.run, 'manifest.json'));
-    await writeFile(path.join(files.run, 'manifest.json'), JSON.stringify({ ...runManifest, protocol: 'memdrive-beam-session-replay-v1' }));
-    await rejected('old-run', {}, /used memdrive-beam-session-replay-v1; the question stage reads only memdrive-beam-session-replay-v2 runs/);
+    for (const earlier of ['memdrive-beam-session-replay-v1', 'memdrive-beam-session-replay-v2']) {
+        await writeFile(path.join(files.run, 'manifest.json'), JSON.stringify({ ...runManifest, protocol: earlier }));
+        await rejected('old-run', {}, new RegExp(`used ${earlier}; the question stage reads only memdrive-beam-session-replay-v3 runs`));
+    }
     await writeFile(path.join(files.run, 'manifest.json'), JSON.stringify({ ...runManifest, protocol: 'memdrive-tool-use-v4' }));
     await rejected('other-run', {}, /Use a BEAM session replay run/);
     assert.deepEqual(files.counts, { ask: 0, judge: 0 });

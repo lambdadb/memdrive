@@ -8,11 +8,12 @@ import { performance } from 'node:perf_hooks';
 import { get_encoding } from 'tiktoken';
 import { createFileTools, fileToolError, getFileToolDefinitions } from '@functional-systems/memdrive';
 
-// v2: the six main-only tools with host-checkpointed writes. v1 used 16 tools with
-// an `at` view selector and published forks with merge; its runs are not comparable.
-export const protocol = 'memdrive-beam-session-replay-v2';
+// v3: the seven main-only tools, with `tree` and a path-ordered, consistent `list`.
+// v2 offered six tools without `tree` and an unordered, eventual `list`; v1 used 16
+// tools with an `at` view selector and published forks with merge. Their runs are not comparable.
+export const protocol = 'memdrive-beam-session-replay-v3';
 /** The SDK's whole agent catalog, in its documented order. `--guide off` leaves out `guide`. */
-export const toolNames = Object.freeze(['guide', 'read', 'list', 'search', 'findText', 'write']);
+export const toolNames = Object.freeze(['guide', 'read', 'tree', 'list', 'search', 'findText', 'write']);
 export const guideSettings = Object.freeze(['on', 'off']);
 /** The tools offered with a guide setting, from a full allowlist. */
 export const withGuide = (tools, guide) => {
@@ -204,11 +205,13 @@ export function openAI({ key, fetcher = fetch, endpoint = 'responses' }) {
 
 /**
  * Deterministic transport and metrics smoke only; never evidence of model behavior.
- * Session 0 reads the guide, searches, creates a note and lists main in its first
- * turn; in its second, when it has one, it reads the note, edits it exactly and tries
- * to create it again (`PATH_EXISTS`, which changes nothing). Session 1 creates a file
- * without looking first, finds the note literally and deletes it. Every other turn only replies. A step whose tool the run
- * does not offer (`guide` with `--guide off`) is skipped.
+ * Session 0 reads the guide, describes the whole drive with `tree`, searches, creates
+ * a note and lists its folder by `prefix` in its first turn; in its second, when it
+ * has one, it reads the note, edits it exactly and tries to create it again
+ * (`PATH_EXISTS`, which changes nothing). Session 1 describes the note's folder with
+ * `tree`, creates a file without a lookup (`tree` is none), finds the note literally
+ * and deletes it. Every other turn only replies. A step whose tool the run does not
+ * offer (`guide` with `--guide off`) is skipped.
  */
 export function scriptedTransport() {
     const note = '/notes/scripted.md';
@@ -218,14 +221,16 @@ export function scriptedTransport() {
         if (session === 0 && turn === 0) {
             add('guide', {});
             add('guide', { topic: 'editing' });
+            add('tree', {});
             add('search', { query: 'scripted note', mode: 'keyword' });
             add('write', { op: 'create', path: note, content: 'Scripted note.\n' });
-            add('list', {});
+            add('list', { prefix: '/notes/' });
         } else if (session === 0 && turn === 1) {
             add('read', { path: note });
             add('write', previous => ({ op: 'update', fileId: previous.fileId, edits: [{ oldText: 'Scripted note.', newText: 'Scripted note, revised.' }] }));
             add('write', { op: 'create', path: note, content: 'A second note at the same path.\n' });
         } else if (session === 1 && turn === 0) {
+            add('tree', { prefix: '/notes/' });
             add('write', { op: 'create', path: '/notes/unsearched.md', content: 'Saved without looking first.\n' });
             add('findText', { query: 'revised', prefix: '/notes/' });
             add('write', previous => ({ op: 'delete', fileId: previous.hits[0].fileId }));

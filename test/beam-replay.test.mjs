@@ -3,10 +3,10 @@ import { access, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:f
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { fileToolInstructions, getFileToolDefinitions, MemDrive } from '@functional-systems/memdrive';
+import { fileToolInstructions, getFileToolDefinitions } from '@functional-systems/memdrive';
 import { limits, openAI, toolNames } from '../benchmark/beam/replay-agent.mjs';
-import { conversationMetrics, sessionMetrics } from '../benchmark/beam/replay-metrics.mjs';
-import { describeFailure, listChecker, runReplay, writtenFileIds } from '../benchmark/beam/replay.mjs';
+import { conversationMetrics, sessionMetrics, toolUse, toolUseTotals } from '../benchmark/beam/replay-metrics.mjs';
+import { describeFailure, runReplay } from '../benchmark/beam/replay.mjs';
 import { dateOf, groupSessions, hash, loadSessions, stripMarker } from '../benchmark/beam/replay-sessions.mjs';
 import { cleanupStore, lambdadbConnection } from '../benchmark/beam/replay-store.mjs';
 import { fileClient } from './helpers/file-client.mjs';
@@ -109,7 +109,7 @@ test('loading verifies the prepared manifest and runtime checksum without readin
     await assert.rejects(loadSessions(files.manifest, '7'), /Unexpected prepared dataset source hashes/);
 });
 
-test('a scripted replay records lookups, checkpointed writes, a rejected write, a deletion and the inventory per session', async t => {
+test('a scripted replay records tree and list use, lookups, checkpointed writes, a rejected write, a deletion and the inventory per session', async t => {
     const files = await prepared(t);
     let now = 0;
     const { summary, manifest, results } = await runReplay({ manifest: files.manifest, conversation: '7', output: files.output, mode: 'scripted', instructions: 'none',
@@ -122,36 +122,48 @@ test('a scripted replay records lookups, checkpointed writes, a rejected write, 
     assert.deepEqual([manifest.guide, manifest.tools, summary.guide, manifest.writes.checkpointed], ['on', [...toolNames], 'on', true]);
 
     const operations = (counts = {}) => ({ create: 0, updateEdits: 0, updateContent: 0, updateOther: 0, delete: 0, ...counts });
-    const noList = { traversals: 0, checked: 0, uncheckedByReason: {}, withMissedFiles: 0, missedFiles: 0, withStaleFiles: 0, staleFiles: 0 };
     const tokens = { inputTokens: 0, outputTokens: 0, unknownUsageRequests: 0 };
+    const noList = { listings: 0, continuations: 0, afterTree: 0, withPrefix: 0, withNameContains: 0, withDelimiter: 0, stoppedBeforeEnd: 0 };
+    const used = fields => ({ firstTool: 'none', firstNonGuideTool: 'none', tree: { withPrefix: 0, withoutPrefix: 0 }, list: noList, search: 0, findText: 0,
+        read: { whole: 0, ranged: 0, wholeChars: 0, rangedChars: 0 }, failedTreesByCode: {}, failedListsByCode: {}, ...fields });
     const [first, second, third] = results.map(result => result.metrics);
-    assert.deepEqual(first, { userTurns: 3, modelRequests: 11, ...tokens, toolCalls: 8,
-        toolCallsByName: { guide: 2, list: 1, read: 1, search: 1, write: 3 }, toolErrorsByCode: { PATH_EXISTS: 1 },
-        toolCallsPerTurn: { mean: 8 / 3, max: 5 }, toolRounds: 8, toolRoundsPerTurn: { mean: 8 / 3, max: 5 },
+    assert.deepEqual(first, { userTurns: 3, modelRequests: 12, ...tokens, toolCalls: 9,
+        toolCallsByName: { guide: 2, list: 1, read: 1, search: 1, tree: 1, write: 3 }, toolErrorsByCode: { PATH_EXISTS: 1 },
+        toolCallsPerTurn: { mean: 3, max: 6 }, toolRounds: 9, toolRoundsPerTurn: { mean: 3, max: 6 },
         guideCalls: { index: 1, byTopic: { editing: 1 } }, writeCalls: 3, failedWritesByCode: { PATH_EXISTS: 1 },
         noSuccessfulWrite: false, turnsWithWrite: 2, turnsWithMultipleWriteCalls: 1, operations: operations({ create: 1, updateEdits: 1 }),
         filesCreated: 1, filesUpdated: 1, filesWrittenInSeveralTurns: 1, createsAfterLookup: 1, createsWithoutLookup: 0,
-        filesAfter: 1, latestCheckpointAsExpected: true, listCheck: { ...noList, traversals: 1, checked: 1 } });
-    assert.deepEqual(second, { userTurns: 1, modelRequests: 4, ...tokens, toolCalls: 3,
-        toolCallsByName: { findText: 1, write: 2 }, toolErrorsByCode: {},
-        toolCallsPerTurn: { mean: 3, max: 3 }, toolRounds: 3, toolRoundsPerTurn: { mean: 3, max: 3 },
+        filesAfter: 1, latestCheckpointAsExpected: true,
+        // The whole-drive tree comes after the guide; the note's folder is listed by prefix after it.
+        toolUse: used({ firstTool: 'guide', firstNonGuideTool: 'tree', tree: { withPrefix: 0, withoutPrefix: 1 },
+            list: { ...noList, listings: 1, afterTree: 1, withPrefix: 1 }, search: 1,
+            read: { whole: 1, ranged: 0, wholeChars: 'Scripted note.\n'.length, rangedChars: 0 } }) });
+    assert.deepEqual(second, { userTurns: 1, modelRequests: 5, ...tokens, toolCalls: 4,
+        toolCallsByName: { findText: 1, tree: 1, write: 2 }, toolErrorsByCode: {},
+        toolCallsPerTurn: { mean: 4, max: 4 }, toolRounds: 4, toolRoundsPerTurn: { mean: 4, max: 4 },
         guideCalls: { index: 0, byTopic: {} }, writeCalls: 2, failedWritesByCode: {},
         noSuccessfulWrite: false, turnsWithWrite: 1, turnsWithMultipleWriteCalls: 1, operations: operations({ create: 1, delete: 1 }),
+        // A tree call returns no files, so the create after it still counts as without a lookup.
         filesCreated: 1, filesUpdated: 0, filesWrittenInSeveralTurns: 0, createsAfterLookup: 0, createsWithoutLookup: 1,
-        filesAfter: 1, latestCheckpointAsExpected: true, listCheck: noList });
+        filesAfter: 1, latestCheckpointAsExpected: true,
+        toolUse: used({ firstTool: 'tree', firstNonGuideTool: 'tree', tree: { withPrefix: 1, withoutPrefix: 0 }, findText: 1 }) });
     assert.deepEqual(third, { userTurns: 2, modelRequests: 2, ...tokens, toolCalls: 0, toolCallsByName: {}, toolErrorsByCode: {},
         toolCallsPerTurn: { mean: 0, max: 0 }, toolRounds: 0, toolRoundsPerTurn: { mean: 0, max: 0 },
         guideCalls: { index: 0, byTopic: {} }, writeCalls: 0, failedWritesByCode: {},
         noSuccessfulWrite: true, turnsWithWrite: 0, turnsWithMultipleWriteCalls: 0, operations: operations(),
         filesCreated: 0, filesUpdated: 0, filesWrittenInSeveralTurns: 0, createsAfterLookup: 0, createsWithoutLookup: 0,
-        filesAfter: 1, latestCheckpointAsExpected: true, listCheck: noList });
-    assert.deepEqual(summary.smoke, { sessions: 4, userTurns: 8, modelRequests: 19, ...tokens, toolCalls: 11,
-        toolCallsByName: { findText: 1, guide: 2, list: 1, read: 1, search: 1, write: 5 }, toolErrorsByCode: { PATH_EXISTS: 1 },
-        toolCallsPerTurn: { mean: 11 / 8, max: 5 }, toolRounds: 11, toolRoundsPerTurn: { mean: 11 / 8, max: 5 },
+        filesAfter: 1, latestCheckpointAsExpected: true, toolUse: used({}) });
+    assert.deepEqual(summary.smoke, { sessions: 4, userTurns: 8, modelRequests: 21, ...tokens, toolCalls: 13,
+        toolCallsByName: { findText: 1, guide: 2, list: 1, read: 1, search: 1, tree: 2, write: 5 }, toolErrorsByCode: { PATH_EXISTS: 1 },
+        toolCallsPerTurn: { mean: 13 / 8, max: 6 }, toolRounds: 13, toolRoundsPerTurn: { mean: 13 / 8, max: 6 },
         guideCalls: { index: 1, byTopic: { editing: 1 } }, writeCalls: 5, failedWritesByCode: { PATH_EXISTS: 1 },
         sessionsWithoutWrite: 2, turnsWithWrite: 3, turnsWithMultipleWriteCalls: 2, operations: operations({ create: 2, updateEdits: 1, delete: 1 }),
         filesCreated: 2, filesUpdated: 1, filesWrittenInSeveralTurns: 1, createsAfterLookup: 1, createsWithoutLookup: 1,
-        finalFiles: 1, sessionsWithUnexpectedLatestCheckpoint: 0, listCheck: { ...noList, traversals: 1, checked: 1 } });
+        finalFiles: 1, sessionsWithUnexpectedLatestCheckpoint: 0,
+        toolUse: { conversations: 4, firstTool: { guide: 1, none: 2, tree: 1 }, firstNonGuideTool: { none: 2, tree: 2 },
+            tree: { withPrefix: 1, withoutPrefix: 1 }, list: { ...noList, listings: 1, afterTree: 1, withPrefix: 1 },
+            search: { calls: 1, mean: 0.25, max: 1 }, findText: { calls: 1, mean: 0.25, max: 1 }, withoutSearchOrFindText: 2,
+            read: { whole: 1, ranged: 0, wholeChars: 'Scripted note.\n'.length, rangedChars: 0 }, failedTreesByCode: {}, failedListsByCode: {} } });
     assert.deepEqual(summary.smoke, conversationMetrics(results.map(result => result.metrics)));
 
     // Harness reads are recorded apart from the model's tool events.
@@ -159,26 +171,26 @@ test('a scripted replay records lookups, checkpointed writes, a rejected write, 
     assert.deepEqual((await readdir(files.output)).sort(), ['manifest.json', 'session-001-s000', 'session-002-s001', 'session-003-s002', 'session-004-s003', 'summary.json']);
     const events = await jsonl(path.join(sessionDirectory, 'events.jsonl'));
     assert.deepEqual(events.map(event => [event.turn, event.name, event.ok, event.error?.code]), [[0, 'guide', true, undefined], [0, 'guide', true, undefined],
-        [0, 'search', true, undefined], [0, 'write', true, undefined], [0, 'list', true, undefined], [1, 'read', true, undefined],
+        [0, 'tree', true, undefined], [0, 'search', true, undefined], [0, 'write', true, undefined], [0, 'list', true, undefined], [1, 'read', true, undefined],
         [1, 'write', true, undefined], [1, 'write', false, 'PATH_EXISTS']]);
+    // The tree before the first write is empty; the listing right after it already holds the note.
+    assert.deepEqual([events[2].result, events[5].result.files.map(file => file.path)], [{ fileCount: 0, folders: [], truncated: false }, ['/notes/scripted.md']]);
     // Every write call gets its own checkpoint name; the model's results never carry one.
     const names = events.filter(event => event.name === 'write').map(event => event.checkpoint);
     assert(names.every(name => /^turn-[0-9a-z]+-[0-9a-f]{8}$/.test(name) && name.length <= 41) && new Set(names).size === 3);
     assert(!JSON.stringify(await jsonl(path.join(sessionDirectory, 'transcript.jsonl'))).includes('turn-'));
-    assert.deepEqual(await jsonl(path.join(sessionDirectory, 'list-checks.jsonl')), [{ turn: 0, round: 4, pages: 1, delivered: true,
-        checked: true, expected: 1, listed: 1, missed: [], stale: [] }]);
     // Main's latest checkpoint is the last successful write's; the rejected create changed nothing.
     const observation = await json(path.join(sessionDirectory, 'observation.json'));
     assert.deepEqual({ ...observation, inventory: observation.inventory.map(({ path: file, chars }) => ({ path: file, chars })) },
-        { latestCheckpointBefore: null, latestCheckpointAfter: names[1], inventory: [{ path: '/notes/scripted.md', chars: 'Scripted note, revised.\n'.length }],
-            unlisted: [], stale: [], errors: [] });
+        { latestCheckpointBefore: null, latestCheckpointAfter: names[1], tree: { fileCount: 1, folders: [{ path: '/notes/', fileCount: 1 }], truncated: false },
+            inventory: [{ path: '/notes/scripted.md', chars: 'Scripted note, revised.\n'.length }], errors: [] });
     const later = await json(path.join(files.output, 'session-002-s001', 'observation.json'));
     assert.deepEqual([later.latestCheckpointBefore, later.inventory.map(file => file.path)], [names[1], ['/notes/unsearched.md']]);
     // Each clock reading advances by one, so every timed request and tool call lasts exactly 1.
     const receipts = await jsonl(path.join(sessionDirectory, 'requests.jsonl'));
     assert(receipts.every(receipt => receipt.status === 'pending' ? !('elapsedMs' in receipt) : receipt.elapsedMs === 1));
     assert(events.every(event => event.elapsedMs === 1));
-    assert.deepEqual(results[0].timing.perTurn, [{ modelRequestMs: 6, toolMs: 5 }, { modelRequestMs: 4, toolMs: 3 }, { modelRequestMs: 1, toolMs: 0 }]);
+    assert.deepEqual(results[0].timing.perTurn, [{ modelRequestMs: 7, toolMs: 6 }, { modelRequestMs: 4, toolMs: 3 }, { modelRequestMs: 1, toolMs: 0 }]);
     for (const [index, result] of results.entries()) {
         const { wallMs, perTurn, ...timing } = result.timing;
         assert.deepEqual(timing, { modelRequestMs: result.metrics.modelRequests, toolMs: result.metrics.toolCalls, toolMsByName: result.metrics.toolCallsByName });
@@ -196,7 +208,7 @@ test('a scripted replay records lookups, checkpointed writes, a rejected write, 
     const unguided = await runReplay({ manifest: files.manifest, conversation: '7', output: path.join(files.root, 'unguided'), mode: 'scripted',
         instructions: 'none', guide: 'off', sessions: 1 });
     assert.deepEqual([unguided.manifest.tools, unguided.results[0].metrics.toolCallsByName, unguided.results[0].metrics.guideCalls],
-        [['read', 'list', 'search', 'findText', 'write'], { list: 1, read: 1, search: 1, write: 3 }, { index: 0, byTopic: {} }]);
+        [['read', 'tree', 'list', 'search', 'findText', 'write'], { list: 1, read: 1, search: 1, tree: 1, write: 3 }, { index: 0, byTopic: {} }]);
 });
 
 test('the model request holds only utterances, SDK tool definitions and the selected server instructions', async t => {
@@ -214,7 +226,7 @@ test('the model request holds only utterances, SDK tool definitions and the sele
     const both = await run('both', { instructions: 'sdk', policyFile });
     const expected = fileToolInstructions + '\n\n' + policy;
     assert.deepEqual(both.manifest.instructions, { source: 'sdk', policySha256: hash(policy), text: expected, sha256: hash(expected) });
-    assert.deepEqual(both.manifest.tools, [...toolNames]);
+    assert.deepEqual([both.manifest.tools, both.manifest.protocol], [['guide', 'read', 'tree', 'list', 'search', 'findText', 'write'], 'memdrive-beam-session-replay-v3']);
     assert.deepEqual(both.manifest.toolDefinitions, definitions);
     assert.equal(both.manifest.transport, 'injected-test');
     assert.equal(both.summary.modelBehavior, null, 'An injected transport is never a model measurement');
@@ -263,10 +275,10 @@ test('the model request holds only utterances, SDK tool definitions and the sele
     // Without the guide tool the catalog drops it and the SDK instruction text stays as it is:
     // that text asks for the guide only when it is available.
     const unguided = await run('unguided', { instructions: 'sdk', guide: 'off', sessions: 1, turns: 1 });
-    const withoutGuide = getFileToolDefinitions({ embeddingMode: 'managed', tools: ['read', 'list', 'search', 'findText', 'write'] });
+    const withoutGuide = getFileToolDefinitions({ embeddingMode: 'managed', tools: ['read', 'tree', 'list', 'search', 'findText', 'write'] });
     assert.deepEqual([unguided.manifest.guide, unguided.manifest.tools, unguided.manifest.toolDefinitions, unguided.summary.guide],
-        ['off', ['read', 'list', 'search', 'findText', 'write'], withoutGuide, 'off']);
-    assert.deepEqual(unguided.requests[0].request.tools.map(tool => tool.name), ['read', 'list', 'search', 'findText', 'write']);
+        ['off', ['read', 'tree', 'list', 'search', 'findText', 'write'], withoutGuide, 'off']);
+    assert.deepEqual(unguided.requests[0].request.tools.map(tool => tool.name), ['read', 'tree', 'list', 'search', 'findText', 'write']);
     assert.deepEqual(unguided.requests[0].request.input[0], { role: 'developer', content: fileToolInstructions });
     assert.match(fileToolInstructions, /When guide is available/);
     await assert.rejects(run('guide', { guide: 'none' }), /--guide on or off/);
@@ -390,7 +402,10 @@ test('metrics count operations, files, lookups, guide topics and the latest chec
         filesCreated: 2, filesUpdated: 2, filesWrittenInSeveralTurns: 2,
         // The first create came before any successful lookup; the failed search does not count.
         createsAfterLookup: 1, createsWithoutLookup: 1, filesAfter: 1, latestCheckpointAsExpected: true,
-        listCheck: { traversals: 0, checked: 0, uncheckedByReason: {}, withMissedFiles: 0, missedFiles: 0, withStaleFiles: 0, staleFiles: 0 } });
+        // These events have no delivered flag, so the read's characters are not counted.
+        toolUse: { firstTool: 'search', firstNonGuideTool: 'search', tree: { withPrefix: 0, withoutPrefix: 0 },
+            list: { listings: 0, continuations: 0, afterTree: 0, withPrefix: 0, withNameContains: 0, withDelimiter: 0, stoppedBeforeEnd: 0 },
+            search: 1, findText: 0, read: { whole: 1, ranged: 0, wholeChars: 0, rangedChars: 0 }, failedTreesByCode: {}, failedListsByCode: {} } });
     assert.equal(sessionMetrics({ userTurns: 4, requests: [], events, observation: observation('c2') }).latestCheckpointAsExpected, false);
     // Without a successful write the latest checkpoint must stay where it was.
     assert.equal(sessionMetrics({ userTurns: 1, requests: [], events: [], observation: observation('c0') }).latestCheckpointAsExpected, true);
@@ -547,78 +562,74 @@ test('per-session token and time limits reach the session budget and the manifes
     assert.equal(await exists(path.join(files.root, 'invalid')), false);
 });
 
-test('the list check judges only traversals followed to the end against consistent reads by file ID', async t => {
-    const { client } = fileClient();
-    const drive = await MemDrive.create({ client, name: 'list-check' });
-    const created = await drive.write({ operations: ['/a/x.md', '/a/y.md', '/b/z.md', '/b/gone.md'].map(file => ({ op: 'create', path: file, content: file })) });
-    await drive.write({ op: 'delete', fileId: created[3].fileId });
-    // The run knows every file it wrote, including the deleted one, which read reports as gone.
-    const known = new Set(created.map(file => file.fileId));
-    const checker = listChecker(drive, known);
-    let round = 0;
-    const listed = async (args, result) => {
-        result ??= await drive.list(args);
-        return checker.onEvent({ turn: 1, round: round++, name: 'list', args, ok: true, delivered: true, result });
-    };
-    const without = (result, omitted) => ({ ...result, files: result.files.filter(file => !omitted.includes(file.path)) });
-    const checked = (fields, extra = {}) => ({ turn: 1, pages: 1, delivered: true, checked: true, stale: [], missed: [], ...fields, ...extra });
-
-    const full = await drive.list({});
-    assert.deepEqual(await listed({}, full), [checked({ round: 0, expected: 3, listed: 3 })]);
-    assert.deepEqual(await listed({}, without(full, ['/a/y.md'])), [checked({ round: 1, expected: 3, listed: 2, missed: ['/a/y.md'] })]);
-    assert.deepEqual(await listed({ prefix: '/a/' }, without(await drive.list({ prefix: '/a/' }), ['/a/x.md'])),
-        [checked({ round: 2, expected: 2, listed: 1, missed: ['/a/x.md'] })]);
-    assert.deepEqual(await listed({ nameContains: 'z' }), [checked({ round: 3, expected: 1, listed: 1 })]);
-    // An entry for a deleted file, or under a path the file has left, is stale; a file listed
-    // by its ID under an old path is stale, not missed.
-    const ghost = { fileId: created[3].fileId, path: '/b/gone.md', modifiedAt: created[3].modifiedAt };
-    const moved = { ...full.files.find(file => file.path === '/b/z.md'), path: '/b/old-z.md' };
-    assert.deepEqual(await listed({ prefix: '/b/' }, { files: [ghost, moved], prefixes: [], consistency: 'eventual' }),
-        [checked({ round: 4, expected: 1, listed: 2, stale: ['/b/gone.md', '/b/old-z.md'] })]);
-
-    // A paginated traversal is judged once, after its last page.
-    let page = await drive.list({ limit: 1 });
-    assert.deepEqual(await listed({ limit: 1 }, page), []);
-    for (let cursor = page.next; cursor; cursor = page.next) {
-        page = await drive.list(cursor);
-        const records = await listed({ cursor: cursor.cursor }, page);
-        assert.deepEqual(records, page.next ? [] : [checked({ round: 5, pages: 3, expected: 3, listed: 3 })]);
-    }
-    // Grouped, unknown, interrupted and abandoned traversals are reported unchecked by reason.
-    assert.deepEqual((await listed({ delimiter: '/' })).map(record => record.reason), ['delimiter']);
-    assert.deepEqual((await listed({ cursor: 'made-up' }, { files: [], prefixes: [], consistency: 'eventual' })).map(record => record.reason), ['unknown_cursor']);
-    const interrupted = await drive.list({ limit: 2 });
-    await listed({ limit: 2 }, interrupted);
-    await checker.onEvent({ turn: 1, round: round++, name: 'write', ok: true, args: {}, result: {} });
-    assert.deepEqual((await listed({ cursor: interrupted.next.cursor }, await drive.list(interrupted.next))).map(record => record.reason), ['write_during']);
-    await listed({ limit: 1 });
-    assert.deepEqual(checker.finish().map(record => [record.reason, record.pages]), [['unfinished', 1]]);
-    assert.deepEqual(checker.finish(), []);
-    const broken = listChecker({ read: async () => { throw Object.assign(new Error('x'), { name: 'MemDriveError' }); } }, known);
-    assert.deepEqual((await broken.onEvent({ turn: 0, round: 0, name: 'list', args: {}, ok: true, delivered: true, result: full })).map(record => record.reason),
-        ['read_failed']);
-
-    // In a run on a backend whose listing lags, the model gets the stale page unchanged, the
-    // check counts the miss and the inventory still finds the file by reading it.
-    const files = await prepared(t);
-    const live = liveFixture();
-    live.fixture.listPage = () => ({ isDocsInline: true, total: 0, docs: [] });
-    const script = [['write', { op: 'create', path: '/kept.md', content: 'kept' }], ['list', {}]];
-    const delivered = [];
-    const run = await runReplay({ manifest: files.manifest, conversation: '7', output: files.output, backend: 'lambdadb', connect: live.connect,
-        mode: 'model', instructions: 'none', sessions: 1, turns: 1, askFactory: () => async (request, { round: step }) => {
-            if (step === script.length) delivered.push(JSON.parse(request.input.at(-1).output));
-            return step < script.length ? toolCall(request, `call-${step}`, ...script[step]) : reply(request);
-        } });
-    assert.deepEqual(delivered, [{ files: [], prefixes: [], consistency: 'eventual' }]);
-    assert.deepEqual(run.results[0].metrics.listCheck, { traversals: 1, checked: 1, uncheckedByReason: {}, withMissedFiles: 1, missedFiles: 1, withStaleFiles: 0, staleFiles: 0 });
-    assert.deepEqual((await jsonl(path.join(files.output, 'session-001-s000', 'list-checks.jsonl'))).map(entry => entry.missed), [['/kept.md']]);
-    const observation = await json(path.join(files.output, 'session-001-s000', 'observation.json'));
-    assert.deepEqual([observation.inventory.map(file => file.path), observation.unlisted, observation.stale], [['/kept.md'], ['/kept.md'], []]);
-    assert.equal(run.results[0].metrics.filesAfter, 1);
+test('tool use records first tools, tree and list narrowing, partial listings, read kinds and characters, and list and tree failures', () => {
+    const call = (name, args, outcome = {}) => ({ name, args, ok: true, delivered: true, result: {}, ...outcome });
+    const failed = (name, args, code) => ({ name, args, ok: false, delivered: true, error: { code } });
+    const page = (paths, cursor) => ({ files: paths.map(file => ({ fileId: file, path: file })), prefixes: [], ...(cursor ? { next: { cursor } } : {}) });
+    const events = [
+        call('guide', {}),
+        failed('list', {}, 'LIST_TOO_MANY_FILES'),
+        // `/` is the whole drive for tree and list: no narrowing prefix.
+        call('tree', { prefix: '/' }),
+        failed('tree', { prefix: '/deep/' }, 'DATABASE_ERROR'),
+        call('list', { prefix: '/', delimiter: '/' }, { result: page(['/a.md'], 'c1') }),
+        // The continuation's own next is never forwarded: the model saw only part of that listing.
+        call('list', { cursor: 'c1' }, { result: page(['/b.md'], 'c2') }),
+        // An undelivered page's next never reached the model.
+        call('list', { prefix: '/notes/', nameContains: '', limit: 1 }, { delivered: false, result: page(['/notes/a.md'], 'c3') }),
+        call('list', { nameContains: 'decision' }, { result: page([]) }),
+        { name: 'list', rawArguments: '{', ok: false, delivered: true, error: { code: 'INVALID_JSON' } },
+        call('read', { path: '/a.md' }, { result: { content: 'abc' } }),
+        call('read', { paths: ['/a.md', '/b.md'] }, { result: [{ content: 'abc' }, { content: 'de' }] }),
+        call('read', { path: '/gone.md' }, { result: null }),
+        call('read', { fileId: 'x', startLine: 2, endLine: 3 }, { result: { content: 'line' } }),
+        call('read', { fileId: 'x', maxChars: 10 }, { delivered: false, result: { content: '0123456789' } }),
+        call('read', { fileId: 'x', offset: 4, revision: 'r' }, { result: { content: 'more' } }),
+        failed('read', { fileId: 'x', startLine: 0 }, 'INVALID_INPUT'),
+        call('search', { query: 'x' }), call('findText', { query: 'y' }), call('search', { query: 'z' }),
+    ];
+    const used = toolUse(events);
+    assert.deepEqual(used, { firstTool: 'guide', firstNonGuideTool: 'list', tree: { withPrefix: 1, withoutPrefix: 1 },
+        // Four new listings, three after the first tree, and one continuation; the unparseable call is in neither.
+        list: { listings: 4, continuations: 1, afterTree: 3, withPrefix: 1, withNameContains: 1, withDelimiter: 1, stoppedBeforeEnd: 1 },
+        search: 2, findText: 1,
+        // Characters of delivered successful results only.
+        read: { whole: 3, ranged: 4, wholeChars: 'abc'.length + 'abcde'.length, rangedChars: 'line'.length + 'more'.length },
+        failedTreesByCode: { DATABASE_ERROR: 1 }, failedListsByCode: { INVALID_JSON: 1, LIST_TOO_MANY_FILES: 1 } });
+    assert.deepEqual(toolUseTotals([used, toolUse([]), toolUse([call('guide', {})])]), { conversations: 3,
+        firstTool: { guide: 2, none: 1 }, firstNonGuideTool: { list: 1, none: 2 }, tree: used.tree, list: used.list,
+        search: { calls: 2, mean: 2 / 3, max: 2 }, findText: { calls: 1, mean: 1 / 3, max: 1 }, withoutSearchOrFindText: 2,
+        read: used.read, failedTreesByCode: used.failedTreesByCode, failedListsByCode: used.failedListsByCode });
+    assert.deepEqual([toolUseTotals([]).search, toolUseTotals([]).firstTool], [{ calls: 0, mean: null, max: null }, {}]);
 });
 
-test('the observation reads files a failed write may have touched, and a restored write keeps the latest checkpoint', async t => {
+test('a listing over 1,000 files fails for the model and for the observation, which records the error and still describes the tree', async t => {
+    const files = await prepared(t);
+    const live = liveFixture();
+    const seeded = Array.from({ length: 1001 }, (_, index) => `/archive/${String(index).padStart(4, '0')}.md`);
+    const script = [['tree', {}], ['list', {}], ['list', { prefix: '/archive/', nameContains: '0999' }]];
+    const outputs = [];
+    const { results } = await runReplay({ manifest: files.manifest, conversation: '7', output: files.output, backend: 'lambdadb', connect: live.connect,
+        mode: 'model', instructions: 'none', sessions: 1, turns: 1, askFactory: () => async (request, { round }) => {
+            // Stored directly, as if a model had written them earlier.
+            if (round === 0) live.fixture.seedFiles([...live.fixture.collections.keys()][0], 'main', seeded);
+            else outputs.push(JSON.parse(request.input.at(-1).output));
+            return round < script.length ? toolCall(request, `call-${round}`, ...script[round]) : reply(request);
+        } });
+    const tree = { fileCount: 1001, folders: [{ path: '/archive/', fileCount: 1001 }], truncated: false };
+    assert.deepEqual([outputs[0], outputs[1].error.code, outputs[1].error.details, outputs[2].files.map(file => file.path)],
+        [tree, 'LIST_TOO_MANY_FILES', { maximum: 1000 }, ['/archive/0999.md']]);
+    const { metrics } = results[0];
+    assert.deepEqual([metrics.toolErrorsByCode, metrics.toolUse.failedListsByCode, metrics.toolUse.list.afterTree, metrics.toolUse.list.withPrefix],
+        [{ LIST_TOO_MANY_FILES: 1 }, { LIST_TOO_MANY_FILES: 1 }, 2, 1]);
+    // The observation does not work around the limit: no inventory, but the tree and the latest checkpoint.
+    const observation = await json(path.join(files.output, 'session-001-s000', 'observation.json'));
+    assert.deepEqual(observation, { latestCheckpointBefore: null, latestCheckpointAfter: null, tree, inventory: null,
+        errors: [{ step: 'list', code: 'LIST_TOO_MANY_FILES' }] });
+    assert.deepEqual([metrics.filesAfter, metrics.latestCheckpointAsExpected], [null, true]);
+});
+
+test('a restored write keeps the latest checkpoint and leaves only the kept file in the inventory', async t => {
     const files = await prepared(t);
     const live = liveFixture();
     // The second write call's checkpoint cannot be created, so the SDK restores main to the first one.
@@ -634,9 +645,4 @@ test('the observation reads files a failed write may have touched, and a restore
     const observation = await json(path.join(files.output, 'session-001-s000', 'observation.json'));
     assert.deepEqual([observation.inventory.map(file => file.path), observation.latestCheckpointAfter], [['/one.md'], events[0].checkpoint]);
     assert.deepEqual([results[0].metrics.failedWritesByCode, results[0].metrics.latestCheckpointAsExpected], [{ CHECKPOINT_WRITE_FAILED: 1 }, true]);
-    // The SDK's file IDs are read: a success's results and a failure's details, never the model's own arguments.
-    assert.deepEqual([...writtenFileIds({ name: 'write', ok: false, args: { operations: [{ op: 'delete', fileId: 'made-up' }, { op: 'create', path: '/x' }] },
-        error: { code: 'CHECKPOINT_RESTORE_FAILED', details: { unrestoredFileIds: ['u'], cause: { details: { completedFileIds: ['c'] } } } } })].sort(), ['c', 'u']);
-    assert.deepEqual([...writtenFileIds({ name: 'write', ok: true, args: { operations: [{ op: 'create', path: '/x' }, { op: 'delete', fileId: 'y' }] },
-        result: [{ fileId: 'x' }, { fileId: 'y' }] })], ['x', 'y']);
 });

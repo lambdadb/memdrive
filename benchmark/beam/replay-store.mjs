@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { HTTPClient, LambdaDBClient, MemDrive } from '@functional-systems/memdrive';
+import { fileToolError, HTTPClient, LambdaDBClient, MemDrive } from '@functional-systems/memdrive';
 
 // v2 stores use the SDK's single-collection `files-v1` layout. A v1 ledger names a
 // `files-v0` store with a publication journal, which this SDK can neither open nor destroy.
@@ -105,21 +105,38 @@ export async function cleanupStore({ output, client, endpoint, project }) {
     return { status: 'cleaned', name: ledger.name };
 }
 
-/** Consistent reads of main by file ID: each file as it is now, or null when it is gone. */
-export async function readFiles(drive, fileIds) {
-    const files = new Map();
-    for (const fileId of fileIds) {
-        const file = await drive.read({ fileId });
-        files.set(fileId, file && { fileId, path: file.path, modifiedAt: file.modifiedAt, chars: file.content.length });
-    }
-    return files;
-}
-
-/** Every page of a recursive listing of main, deduplicated by file ID. The listing is eventual. */
-export async function listAll(drive) {
-    const files = new Map();
+/** Every page of a recursive listing of main, in path order. The listing is consistent. */
+async function listAll(drive) {
+    const files = [];
     for (let page = await drive.list({ limit: 1000 }); ; page = await drive.list(page.next)) {
-        for (const file of page.files) files.set(file.fileId, file);
+        files.push(...page.files);
         if (!page.next) return files;
     }
+}
+
+/**
+ * The harness's read-only view of main: its latest checkpoint, `tree` of the whole
+ * drive, and an inventory from `list` with every `next` followed. `list` is
+ * path-ordered and consistent, so the inventory is all of main. Each listed file is
+ * read once by file ID only for `chars`, the UTF-16 length of its original, which no
+ * listing reports (null if the read finds no file). A failed step is recorded by
+ * step and code and leaves its value null; nothing works around it, so a drive with
+ * more than 1,000 files records LIST_TOO_MANY_FILES and no inventory.
+ */
+export async function observeStore(drive) {
+    const state = { latestCheckpoint: null, tree: null, files: null, errors: [] };
+    const attempt = async (step, read) => {
+        try { return await read(); }
+        catch (error) { state.errors.push({ step, code: fileToolError(error).error.code }); return null; }
+    };
+    state.latestCheckpoint = await attempt('describe', async () => (await drive.describe()).latestCheckpoint?.at.name ?? null);
+    state.tree = await attempt('tree', () => drive.tree());
+    const listed = await attempt('list', () => listAll(drive));
+    if (listed) state.files = await attempt('read', async () => {
+        const files = [];
+        for (const { fileId, path: filePath, modifiedAt } of listed)
+            files.push({ fileId, path: filePath, modifiedAt, chars: (await drive.read({ fileId }))?.content.length ?? null });
+        return files;
+    });
+    return state;
 }

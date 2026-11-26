@@ -10,16 +10,18 @@ import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { MemDrive, fileToolInstructions, getFileToolDefinitions } from '@functional-systems/memdrive';
 import { createToolHost, failureCodes, limits, openAI, protocol as replayProtocol, ReplayFailure, runSession, withGuide } from './replay-agent.mjs';
+import { toolUse, toolUseTotals } from './replay-metrics.mjs';
 import { fingerprint, groupSessions, hash } from './replay-sessions.mjs';
-import { assertOwner, lambdadbConnection, ledgerFile, listAll, readFiles, readLedger } from './replay-store.mjs';
+import { assertOwner, lambdadbConnection, ledgerFile, observeStore, readLedger } from './replay-store.mjs';
 
-// v2 asks with the SDK's read-only main tools; v1 offered 9 tools with an `at` view selector.
-export const questionsProtocol = 'memdrive-beam-replay-questions-v2';
-// Rejudging reads only stored answers and judgments, whose format both versions share.
-const judgeableProtocols = ['memdrive-beam-replay-questions-v1', questionsProtocol];
+// v3 asks with the SDK's read-only main tools including `tree`; v2 had no `tree` and an
+// unordered, eventual `list`; v1 offered 9 tools with an `at` view selector.
+export const questionsProtocol = 'memdrive-beam-replay-questions-v3';
+// Rejudging reads only stored answers and judgments, whose format every version shares.
+const judgeableProtocols = ['memdrive-beam-replay-questions-v1', 'memdrive-beam-replay-questions-v2', questionsProtocol];
 export const rejudgeProtocol = 'memdrive-beam-replay-rejudge-v1';
 /** The read-only catalog; `--guide off` leaves out `guide`. */
-export const readToolNames = Object.freeze(['guide', 'read', 'list', 'search', 'findText']);
+export const readToolNames = Object.freeze(['guide', 'read', 'tree', 'list', 'search', 'findText']);
 export const defaultJudgeModel = 'gpt-4.1-mini-2025-04-14';
 // `unresolved` questions cite a message ID the conversation lacks and are never asked.
 const scopes = { replayed: ['user_replayed', 'no_sources'], all: ['user_replayed', 'no_sources', 'needs_assistant', 'not_replayed'] };
@@ -189,23 +191,12 @@ function answerMetrics({ requests, events }) {
         unknownUsageRequests: requests.filter(request => !validUsage(request.usage)).length,
         toolCalls: events.length, toolCallsByName: tally(events, event => event.name),
         toolErrorsByCode: tally(events.filter(event => !event.ok), event => event.error?.code ?? 'UNKNOWN'),
-        retrievalCall: events.some(event => retrievalTools.has(event.name)) };
+        retrievalCall: events.some(event => retrievalTools.has(event.name)), toolUse: toolUse(events) };
 }
 
 /** The final assistant text: every output_text part of the last response, in order. */
 const finalText = response => response.output.filter(item => item.type === 'message' && item.role === 'assistant')
     .flatMap(item => item.content.map(part => part.text)).join('\n\n');
-
-/**
- * Main's latest checkpoint and its files, read by file ID as the replay's observation does:
- * the listed files and the run's final inventory (`known`), so a listing that still lags
- * behind the run's last writes cannot make the store look changed.
- */
-async function storeState(drive, known) {
-    const files = await readFiles(drive, new Set([...known, ...(await listAll(drive)).keys()]));
-    return { latestCheckpoint: (await drive.describe()).latestCheckpoint?.at.name ?? null,
-        files: [...files.values()].filter(Boolean).sort((a, b) => a.fileId < b.fileId ? -1 : 1) };
-}
 
 export function summarizeQuestions(manifest, results, store = null) {
     const judgeItems = results.flatMap(result => result.judge?.items ?? []);
@@ -218,7 +209,8 @@ export function summarizeQuestions(manifest, results, store = null) {
             complete: results.length === manifest.selected.length },
         scores: scoreSummary(results),
         retrieval: { questionsWithRetrievalCall: results.filter(result => result.metrics.retrievalCall).length,
-            toolCallsByName: sumMaps(results.map(result => result.metrics.toolCallsByName)) },
+            toolCallsByName: sumMaps(results.map(result => result.metrics.toolCallsByName)),
+            toolUse: toolUseTotals(results.map(result => result.metrics.toolUse)) },
         tokens: { answer: { input: sum(results, result => result.metrics.inputTokens), output: sum(results, result => result.metrics.outputTokens),
             unknownUsageRequests: sum(results, result => result.metrics.unknownUsageRequests) },
         judge: { requests: judgeItems.length, failedRequests: judgeItems.filter(item => item.status === 'failed').length,
@@ -301,10 +293,6 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
     const completed = runManifest.plan.filter(planned => runSummary.sessions.find(session => session.id === planned.id)?.status === 'completed');
     const date = runManifest.context?.currentDate === 'session-date' ? completed.at(-1)?.date ?? null : null;
     const selected = selectQuestions(classification, scope, limit);
-    // The files the run's last session observed; none when that observation failed.
-    const last = runSummary.sessions.at(-1);
-    const observed = last && await readJSON(path.join(runDirectory, `session-${String(last.index + 1).padStart(3, '0')}-${last.id}`, 'observation.json'));
-    const known = new Set((observed?.inventory ?? []).map(file => file.fileId));
 
     // Read-only from here: open only reads the configuration, and the model gets read tools only.
     const { client } = connection;
@@ -319,7 +307,7 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
         judgeTransport: judge ? 'injected-test' : 'openai-chat-completions', startedAt: new Date().toISOString(), node: process.version,
         package: (await readJSON(path.join(root, 'package.json'))).version,
         sourceCommit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
-        sources: { ...Object.fromEntries(await Promise.all(['replay.mjs', 'replay-questions.mjs', 'replay-agent.mjs', 'replay-sessions.mjs', 'replay-store.mjs',
+        sources: { ...Object.fromEntries(await Promise.all(['replay.mjs', 'replay-questions.mjs', 'replay-agent.mjs', 'replay-metrics.mjs', 'replay-sessions.mjs', 'replay-store.mjs',
             'original-config.json', 'original-judge-prompt.json'].map(async name => [`benchmark/beam/${name}`, hash(await readFile(path.join(root, 'benchmark/beam', name)))]))),
         ...await fingerprint(path.join(root, 'dist/esm'), root), 'package-lock.json': hash(await readFile(path.join(root, 'package-lock.json'))) },
         run: { directory: path.relative(root, runDirectory) || '.', manifestSha256: hash(runManifestBytes), transport: runManifest.transport,
@@ -344,7 +332,7 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
     const results = [];
     const writeSummary = store => writeFile(path.join(output, 'summary.json'), json(summarizeQuestions(manifest, results, store)), privateFile);
     await writeSummary();
-    const before = await storeState(drive, known);
+    const before = await observeStore(drive);
     const call = createToolHost({ drive, resultBytes: budget.resultBytes, tools });
     const texts = new Map(runtime.questions.map(question => [question.id, question.text]));
     const items = new Map(evaluation.map(item => [item.id, item]));
@@ -386,9 +374,10 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
         results.push(result);
         await writeSummary();
     }
-    // File IDs, paths, modification times and lengths; the read-only catalog is what keeps file contents unchanged.
-    const after = await storeState(drive, known);
-    const store = { before, after, unchanged: JSON.stringify(before) === JSON.stringify(after) };
+    // Checkpoint, tree, and file IDs, paths, modification times and lengths; the read-only catalog is what
+    // keeps file contents unchanged. A failed observation step leaves the comparison unknown (null).
+    const after = await observeStore(drive);
+    const store = { before, after, unchanged: before.errors.length || after.errors.length ? null : JSON.stringify(before) === JSON.stringify(after) };
     await writeSummary(store);
     return { manifest, results, summary: summarizeQuestions(manifest, results, store) };
 }
