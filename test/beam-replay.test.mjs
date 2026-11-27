@@ -610,11 +610,11 @@ test('tool use records first tools, tree and list narrowing, partial listings, r
     assert.deepEqual([toolUseTotals([]).search, toolUseTotals([]).firstTool], [{ calls: 0, mean: null, max: null }, {}]);
 });
 
-test('a listing over 1,000 files fails for the model and for the observation, which records the error and still describes the tree', async t => {
+test('the model can list a folder with over 1,000 files and observation reads the complete inventory', async t => {
     const files = await prepared(t);
     const live = liveFixture();
     const seeded = Array.from({ length: 1001 }, (_, index) => `/archive/${String(index).padStart(4, '0')}.md`);
-    const script = [['tree', {}], ['list', {}], ['list', { prefix: '/archive/', nameContains: '0999' }]];
+    const script = [['tree', {}], ['list', { delimiter: '/' }], ['list', { prefix: '/archive/', nameContains: '0999' }]];
     const outputs = [];
     const { results } = await runReplay({ manifest: files.manifest, conversation: '7', output: files.output, backend: 'lambdadb', connect: live.connect,
         mode: 'model', instructions: 'none', sessions: 1, turns: 1, askFactory: () => async (request, { round }) => {
@@ -624,16 +624,16 @@ test('a listing over 1,000 files fails for the model and for the observation, wh
             return round < script.length ? toolCall(request, `call-${round}`, ...script[round]) : reply(request);
         } });
     const tree = { fileCount: 1001, folders: [{ path: '/archive/', fileCount: 1001 }], truncated: false };
-    assert.deepEqual([outputs[0], outputs[1].error.code, outputs[1].error.details, outputs[2].files.map(file => file.path)],
-        [tree, 'LIST_TOO_MANY_FILES', { maximum: 1000 }, ['/archive/0999.md']]);
+    assert.deepEqual([outputs[0], outputs[1], outputs[2].files.map(file => file.path)],
+        [tree, { files: [], prefixes: ['/archive/'] }, ['/archive/0999.md']]);
     const { metrics } = results[0];
     assert.deepEqual([metrics.toolErrorsByCode, metrics.toolUse.failedListsByCode, metrics.toolUse.list.afterTree, metrics.toolUse.list.withPrefix],
-        [{ LIST_TOO_MANY_FILES: 1 }, { LIST_TOO_MANY_FILES: 1 }, 2, 1]);
-    // The observation does not work around the limit: no inventory, but the tree and the latest checkpoint.
+        [{}, {}, 2, 1]);
     const observation = await json(path.join(files.output, 'session-001-s000', 'observation.json'));
-    assert.deepEqual(observation, { latestCheckpointBefore: null, latestCheckpointAfter: null, tree, inventory: null,
-        errors: [{ step: 'list', code: 'LIST_TOO_MANY_FILES' }] });
-    assert.deepEqual([metrics.filesAfter, metrics.latestCheckpointAsExpected], [null, true]);
+    const { inventory, ...summary } = observation;
+    assert.deepEqual(summary, { latestCheckpointBefore: null, latestCheckpointAfter: null, tree, errors: [] });
+    assert.deepEqual(inventory.map(file => file.path), seeded);
+    assert.deepEqual([metrics.filesAfter, metrics.latestCheckpointAsExpected], [1001, true]);
 });
 
 test('a restored write keeps the latest checkpoint and leaves only the kept file in the inventory', async t => {

@@ -102,7 +102,10 @@ test('live file store writes main and forks, searches, lists, checkpoints and ro
         assert.deepEqual(firstPage.files, [reference(empty)]);
         assert.deepEqual(firstPage.next?.at, at);
         await assert.rejects(reopened.list({ cursor: firstPage.next.cursor }, options()), { code: 'CURSOR_VIEW_MISMATCH' });
-        assert.deepEqual((await reopened.list(firstPage.next, options())).files, [reference(nested)]);
+        const secondPage = await reopened.list(firstPage.next, options());
+        assert.deepEqual(secondPage.files, [reference(nested)]);
+        assert(secondPage.next);
+        assert.deepEqual(await reopened.list(secondPage.next, options()), { files: [reference(original)], prefixes: [] });
         // With a delimiter a folder takes one entry; limit 1 puts the file and the folder on separate pages.
         const grouped = await listAll(reopened, { at, prefix: '/notes/', delimiter: '/', limit: 1 });
         assert.deepEqual(grouped, { files: [reference(original)], prefixes: ['/notes/sub/'] });

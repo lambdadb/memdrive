@@ -251,11 +251,11 @@ test('the stage leaves the store byte-for-byte unchanged, also when the model ca
     assert.deepEqual([summary.store.before.files.map(file => [file.path, file.chars]), summary.store.before.latestCheckpoint, summary.store.before.tree,
         summary.store.before.errors], [[['/notes.md', 'Synthetic note.\n'.length]], JSON.parse(before.sdk).latest.at.name,
         { fileCount: 1, folders: [], truncated: false }, []]);
-    // Over 1,000 files the harness listing fails; it is recorded, not worked around, and the comparison is unknown.
+    // The inventory comparison includes files from every page of a large drive.
     files.fixture.seedFiles(files.replay.manifest.store.name, 'main', Array.from({ length: 1001 }, (_, index) => `/archive/${index}.md`));
     const crowded = await files.stage('crowded', { limit: 1 });
-    assert.deepEqual([crowded.summary.store.unchanged, crowded.summary.store.before.files, crowded.summary.store.before.errors, crowded.summary.store.after.tree.fileCount],
-        [null, null, [{ step: 'list', code: 'LIST_TOO_MANY_FILES' }], 1002]);
+    assert.deepEqual([crowded.summary.store.unchanged, crowded.summary.store.before.files.length,
+        crowded.summary.store.before.errors, crowded.summary.store.after.tree.fileCount], [true, 1002, [], 1002]);
 });
 
 test('judging follows the upstream per-rubric-item prompt and reports means with their counts', async t => {

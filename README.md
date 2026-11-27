@@ -14,11 +14,13 @@ const client = new LambdaDBClient({ baseUrl, projectName, projectApiKey });
 
 MemDrive is a thin file abstraction over LambdaDB primitives. A store is one
 LambdaDB collection; main and forks are its branches, and checkpoints are its
-tags. It requires LambdaDB with the versioned reference API supported by client
-0.15.0, including tag creation and branch rollback before a tag's first
-snapshot is published. An older self-hosted deployment can fail ref response
-validation if it omits fields required by this client, or reject those requests.
-[LambdaDB rollback support](https://github.com/lambdadb/lambdadb/pull/640)
+tags. It requires LambdaDB with the features supported by client 0.15.0,
+including tag creation and branch rollback before a tag's first snapshot is
+published, and ordered document listing with consistent branch reads. An older
+self-hosted deployment can reject these requests or fail response validation
+when it omits required fields.
+[LambdaDB rollback support](https://github.com/lambdadb/lambdadb/pull/640),
+[LambdaDB document listing](https://docs.lambdadb.ai/guides/documents/list-data#sort-and-read-pending-writes)
 
 
 ## File stores
@@ -159,15 +161,12 @@ LambdaDB lacks; callers build them when they need them.
   caller inspects the files before retrying. Fork, checkpoint, deletion and
   rollback requests are sent once; an error without an HTTP status may have
   taken effect.
-- **Listings of at most 1,000 files.** `list` reads every matching file in one
-  query, so a listing that matches more fails with `LIST_TOO_MANY_FILES`; see
-  [List files](#list-files). `tree` returns at most 100 folder buckets per call, including the prefix and
-  its ancestors.
+- **Tree folder buckets.** `tree` returns at most 100 folder buckets per call,
+  including the prefix and its ancestors.
 
-When LambdaDB adds merge, conditional writes (`if-match`/`if-none-match`),
-consistent ordered listing (which lifts the 1,000-file listing limit), more facet
-buckets, substring filters or point-in-time reads (`asOf`), the SDK can expose or
-use them.
+When LambdaDB adds merge, conditional writes (`if-match`/`if-none-match`), more
+facet buckets, substring filters or point-in-time reads (`asOf`), the SDK can
+expose or use them.
 
 ## Structured text chunking
 
@@ -724,7 +723,7 @@ use the guide tool.
 
 The guide describes one drive and main only. Its topics hold procedures and
 explanations the tool descriptions leave out: choosing a search mode, what to do
-when results are missing or too many, folder and listing limits, ranged-read
+when results are missing or too many, tree limits, listing pagination, ranged-read
 pages and cursors (`retrieval`); what counts as a duplicate, keeping both
 statements when new information conflicts with what is saved (the later one is
 current when it updates the earlier one), preserving selected conversational
@@ -814,10 +813,9 @@ matched exactly.
 LambdaDB rejects an aggregation over more than 10,000 distinct folders or 256 KiB
 of folder paths with HTTP 400. `tree` reports any HTTP 400 as `DATABASE_ERROR`
 with status 400 and a message suggesting a narrower prefix; LambdaDB's response
-does not identify the budget case reliably, so it has no code of its own. On such
-a drive, `list` with a delimiter can also exceed its 1,000-file limit, so neither
-names a folder to narrow to: take candidate folders from the paths of `search`
-hits and call `tree` with one as prefix.
+does not identify the budget case reliably, so it has no code of its own. Use
+`list` with a delimiter or the paths of `search` hits to find candidate folders,
+then call `tree` with one as prefix.
 
 ## List files
 
@@ -833,12 +831,12 @@ for (;;) {
 
 `prefix` matches the beginning of the full path. `nameContains` checks a case-sensitive literal substring of the filename, including its extension. Omit `delimiter` for recursive results; the `'/'` delimiter shows each immediate subfolder once in `prefixes` instead of its files. Results carry file IDs, paths, modification times, and any declared metadata. For text files, use `read` to retrieve the exact original. Listing does not expose datastore or file versions or file sizes. Use `tree` for folder structure and file counts; `list` has no total count.
 
-Each call is one LambdaDB query that reads the listing fields of every matching
-file record, sorted by path, with a consistent read on main and forks, so a file
-written just before is listed. LambdaDB selects the files below the folder of
-`prefix` up to its last `/` whose names contain the longest run of letters,
-digits and spaces in `nameContains`; the SDK then checks the exact prefix and
-substring:
+`list` reads the projected file fields through ordered LambdaDB document pages.
+It reads main and forks consistently, including files written just before the
+call, and reads checkpoints through their tags. The SDK applies the exact path
+prefix and filename substring and gathers enough matches to fill the requested
+page and discover whether another entry follows. A delimiter or a filter with
+few matches can require reading several document pages.
 
 - Files and folder prefixes form one sequence in Unicode code point order of their
   paths, the order LambdaDB sorts keywords in. A folder takes the place of its
@@ -846,30 +844,17 @@ substring:
   processes can leave, follow in `fileId` order.
 - `limit` (default 100, 1–1000) counts files and prefixes together. Every page
   but the last is full, and `next` is present exactly when more entries follow.
-- One listing works on at most 1,000 file records selected by LambdaDB. The same
-  query counts them with a `kind` facet, so more fail with `LIST_TOO_MANY_FILES`
-  (details `{ maximum: 1000 }`) instead of returning a partial result. Pass a
-  prefix ending at a deeper folder, or use `search` or `findText` to find
-  content. A prefix narrows the count only at a `/` boundary and `nameContains`
-  only through its letters, digits and spaces: `{ prefix: '/notes/dec' }`
-  counts every file below `/notes/`, while `{ prefix: '/notes/', nameContains:
-  'decision.md' }` counts the files whose names contain `decision`.
 
 Forward the returned `next` (`{ at, cursor }`) unchanged. The cursor is an opaque
 token carrying the listing criteria and the last returned path (with its file ID,
 or as a folder prefix), so it continues on any drive object or client of the
-same store and does not expire. Each page re-runs the query and returns the
-entries after that position, so it reflects the view at the time of that call:
-files written or deleted between pages appear or disappear on later pages, and
-an entry already returned is not repeated, except that a file moved past the
-position appears again at its new path. On a checkpoint the view is immutable.
-A continuation can fail with `LIST_TOO_MANY_FILES` when files were added
-meanwhile. Passing a cursor with another `at` (omitted means main) fails with
-`CURSOR_VIEW_MISMATCH`, and a malformed cursor, one from another store or one
-from an earlier SDK version fails with `LIST_CURSOR_UNAVAILABLE`. A list cursor
-is not bound to the identity of its fork or checkpoint: after a ref is deleted
-and recreated under the same name, a continuation lists the new ref from the
-same position.
-
-When LambdaDB ships consistent ordered listing, the SDK can use it internally
-without changing this contract, and lift the 1,000-file limit.
+same store and does not expire. Existing position-based `l2` cursors continue
+across this change. Each page returns entries after the saved position. A live
+listing can observe writes during or between page calls. An entry already
+returned is not repeated, except that a file moved past the position can appear
+again at its new path. On a checkpoint the view is immutable. Passing a cursor
+with another `at` (omitted means main) fails with `CURSOR_VIEW_MISMATCH`. A
+malformed cursor, one from another store or an obsolete cursor format fails
+with `LIST_CURSOR_UNAVAILABLE`. After a fork or checkpoint is deleted and
+recreated under the same name, a continuation lists the new ref from the same
+position.

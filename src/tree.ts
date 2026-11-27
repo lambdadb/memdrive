@@ -1,6 +1,6 @@
 import { isObject, keysOnly } from './config.js';
 import { checkAbort, databaseError, MemDriveError, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
-import { codePointOrder, matchedCount } from './list.js';
+import { codePointOrder } from './list.js';
 import { resultDocs, validPath } from './records.js';
 import { ancestorFilter, viewRead, type Handle, type ViewRef, type WithoutAt } from './storage-reads.js';
 import type { RequestOptions, TreeRequest, TreeResult } from './types.js';
@@ -11,6 +11,17 @@ import type { RequestOptions, TreeRequest, TreeResult } from './types.js';
  */
 export const treeBucketLimit = 100;
 const kind = { queryString: { query: '"file"', defaultField: 'kind' }, occur: 'filter' };
+
+/** The number of file records a query matched, from its `kind` facet: every file record has kind "file". */
+function matchedCount(response: unknown) {
+    const buckets: unknown = isObject(response) && isObject(response.facets) && isObject(response.facets.kind)
+        ? response.facets.kind.buckets : undefined;
+    if (!Array.isArray(buckets) || buckets.length > 1) return undefined;
+    if (!buckets.length) return 0;
+    const [bucket] = buckets as unknown[];
+    return isObject(bucket) && bucket.value === 'file' && Number.isSafeInteger(bucket.count) && (bucket.count as number) > 0
+        ? bucket.count as number : undefined;
+}
 
 /**
  * Describe the folders under a prefix with one facet query over `ancestorPaths`,
