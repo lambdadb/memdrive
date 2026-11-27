@@ -295,9 +295,6 @@ length of the original; null if that read finds no file), in path order.
 `tree` (the SDK result: `fileCount`, `folders` with their file counts, and
 `truncated`), the `inventory` and `errors`. A failed step is recorded by step
 and code (`describe`, `tree`, `list`, `read`) and leaves its value null.
-Nothing works around a failure: on a drive with more than 1,000 files the
-listing fails with `LIST_TOO_MANY_FILES`, which is recorded, and the
-inventory stays null while `tree` still reports the exact file count.
 
 ### Metrics
 
@@ -375,8 +372,7 @@ prefix like that does not count as narrowing. Per conversation:
   a `paths` batch; a missing file adds nothing). Results withheld for the
   delivery limit are not counted;
 - `failedTreesByCode`, `failedListsByCode`: failed `tree` and `list` calls by
-  error code, such as `LIST_TOO_MANY_FILES` when more than 1,000 files fall in
-  a listing's folder scope. These codes are also in `toolErrorsByCode`.
+  error code. These codes are also in `toolErrorsByCode`.
 
 Over several conversations (the replay's conversation totals and the question
 stage's summary), `toolUse` has `conversations`; `firstTool` and
@@ -507,9 +503,8 @@ judged, and the stage continues. The answer is the final response's assistant
 text. The harness only reads the store: before and after the questions it
 observes main as the replay does after a session (`latestCheckpoint`, `tree`,
 the listed `files` and `errors`), and reports both and whether they are equal
-in `summary.json` (`store.unchanged`). When a step failed in either, for
-example with `LIST_TOO_MANY_FILES`, `unchanged` is null rather than a
-comparison of partial reads.
+in `summary.json` (`store.unchanged`). If a step failed in either observation,
+`unchanged` is null.
 
 Judging follows upstream BEAM's `evaluate_*` functions: one Chat Completions
 request per rubric item with `unified_llm_judge_base_prompt`, replacing

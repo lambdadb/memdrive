@@ -10,7 +10,7 @@ const codePoints = (a, b) => {
     for (let index = 0; index < Math.min(x.length, y.length); index++) if (x[index] !== y[index]) return x[index] - y[index];
     return x.length - y.length;
 };
-// The filter clauses the SDK sends to listing and tree queries.
+// The filter clauses the SDK sends to file listings and tree queries.
 function matches(doc, { bool, queryString }) {
     if (bool) return bool[0]?.occur === 'should' ? bool.some(clause => matches(doc, clause)) : bool.every(clause => matches(doc, clause));
     const { query, defaultField, skipSyntax } = queryString;
@@ -200,8 +200,8 @@ export function fileClient() {
                 async query(request, options) {
                     calls.push({ kind: 'query', request: structuredClone(request) });
                     const source = [...sourceDocs(request.ref).values()];
-                    // Listing and tree queries: keyword sort and facets with LambdaDB's semantics.
-                    if (request.facets !== undefined || request.sort?.some(key => Object.hasOwn(key, 'path'))) {
+                    // Tree queries: facets with LambdaDB's semantics.
+                    if (request.facets !== undefined) {
                         const facets = Object.entries(request.facets ?? {});
                         if (!Number.isInteger(request.size) || request.size < 0 || request.size > 1000 || (request.size === 0 && !facets.length)
                             || facets.length > 5 || facets.some(([, facet]) => facet.size !== undefined && (facet.size < 1 || facet.size > 100)))
@@ -209,14 +209,7 @@ export function fileClient() {
                         if (request.consistentRead && request.ref?.kind === 'tag') fail(400, 'consistentRead requires a branch');
                         const override = await fixture.facetQuery?.(request, options);
                         if (override !== undefined) return override;
-                        const selected = source.filter(doc => matches(doc, request.query)).sort((a, b) => {
-                            for (const key of request.sort ?? []) {
-                                const [[field, direction]] = Object.entries(key);
-                                const order = codePoints(a[field], b[field]);
-                                if (order) return direction === 'asc' ? order : -order;
-                            }
-                            return 0;
-                        });
+                        const selected = source.filter(doc => matches(doc, request.query));
                         const native = response(selected.slice(0, request.size), request.fields);
                         if (!facets.length) return native;
                         // A document counts once per distinct value of an array field. The budget
@@ -309,6 +302,32 @@ export function fileClient() {
                     return response(docs, request.fields);
                 },
                 docs: {
+                    async list(request, options) {
+                        calls.push({ kind: 'docs-list', request: structuredClone(request), signal: options?.signal });
+                        const override = await fixture.listDocs?.(request, options);
+                        if (override !== undefined) return override;
+                        if (request.consistentRead && request.ref.kind !== 'branch') fail(400, 'consistentRead requires a branch');
+                        const scope = JSON.stringify({ ...request, pageToken: undefined });
+                        const sort = (a, b) => codePoints(a.path, b.path) || codePoints(a.id, b.id);
+                        let after;
+                        if (request.pageToken !== undefined) {
+                            try {
+                                const { key, position } = JSON.parse(Buffer.from(request.pageToken, 'base64url'));
+                                if (key === scope) after = position;
+                            } catch { /* Native tokens are scoped to the original request. */ }
+                            if (!after) fail(400, 'Invalid document list pageToken');
+                        }
+                        const size = Math.min(request.size, fixture.listPageSize ?? request.size);
+                        const docs = [...sourceDocs(request.ref).values()].filter(doc => matches(doc, request.filter)
+                            && (!after || sort(doc, after) > 0)).sort(sort);
+                        const selected = docs.slice(0, size);
+                        const native = response(selected, request.fields);
+                        if (docs.length > selected.length) {
+                            const { path, id } = selected.at(-1);
+                            native.nextPageToken = Buffer.from(JSON.stringify({ key: scope, position: { path, id } })).toString('base64url');
+                        }
+                        return native;
+                    },
                     async fetch(request) {
                         calls.push({ kind: 'fetch', request: structuredClone(request) });
                         const docs = sourceDocs(request.ref);

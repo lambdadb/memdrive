@@ -120,8 +120,7 @@ async function listAll(drive) {
  * path-ordered and consistent, so the inventory is all of main. Each listed file is
  * read once by file ID only for `chars`, the UTF-16 length of its original, which no
  * listing reports (null if the read finds no file). A failed step is recorded by
- * step and code and leaves its value null; nothing works around it, so a drive with
- * more than 1,000 files records LIST_TOO_MANY_FILES and no inventory.
+ * step and code and leaves its value null.
  */
 export async function observeStore(drive) {
     const state = { latestCheckpoint: null, tree: null, files: null, errors: [] };

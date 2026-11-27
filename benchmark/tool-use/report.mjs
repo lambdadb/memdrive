@@ -11,7 +11,7 @@ import { retrievalMetrics } from './scenarios.mjs';
 const toolNames = ['guide', 'tree', 'list', 'read', 'search', 'findText', 'fork', 'checkpoint', 'listForks', 'listCheckpoints',
     'deleteFork', 'deleteCheckpoint', 'write', 'rollback', 'status', 'history', 'diff', 'merge'];
 // BINDING_CHANGED and REF_DELETED identify errors in protocol-v1 run directories. The HISTORY_*,
-// MERGE_*, LIST_SCAN_LIMIT, REF_*_UNCONFIRMED, HISTORICAL_VIEW_UNAVAILABLE and VERSION_NOT_FOUND
+// MERGE_*, LIST_SCAN_LIMIT, LIST_TOO_MANY_FILES, REF_*_UNCONFIRMED, HISTORICAL_VIEW_UNAVAILABLE and VERSION_NOT_FOUND
 // codes are no longer raised; earlier run directories can hold them.
 const toolErrorCodes = [
     'ABORTED', 'BINDING_CHANGED', 'BRANCH_CONFLICT', 'BRANCH_NOT_FOUND', 'CHECKPOINT_CONFLICT', 'CHECKPOINT_NOT_FOUND',

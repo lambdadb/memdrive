@@ -48,12 +48,11 @@ test('the fixed catalog serves exactly seven main-only tools and requires an exp
         assert.match(tree.description, /tree -d, folders only, each with its file count \(including files in its subfolders\)\. It returns no files\./);
         assert.match(tree.description, /start of a conversation/);
         assert.match(tree.description, /LambdaDB counts at most 100 folders, the most populated first, including the prefix and its ancestors/);
-        assert.match(list.description, /prefix up to its last \//);
         assert.match(tree.description, /Use list for the files in a folder/);
         assert.deepEqual(tree.inputSchema.required, []);
         assert.deepEqual(Object.keys(tree.inputSchema.properties), ['prefix']);
         assert.match(list.description, /in path order/);
-        assert.match(list.description, /LIST_TOO_MANY_FILES/);
+        assert.match(list.description, /forward next unchanged for more/);
         assert.doesNotMatch(list.description, /eventual|storage order|deduplicat/i);
         assert.equal(tree.readOnly, true);
     }
@@ -276,7 +275,7 @@ test('guide index and both topics share immutable content without accessing the 
     assert.match(fileToolGuideTopics.editing.content, /the later one is current/);
     assert.match(fileToolGuideTopics.editing.content, /do not claim permanent erasure/);
     assert.match(fileToolGuideTopics.retrieval.content, /file count tree reports for its prefix is always exact/);
-    assert.match(fileToolGuideTopics.retrieval.content, /LIST_TOO_MANY_FILES/);
+    assert.match(fileToolGuideTopics.retrieval.content, /Follow each list page's next unchanged/);
     assert.match(fileToolGuideTopics.retrieval.content, /candidate folders from the paths of search hits/);
     assert.doesNotMatch(text, /eventual|storage order|same prefix can appear again|deduplicat/i);
     assert.deepEqual(index.topics.map(item => item.topic), ['retrieval', 'editing']);
