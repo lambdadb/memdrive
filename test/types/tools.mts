@@ -1,5 +1,5 @@
 import { createFileTools, getFileToolDefinitions, fileToolError, fileToolInstructions, fileToolGuide, fileToolGuideTopics } from '@functional-systems/memdrive';
-import type { FileToolCheckpoint, FileToolGuideTopic, FileDrive, FileToolDefinition, FileToolErrorResult, FileToolName, FileTools } from '@functional-systems/memdrive';
+import type { FileActor, FileToolCheckpoint, FileToolGuideTopic, FileDrive, FileToolDefinition, FileToolErrorResult, FileToolName, FileTools } from '@functional-systems/memdrive';
 
 export async function toolConsumer(drive: FileDrive, external: FileDrive<'external'>, name: string, input: unknown) {
     const names: readonly FileToolName[] = ['guide', 'read', 'tree', 'list', 'search', 'findText', 'write'];
@@ -15,6 +15,13 @@ export async function toolConsumer(drive: FileDrive, external: FileDrive<'extern
     createFileTools({ drive, tools: ['write'], checkpoint: async () => ({ name: 'turn-async' }) });
     // @ts-expect-error The hook returns a checkpoint name object.
     createFileTools({ drive, tools: ['write'], checkpoint: () => 'turn' });
+    // The host names the actor and clock of every write tool call.
+    const actor: FileActor = { user: 'user-1', agent: 'assistant' };
+    createFileTools({ drive, tools: ['write'], checkpoint, actor, now: () => new Date() });
+    // @ts-expect-error now returns a Date.
+    createFileTools({ drive, tools: ['write'], now: () => '2026-01-01T00:00:00.000Z' });
+    // @ts-expect-error An actor names a user or an agent.
+    createFileTools({ drive, tools: ['write'], actor: { team: 'core' } });
     const definitions: readonly FileToolDefinition[] = tools.definitions;
     const fixedDefinitions: readonly FileToolDefinition[] = getFileToolDefinitions({ embeddingMode: 'managed', tools: names });
     getFileToolDefinitions({ embeddingMode: 'external', tools: ['search', 'write'] });

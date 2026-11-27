@@ -89,8 +89,8 @@ test('live file store writes main and forks, searches, lists, checkpoints and ro
         const nextRange = await reopened.read(firstRange.next, options());
         assert.equal(nextRange.content, content.slice(nextRange.range.start, nextRange.range.end));
         assert.equal(nextRange.revision, firstRange.revision);
-        const reference = ({ fileId, path, modifiedAt, metadata }) => ({
-            fileId, path, modifiedAt, ...(metadata === undefined ? {} : { metadata }),
+        const reference = ({ fileId, path, createdAt, modifiedAt, metadata }) => ({
+            fileId, path, createdAt, modifiedAt, ...(metadata === undefined ? {} : { metadata }),
         });
         // Listings are consistent branch reads in Unicode code point order: 's' sorts before '한'.
         const expected = [reference(nested), reference(original)];
@@ -275,6 +275,17 @@ test('live file store writes main and forks, searches, lists, checkpoints and ro
             assert.deepEqual(await main.listForks({}, options()), { forks: [] });
             await assert.rejects(reopened.read({ at, path }, options()), { code: 'BRANCH_NOT_FOUND' });
         }
+        // An update by another actor keeps the creation fields and records the new modifier;
+        // a move without an actor then removes it from the stored original.
+        const authored = await main.write({ op: 'create', path: '/authored.txt', content: 'Authored synthetic text.',
+            by: { user: 'live-user', agent: 'writer' } }, options());
+        await main.write({ op: 'update', fileId: authored.fileId, content: 'Revised synthetic text.', by: { agent: 'reviewer' } }, options());
+        const revised = await reopened.read({ fileId: authored.fileId }, options());
+        assert.deepEqual([revised.createdAt, revised.createdBy, revised.modifiedBy],
+            [authored.createdAt, { user: 'live-user', agent: 'writer' }, { agent: 'reviewer' }]);
+        await main.write({ op: 'update', fileId: authored.fileId, newPath: '/authored-moved.txt' }, options());
+        assert.equal(Object.hasOwn(await reopened.read({ fileId: authored.fileId }, options()), 'modifiedBy'), false);
+
         await MemDrive.destroy({ client, name }, options());
         await assert.rejects(main.read({ path: '/main.txt' }, options()), { code: 'STORE_NOT_FOUND', status: 404 });
         await assert.rejects(client.collection(name).get(options()), error => statusOf(error) === 404);

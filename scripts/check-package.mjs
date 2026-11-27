@@ -84,8 +84,9 @@ try {
     copyFileSync(join(root, 'test/read-range.test.mjs'), join(temporary, 'test/read-range.test.mjs'));
     copyFileSync(join(root, 'test/find-text.test.mjs'), join(temporary, 'test/find-text.test.mjs'));
     copyFileSync(join(root, 'test/checkpointed-writes.test.mjs'), join(temporary, 'test/checkpointed-writes.test.mjs'));
+    copyFileSync(join(root, 'test/file-authorship.test.mjs'), join(temporary, 'test/file-authorship.test.mjs'));
     run(process.execPath, ['--test', 'test/memdrive-files.test.mjs', 'test/file-tools.test.mjs', 'test/lifecycle.test.mjs', 'test/read-range.test.mjs',
-        'test/find-text.test.mjs', 'test/checkpointed-writes.test.mjs']);
+        'test/find-text.test.mjs', 'test/checkpointed-writes.test.mjs', 'test/file-authorship.test.mjs']);
     // Core consumers above work without the optional native package. Test its
     // separate entry point only after explicitly installing the pinned backend.
     run('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund', '--save-exact', 'docling.rs@2.85.0']);

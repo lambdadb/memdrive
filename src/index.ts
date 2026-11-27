@@ -3,7 +3,8 @@ import type { CheckpointAt, CheckpointedWriteResult, ConnectionOptions, CreateEx
     SearchFilesRequest, WritableAt, CreateExternalFileRequest, UpdateExternalFileRequest, WriteFileRequest } from './types.js';
 import { checkAbort, databaseError, errorSummary, MemDriveError, mutationOptions, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
 import { isObject, keysOnly, parseStore, snapshotRetentionInDays, storeConfiguration } from './config.js';
-import { contentHash, decodeFile, decodeFileEntry, resultDocs, validFileId, validPath } from './records.js';
+import { contentHash, decodeFile, decodeFileEntry, fileEntryFields, requireActor, requireTime, resultDocs, validFileId, validPath,
+    type WriteChange } from './records.js';
 import { branchRef, fetchOriginals, pathQuery, viewRead, type Handle, type ViewRef, type WithoutAt } from './storage-reads.js';
 import { fileWriter, writeBatchLimit, type WriteTrack } from './writes.js';
 import { searchQuery, validateReranking, vectorSearchQuery } from './search.js';
@@ -242,7 +243,7 @@ function store(handle: Handle, description: FileStoreDescription<EmbeddingMode>,
         if (dimensions !== undefined) {
             const body = vectorSearchQuery(request, metadataSchema, dimensions);
             const response = await remote(() => handle.query({ ...body, ...viewRead(ref),
-                fields: { include: ['id', 'kind', 'fileId', 'path', 'modifiedAt', 'metadata'] } },
+                fields: { include: fileEntryFields } },
             nativeOptions(signal)), 'File search failed.', signal);
             checkAbort(signal);
             const seen = new Set<string>();
@@ -424,7 +425,7 @@ function store(handle: Handle, description: FileStoreDescription<EmbeddingMode>,
      * latest checkpoint, or, without one, the files this call created are deleted.
      * The restore ignores the caller's abort signal so that it completes.
      */
-    async function checkpointedWrite(branch: string, operations: WriteOperation | WriteOperation[], name: string, signal?: AbortSignal) {
+    async function checkpointedWrite(branch: string, operations: WriteOperation | WriteOperation[], change: WriteChange, name: string, signal?: AbortSignal) {
         const tagName = checkpointPrefix + name;
         const checkpoint = { at: { kind: 'checkpoint' as const, name } };
         const track: WriteTrack = { created: [], changed: [] };
@@ -477,7 +478,7 @@ function store(handle: Handle, description: FileStoreDescription<EmbeddingMode>,
             const touched = stage === 'write' ? new Set([...(Array.isArray(details.completedFileIds) ? details.completedFileIds : []),
                 ...[details.incompleteTargets, details.targets].flatMap(targets => Array.isArray(targets) ? targets.map(item => item?.fileId) : [])]) : undefined;
             const unrestoredFileIds = track.changed.filter(fileId => !touched || touched.has(fileId));
-            try { if (track.created.length) await writer.write(branch, track.created.map(fileId => ({ op: 'delete' as const, fileId }))); }
+            try { if (track.created.length) await writer.write(branch, track.created.map(fileId => ({ op: 'delete' as const, fileId })), {}); }
             catch (restoreError) { throw notRestored(partial, restoreError, { restoredTo: null, createdFileIds: [...track.created], unrestoredFileIds, ...removal }); }
             if (unrestoredFileIds.length) throw notRestored(`${applied}. The branch has no earlier checkpoint, so its created files were removed but changes to existing files remain.`,
                 undefined, { restoredTo: null, unrestoredFileIds, ...removal });
@@ -485,7 +486,7 @@ function store(handle: Handle, description: FileStoreDescription<EmbeddingMode>,
                 { restored: true, restoredTo: null, ...removal });
         }
 
-        try { result = await writer.write(branch, operations, { signal }, track); }
+        try { result = await writer.write(branch, operations, change, { signal }, track); }
         catch (cause) {
             // Errors raised before the first native mutation, including an abort, leave the branch untouched.
             if (!track.dispatched || !(cause instanceof MemDriveError)) throw cause;
@@ -624,17 +625,19 @@ function store(handle: Handle, description: FileStoreDescription<EmbeddingMode>,
         deleteCheckpoint: (request: unknown, options?: RequestOptions) => deleteRef('checkpoint', request, options),
         write: (request: unknown, options?: RequestOptions) => onView(request, 'Write requires a request object.', options, (at, _ref, rest, signal) => {
             requireInput(at.kind !== 'checkpoint', 'Checkpoints are read-only. Write to main or a fork.');
-            const { checkpoint, ...body } = rest;
+            const { checkpoint, by, time, ...body } = rest;
             requireInput(!('operations' in body) || keysOnly(body, ['operations']) && Array.isArray(body.operations),
-                'A batch write accepts only at, checkpoint and an operations array.');
+                'A batch write accepts only at, by, time, checkpoint and an operations array.');
             requireInput(checkpoint === undefined || keysOnly(checkpoint, ['name']) && validCheckpointName(checkpoint.name),
                 'checkpoint must be { name } with 3–41 letters, digits, underscores or hyphens.');
+            const change = { ...(by === undefined ? {} : { by: requireActor(by, 'by') }),
+                ...(time === undefined ? {} : { time: requireTime(time) }) };
             const branch = branchOf(at);
             const operations = 'operations' in body ? body.operations as WriteOperation[] : body as unknown as WriteOperation;
             const name = checkpoint?.name as string;
             return onBranch<unknown>(cursorStore, branch, signal, () => checkpoint === undefined
-                ? writer.write(branch, operations, { signal })
-                : checkpointedWrite(branch, operations, name, signal));
+                ? writer.write(branch, operations, change, { signal })
+                : checkpointedWrite(branch, operations, change, name, signal));
         }),
         /** Restore main or a fork to a checkpoint with one native rollback, never retried. */
         async rollback(request: unknown, options?: RequestOptions) {

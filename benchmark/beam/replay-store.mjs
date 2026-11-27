@@ -8,7 +8,7 @@ import { readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileToolError, HTTPClient, LambdaDBClient, MemDrive } from '@functional-systems/memdrive';
 
-// v2 stores use the SDK's single-collection `files-v1` layout. A v1 ledger names a
+// v2 stores use the SDK's single-collection file store layout. A v1 ledger names a
 // `files-v0` store with a publication journal, which this SDK can neither open nor destroy.
 export const storeProtocol = 'memdrive-beam-session-replay-store-v2';
 const earlierStoreProtocol = 'memdrive-beam-session-replay-store-v1';

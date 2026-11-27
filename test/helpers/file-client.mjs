@@ -368,9 +368,10 @@ export function fileClient() {
             const parts = path.slice(1).split('/');
             const fileName = parts.pop();
             const ancestorPaths = parts.reduce((list, part) => [...list, `${list.at(-1)}${part}/`], ['/']);
-            const doc = { id: `file:${fileId}`, kind: 'file', fileId, path, fileName, ancestorPaths, modifiedAt: new Date().toISOString(), body: '' };
+            const createdAt = new Date().toISOString();
+            const doc = { id: `file:${fileId}`, kind: 'file', fileId, path, fileName, ancestorPaths, createdAt, modifiedAt: createdAt, body: '' };
             docs.set(doc.id, doc);
-            return { fileId, path, modifiedAt: doc.modifiedAt };
+            return { fileId, path, createdAt, modifiedAt: doc.modifiedAt };
         });
     };
     return Object.assign(fixture, { client });

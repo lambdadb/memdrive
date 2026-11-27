@@ -1,7 +1,7 @@
 import type { TextChunker } from './text-chunks.js';
 import { editRequest, planEdit } from './edits.js';
 import { checkAbort, databaseError, MemDriveError, mutationOptions, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
-import { bytes, createRecords, fileOriginal, fileRecords, originalId, resultDocs, validFileId } from './records.js';
+import { bytes, createRecords, fileOriginal, fileRecords, originalId, resultDocs, validFileId, type WriteChange } from './records.js';
 import { afterId, branchRead, branchRef, fetchOriginals, pathQuery, viewRead, type Handle, type ViewRef } from './storage-reads.js';
 import type { CreateExternalFileRequest, FileListEntry, MetadataSchema, RequestOptions, UpdateExternalFileRequest,
     WriteFileRequest } from './types.js';
@@ -60,15 +60,24 @@ export function writeBatches(records: { docs: WriteRecord[] }[], branch: string)
     return batches;
 }
 
-function moveRecords(original: ReturnType<typeof fileOriginal>, ids: string[]): { docs: WriteRecord[] } {
-    requireInput(bytes(original) <= 5 * 1024 * 1024, 'The file original exceeds the native 5 MiB document limit.');
+/**
+ * Patch the chunks and original of a file whose text and metadata are unchanged.
+ * A native patch merges into the stored document and cannot remove a field, so a
+ * new `modifiedBy` is recorded by writing the whole original, after its chunks.
+ */
+function moveRecords(original: ReturnType<typeof fileOriginal>, ids: string[], newModifier: boolean) {
+    const originalBytes = bytes(original);
+    requireInput(originalBytes <= 5 * 1024 * 1024, 'The file original exceeds the native 5 MiB document limit.');
     const { id, fileId, path, fileName, ancestorPaths, modifiedAt, revision } = original;
     const shared = { fileId, path, fileName, ancestorPaths, modifiedAt, revision };
     const patches = [
         ...ids.map(id => ({ id, kind: 'chunk' as const, ...shared })),
-        { id, kind: 'file' as const, ...shared },
+        ...(newModifier ? [] : [{ id, kind: 'file' as const, ...shared }]),
     ];
-    return { docs: patches.map(doc => ({ doc, inputBytes: 0, wireBytes: bytes(doc) + 1 })) };
+    return {
+        patches: { docs: patches.map(doc => ({ doc, inputBytes: 0, wireBytes: bytes(doc) + 1 })) },
+        originals: { docs: newModifier ? [{ doc: original, inputBytes: 0, wireBytes: originalBytes + 1 }] : [] },
+    };
 }
 
 const chunkKind = { queryString: { query: '"chunk"', defaultField: 'kind' }, occur: 'filter' };
@@ -148,14 +157,14 @@ export function fileWriter(handle: Handle, name: string, schema: MetadataSchema,
      * `track`, when given, receives the file IDs this call creates and the
      * existing file IDs it targets, before the first native mutation.
      */
-    async function write(branch: string, request: Mutation | Mutation[], options?: RequestOptions, track?: WriteTrack) {
+    async function write(branch: string, request: Mutation | Mutation[], change: WriteChange, options?: RequestOptions, track?: WriteTrack) {
         const { signal } = operationOptions(options);
         checkAbort(signal);
         const multi = Array.isArray(request);
         const operations = multi ? [...request] : [request];
         requireInput(operations.length >= 1 && operations.length <= writeBatchLimit, 'Submit 1–100 file operations.');
         const inputs = await Promise.all(operations.map(async operation => operation?.op === 'create'
-            ? { op: 'create' as const, records: await createRecords(operation, schema, dimensions, chunker, { signal }) }
+            ? { op: 'create' as const, records: await createRecords(operation, change, schema, dimensions, chunker, { signal }) }
             : editRequest(operation, schema, dimensions)));
         checkAbort(signal);
         const targetIds = inputs.flatMap(input => input.op === 'create' ? [] : [input.fileId]);
@@ -168,7 +177,7 @@ export function fileWriter(handle: Handle, name: string, schema: MetadataSchema,
 
         const originals = await fetchOriginals(handle, name, branchRef(branch), targetIds, signal, dimensions !== undefined);
         const plans: Plan[] = await Promise.all(inputs.map(input =>
-            input.op === 'create' ? input : planEdit(input, originals.get(input.fileId), schema, dimensions, chunker, { signal })));
+            input.op === 'create' ? input : planEdit(input, originals.get(input.fileId), change, schema, dimensions, chunker, { signal })));
         // Only new paths are checked: creates and moves. An update that keeps its
         // path never fails on it, even when a concurrent create shares that path.
         const destinations = new Map<string, string>();
@@ -200,8 +209,9 @@ export function fileWriter(handle: Handle, name: string, schema: MetadataSchema,
         }
 
         // Plan all native request boundaries before mutating the first file.
+        // An edit sends its patches before its full documents.
         const steps: Array<{ creates: FileRecords[]; batches: WriteRecord[][] }
-            | { edit: Exclude<Plan, { op: 'create' }>; batches: WriteRecord[][]; patch: boolean }> = [];
+            | { edit: Exclude<Plan, { op: 'create' }>; patches: WriteRecord[][]; batches: WriteRecord[][] }> = [];
         let creates: FileRecords[] = [];
         const queueCreates = () => {
             if (creates.length) steps.push({ creates, batches: writeBatches(creates, branch) });
@@ -211,13 +221,14 @@ export function fileWriter(handle: Handle, name: string, schema: MetadataSchema,
             if (plan.op === 'create') creates.push(plan.records);
             else {
                 queueCreates();
-                let batches: WriteRecord[][] = [], patch = false;
+                let patches: WriteRecord[][] = [], batches: WriteRecord[][] = [];
                 if (plan.op === 'update') {
                     const ids = plan.moveOnly
                         ? await listChunkIds(handle, name, branchRef(branch), plan.file.fileId, { generation: plan.generation }, signal) : [];
                     if (plan.moveOnly && (ids.length || !plan.file.content.trim())) {
-                        batches = writeBatches([moveRecords(plan.original, ids)], branch);
-                        patch = true;
+                        const moved = moveRecords(plan.original, ids, plan.newModifier);
+                        patches = writeBatches([moved.patches], branch);
+                        batches = writeBatches([moved.originals], branch);
                     } else {
                         // A nonempty original without chunks in its generation, for
                         // example after concurrent writers removed each other's
@@ -228,7 +239,7 @@ export function fileWriter(handle: Handle, name: string, schema: MetadataSchema,
                         batches = writeBatches([records], branch);
                     }
                 }
-                steps.push({ edit: plan, batches, patch });
+                steps.push({ edit: plan, patches, batches });
             }
         }
         queueCreates();
@@ -340,7 +351,8 @@ export function fileWriter(handle: Handle, name: string, schema: MetadataSchema,
             }
             const edit = step.edit;
             if (edit.op === 'update') {
-                for (const batch of step.batches) await put(batch.map(record => record.doc), step.patch);
+                for (const batch of step.patches) await put(batch.map(record => record.doc), true);
+                for (const batch of step.batches) await put(batch.map(record => record.doc), false);
                 completed.push(edit.file);
                 if (dimensions === undefined) await cleanup({ fileId: edit.file.fileId, path: edit.file.path });
             } else {

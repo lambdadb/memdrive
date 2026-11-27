@@ -23,7 +23,7 @@ test('external file reads and vector searches return references from the selecte
     const { at: work } = await main.fork({ name: 'vector-draft' });
     const metadata = { topic: 'owner "one" *', ordinal: 4 };
     const file = await main.write({ at: work, op: 'create', path: '/local/note', content: vector(), metadata });
-    assert.deepEqual(file, { fileId: file.fileId, path: '/local/note', modifiedAt: file.modifiedAt, metadata });
+    assert.deepEqual(file, { fileId: file.fileId, path: '/local/note', createdAt: file.createdAt, modifiedAt: file.modifiedAt, metadata });
     const writes = calls.filter(({ kind }) => kind === 'upsert');
     assert.equal(writes.length, 1);
     const [doc] = writes[0].request.docs;
@@ -35,7 +35,7 @@ test('external file reads and vector searches return references from the selecte
 
     const { at: saved } = await main.checkpoint({ at: work, name: 'before-move' });
     const moved = await main.write({ at: work, op: 'update', fileId: file.fileId, newPath: '/local/updated', metadata: {} });
-    assert.deepEqual(moved, { fileId: file.fileId, path: '/local/updated', modifiedAt: moved.modifiedAt });
+    assert.deepEqual(moved, { fileId: file.fileId, path: '/local/updated', createdAt: file.createdAt, modifiedAt: moved.modifiedAt });
     const persisted = collections.get(name).branches.get('fork-vector-draft').docs.get(doc.id);
     assert.deepEqual(persisted.embedding, doc.embedding);
     assert.deepEqual(await main.read({ at: work, paths: [file.path, moved.path] }), [moved]);

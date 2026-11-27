@@ -26,7 +26,7 @@ test('create makes one collection with one-day native snapshot retention and no 
     assert.deepEqual([...collections.keys()], [name]);
     const { metadata, branches, tags } = collections.get(name);
     assert.equal(metadata.snapshotRetentionInDays, 1);
-    assert.equal(metadata.tags['memdrive.format'], 'files-v1');
+    assert.equal(metadata.tags['memdrive.format'], 'files-v2');
     assert.equal(metadata.description, 'memdrive-config-v1:{"chunking":{"strategy":"auto"}}');
     assert.equal(Object.hasOwn(metadata.indexConfigs, 'changed'), false);
     assert.deepEqual([...branches.keys()], ['main']);

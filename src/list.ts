@@ -1,6 +1,6 @@
 import { isObject, keysOnly } from './config.js';
 import { checkAbort, databaseError, MemDriveError, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
-import { decodeFileEntry, originalId, resultDocs, validPath } from './records.js';
+import { decodeFileEntry, fileEntryFields, originalId, resultDocs, validPath } from './records.js';
 import { ancestorFilter, viewRead, type Handle, type ViewRef, type WithoutAt } from './storage-reads.js';
 import { decodeToken, encodeToken } from './cursor-tokens.js';
 import type { FileAt, ListFilesRequest, ListFilesResult, MetadataSchema, RequestOptions } from './types.js';
@@ -10,7 +10,7 @@ type Criteria = { prefix: string; nameContains: string; delimiter?: '/' | undefi
 type Position = { key: string; id?: string | undefined };
 const encoder = new TextEncoder();
 const token = 'l2';
-const fields = { include: ['id', 'kind', 'fileId', 'path', 'modifiedAt', 'metadata'] };
+const fields = { include: fileEntryFields };
 // Bound the optional cursor hint by LambdaDB's accepted page-token length.
 const maximumAnchorLength = 144 * 1024;
 const validNativeToken = (value: unknown): value is string => typeof value === 'string' && value.length > 0;

@@ -1,5 +1,5 @@
 import type { CheckpointedWriteResult, LambdaDBClient, RollbackResult, WritableAt } from '@functional-systems/memdrive';
-import { create, open, type DriveFile, type FileAt, type ForkAt, type CheckpointAt, type FileFilter, type FindTextResult, type DeleteFileResult,
+import { create, open, type DriveFile, type FileActor, type FileAt, type ForkAt, type CheckpointAt, type FileFilter, type FindTextResult, type DeleteFileResult,
     type SearchFilesResult, type ListFilesResult, type TreeFolder, type TreeRequest, type TreeResult, type FileDrive, type EmbeddingMode, type OpenFileStoreOptions, type FileRef } from '@functional-systems/memdrive';
 
 export async function nativeRollbackConsumer(client: LambdaDBClient) {
@@ -38,6 +38,23 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     void savedAt; void savedBatch;
     // @ts-expect-error A checkpoint is named by an object.
     await reopened.write({ op: 'create', path: '/turn.md', content: '', checkpoint: 'turn-3' });
+    // Every request form names the call's actor and time; results carry the attribution.
+    const by: FileActor = { user: 'user-1', agent: 'planner' };
+    const authored: DriveFile = await reopened.write({ op: 'create', path: '/authored.md', content: '', by, time: new Date() });
+    const createdAt: string = authored.createdAt;
+    const createdBy: FileActor | undefined = authored.createdBy;
+    const modifiedBy: FileActor | undefined = authored.modifiedBy;
+    void createdAt; void createdBy; void modifiedBy;
+    await reopened.write({ at, by: { agent: 'reviewer' }, time: new Date(), operations: [{ op: 'delete', fileId: authored.fileId }] });
+    await reopened.write({ by, time: new Date(), operations: [{ op: 'delete', fileId: authored.fileId }], checkpoint: { name: 'turn-4' } });
+    // @ts-expect-error Operations of a batch take no actor; by applies to the whole call.
+    await reopened.write({ operations: [{ op: 'delete', fileId: authored.fileId, by }] });
+    // @ts-expect-error An actor names a user or an agent.
+    await reopened.write({ op: 'delete', fileId: authored.fileId, by: { role: 'admin' } });
+    // @ts-expect-error time is a Date.
+    await reopened.write({ op: 'delete', fileId: authored.fileId, time: '2026-01-01T00:00:00.000Z' });
+    const listedAuthor: FileActor | undefined = (await reopened.list()).files[0]?.modifiedBy;
+    void listedAuthor;
     // @ts-expect-error Batches are an operations array with at, not a bare array.
     await reopened.write([{ op: 'create', path: '/batch.txt', content: 'Batch' }]);
     const listed: ListFilesResult = await reopened.list({ at, prefix: '/notes/', delimiter: '/', limit: 2 });
@@ -139,6 +156,9 @@ export async function externalFileConsumer(client: LambdaDBClient, options: Open
     const [file] = await drive.write({ at, operations: [{ op: 'create', path: '/note', content: vector }] });
     const reopened: FileDrive<'external'> = await open({ client, name: 'workspace', mode: 'external' });
     const reference = await reopened.read({ at, fileId: file!.fileId });
+    const referenceCreatedAt: string | undefined = reference?.createdAt;
+    void referenceCreatedAt;
+    await reopened.write({ at, op: 'update', fileId: file!.fileId, newPath: '/moved', by: { agent: 'indexer' }, time: new Date() });
     const vectorTree: TreeResult = await reopened.tree({ at });
     void vectorTree;
     await reopened.write({ at, op: 'update', fileId: file!.fileId, content: vector, newPath: '/updated' });
