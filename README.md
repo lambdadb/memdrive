@@ -416,14 +416,23 @@ actor, `createdBy` and `modifiedBy`. Write results, `read`, `list`, `search` and
   authenticate or interpret them: naming the caller is the host's job.
 - `time` is a valid `Date` in the years 0000–9999. It replaces the current time
   for the call's `createdAt` and `modifiedAt` values. Without it each value is
-  the current time, as before.
+  the current time, as before. A `time` earlier than a file's `createdAt` is
+  accepted and leaves `modifiedAt` before `createdAt`; keeping times in order is
+  the host's job.
 
 Invalid `by` or `time` fails with `INVALID_INPUT` before any storage request.
 `createdAt` has a `datetime` index like `modifiedAt`; the actors have no index
-and cannot be filtered on. Chunks carry none of these fields. In a text store,
-a move whose `modifiedBy` differs from the stored one sends one more request
-than other moves: a LambdaDB patch merges into the stored original and cannot
-remove a field, so the SDK patches the chunks and then writes the whole original.
+and cannot be filtered on. Chunks carry none of these fields.
+
+A move keeps its single native patch of the chunks and the original. A LambdaDB
+patch merges into the stored original and cannot remove a field, so when a move
+changes `modifiedBy` the patch sends both names, `null` for a missing one:
+`{ user: null, agent: 'reviewer' }`, or `{ user: null, agent: null }` for a
+move without an actor. Reads treat a `null` name as absent and an actor without names
+as none, so results never contain `null`. The next content or metadata change
+writes the whole original and stores the actor without nulls. A move that keeps
+`modifiedBy`, including any move in a store that never names actors, sends no
+`modifiedBy`.
 
 ## Checkpointed writes
 

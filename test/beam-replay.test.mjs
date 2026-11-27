@@ -501,7 +501,7 @@ test('a LambdaDB run records ownership before create, retains its store and clea
     assert.deepEqual(ledger, { ...ledgers[0], status: 'ready' });
     assert.deepEqual(Object.keys(ledger), ['protocol', 'name', 'endpoint', 'project', 'labels', 'status']);
     assert.match(ledger.name, /^beam-replay-[0-9a-f]{32}$/);
-    assert.deepEqual([ledger.endpoint, ledger.project, ledger.labels['beam.application']], [endpoint, project, 'memdrive-beam-session-replay-store-v2']);
+    assert.deepEqual([ledger.endpoint, ledger.project, ledger.labels['beam.application']], [endpoint, project, 'memdrive-beam-session-replay-store-v3']);
     assert(!JSON.stringify(ledger).includes('key'));
     assert.deepEqual([completed.manifest.backend, completed.manifest.store, completed.summary.complete, completed.summary.cleanup, completed.summary.store],
         ['lambdadb', { name: ledger.name, ledger: 'store.json' }, true, 'retained', { name: ledger.name, ledger: 'store.json' }]);
@@ -540,11 +540,13 @@ test('a LambdaDB run records ownership before create, retains its store and clea
     await cleanupStore({ output: outputs[2], ...lost.connection });
     assert.deepEqual([lost.fixture.collections.size, (await json(path.join(outputs[2], 'store.json'))).status], [0, 'cleaned']);
 
-    // A ledger of the earlier protocol names a store this SDK cannot destroy: cleanup refuses it and deletes nothing.
-    const deletions = live.fixture.calls.filter(call => call.kind === 'collection-delete').length;
-    await writeFile(path.join(outputs[1], 'store.json'), JSON.stringify({ ...failedLedger, protocol: 'memdrive-beam-session-replay-store-v1' }));
-    await assert.rejects(cleanupStore({ output: outputs[1], ...live.connection }), /earlier replay protocol.*LambdaDB directly/);
-    assert.equal(live.fixture.calls.filter(call => call.kind === 'collection-delete').length, deletions);
+    // A ledger of an earlier protocol names a store this SDK cannot destroy: cleanup refuses it before any request.
+    const requests = live.fixture.calls.length;
+    for (const protocol of ['memdrive-beam-session-replay-store-v1', 'memdrive-beam-session-replay-store-v2']) {
+        await writeFile(path.join(outputs[1], 'store.json'), JSON.stringify({ ...failedLedger, protocol }));
+        await assert.rejects(cleanupStore({ output: outputs[1], ...live.connection }), /earlier replay protocol.*LambdaDB directly/);
+    }
+    assert.equal(live.fixture.calls.length, requests);
 });
 
 test('per-session token and time limits reach the session budget and the manifest', async t => {

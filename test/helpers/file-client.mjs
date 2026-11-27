@@ -10,6 +10,14 @@ const codePoints = (a, b) => {
     for (let index = 0; index < Math.min(x.length, y.length); index++) if (x[index] !== y[index]) return x[index] - y[index];
     return x.length - y.length;
 };
+// Like LambdaDB, a patch merges objects into stored objects and stores other values,
+// null included, as given: it cannot remove a field.
+const isPlainObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+function deepMerge(target, patch) {
+    for (const [key, value] of Object.entries(patch))
+        target[key] = isPlainObject(target[key]) && isPlainObject(value) ? deepMerge(target[key], value) : value;
+    return target;
+}
 // The filter clauses the SDK sends to file listings and tree queries.
 function matches(doc, { bool, queryString }) {
     if (bool) return bool[0]?.occur === 'should' ? bool.some(clause => matches(doc, clause)) : bool.every(clause => matches(doc, clause));
@@ -347,7 +355,7 @@ export function fileClient() {
                         calls.push({ kind: 'update', request: structuredClone(request), retries: options?.retries });
                         const docs = docsAt(request.branch);
                         if (request.docs.some(doc => !docs.has(doc.id))) fail(400, 'Update target missing');
-                        for (const doc of request.docs) docs.set(doc.id, { ...docs.get(doc.id), ...structuredClone(doc) });
+                        for (const doc of request.docs) docs.set(doc.id, deepMerge(structuredClone(docs.get(doc.id)), structuredClone(doc)));
                     },
                     async delete(request, options) {
                         calls.push({ kind: 'delete', collection: name, request: structuredClone(request), retries: options?.retries });

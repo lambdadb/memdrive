@@ -275,16 +275,27 @@ test('live file store writes main and forks, searches, lists, checkpoints and ro
             assert.deepEqual(await main.listForks({}, options()), { forks: [] });
             await assert.rejects(reopened.read({ at, path }, options()), { code: 'BRANCH_NOT_FOUND' });
         }
-        // An update by another actor keeps the creation fields and records the new modifier;
-        // a move without an actor then removes it from the stored original.
-        const authored = await main.write({ op: 'create', path: '/authored.txt', content: 'Authored synthetic text.',
-            by: { user: 'live-user', agent: 'writer' } }, options());
-        await main.write({ op: 'update', fileId: authored.fileId, content: 'Revised synthetic text.', by: { agent: 'reviewer' } }, options());
-        const revised = await reopened.read({ fileId: authored.fileId }, options());
-        assert.deepEqual([revised.createdAt, revised.createdBy, revised.modifiedBy],
-            [authored.createdAt, { user: 'live-user', agent: 'writer' }, { agent: 'reviewer' }]);
-        await main.write({ op: 'update', fileId: authored.fileId, newPath: '/authored-moved.txt' }, options());
-        assert.equal(Object.hasOwn(await reopened.read({ fileId: authored.fileId }, options()), 'modifiedBy'), false);
+        // A move by another actor keeps the creation fields and patches the modifier with an
+        // explicit null; a move without an actor then patches both names to null.
+        const writer = { user: 'live-user', agent: 'writer' };
+        const authored = await main.write({ op: 'create', path: '/authored.txt', content: 'Authored synthetic text.', by: writer }, options());
+        const attributed = async () => {
+            const hit = (await main.search({ query: 'Authored synthetic text', rerank: false, limit: 10 }, options())).hits
+                .find(item => item.fileId === authored.fileId);
+            const entries = [await reopened.read({ fileId: authored.fileId }, options()),
+                (await main.list({ prefix: '/authored' }, options())).files[0], hit];
+            for (const entry of entries) assert.deepEqual([entry?.createdAt, entry?.createdBy], [authored.createdAt, writer]);
+            return entries.map(entry => entry.modifiedBy);
+        };
+        const storedModifier = async () => (await native.docs.fetch({ ids: [`file:${authored.fileId}`], ref: { kind: 'branch', name: 'main' },
+            consistentRead: true, fields: { include: ['modifiedBy'] } }, options())).docs[0]?.doc.modifiedBy;
+        const shape = value => JSON.stringify(value && Object.fromEntries(Object.entries(value).map(([key, item]) => [key, item === null ? 'null' : typeof item])));
+        await main.write({ op: 'update', fileId: authored.fileId, newPath: '/authored-moved.txt', by: { agent: 'reviewer' } }, options());
+        t.diagnostic(`Stored modifiedBy after the agent-only move: ${shape(await storedModifier())}.`);
+        assert.deepEqual(await attributed(), [{ agent: 'reviewer' }, { agent: 'reviewer' }, { agent: 'reviewer' }]);
+        await main.write({ op: 'update', fileId: authored.fileId, newPath: '/authored-again.txt' }, options());
+        t.diagnostic(`Stored modifiedBy after the move without an actor: ${shape(await storedModifier())}.`);
+        assert.deepEqual(await attributed(), [undefined, undefined, undefined]);
 
         await MemDrive.destroy({ client, name }, options());
         await assert.rejects(main.read({ path: '/main.txt' }, options()), { code: 'STORE_NOT_FOUND', status: 404 });

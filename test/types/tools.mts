@@ -22,6 +22,8 @@ export async function toolConsumer(drive: FileDrive, external: FileDrive<'extern
     createFileTools({ drive, tools: ['write'], now: () => '2026-01-01T00:00:00.000Z' });
     // @ts-expect-error An actor names a user or an agent.
     createFileTools({ drive, tools: ['write'], actor: { team: 'core' } });
+    // @ts-expect-error An actor names at least one of a user and an agent.
+    createFileTools({ drive, tools: ['write'], actor: {} });
     const definitions: readonly FileToolDefinition[] = tools.definitions;
     const fixedDefinitions: readonly FileToolDefinition[] = getFileToolDefinitions({ embeddingMode: 'managed', tools: names });
     getFileToolDefinitions({ embeddingMode: 'external', tools: ['search', 'write'] });

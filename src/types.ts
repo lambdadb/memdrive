@@ -44,10 +44,7 @@ type ModeOption<Mode extends EmbeddingMode> = Mode extends 'external' ? { mode: 
  * Who made a change, as named by the host: at least one of a user and an agent.
  * The SDK stores the strings as given and never interprets them.
  */
-export interface FileActor {
-    user?: string | undefined;
-    agent?: string | undefined;
-}
+export type FileActor = { user: string; agent?: string | undefined } | { user?: string | undefined; agent: string };
 
 export interface FileListEntry {
     fileId: string;

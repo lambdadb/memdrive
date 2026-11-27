@@ -8,10 +8,11 @@ import { readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileToolError, HTTPClient, LambdaDBClient, MemDrive } from '@functional-systems/memdrive';
 
-// v2 stores use the SDK's single-collection file store layout. A v1 ledger names a
-// `files-v0` store with a publication journal, which this SDK can neither open nor destroy.
-export const storeProtocol = 'memdrive-beam-session-replay-store-v2';
-const earlierStoreProtocol = 'memdrive-beam-session-replay-store-v1';
+// v3 stores use the SDK's `files-v2` layout. Ledgers of earlier protocols name stores this
+// SDK can neither open nor destroy: v2 a `files-v1` store, v1 a `files-v0` store with a
+// publication journal.
+export const storeProtocol = 'memdrive-beam-session-replay-store-v3';
+const earlierStoreProtocols = ['memdrive-beam-session-replay-store-v1', 'memdrive-beam-session-replay-store-v2'];
 export const ledgerFile = 'store.json';
 const storeName = /^beam-replay-[0-9a-f]{32}$/;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -56,8 +57,8 @@ export async function writeLedger(directory, ledger, { create = false } = {}) {
 /** Read one run's ledger and check its format, endpoint, project and ownership receipt. */
 export async function readLedger(directory, { endpoint, project }) {
     const ledger = JSON.parse(await readFile(path.join(directory, ledgerFile), 'utf8'));
-    assert(ledger.protocol !== earlierStoreProtocol, 'This ledger is from an earlier replay protocol whose store this SDK cannot open or destroy; '
-        + 'delete its collection and md-journal-* collection with LambdaDB directly');
+    assert(!earlierStoreProtocols.includes(ledger.protocol), 'This ledger is from an earlier replay protocol whose store this SDK cannot open or destroy; '
+        + 'delete its collection (and, for v1, its md-journal-* collection) with LambdaDB directly');
     assert.equal(ledger.protocol, storeProtocol, 'Unexpected replay store ledger format');
     assert(ledger.endpoint === endpoint && ledger.project === project, 'Ledger belongs to another endpoint/project');
     assert(storeName.test(ledger.name) && uuid.test(ledger.labels?.['beam.owner'] ?? '')

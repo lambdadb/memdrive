@@ -51,6 +51,10 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     await reopened.write({ operations: [{ op: 'delete', fileId: authored.fileId, by }] });
     // @ts-expect-error An actor names a user or an agent.
     await reopened.write({ op: 'delete', fileId: authored.fileId, by: { role: 'admin' } });
+    // @ts-expect-error An actor names at least one of a user and an agent.
+    await reopened.write({ op: 'delete', fileId: authored.fileId, by: {} });
+    const agentOnly: FileActor = { agent: 'reviewer' };
+    void agentOnly;
     // @ts-expect-error time is a Date.
     await reopened.write({ op: 'delete', fileId: authored.fileId, time: '2026-01-01T00:00:00.000Z' });
     const listedAuthor: FileActor | undefined = (await reopened.list()).files[0]?.modifiedBy;

@@ -67,49 +67,64 @@ test('modifiedBy follows modifiedAt: updates set or clear it, unchanged updates 
     assert.deepEqual(attribution(await drive.read({ fileId })), stamp(t1, alice, t4, bob));
 });
 
-test('moves record the new modifier, writing the whole original after the chunk patches only when the modifier changes', async () => {
-    const { fixture, drive, stored, chunks, mutations } = await setup();
-    const { fileId } = await drive.write({ op: 'create', path: '/a.md', content: 'Alpha text.', by: alice, time: t1 });
-    const move = async (newPath, change) => {
+test('a move patches the modifier with explicit nulls in the native requests of an ordinary move, and reads normalize them', async () => {
+    const { fixture, drive, stored, mutations } = await setup();
+    const { fileId } = await drive.write({ op: 'create', path: '/a.md', content: 'Alpha needle.', by: alice, time: t1 });
+    const patched = since => fixture.calls.slice(since).filter(call => call.kind === 'update').flatMap(call => call.request.docs);
+    const reads = async () => [await drive.read({ fileId }), (await drive.list()).files[0], (await drive.search({ query: 'needle' })).hits[0],
+        (await drive.findText({ query: 'needle' })).hits[0]];
+    // From { user, agent } to { agent }, to { user }, to no actor and back to an actor.
+    for (const [index, [by, sent]] of [[{ agent: 'planner' }, { user: null, agent: 'planner' }], [{ user: 'alice' }, { user: 'alice', agent: null }],
+        [undefined, { user: null, agent: null }], [bob, { user: null, agent: 'reviewer' }]].entries()) {
         const since = fixture.calls.length;
-        const moved = await drive.write({ op: 'update', fileId, newPath, ...change });
-        return { moved, sent: mutations(since) };
-    };
-    // The same modifier: one patch of the chunk and the original, as before.
-    let { moved, sent } = await move('/b.md', { by: alice, time: t2 });
-    assert.deepEqual(attribution(moved), stamp(t1, alice, t2, alice));
-    assert.deepEqual(sent, [['update', 'chunk', 'file']]);
-    // A patch merges into the stored original, so another modifier rewrites it.
-    ({ moved, sent } = await move('/c.md', { by: bob, time: t3 }));
-    assert.deepEqual(sent, [['update', 'chunk'], ['upsert', 'file']]);
-    assert.deepEqual(attribution(stored(fileId)), stamp(t1, alice, t3, bob));
-    ({ moved, sent } = await move('/d.md', { time: t4 }));
-    assert.deepEqual(sent, [['update', 'chunk'], ['upsert', 'file']]);
-    assert.deepEqual(attribution(stored(fileId)), stamp(t1, alice, t4, null));
-    assert.deepEqual(await drive.read({ path: '/d.md' }), moved);
-    assert.equal(stored(fileId).body, 'Alpha text.');
-    assert.deepEqual(chunks(fileId).map(chunk => [chunk.path, chunk.revision]), [['/d.md', stored(fileId).revision]]);
-    assert.deepEqual((await drive.search({ query: 'Alpha' })).hits.map(hit => [hit.path, hit.modifiedAt]), [['/d.md', iso(t4)]]);
-    ({ sent } = await move('/e.md', {}));
-    assert.deepEqual(sent, [['update', 'chunk', 'file']]);
+        const moved = await drive.write({ op: 'update', fileId, newPath: `/moved-${index}.md`, time: t2, ...(by ? { by } : {}) });
+        // One patch of the chunk and the original, as for any move; only the original carries modifiedBy.
+        assert.deepEqual(mutations(since), [['update', 'chunk', 'file']]);
+        const [chunk, original] = patched(since);
+        assert.equal(Object.hasOwn(chunk, 'modifiedBy'), false);
+        assert.deepEqual(original.modifiedBy, sent);
+        // LambdaDB merges the patch into the stored actor and keeps the nulls.
+        assert.deepEqual(stored(fileId).modifiedBy, sent);
+        for (const entry of [moved, ...await reads()]) assert.deepEqual(attribution(entry), stamp(t1, alice, t2, by ?? null));
+    }
+    // The same modifier, or none before and after, leaves modifiedBy out of the patch.
+    let since = fixture.calls.length;
+    await drive.write({ op: 'update', fileId, newPath: '/same.md', by: bob });
+    assert.equal(Object.hasOwn(patched(since)[1], 'modifiedBy'), false);
+    const plain = await drive.write({ op: 'create', path: '/plain.md', content: 'Plain.' });
+    since = fixture.calls.length;
+    await drive.write({ op: 'update', fileId: plain.fileId, newPath: '/plain-moved.md' });
+    assert.equal(Object.hasOwn(patched(since)[1], 'modifiedBy'), false);
+    assert.equal(Object.hasOwn(stored(plain.fileId), 'modifiedBy'), false);
 
-    // An empty file has no chunks: only its original is written.
+    // A later full write of the original stores the clean shape again.
+    await drive.write({ op: 'update', fileId, newPath: '/none.md' });
+    assert.deepEqual(stored(fileId).modifiedBy, { user: null, agent: null });
+    await drive.write({ op: 'update', fileId, content: 'Alpha needle, revised.', by: { user: 'carol' } });
+    assert.deepEqual(stored(fileId).modifiedBy, { user: 'carol' });
+    assert.equal(JSON.stringify(stored(fileId)).includes('null'), false);
+
+    // An empty file has no chunks: the patch holds only its original.
     const empty = await drive.write({ op: 'create', path: '/empty.md', content: '', by: alice });
-    const since = fixture.calls.length;
+    since = fixture.calls.length;
     await drive.write({ op: 'update', fileId: empty.fileId, newPath: '/empty-moved.md', by: bob });
-    assert.deepEqual(mutations(since), [['upsert', 'file']]);
-    assert.deepEqual(stored(empty.fileId).modifiedBy, bob);
+    assert.deepEqual(mutations(since), [['update', 'file']]);
+    assert.deepEqual((await drive.read({ fileId: empty.fileId })).modifiedBy, bob);
 });
 
 test('a batch applies by and time to every operation, and its operations accept neither', async () => {
     const { fixture, drive } = await setup();
     const first = await drive.write({ op: 'create', path: '/a.md', content: 'Alpha.', by: alice, time: t1 });
-    const [created, updated] = await drive.write({ by: bob, time: t2, operations: [
+    const [created, updated, other] = await drive.write({ by: bob, time: t2, operations: [
         { op: 'create', path: '/b.md', content: 'Beta.' },
         { op: 'update', fileId: first.fileId, content: 'Alpha, revised.' },
+        { op: 'create', path: '/c.md', content: 'Gamma.' },
     ] });
     assert.deepEqual(attribution(created), stamp(t2, bob));
     assert.deepEqual(attribution(updated), stamp(t1, alice, t2, bob));
+    // Each file gets its own copy of the actor.
+    created.createdBy.agent = created.modifiedBy.agent = 'changed';
+    assert.deepEqual([updated.modifiedBy, other.createdBy, other.modifiedBy], [bob, bob, bob]);
     const before = fixture.calls.length;
     for (const operation of [{ op: 'create', path: '/c.md', content: 'C.', by: bob }, { op: 'update', fileId: first.fileId, content: 'C.', time: t3 },
         { op: 'delete', fileId: first.fileId, by: bob }])
@@ -128,12 +143,22 @@ test('invalid actors and times fail with INVALID_INPUT before any storage reques
         await assert.rejects(drive.write({ ...create, by }), { code: 'INVALID_INPUT' }, JSON.stringify(by));
         await assert.rejects(drive.write({ by, operations: [create], checkpoint: { name: 'turn-1' } }), { code: 'INVALID_INPUT' });
     }
-    for (const time of [null, iso(t1), t1.getTime(), new Date(Number.NaN), new Date('+010000-01-01T00:00:00.000Z'), new Date('-000001-01-01T00:00:00.000Z')])
-        await assert.rejects(drive.write({ ...create, time }), { code: 'INVALID_INPUT' }, String(time));
+    // A subclass cannot pass an invalid internal time through overridden methods.
+    class Lying extends Date { getTime() { return t1.getTime(); } toISOString() { return iso(t1); } valueOf() { return t1.getTime(); } }
+    for (const time of [null, iso(t1), t1.getTime(), new Date(Number.NaN), new Date('+010000-01-01T00:00:00.000Z'), new Date('-000001-01-01T00:00:00.000Z'),
+        new Lying(Number.NaN), Object.create(Date.prototype), { getTime: () => t1.getTime(), toISOString: () => iso(t1) }])
+        await assert.rejects(drive.write({ ...create, time }), { code: 'INVALID_INPUT' }, Object.prototype.toString.call(time));
     assert.equal(fixture.calls.length, before);
     // The limits are inclusive, and a well-formed surrogate pair is allowed.
     for (const user of ['x'.repeat(256), '가'.repeat(85), '😀 agent'])
         assert.equal((await drive.write({ op: 'create', path: `/${user.length}.md`, content: '', by: { user } })).createdBy.user, user);
+    // A valid lying subclass records its internal time.
+    assert.equal((await drive.write({ op: 'create', path: '/lying.md', content: '', time: new Lying(t2.getTime()) })).createdAt, iso(t2));
+    // Each name is read once: a getter cannot change it after validation.
+    let reads = 0;
+    const shifting = { get user() { return reads++ ? '\u0000' : 'dana'; } };
+    const named = await drive.write({ op: 'create', path: '/getter.md', content: '', by: shifting });
+    assert.deepEqual([named.createdBy, (await drive.read({ fileId: named.fileId })).createdBy, reads], [{ user: 'dana' }, { user: 'dana' }, 1]);
     const early = new Date('0000-01-01T00:00:00.000Z');
     assert.equal((await drive.write({ op: 'create', path: '/early.md', content: '', time: early })).createdAt, '0000-01-01T00:00:00.000Z');
 });
@@ -167,9 +192,14 @@ test('read, list, search and findText return the stored attribution and reject i
     check((await drive.search({ query: 'needle' })).hits);
     check((await drive.findText({ query: 'needle' })).hits);
 
-    stored(plain.fileId).modifiedBy = { user: '' };
-    await assert.rejects(drive.read({ fileId: plain.fileId }), { code: 'INVALID_RESULT' });
-    delete stored(plain.fileId).modifiedBy;
+    for (const [field, value] of [['modifiedBy', { user: '' }], ['createdBy', { agent: 1 }], ['createdBy', { user: 'a', role: 'admin' }], ['modifiedBy', null]]) {
+        stored(plain.fileId)[field] = value;
+        await assert.rejects(drive.read({ fileId: plain.fileId }), { code: 'INVALID_RESULT' }, `${field} ${JSON.stringify(value)}`);
+        delete stored(plain.fileId)[field];
+    }
+    // Names a patch set to null are absent, and an actor without names is none.
+    Object.assign(stored(authored.fileId), { createdBy: { user: null, agent: 'planner' }, modifiedBy: { user: null, agent: null } });
+    assert.deepEqual(attribution(await drive.read({ fileId: authored.fileId })), stamp(t1, { agent: 'planner' }, t1, null));
     delete stored(plain.fileId).createdAt;
     await assert.rejects(drive.list(), { code: 'INVALID_RESULT' });
 });

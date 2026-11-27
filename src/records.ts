@@ -18,30 +18,45 @@ export function requirePath(path: unknown): asserts path is string {
 
 const actorName = (value: unknown) => typeof value === 'string' && value.trim() !== ''
     && !/[\p{Cc}\p{Surrogate}]/u.test(value) && encoder.encode(value).length <= 256;
-/** An actor with at least one name; keys holding `undefined` count as absent. */
-export const validActor = (value: unknown): value is FileActor => keysOnly(value, ['user', 'agent'])
-    && Object.values(value).some(name => name !== undefined) && Object.values(value).every(name => name === undefined || actorName(name));
-const actorCopy = ({ user, agent }: FileActor): FileActor => ({ ...(user === undefined ? {} : { user }), ...(agent === undefined ? {} : { agent }) });
+/** A new actor of the string names among `user` and `agent`, or undefined when there are none. */
+const actorOf = (user: unknown, agent: unknown): FileActor | undefined => typeof user === 'string'
+    ? { user, ...(typeof agent === 'string' ? { agent } : {}) } : typeof agent === 'string' ? { agent } : undefined;
 const sameActor = (a?: FileActor, b?: FileActor) => a?.user === b?.user && a?.agent === b?.agent;
 
+/** Validate an actor; keys holding `undefined` count as absent. */
 export function requireActor(value: unknown, name: string): FileActor {
-    requireInput(validActor(value),
+    // Read each name once, so a getter cannot change what was validated.
+    const names = keysOnly(value, ['user', 'agent']) ? [value.user, value.agent] : [];
+    const actor = actorOf(names[0], names[1]);
+    requireInput(actor !== undefined && names.every(item => item === undefined || actorName(item)),
         `${name} must be { user?, agent? } with at least one nonblank string of at most 256 UTF-8 bytes without control characters or lone surrogates.`);
-    return actorCopy(value);
+    return actor;
+}
+
+/** A stored actor. A move's patch stores `null` for a name it removes, and an actor without names is none. */
+function storedActor(value: unknown): FileActor | undefined {
+    if (value === undefined) return undefined;
+    if (!keysOnly(value, ['user', 'agent']) || !Object.values(value).every(item => item === null || actorName(item)))
+        throw new MemDriveError('INVALID_RESULT', 'Read returned an invalid file actor.');
+    return actorOf(value.user, value.agent);
 }
 
 /** The actor and time of one write call; an omitted time means the clock at each use. */
 export type WriteChange = { by?: FileActor | undefined; time?: Date | undefined };
 
 export function requireTime(value: unknown): Date {
-    requireInput(value instanceof Date && !Number.isNaN(value.getTime()) && validDate(value.toISOString()),
-        'time must be a valid Date between the years 0000 and 9999.');
-    return new Date(value);
+    // The internal time value, not overridable methods, is what a copy stores.
+    let time = Number.NaN;
+    try { time = Date.prototype.getTime.call(value); }
+    catch { /* not a Date */ }
+    const copy = new Date(time);
+    requireInput(!Number.isNaN(time) && validDate(copy.toISOString()), 'time must be a valid Date between the years 0000 and 9999.');
+    return copy;
 }
 
 /** The `modifiedAt` and `modifiedBy` a change records: this call's time and actor, never an earlier modifier. */
 export const modification = ({ by, time }: WriteChange) =>
-    ({ modifiedAt: (time ?? new Date()).toISOString(), ...(by === undefined ? {} : { modifiedBy: by }) });
+    ({ modifiedAt: (time ?? new Date()).toISOString(), ...(by === undefined ? {} : { modifiedBy: { ...by } }) });
 
 /**
  * The identity and attribution of an updated file: its creation fields, and this
@@ -69,16 +84,14 @@ export function resultDocs(response: unknown, collection: string, maximum: numbe
 export const fileEntryFields = ['id', 'kind', 'fileId', 'path', 'createdAt', 'createdBy', 'modifiedAt', 'modifiedBy', 'metadata'];
 
 export function decodeFileEntry(doc: Record<string, unknown>, schema: MetadataSchema): FileListEntry {
-    const { createdBy, modifiedBy } = doc;
     if (doc.kind !== 'file' || !validFileId(doc.fileId) || doc.id !== originalId(doc.fileId)
-        || !validPath(doc.path) || !validDate(doc.createdAt) || !validDate(doc.modifiedAt)
-        || (createdBy !== undefined && !validActor(createdBy)) || (modifiedBy !== undefined && !validActor(modifiedBy)))
+        || !validPath(doc.path) || !validDate(doc.createdAt) || !validDate(doc.modifiedAt))
         throw new MemDriveError('INVALID_RESULT', 'Read returned an invalid file original.');
+    const createdBy = storedActor(doc.createdBy), modifiedBy = storedActor(doc.modifiedBy);
     try {
         const metadata = metadataValues(doc.metadata, schema);
-        return { fileId: doc.fileId, path: doc.path, createdAt: doc.createdAt,
-            ...(createdBy === undefined ? {} : { createdBy: actorCopy(createdBy) }), modifiedAt: doc.modifiedAt,
-            ...(modifiedBy === undefined ? {} : { modifiedBy: actorCopy(modifiedBy) }), ...(metadata === undefined ? {} : { metadata }) };
+        return { fileId: doc.fileId, path: doc.path, createdAt: doc.createdAt, ...(createdBy === undefined ? {} : { createdBy }),
+            modifiedAt: doc.modifiedAt, ...(modifiedBy === undefined ? {} : { modifiedBy }), ...(metadata === undefined ? {} : { metadata }) };
     } catch (cause) {
         throw new MemDriveError('INVALID_RESULT', 'Read returned invalid file metadata.', { cause });
     }
@@ -127,7 +140,7 @@ export async function createRecords(request: CreateFileRequest | CreateExternalF
     const metadata = metadataValues(request.metadata, schema);
     const created = modification(change);
     const file: StoredFile = { fileId: globalThis.crypto.randomUUID(), path, createdAt: created.modifiedAt,
-        ...(change.by === undefined ? {} : { createdBy: change.by }), ...created, ...payload, ...(metadata === undefined ? {} : { metadata }) };
+        ...(change.by === undefined ? {} : { createdBy: { ...change.by } }), ...created, ...payload, ...(metadata === undefined ? {} : { metadata }) };
     return fileRecords(file, undefined, chunker, options);
 }
 
