@@ -4,7 +4,7 @@ TypeScript file SDK backed by LambdaDB. MemDrive accepts an initialized LambdaDB
 
 The package is `@functional-systems/memdrive`, licensed under Apache-2.0. It supports ESM, CommonJS, TypeScript, Node.js 20.12+, and browser bundlers.
 
-MemDrive pins `@functional-systems/lambdadb` `0.14.0` and re-exports its `LambdaDBClient` and `HTTPClient`. Import them from `@functional-systems/memdrive` so the client always matches the SDK; do not install a separate copy of the LambdaDB client for MemDrive.
+MemDrive pins `@functional-systems/lambdadb` `0.15.0` and re-exports its `LambdaDBClient` and `HTTPClient`. Import them from `@functional-systems/memdrive` so the client always matches the SDK; do not install a separate copy of the LambdaDB client for MemDrive.
 
 ```ts
 import { LambdaDBClient } from '@functional-systems/memdrive';
@@ -15,10 +15,10 @@ const client = new LambdaDBClient({ baseUrl, projectName, projectApiKey });
 MemDrive is a thin file abstraction over LambdaDB primitives. A store is one
 LambdaDB collection; main and forks are its branches, and checkpoints are its
 tags. It requires LambdaDB with the versioned reference API supported by client
-0.14.0, including tags on a branch before its first snapshot commits and branch
-rollback to a tag (`branches.rollback`). An older self-hosted deployment can fail
-ref response validation if it omits fields required by this client, or reject
-those requests.
+0.15.0, including tag creation and branch rollback before a tag's first
+snapshot is published. An older self-hosted deployment can fail ref response
+validation if it omits fields required by this client, or reject those requests.
+[LambdaDB rollback support](https://github.com/lambdadb/lambdadb/pull/640)
 
 
 ## File stores
@@ -472,13 +472,6 @@ of:
 | `CHECKPOINT_WRITE_FAILED` | Nothing from the call remains. `stage: 'write'`: the write failed; `'checkpoint'` or `'alias'`: the write was applied but its checkpoint could not be recorded. | `stage`, `restored: true`, `restoredTo` (the checkpoint `at`, or `null` when created files were deleted), `cause` (code, message, status, details of the original error), `checkpointCreated` and `checkpointRemoved` when the call created or may have created its tag |
 | `CHECKPOINT_RESTORE_FAILED` | The restore failed or could not undo everything; the branch may hold part of the write. Read the affected files. | `stage`, `restored: false`, `cause`, `restoreCause` when a restore request failed, `previousCheckpoint` or `restoredTo: null`, `checkpointCreated` (`true`, `false` or `'unknown'`), `unrestoredFileIds` for existing files a first checkpointed write changed, `createdFileIds` when their deletion failed |
 
-LambdaDB can reject a rollback to a checkpoint created moments earlier with
-status 400 (`Rollback requires a tag with a published snapshot`) until its
-snapshot is published, typically for tens of seconds; LambdaDB PR #640 addresses
-this. A checkpointed write that fails within that window after the previous one
-reports `CHECKPOINT_RESTORE_FAILED` with that `restoreCause`; the SDK does not
-wait or retry.
-
 A rollback restores the whole branch to the latest checkpoint, so it is safe only
 when every write to that branch goes through checkpointed writes from one
 process: the queue keeps write, tag and alias move together within the process.
@@ -550,17 +543,17 @@ checkpoint: the view's files become exactly the checkpoint's files, so files
 created, changed or deleted in that view since then revert. `at` is required and
 must be main or a fork; `to` must be a checkpoint. The checkpoint can come from
 any view of the store, so rolling main back to a checkpoint taken from a fork
-replaces main with that fork's state at the time. The result is `{ at }`.
+replaces main with that fork's state at the time. A checkpoint can be restored
+as soon as it is created. The result is `{ at }`, including when the native
+client returns `headSnapshot: null` before the checkpoint's first snapshot is
+published. MemDrive's consistent branch reads see the restored files immediately.
 
 Rollback is one native `branches.rollback` call and is never retried, by the SDK
 or the LambdaDB client. Resending a rollback also undoes writes made after the
 first one, so after an error without a status, or a lost result, read the view
 before deciding to send it again. A missing view or checkpoint fails with
 `BRANCH_NOT_FOUND` or `CHECKPOINT_NOT_FOUND`; other errors pass through with
-their HTTP status. LambdaDB can reject a checkpoint created moments earlier with
-status 400 (`Rollback requires a tag with a published snapshot`) until its
-snapshot is published (LambdaDB PR #640 addresses this). The SDK does not wait or
-retry; try again later.
+their HTTP status.
 
 When the branch has a latest checkpoint, the rollback also moves it to `to`, so
 a later failing checkpointed write restores the state the branch was rolled back

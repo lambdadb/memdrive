@@ -106,9 +106,7 @@ export function fileClient() {
                         const { page, ...next } = refPage([...state().branches].map(([name, branch]) => ({ name, createdAt: branch.createdAt })), params);
                         return { branches: page, ...next };
                     },
-                    // Restores the branch to the tag's documents. `fixture.beforeRollback` may throw, for
-                    // example the definite 400 of a tag whose snapshot is not yet published.
-                    // Like the native client, rollback is never retried.
+                    // Restore the branch to the tag's documents without retrying a rejection.
                     async rollback(branchName, { tag }, options) {
                         calls.push({ kind: 'branch-rollback', name: branchName, tag, retries: options?.retries });
                         await fixture.beforeRollback?.(branchName, tag);

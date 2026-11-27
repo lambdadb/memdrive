@@ -90,18 +90,6 @@ test('live external vectors preserve private application text, checkpoints and r
     const native = client(), handle = native.collection(name);
     // A view is one drive object plus an explicit at; omitted at selects main.
     const open = async at => ({ drive: await MemDrive.open({ client: client(), name, mode: 'external' }, options()), at });
-    // The SDK sends a rollback once. A just-created checkpoint can be rejected with a
-    // definite 400 until its snapshot is published; only the test waits for that.
-    async function rollbackWhenPublished(drive, request) {
-        const deadline = Date.now() + 120_000;
-        for (;;) {
-            try { return await drive.rollback(request, options()); }
-            catch (error) {
-                if (error?.status !== 400 || !/published snapshot/i.test(String(error?.cause?.message)) || Date.now() > deadline) throw error;
-                await sleep(5_000);
-            }
-        }
-    }
     async function records(ref, ids) {
         const response = await handle.docs.fetch({ ref, ids: ids.map(originalId), includeVectors: true,
             consistentRead: ref.kind === 'branch' }, options());
@@ -208,7 +196,7 @@ test('live external vectors preserve private application text, checkpoints and r
         await nearest(fresh, [a.fileId], { probe: capturedVector, limit: 1 });
 
         phase = 'Roll the fork back to its checkpoint';
-        assert.deepEqual(await rollbackWhenPublished(fresh.drive, { at: work.at, to: checkpointAt }), { at: work.at });
+        assert.deepEqual(await fresh.drive.rollback({ at: work.at, to: checkpointAt }, options()), { at: work.at });
         assert.deepEqual((await records(sourceRef, [a.fileId, b.fileId])).get(a.fileId), nativeVectors.get(a.fileId));
         assert.equal((await fresh.drive.read({ at: work.at, fileId: b.fileId }, options())).path, b.path);
         await nearest(fresh, [a.fileId, b.fileId]);

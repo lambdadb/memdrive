@@ -246,9 +246,7 @@ test('an explicit checkpoint whose alias move fails keeps the checkpoint, change
 test('a failed restore is reported once with what is known and is never retried', async () => {
     const { fixture, drive, state, start } = await withLatest();
     fixture.beforeAliasRetarget = () => { throw failure(503); };
-    // Until LambdaDB publishes a just-created checkpoint's snapshot, rollback to it is rejected with 400.
-    const notPublished = failure(400, 'Rollback requires a tag with a published snapshot');
-    fixture.beforeRollback = () => { throw notPublished; };
+    fixture.beforeRollback = () => { throw failure(400, 'Rollback rejected'); };
     const error = await drive.write({ ...create('/new.md'), checkpoint: { name: 'two' } }).catch(cause => cause);
     assert.equal(error.code, 'CHECKPOINT_RESTORE_FAILED');
     assert.equal(error.details.stage, 'alias');

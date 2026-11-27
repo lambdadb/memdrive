@@ -2,6 +2,14 @@ import type { CheckpointedWriteResult, LambdaDBClient, RollbackResult, WritableA
 import { create, open, type DriveFile, type FileAt, type ForkAt, type CheckpointAt, type FileFilter, type FindTextResult, type DeleteFileResult,
     type SearchFilesResult, type ListFilesResult, type TreeFolder, type TreeRequest, type TreeResult, type FileDrive, type EmbeddingMode, type OpenFileStoreOptions, type FileRef } from '@functional-systems/memdrive';
 
+export async function nativeRollbackConsumer(client: LambdaDBClient) {
+    const { headSnapshot } = await client.collection('workspace').branches.rollback('main', { tag: 'checkpoint-saved' });
+    // @ts-expect-error A rollback to an unpublished tag can return a null snapshot head.
+    void headSnapshot.snapshotId;
+    const snapshotId: string | undefined = headSnapshot?.snapshotId;
+    return snapshotId;
+}
+
 export async function fileConsumer(client: LambdaDBClient, options: OpenFileStoreOptions) {
     const drive: FileDrive = await create({ client, name: 'workspace', metadataSchema: { topic: { type: 'string' } } });
     const { at }: FileRef<ForkAt> = await drive.fork({ name: 'research' });
