@@ -246,8 +246,9 @@ query, and there is no latency or cost. `tree`, `list`, `read`, `search` and
 `--backend lambdadb` creates the store in a LambdaDB project. Use a dedicated
 test project: the run makes paid requests (managed embeddings on every write,
 searches) on top of any model requests. The LambdaDB deployment must support
-the versioned reference API of LambdaDB client `0.14.0`, including tags,
-aliases and branch rollback. The environment or an untracked `--env-file`
+the versioned reference API of LambdaDB client `0.15.0`, including tags,
+aliases and branch rollback before a tag's first snapshot is published. The
+environment or an untracked `--env-file`
 must supply `LAMBDADB_BASE_URL` (an HTTPS origin), `LAMBDADB_PROJECT_NAME` and
 `LAMBDADB_PROJECT_API_KEY`; missing or malformed settings fail before the run
 directory exists. Requests are confined to that project, have a 30-second
@@ -256,11 +257,8 @@ are rejected. The store is created with the same settings as on the fixture
 (default managed embeddings, the default text analyzer and chunking), named
 `beam-replay-<32 hex>`, and labeled with `beam.application` and a random
 `beam.owner`. It is one collection; each checkpointed write adds a tag and
-moves main's `latest-main` alias. LambdaDB can reject a rollback to a
-checkpoint created moments earlier, so a checkpointed write that fails after
-it has changed main within seconds of the previous one can report
-`CHECKPOINT_RESTORE_FAILED` instead of being undone; the SDK README describes
-this.
+moves main's `latest-main` alias. A failed checkpointed write can restore the
+previous checkpoint immediately. See the [SDK restore behavior](../../README.md#checkpointed-writes).
 
 Before the create request the runner writes `store.json` in the run
 directory with the store name, endpoint origin, project name, labels and

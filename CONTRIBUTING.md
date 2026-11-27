@@ -83,10 +83,9 @@ with a native not-found response.
 Opt-in flags extend it, each cleaning up what it creates:
 `MEMDRIVE_RUN_LIVE_CHECKPOINT_TESTS=1` adds checkpoint conflicts and reads,
 forking from checkpoints and forks, and another fork rollback to the basic store,
-plus a separate store with checkpointed writes on main: it waits until a rollback
-to the first checkpoint is accepted, reporting the delay, injects an alias
-failure into the second checkpointed write and verifies the restore, and pages
-`listCheckpoints`;
+plus a separate store with checkpointed writes on main. It injects an alias
+failure into the second checkpointed write immediately after the first and
+verifies the restore uses one rollback, then pages `listCheckpoints`.
 `MEMDRIVE_RUN_LIVE_EXTERNAL_VECTOR_TESTS=1` exercises external-vector writes,
 filters and checkpoints in an isolated collection;
 `MEMDRIVE_RUN_LIVE_FIND_TEXT_TESTS=1` verifies literal matching, live and

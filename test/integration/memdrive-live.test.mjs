@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
-import { setTimeout as sleep } from 'node:timers/promises';
 import { HTTPClient, LambdaDBClient, MemDrive } from '@functional-systems/memdrive';
 
 const enabled = process.env.MEMDRIVE_RUN_LIVE_TESTS === '1';
@@ -14,20 +13,6 @@ const safeFailure = (phase, error) => {
     const detail = error instanceof assert.AssertionError ? ` ${error.message}` : '';
     return new Error(`${phase} failed (${error?.code ?? error?.name ?? 'Error'}${statusOf(error) ? `, status ${statusOf(error)}` : ''}).${detail}`);
 };
-
-// The SDK sends a rollback once. A just-created checkpoint can be rejected with a
-// definite 400 until its snapshot is published; only the test waits for that.
-async function rollbackWhenPublished(drive, request, t) {
-    const deadline = Date.now() + 120_000;
-    for (let attempt = 1; ; attempt++) {
-        try { return await drive.rollback(request, options()); }
-        catch (error) {
-            if (error?.status !== 400 || !/published snapshot/i.test(String(error?.cause?.message)) || Date.now() > deadline) throw error;
-            t.diagnostic(`Rollback attempt ${attempt} waits for the checkpoint snapshot.`);
-            await sleep(5_000);
-        }
-    }
-}
 
 test('live file store writes main and forks, searches, lists, checkpoints and rolls back with verified cleanup', {
     skip: enabled ? false : 'Set MEMDRIVE_RUN_LIVE_TESTS=1 to permit live resources.',
@@ -270,7 +255,7 @@ test('live file store writes main and forks, searches, lists, checkpoints and ro
             const rankedPin = await pinned.search({ at: retained, query: 'Synthetic reference', rerank: false }, options());
             assert.deepEqual(rankedPin.hits, [{ ...sample, range: { start: 0, end: sample.content.length } }]);
             // Roll the child fork back to the checkpoint: its move is undone.
-            assert.deepEqual(await rollbackWhenPublished(pinned, { at: child, to: retained }, t), { at: child });
+            assert.deepEqual(await pinned.rollback({ at: child, to: retained }, options()), { at: child });
             assert.deepEqual(await pinned.read({ at: child, fileId: sample.fileId }, options()), sample);
             assert.equal(await pinned.read({ at: child, path: '/child-only.txt' }, options()), null);
             const copied = (await pinned.checkpoint({ at: retained, name: 'copied' }, options())).at;
@@ -325,14 +310,19 @@ test('live checkpointed writes record the latest checkpoint and restore it after
 }, async t => {
     for (const key of required) assert(process.env[key]?.trim(), `Missing live configuration: ${key}`);
     const httpClient = new HTTPClient();
-    httpClient.addHook('response', (response, request) => {
-        if (!response.ok && response.status !== 404) t.diagnostic(`${request.method} ${new URL(request.url).pathname} -> HTTP ${response.status}`);
+    const rollbacks = [];
+    httpClient.addHook('response', async (response, request) => {
+        const { pathname } = new URL(request.url);
+        if (request.method === 'POST' && pathname.endsWith('/branches/main/rollback')) {
+            const headSnapshot = response.ok ? (await response.clone().json()).headSnapshot : undefined;
+            rollbacks.push({ status: response.status, unpublished: headSnapshot === null });
+        }
+        if (!response.ok && response.status !== 404) t.diagnostic(`${request.method} ${pathname} -> HTTP ${response.status}`);
     });
     const client = new LambdaDBClient({ httpClient, baseUrl: process.env.LAMBDADB_BASE_URL,
         projectName: process.env.LAMBDADB_PROJECT_NAME, projectApiKey: process.env.LAMBDADB_PROJECT_API_KEY,
         timeoutMs: 60_000, retryConfig: { strategy: 'none' }, debugLogger: { log() {}, group() {}, groupEnd() {} } });
     const name = `memdrive-smoke-latest-${randomUUID().replaceAll('-', '').slice(0, 16)}`;
-    const main = { kind: 'main' };
     const turn = label => ({ kind: 'checkpoint', name: label });
     let failure, collision = false, phase = 'create the store';
     try {
@@ -342,17 +332,10 @@ test('live checkpointed writes record the latest checkpoint and restore it after
 
         phase = 'first checkpointed write';
         const first = await drive.write({ op: 'create', path: '/turn.md', content: 'First turn wording.', checkpoint: { name: 'turn-1' } }, options());
-        const tagged = Date.now();
         assert.deepEqual(first.checkpoint, { at: turn('turn-1') });
         assert.deepEqual(await drive.read({ fileId: first.result.fileId }, options()), first.result);
         assert.deepEqual((await drive.describe({}, options())).latestCheckpoint, { at: turn('turn-1') });
         assert.equal((await native.aliases.get('latest-main', options())).alias.targetName, 'checkpoint-turn-1');
-
-        // Until LambdaDB publishes the new checkpoint's snapshot, a rollback to it is
-        // rejected with 400. Main equals turn-1 now, so this probe changes no files.
-        phase = 'wait until the first checkpoint can be restored';
-        await rollbackWhenPublished(drive, { at: main, to: turn('turn-1') }, t);
-        t.diagnostic(`A rollback to the just-created checkpoint succeeded ${Date.now() - tagged} ms after its checkpointed write returned.`);
 
         phase = 'second checkpointed write with an injected alias failure';
         // The same client, except that moving the alias fails with a definite 503.
@@ -369,6 +352,8 @@ test('live checkpointed writes record the latest checkpoint and restore it after
         assert.equal(error?.code, 'CHECKPOINT_WRITE_FAILED', `Unexpected outcome ${error?.code} ${JSON.stringify(error?.details?.restoreCause ?? null)}`);
         assert.deepEqual([error.details.stage, error.details.restored, error.details.restoredTo, error.details.checkpointRemoved],
             ['alias', true, turn('turn-1'), true]);
+        assert.deepEqual(rollbacks.map(({ status }) => status), [200]);
+        t.diagnostic(`The restore sent one rollback. Its target was ${rollbacks[0].unpublished ? 'unpublished' : 'published'}.`);
         assert.deepEqual(await drive.read({ fileId: first.result.fileId }, options()), first.result);
         assert.equal(await drive.read({ path: '/second.md' }, options()), null);
         await assert.rejects(native.tags.get('checkpoint-turn-2', options()), cause => statusOf(cause) === 404);

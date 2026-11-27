@@ -172,7 +172,7 @@ test('a host checkpoint hook makes every write tool call a checkpointed write an
     assert.doesNotMatch(JSON.stringify(failure), /turn-|checkpoint-|restoredTo|previousCheckpoint|checkpointRemoved/);
     // A restore failure keeps its code, restore cause status and file IDs.
     fixture.beforeAliasRetarget = () => { throw Object.assign(new Error('Unavailable'), { statusCode: 503 }); };
-    fixture.beforeRollback = () => { throw Object.assign(new Error('Rollback requires a tag with a published snapshot: checkpoint-turn-2'), { statusCode: 400 }); };
+    fixture.beforeRollback = () => { throw Object.assign(new Error('Rollback rejected: checkpoint-turn-2'), { statusCode: 400 }); };
     const unrestored = await tools.execute('write', { op: 'create', path: '/partial.md', content: 'Partial.' }).catch(fileToolError);
     fixture.beforeAliasRetarget = fixture.beforeRollback = undefined;
     assert.deepEqual(unrestored.error.details, { stage: 'alias', restored: false, cause: { code: 'DATABASE_ERROR', status: 503 },

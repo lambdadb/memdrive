@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
-import { setTimeout as sleep } from 'node:timers/promises';
 import { LambdaDBClient, MemDrive } from '@functional-systems/memdrive';
 import { createDoclingChunker } from '@functional-systems/memdrive/docling';
 
@@ -73,18 +72,7 @@ test('live local Docling chunks retain exact originals through checkpoints, main
         assert.equal(await main.read({ at: checkpoint, fileId: extra.fileId }, options()), null);
 
         phase = 'roll the fork back to its checkpoint';
-        // The SDK sends one rollback. A just-created checkpoint can be rejected with a
-        // definite 400 until its snapshot is published; only this test waits for that.
-        const deadline = Date.now() + 120_000;
-        for (let attempt = 1; ; attempt++) {
-            try {
-                assert.deepEqual(await main.rollback({ at, to: checkpoint }, options()), { at });
-                break;
-            } catch (error) {
-                if (error?.status !== 400 || !/published snapshot/i.test(String(error?.cause?.message)) || Date.now() > deadline) throw error;
-                await sleep(5_000);
-            }
-        }
+        assert.deepEqual(await main.rollback({ at, to: checkpoint }, options()), { at });
         assert.deepEqual(await reopened.read({ at, fileId: file.fileId }, options()), file);
         assert.equal(await reopened.read({ at, fileId: extra.fileId }, options()), null);
         const after = await reopened.search({ at, query: 'Hello world', rerank: false }, options());

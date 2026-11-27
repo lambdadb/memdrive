@@ -1185,11 +1185,11 @@ test('rollback sends one native rollback of main or a fork to a checkpoint tag a
     assert.equal(calls.filter(call => call.kind === 'branch-rollback').at(-1).name, 'fork-research');
 
     // A definite rejection keeps its status and is never retried by the SDK.
-    const notPublished = Object.assign(new Error('Rollback requires a tag with a published snapshot'), { statusCode: 400 });
-    fixture.beforeRollback = () => { throw notPublished; };
+    const rejected = Object.assign(new Error('Rollback rejected'), { statusCode: 400 });
+    fixture.beforeRollback = () => { throw rejected; };
     const rollbacks = () => calls.filter(call => call.kind === 'branch-rollback').length;
     const sent = rollbacks();
-    await assert.rejects(drive.rollback({ at: research, to: saved }), { code: 'DATABASE_ERROR', status: 400, cause: notPublished });
+    await assert.rejects(drive.rollback({ at: research, to: saved }), { code: 'DATABASE_ERROR', status: 400, cause: rejected });
     fixture.beforeRollback = () => { throw new Error('Connection reset'); };
     await assert.rejects(drive.rollback({ at: research, to: saved }), error => error.code === 'DATABASE_ERROR' && error.status === undefined);
     assert.equal(rollbacks(), sent + 2);
