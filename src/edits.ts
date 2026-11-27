@@ -1,7 +1,8 @@
 import { resolvedChunking, type TextChunker } from './text-chunks.js';
 import { keysOnly, metadataValues, vectorValues } from './config.js';
 import { MemDriveError, requireInput } from './errors.js';
-import { validFileId, validPath, validText, decodeStoredFile, fileOriginal, fileRecords, metadataKey, fingerprintOf, type StoredFile } from './records.js';
+import { validFileId, validPath, validText, decodeStoredFile, fileOriginal, fileRecords, metadataKey, fingerprintOf, updatedFields,
+    type StoredFile, type WriteChange } from './records.js';
 import type { DeleteFileRequest, MetadataSchema, TextEdit, UpdateExternalFileRequest, UpdateFileRequest } from './types.js';
 
 type EditRequest = UpdateFileRequest | UpdateExternalFileRequest | DeleteFileRequest;
@@ -60,7 +61,7 @@ function replaceExact(source: string, edits: TextEdit[]): string {
     return text.join('');
 }
 
-export async function planEdit(request: EditRequest, doc: Record<string, unknown> | undefined,
+export async function planEdit(request: EditRequest, doc: Record<string, unknown> | undefined, change: WriteChange,
     schema: MetadataSchema, dimensions?: number, chunker?: TextChunker, options?: { signal?: AbortSignal | undefined }) {
     const { fileId } = request;
     const current = doc?.kind === 'file' ? decodeStoredFile(doc, schema, dimensions) : undefined;
@@ -69,12 +70,12 @@ export async function planEdit(request: EditRequest, doc: Record<string, unknown
     if (!current) throw new MemDriveError('FILE_NOT_FOUND', 'No current file with this ID exists in this view.', { details: { fileId } });
     const path = request.newPath ?? current.path;
     const metadata = request.metadata === undefined ? current.metadata : metadataValues(request.metadata, schema);
-    const fields = { fileId, path, modifiedAt: current.modifiedAt, ...(metadata === undefined ? {} : { metadata }) };
+    const settings = { path, ...(metadata === undefined ? {} : { metadata }) };
     const revision = globalThis.crypto.randomUUID();
     if ('embedding' in current) {
         const embedding = request.content !== undefined && typeof request.content !== 'string' ? [...request.content] : current.embedding;
-        const file: StoredFile = { ...fields, embedding };
-        if (await fingerprintOf(file) !== await fingerprintOf(current)) file.modifiedAt = new Date().toISOString();
+        const changed = await fingerprintOf({ ...settings, embedding }) !== await fingerprintOf(current);
+        const file: StoredFile = { ...updatedFields(current, change, changed).fields, ...settings, embedding };
         const records = await fileRecords(file, { revision });
         return { op: 'update' as const, file: records.file, generation: undefined, moveOnly: false as const, records };
     }
@@ -85,11 +86,11 @@ export async function planEdit(request: EditRequest, doc: Record<string, unknown
         throw new MemDriveError('INVALID_RESULT', 'Read returned invalid file generation data.');
     const replace = content !== current.content || JSON.stringify(metadataKey(metadata)) !== JSON.stringify(metadataKey(current.metadata));
     const generation = replace ? revision : generationValue;
-    const modifiedAt = !replace && path === current.path ? current.modifiedAt : new Date().toISOString();
-    const file = { ...fields, modifiedAt, content };
+    const { fields, newModifier } = updatedFields(current, change, replace || path !== current.path);
+    const file = { ...fields, ...settings, content };
     const tracking = { revision, generation, chunking: resolvedChunking(doc?.chunking) };
     const base = { op: 'update' as const, file, generation };
     return replace
         ? { ...base, moveOnly: false as const, records: await fileRecords(file, tracking, chunker, options) }
-        : { ...base, moveOnly: true as const, original: fileOriginal(file, tracking) };
+        : { ...base, moveOnly: true as const, newModifier, original: fileOriginal(file, tracking) };
 }

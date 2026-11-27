@@ -70,7 +70,7 @@ caches, locks or registries. When a request on a view
 fails with a native 404, the SDK checks what is missing and reports
 `STORE_NOT_FOUND`, `BRANCH_NOT_FOUND` or `CHECKPOINT_NOT_FOUND` (status 404).
 
-`read` returns the original file or `null` when absent. Content can be empty and the SDK preserves whitespace and line endings. Paths are case-sensitive, absolute and slash-separated. Pass `{ at, operations: [...] }` with up to 100 operations to write files in batches. Pass up to 100 distinct paths in `read({ paths })` to read existing files in request order. A store can declare scalar metadata fields with `metadataSchema` and carry collection labels. File writes attach optional `metadata` and record the modification time.
+`read` returns the original file or `null` when absent. Content can be empty and the SDK preserves whitespace and line endings. Paths are case-sensitive, absolute and slash-separated. Pass `{ at, operations: [...] }` with up to 100 operations to write files in batches. Pass up to 100 distinct paths in `read({ paths })` to read existing files in request order. A store can declare scalar metadata fields with `metadataSchema` and carry collection labels. File writes attach optional `metadata` and record when and by whom each file was created and last modified (see [File attribution](#file-attribution)).
 
 `MemDrive.create` sets LambdaDB's native `snapshotRetentionInDays` to its
 one-day minimum; there is no retention option. Forks and checkpoints never
@@ -331,7 +331,7 @@ const { hits: noteHits } = await reopenedNotes.search({
 
 Pass `mode: 'external'` when opening an external store. MemDrive checks the requested mode against the stored configuration. `describe()` returns the configured dimensions, similarity, and identity. External stores can carry up to three caller labels.
 
-Each file record stores one supplied vector. The mode has no text index, text payloads, chunks, managed inference, or reranking. Write, read, list, and search return file references with `fileId`, `path`, `modifiedAt`, and optional metadata. Search counts files toward its result limit and returns `reranked: false`. Use paths and metadata that are suitable to store in LambdaDB.
+Each file record stores one supplied vector. The mode has no text index, text payloads, chunks, managed inference, or reranking. Write, read, list, and search return file references with `fileId`, `path`, `createdAt`, `modifiedAt`, the recorded `createdBy` and `modifiedBy`, and optional metadata. Search counts files toward its result limit and returns `reranked: false`. Use paths and metadata that are suitable to store in LambdaDB.
 
 Pass the replacement vector as `content` in `notes.write({ at: draft, op: 'update', fileId, content: replacementVector })`. A path or metadata update preserves the current vector. Vector files share the same main, fork, checkpoint, rollback and deletion behavior as text files.
 
@@ -380,6 +380,59 @@ checked against other files. Reading that path fails with `PATH_AMBIGUOUS`,
 whose details list `{ path, fileIds }`; move or delete the extra files by
 `fileId`. A create or move to a path that another file holds fails with
 `PATH_EXISTS`.
+
+## File attribution
+
+```ts
+const plan = await drive.write({
+    op: 'create', path: '/notes/plan.md', content: 'Ship on Friday.',
+    by: { user: 'user-42', agent: 'planner' },
+}); // createdAt === modifiedAt; createdBy and modifiedBy are the actor
+await drive.write({ op: 'update', fileId: plan.fileId, by: { agent: 'reviewer' },
+    edits: [{ oldText: 'Friday', newText: 'Monday' }] }); // createdBy stays; modifiedBy is the reviewer
+// Imported or replayed content keeps its original date.
+await drive.write({ time: new Date('2024-05-01T09:00:00.000Z'), operations: [
+    { op: 'create', path: '/imports/2024-05-01.md', content: 'Earlier notes.' },
+] });
+```
+
+Every file records `createdAt`, `modifiedAt` and, when the writes named an
+actor, `createdBy` and `modifiedBy`. Write results, `read`, `list`, `search` and
+`findText` return them in both embedding modes.
+
+- `createdAt` and `createdBy` are set when the file is created and never change.
+- `modifiedAt` changes, as before, when a write changes the file's path, content
+  or metadata (path, vector or metadata in external-vector stores). `modifiedBy`
+  is the actor of the write that set `modifiedAt`, and is removed when that
+  write named none, so an earlier modifier is never credited with a later
+  change. A write that changes nothing keeps both.
+- `by` and `time` are optional fields of the whole `write` request, in every
+  form: one operation or `operations`, with or without `checkpoint`, on main or a
+  fork. They apply to every operation of the call; an operation inside
+  `operations` accepts neither.
+- `by` is `{ user?, agent? }` with at least one nonblank string of at most 256
+  UTF-8 bytes without control characters or lone surrogates; keys holding
+  `undefined` count as absent. The SDK stores the strings as given and does not
+  authenticate or interpret them: naming the caller is the host's job.
+- `time` is a valid `Date` in the years 0000–9999. It replaces the current time
+  for the call's `createdAt` and `modifiedAt` values. Without it each value is
+  the current time, as before. A `time` earlier than a file's `createdAt` is
+  accepted and leaves `modifiedAt` before `createdAt`; keeping times in order is
+  the host's job.
+
+Invalid `by` or `time` fails with `INVALID_INPUT` before any storage request.
+`createdAt` has a `datetime` index like `modifiedAt`; the actors have no index
+and cannot be filtered on. Chunks carry none of these fields.
+
+A move keeps its single native patch of the chunks and the original. A LambdaDB
+patch merges into the stored original and cannot remove a field, so when a move
+changes `modifiedBy` the patch sends both names, `null` for a missing one:
+`{ user: null, agent: 'reviewer' }`, or `{ user: null, agent: null }` for a
+move without an actor. Reads treat a `null` name as absent and an actor without names
+as none, so results never contain `null`. The next content or metadata change
+writes the whole original and stores the actor without nulls. A move that keeps
+`modifiedBy`, including any move in a store that never names actors, sends no
+`modifiedBy`.
 
 ## Checkpointed writes
 
@@ -611,10 +664,10 @@ first waits for the store's pending state-changing calls (see
 other processes before destroying it or reusing its name; the SDK does not
 coordinate them.
 
-Stores created by earlier development builds (format `files-v0`) cannot be
-opened or destroyed by this SDK and fail with `INCOMPATIBLE_STORE`. Delete such
-a collection, and the `md-journal-*` collection those builds created for it,
-directly with LambdaDB.
+Stores created by earlier development builds (formats `files-v0` and
+`files-v1`) cannot be opened or destroyed by this SDK and fail with
+`INCOMPATIBLE_STORE`. Delete such a collection directly with LambdaDB, together
+with the `md-journal-*` collection that `files-v0` builds created for it.
 
 ## Shared file tools
 
@@ -687,6 +740,15 @@ status (plus the writer's file details for stage `write`) and
 once per `write` call, before validation. Its names must be unique for the
 store's lifetime, including across host restarts, so do not use a counter that
 restarts. Without the hook, `write` is a plain write.
+
+`createFileTools({ drive, tools, checkpoint?, actor?, now? })` also attributes
+the agent's writes (see [File attribution](#file-attribution)): `actor` is passed
+as `by` on every `write` call, and the result of `now()`, called once per `write`
+call, as `time`. `actor` and `now` are validated when the tools are created and
+`now()`'s result on each call. The `write` schema has neither field, and an input
+with `by` or `time` fails with `INVALID_INPUT` before any storage request, so the
+agent cannot name itself or date its writes. Results carry the attribution fields
+unchanged.
 
 Tool names, descriptions and schemas are the only text every client delivers to
 a model, so the descriptions carry everything ordinary use needs, including when
@@ -829,7 +891,7 @@ for (;;) {
 }
 ```
 
-`prefix` matches the beginning of the full path. `nameContains` checks a case-sensitive literal substring of the filename, including its extension. Omit `delimiter` for recursive results; the `'/'` delimiter shows each immediate subfolder once in `prefixes` instead of its files. Results carry file IDs, paths, modification times, and any declared metadata. For text files, use `read` to retrieve the exact original. Listing does not expose datastore or file versions or file sizes. Use `tree` for folder structure and file counts; `list` has no total count.
+`prefix` matches the beginning of the full path. `nameContains` checks a case-sensitive literal substring of the filename, including its extension. Omit `delimiter` for recursive results; the `'/'` delimiter shows each immediate subfolder once in `prefixes` instead of its files. Results carry file IDs, paths, creation and modification times with their recorded actors, and any declared metadata. For text files, use `read` to retrieve the exact original. Listing does not expose datastore or file versions or file sizes. Use `tree` for folder structure and file counts; `list` has no total count.
 
 `list` reads the projected file fields through ordered LambdaDB document pages.
 It reads main and forks consistently, including files written just before the

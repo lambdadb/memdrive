@@ -276,10 +276,12 @@ Cleanup requires the same endpoint and project as the ledger, checks the
 store's name and ownership labels, deletes its collection through
 `MemDrive.destroy`, confirms that it is gone and marks the ledger `cleaned`.
 It deletes nothing else, can be repeated, and also handles a `pending` ledger
-whose create outcome is unknown. A ledger from the earlier protocol
-(`memdrive-beam-session-replay-store-v1`) names a store in the earlier SDK
-layout, which this SDK cannot open or destroy; cleanup refuses it, and such a
-store and its `md-journal-*` collection have to be deleted with LambdaDB
+whose create outcome is unknown. Ledgers record the protocol
+`memdrive-beam-session-replay-store-v3`, whose stores use the SDK's `files-v2`
+layout. A ledger from an earlier protocol names a store in an earlier SDK layout
+that this SDK cannot open or destroy: `-v2` a `files-v1` store, `-v1` a
+`files-v0` store with an `md-journal-*` collection. Cleanup refuses such a
+ledger before any request, and its collections have to be deleted with LambdaDB
 directly.
 
 ### Observation after each session

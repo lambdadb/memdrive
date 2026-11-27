@@ -26,7 +26,7 @@ test('file stores round-trip exact text and empty originals by path and stable I
     const empty = await drive.write({ at: research, ...request('/empty.txt') });
     assert.notEqual(empty.fileId, file.fileId);
     assert.notEqual(file.fileId, path);
-    assert.deepEqual(file, { fileId: file.fileId, modifiedAt: file.modifiedAt, path, content });
+    assert.deepEqual(file, { fileId: file.fileId, createdAt: file.createdAt, modifiedAt: file.modifiedAt, path, content });
     assert.equal(empty.content, '');
 
     const otherClient = { ...client };
@@ -48,7 +48,7 @@ test('file stores round-trip exact text and empty originals by path and stable I
     assert.equal(typeof revision, 'string');
     assert.deepEqual(chunking, { strategy: 'boundary', version: '1' });
     assert.deepEqual(storedOriginal, {
-        id: `file:${file.fileId}`, kind: 'file', fileId: file.fileId, path, body: content, modifiedAt: file.modifiedAt,
+        id: `file:${file.fileId}`, kind: 'file', fileId: file.fileId, path, body: content, createdAt: file.createdAt, modifiedAt: file.modifiedAt,
         fileName: '한글 "draft":*?.md', ancestorPaths: ['/', '/notes/'],
     });
     assert.equal(chunk.kind, 'chunk');
@@ -428,7 +428,7 @@ test('list returns files and folders in one path-ordered sequence with consisten
     assert.deepEqual(await drive.list(), { files: [], prefixes: [] });
     // A file written immediately before is listed: branch listings are consistent reads.
     const written = await drive.write(request('/just-written.txt'));
-    assert.deepEqual((await drive.list()).files, [{ fileId: written.fileId, path: written.path, modifiedAt: written.modifiedAt }]);
+    assert.deepEqual((await drive.list()).files, [{ fileId: written.fileId, path: written.path, createdAt: written.createdAt, modifiedAt: written.modifiedAt }]);
     // Unicode code point order, not UTF-16 order: U+FF5E sorts before U+1F600, a surrogate pair.
     await drive.write({ at: alternate, operations: [request('/\u{1F600}.md'), request('/\uFF5E.md')] });
     assert.deepEqual(paths(await drive.list({ at: alternate })), ['/alternate.txt', '/\uFF5E.md', '/\u{1F600}.md']);
@@ -447,7 +447,7 @@ test('list returns files and folders in one path-ordered sequence with consisten
         [['/Root.txt', '/notes.md'], ['/notes/']],
         [[], ['/notesish/']],
     ]);
-    assert.deepEqual(pages[0].files[0], { fileId: root.fileId, path: root.path, modifiedAt: root.modifiedAt });
+    assert.deepEqual(pages[0].files[0], { fileId: root.fileId, path: root.path, createdAt: root.createdAt, modifiedAt: root.modifiedAt });
     // These results fit in one native list request per page.
     assert.equal(listings(fixture.calls).length - before, pages.length);
     assert.deepEqual(paths(await drive.list({ at: research, prefix: '/notes/' })), [
@@ -457,7 +457,7 @@ test('list returns files and folders in one path-ordered sequence with consisten
     assert.deepEqual([paths(grouped), grouped.prefixes], [['/notes/Alpha.txt', '/notes/B [x]*?.md'], ['/notes/archive/']]);
 
     const filtered = await drive.list({ at: research, prefix: '/notes/', nameContains: 'B [x]*?', delimiter: '/' });
-    assert.deepEqual(filtered, { files: [{ fileId: direct.fileId, path: direct.path, modifiedAt: direct.modifiedAt,
+    assert.deepEqual(filtered, { files: [{ fileId: direct.fileId, path: direct.path, createdAt: direct.createdAt, modifiedAt: direct.modifiedAt,
         metadata: { topic: 'synthetic' } }], prefixes: ['/notes/archive/'] });
     assert.deepEqual(paths(await drive.list({ at: research, prefix: '/notes/Al', nameContains: 'txt' })), ['/notes/Alpha.txt']);
     assert.deepEqual(paths(await drive.list({ at: research, prefix: '/notes/archive/"quoted"/' })), ['/notes/archive/"quoted"/sample.txt']);
@@ -475,7 +475,7 @@ test('list returns files and folders in one path-ordered sequence with consisten
         assert([100, 101].includes(size));
         assert.deepEqual(native, { ref: { kind: 'branch', name: 'fork-research' }, consistentRead: true,
             includeVectors: false, sort: [{ path: 'asc' }],
-            fields: { include: ['id', 'kind', 'fileId', 'path', 'modifiedAt', 'metadata'] } });
+            fields: { include: ['id', 'kind', 'fileId', 'path', 'createdAt', 'createdBy', 'modifiedAt', 'modifiedBy', 'metadata'] } });
         assert.deepEqual(filter.bool[0], { queryString: { query: '"file"', defaultField: 'kind' }, occur: 'filter' });
     }
 });

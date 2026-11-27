@@ -2,7 +2,7 @@ import { keysOnly } from './config.js';
 import { checkAbort, databaseError, MemDriveError, nativeOptions, nativeRequest, operationOptions, requireInput } from './errors.js';
 import { compileFilter } from './filter.js';
 import { prefixAncestor, sameAt, validAt, validPathPrefix } from './list.js';
-import { decodeFile, decodeFileEntry, fingerprintOf, originalId, resultDocs, validPath, validText } from './records.js';
+import { decodeFile, decodeFileEntry, fileEntryFields, fingerprintOf, originalId, resultDocs, validPath, validText } from './records.js';
 import { afterId, ancestorFilter, viewRead, type Handle, type ViewRef, type WithoutAt } from './storage-reads.js';
 import type { DriveFile, FileAt, FileFilter, FindTextRequest, FindTextResult, MetadataSchema, RequestOptions } from './types.js';
 import { decodeToken, encodeToken } from './cursor-tokens.js';
@@ -24,7 +24,6 @@ type Scan = Criteria & {
 
 type Page = { result: FindTextResult; next?: Scan };
 
-const entryFields = ['id', 'kind', 'fileId', 'path', 'modifiedAt', 'metadata'];
 const kind = { queryString: { query: '"file"', defaultField: 'kind' }, occur: 'filter' };
 const encoder = new TextEncoder();
 const contextUnits = 80;
@@ -129,7 +128,7 @@ export function fileTextFinder(handle: Handle, name: string, schema: MetadataSch
         try {
             response = await nativeRequest(() => handle.query({
                 ...viewRead(ref), size, sort: [{ id: upperBound ? 'desc' : 'asc' }],
-                fields: { include: upperBound ? entryFields : [...entryFields, 'body'] },
+                fields: { include: upperBound ? fileEntryFields : [...fileEntryFields, 'body'] },
                 query: { bool: clauses },
             }, nativeOptions(signal)), signal);
         } catch (cause) {

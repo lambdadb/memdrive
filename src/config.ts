@@ -9,7 +9,7 @@ export const keysOnly = (value: unknown, keys: string[]): value is Record<string
     isObject(value) && Object.keys(value).every(key => keys.includes(key));
 
 const formatTag = 'memdrive.format';
-export const format = 'files-v1';
+export const format = 'files-v2';
 const embeddingTag = 'memdrive.embedding';
 export const managedEmbedding = { mode: 'managed', provider: 'openai', model: 'text-embedding-3-small',
     dimensions: 1536, similarity: 'cosine' } as const;
@@ -20,6 +20,7 @@ const fileIndexes = {
     path: { type: 'keyword' },
     fileName: { type: 'keyword' },
     ancestorPaths: { type: 'keyword' },
+    createdAt: { type: 'datetime' },
     modifiedAt: { type: 'datetime' },
 } as const;
 const indexTypes = { string: 'keyword', number: 'double', boolean: 'boolean', datetime: 'datetime' } as const;

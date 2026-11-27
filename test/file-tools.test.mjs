@@ -104,7 +104,8 @@ test('each tool forwards its input object unchanged to the SDK method of the sam
         calls.length = 0;
         const result = await tools.execute(name, input, { signal });
         assert.deepEqual(calls, [[name, input, { signal }]]);
-        assert.equal(calls[0][1], input);
+        // write copies its input to add the host's by and time.
+        if (name !== 'write') assert.equal(calls[0][1], input);
         // Search and write results carry no view selectors and pass through; read, tree, list and findText drop at.
         if (name === 'search' || name === 'write') assert.equal(result, results.get(name));
         else assert.deepEqual(result, { from: name, next: { cursor: 'c' } });

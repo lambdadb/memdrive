@@ -117,8 +117,9 @@ test('live findText enumerates original occurrences and resumes on main, forks a
             const fileId = randomUUID();
             const path = `/large/${index}.txt`;
             ids.push(fileId);
+            const createdAt = new Date().toISOString();
             await collection.docs.upsert({ branch: `fork-${large.name}`, docs: [{ id: `file:${fileId}`, kind: 'file', fileId, path,
-                fileName: `${index}.txt`, ancestorPaths: ['/', '/large/'], modifiedAt: new Date().toISOString(),
+                fileName: `${index}.txt`, ancestorPaths: ['/', '/large/'], createdAt, modifiedAt: createdAt,
                 body: 'y'.repeat(1_048_576) + `한글 Needle ${index}` }] }, options());
         }
         const before = { queries, downloads };

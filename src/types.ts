@@ -40,9 +40,22 @@ export type OpenFileStoreOptions<Mode extends EmbeddingMode = 'managed'> = Conne
 
 type ModeOption<Mode extends EmbeddingMode> = Mode extends 'external' ? { mode: 'external' } : { mode?: 'managed' | undefined };
 
+/**
+ * Who made a change, as named by the host: at least one of a user and an agent.
+ * The SDK stores the strings as given and never interprets them.
+ */
+export type FileActor = { user: string; agent?: string | undefined } | { user?: string | undefined; agent: string };
+
 export interface FileListEntry {
     fileId: string;
+    /** When the file was created; never changed afterwards. */
+    createdAt: string;
+    /** The actor that created the file, when the creating write named one. */
+    createdBy?: FileActor | undefined;
+    /** When the file's path, content or metadata last changed. */
     modifiedAt: string;
+    /** The actor of the write that set `modifiedAt`; absent when that write named none. */
+    modifiedBy?: FileActor | undefined;
     path: string;
     metadata?: Metadata | undefined;
 }
@@ -228,9 +241,13 @@ export interface CheckpointList {
 /** Start a fork or checkpoint listing with an optional page size (1–100, default 100), or continue one with its cursor. */
 export type ListFileRefsRequest = { limit?: number | undefined; cursor?: never } | { cursor: string; limit?: never };
 
-/** Select a writable view; omission selects main. */
+/** Select a writable view (omission selects main) and attribute the whole write call. */
 export interface WriteTargetRequest {
     at?: WritableAt | undefined;
+    /** The actor recorded as `createdBy` of created files and `modifiedBy` of changed files. */
+    by?: FileActor | undefined;
+    /** Used instead of the current time for `createdAt` and `modifiedAt`. */
+    time?: Date | undefined;
 }
 
 /** Make a write a checkpointed write: the call also creates `checkpoint-<name>` and makes it the branch's latest checkpoint. */

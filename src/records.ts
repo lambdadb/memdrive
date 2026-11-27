@@ -1,7 +1,7 @@
 import { MemDriveError, requireInput } from './errors.js';
 import { isObject, keysOnly, metadataValues, validDate, vectorValues } from './config.js';
 import type { TextChunker, ResolvedChunking } from './text-chunks.js';
-import type { CreateExternalFileRequest, CreateFileRequest, DriveFile, FileListEntry, MetadataSchema } from './types.js';
+import type { CreateExternalFileRequest, CreateFileRequest, DriveFile, FileActor, FileListEntry, MetadataSchema } from './types.js';
 
 const encoder = new TextEncoder();
 export const bytes = (value: unknown) => encoder.encode(JSON.stringify(value)).length;
@@ -16,6 +16,60 @@ export function requirePath(path: unknown): asserts path is string {
     requireInput(validPath(path), 'File path must be absolute, at most 4096 UTF-8 bytes, and contain valid nonempty components.');
 }
 
+const actorName = (value: unknown) => typeof value === 'string' && value.trim() !== ''
+    && !/[\p{Cc}\p{Surrogate}]/u.test(value) && encoder.encode(value).length <= 256;
+/** A new actor of the string names among `user` and `agent`, or undefined when there are none. */
+const actorOf = (user: unknown, agent: unknown): FileActor | undefined => typeof user === 'string'
+    ? { user, ...(typeof agent === 'string' ? { agent } : {}) } : typeof agent === 'string' ? { agent } : undefined;
+const sameActor = (a?: FileActor, b?: FileActor) => a?.user === b?.user && a?.agent === b?.agent;
+
+/** Validate an actor; keys holding `undefined` count as absent. */
+export function requireActor(value: unknown, name: string): FileActor {
+    // Read each name once, so a getter cannot change what was validated.
+    const names = keysOnly(value, ['user', 'agent']) ? [value.user, value.agent] : [];
+    const actor = actorOf(names[0], names[1]);
+    requireInput(actor !== undefined && names.every(item => item === undefined || actorName(item)),
+        `${name} must be { user?, agent? } with at least one nonblank string of at most 256 UTF-8 bytes without control characters or lone surrogates.`);
+    return actor;
+}
+
+/** A stored actor. A move's patch stores `null` for a name it removes, and an actor without names is none. */
+function storedActor(value: unknown): FileActor | undefined {
+    if (value === undefined) return undefined;
+    if (!keysOnly(value, ['user', 'agent']) || !Object.values(value).every(item => item === null || actorName(item)))
+        throw new MemDriveError('INVALID_RESULT', 'Read returned an invalid file actor.');
+    return actorOf(value.user, value.agent);
+}
+
+/** The actor and time of one write call; an omitted time means the clock at each use. */
+export type WriteChange = { by?: FileActor | undefined; time?: Date | undefined };
+
+export function requireTime(value: unknown): Date {
+    // The internal time value, not overridable methods, is what a copy stores.
+    let time = Number.NaN;
+    try { time = Date.prototype.getTime.call(value); }
+    catch { /* not a Date */ }
+    const copy = new Date(time);
+    requireInput(!Number.isNaN(time) && validDate(copy.toISOString()), 'time must be a valid Date between the years 0000 and 9999.');
+    return copy;
+}
+
+/** The `modifiedAt` and `modifiedBy` a change records: this call's time and actor, never an earlier modifier. */
+export const modification = ({ by, time }: WriteChange) =>
+    ({ modifiedAt: (time ?? new Date()).toISOString(), ...(by === undefined ? {} : { modifiedBy: { ...by } }) });
+
+/**
+ * The identity and attribution of an updated file: its creation fields, and this
+ * call's modification when the file changed or else its stored one.
+ * `newModifier` reports a `modifiedBy` that differs from the stored one.
+ */
+export function updatedFields(current: FileListEntry, change: WriteChange, changed: boolean) {
+    const { fileId, createdAt, createdBy, modifiedAt, modifiedBy } = current;
+    const modified = changed ? modification(change) : { modifiedAt, ...(modifiedBy === undefined ? {} : { modifiedBy }) };
+    return { fields: { fileId, createdAt, ...(createdBy === undefined ? {} : { createdBy }), ...modified },
+        newModifier: !sameActor(modified.modifiedBy, modifiedBy) };
+}
+
 export function resultDocs(response: unknown, collection: string, maximum: number): Record<string, unknown>[] {
     if (!isObject(response) || response.isDocsInline === false || !Array.isArray(response.docs) || response.docs.length > maximum)
         throw new MemDriveError('INVALID_RESULT', 'Read returned an invalid or ambiguous document envelope.');
@@ -26,14 +80,18 @@ export function resultDocs(response: unknown, collection: string, maximum: numbe
     });
 }
 
+/** The original fields that `decodeFileEntry` reads, for queries that project fields. */
+export const fileEntryFields = ['id', 'kind', 'fileId', 'path', 'createdAt', 'createdBy', 'modifiedAt', 'modifiedBy', 'metadata'];
+
 export function decodeFileEntry(doc: Record<string, unknown>, schema: MetadataSchema): FileListEntry {
     if (doc.kind !== 'file' || !validFileId(doc.fileId) || doc.id !== originalId(doc.fileId)
-        || !validPath(doc.path) || !validDate(doc.modifiedAt))
+        || !validPath(doc.path) || !validDate(doc.createdAt) || !validDate(doc.modifiedAt))
         throw new MemDriveError('INVALID_RESULT', 'Read returned an invalid file original.');
+    const createdBy = storedActor(doc.createdBy), modifiedBy = storedActor(doc.modifiedBy);
     try {
         const metadata = metadataValues(doc.metadata, schema);
-        return { fileId: doc.fileId, path: doc.path, modifiedAt: doc.modifiedAt,
-            ...(metadata === undefined ? {} : { metadata }) };
+        return { fileId: doc.fileId, path: doc.path, createdAt: doc.createdAt, ...(createdBy === undefined ? {} : { createdBy }),
+            modifiedAt: doc.modifiedAt, ...(modifiedBy === undefined ? {} : { modifiedBy }), ...(metadata === undefined ? {} : { metadata }) };
     } catch (cause) {
         throw new MemDriveError('INVALID_RESULT', 'Read returned invalid file metadata.', { cause });
     }
@@ -67,7 +125,7 @@ export function decodeStoredFile(doc: Record<string, unknown>, schema: MetadataS
     }
 }
 
-export async function createRecords(request: CreateFileRequest | CreateExternalFileRequest, schema: MetadataSchema, dimensions?: number, chunker?: TextChunker, options?: { signal?: AbortSignal | undefined }) {
+export async function createRecords(request: CreateFileRequest | CreateExternalFileRequest, change: WriteChange, schema: MetadataSchema, dimensions?: number, chunker?: TextChunker, options?: { signal?: AbortSignal | undefined }) {
     requireInput(keysOnly(request, ['op', 'path', 'content', 'metadata']) && request.op === 'create',
         dimensions === undefined ? 'Create requires a path and original text.' : 'Create requires a path and vector content.');
     const { path } = request;
@@ -80,13 +138,14 @@ export async function createRecords(request: CreateFileRequest | CreateExternalF
         payload = { embedding: vectorValues(request.content, dimensions) };
     }
     const metadata = metadataValues(request.metadata, schema);
-    const file: StoredFile = { fileId: globalThis.crypto.randomUUID(), path, modifiedAt: new Date().toISOString(), ...payload,
-        ...(metadata === undefined ? {} : { metadata }) };
+    const created = modification(change);
+    const file: StoredFile = { fileId: globalThis.crypto.randomUUID(), path, createdAt: created.modifiedAt,
+        ...(change.by === undefined ? {} : { createdBy: { ...change.by } }), ...created, ...payload, ...(metadata === undefined ? {} : { metadata }) };
     return fileRecords(file, undefined, chunker, options);
 }
 
 export const metadataKey = (metadata: DriveFile['metadata']) => metadata === undefined ? null : Object.entries(metadata).sort();
-export const fingerprintOf = (file: StoredFile) =>
+export const fingerprintOf = (file: Pick<StoredFile, 'path' | 'metadata'> & ({ content: string } | { embedding: number[] })) =>
     contentHash(JSON.stringify([file.path, metadataKey(file.metadata), 'embedding' in file ? file.embedding : file.content]));
 
 /**
@@ -102,7 +161,7 @@ type FileTracking = {
 };
 
 export function fileOriginal(file: StoredFile, tracking?: FileTracking) {
-    const { fileId, path, modifiedAt, metadata } = file;
+    const { fileId, path, createdAt, createdBy, modifiedAt, modifiedBy, metadata } = file;
     const parts = path.slice(1).split('/');
     const fileName = parts.pop()!;
     const ancestorPaths = ['/'];
@@ -112,7 +171,8 @@ export function fileOriginal(file: StoredFile, tracking?: FileTracking) {
         ancestorPaths.push(ancestor);
     }
     const { revision } = tracking ?? {};
-    const shared = { fileId, path, fileName, ancestorPaths, modifiedAt, ...(metadata === undefined ? {} : { metadata }),
+    const shared = { fileId, path, fileName, ancestorPaths, createdAt, ...(createdBy === undefined ? {} : { createdBy }),
+        modifiedAt, ...(modifiedBy === undefined ? {} : { modifiedBy }), ...(metadata === undefined ? {} : { metadata }),
         ...(revision === undefined ? {} : { revision }) };
     const payload = 'embedding' in file ? { embedding: file.embedding } : { body: file.content };
     return { id: originalId(fileId), kind: 'file' as const, ...shared, ...payload, ...tracking };

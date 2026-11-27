@@ -29,7 +29,7 @@ test('findText verifies original-case Unicode matches, overlaps and excerpt offs
     assert.equal(consistency, 'live');
     assert.equal(next, undefined);
     assert.deepEqual(hits, [{
-        fileId: file.fileId, path, metadata: file.metadata, modifiedAt: file.modifiedAt,
+        fileId: file.fileId, path, metadata: file.metadata, createdAt: file.createdAt, modifiedAt: file.modifiedAt,
         content: '🙂A.*\r\n', range: { startLine: 1, endLine: 1, start: 797, end: 804 },
         context: { content: content.slice(717), range: { start: 717, end: content.length } },
     }]);
@@ -60,7 +60,7 @@ test('findText bounds each scan page and continues through files after an empty 
     for (let index = 1; index <= 18; index++) {
         const fileId = `11111111-1111-4111-8111-${String(index).padStart(12, '0')}`;
         const id = `file:${fileId}`;
-        originals.set(id, { id, kind: 'file', fileId, path: `/file-${index}`, modifiedAt, body: index === 18 ? 'Match Match' : '.',
+        originals.set(id, { id, kind: 'file', fileId, path: `/file-${index}`, createdAt: modifiedAt, modifiedAt, body: index === 18 ? 'Match Match' : '.',
             chunking: { strategy: 'boundary', version: '1' } });
     }
     const queries = async request => {
@@ -76,7 +76,7 @@ test('findText bounds each scan page and continues through files after an empty 
     assert.deepEqual(first.next.at, at);
     assert.deepEqual(firstQueries, [['desc', 1, false, '"file"'], ['asc', 16, true, '"file"']]);
     const addedId = '11111111-1111-4111-8111-999999999999';
-    originals.set(`file:${addedId}`, { id: `file:${addedId}`, kind: 'file', fileId: addedId, path: '/late', modifiedAt, body: 'Match' });
+    originals.set(`file:${addedId}`, { id: `file:${addedId}`, kind: 'file', fileId: addedId, path: '/late', createdAt: modifiedAt, modifiedAt, body: 'Match' });
 
     // The batch also returns the concurrent insert above the live upper bound, which ends the scan.
     const { result: second, queries: secondQueries } = await queries(first.next);
@@ -131,7 +131,7 @@ test('batched findText pages equal the one-original-per-query reference and boun
         const path = `${index % 4 === 0 ? '/out' : '/in'}/${index}.md`;
         // Zero to four occurrences, with mixed case, per original.
         const body = Array.from({ length: index % 5 }, (_, n) => `${'x'.repeat(n)}${n % 2 ? 'AB' : 'ab'}`).join(' ');
-        files.push({ id: `file:${fileId}`, kind: 'file', fileId, path, ancestorPaths: ['/', path.slice(0, path.lastIndexOf('/') + 1)], modifiedAt,
+        files.push({ id: `file:${fileId}`, kind: 'file', fileId, path, ancestorPaths: ['/', path.slice(0, path.lastIndexOf('/') + 1)], createdAt: modifiedAt, modifiedAt,
             metadata: { topic: index % 3 === 0 ? 'drop' : 'keep' }, body });
     }
     const branch = fixture.collections.get(name).branches.get('fork-draft').docs;
@@ -182,7 +182,7 @@ test('a batched findText page validates its native batch and never resumes a del
     const modifiedAt = '2026-01-01T00:00:00.000Z';
     const files = [1, 2, 3].map(index => {
         const fileId = `33333333-3333-4333-8333-${String(index).padStart(12, '0')}`;
-        return { id: `file:${fileId}`, kind: 'file', fileId, path: `/${index}`, modifiedAt, body: 'hit hit' };
+        return { id: `file:${fileId}`, kind: 'file', fileId, path: `/${index}`, createdAt: modifiedAt, modifiedAt, body: 'hit hit' };
     });
     for (const file of files) branch.set(file.id, file);
     const envelope = (docs, extra = {}) => ({ isDocsInline: true, total: docs.length,
@@ -292,7 +292,7 @@ test('findText reads a maximum-sized original and escapes literal syntax', async
     const { fixture, name, drive } = await setup();
     const fileId = '11111111-1111-4111-8111-111111111111';
     const id = `file:${fileId}`;
-    const original = { id, kind: 'file', fileId, path: '/large', modifiedAt: '2026-01-01T00:00:00.000Z', body: '' };
+    const original = { id, kind: 'file', fileId, path: '/large', createdAt: '2026-01-01T00:00:00.000Z', modifiedAt: '2026-01-01T00:00:00.000Z', body: '' };
     const literal = '[X].\\${Q}$^+?()|/';
     // Put a surrogate pair across each nominal context boundary.
     const tail = '🙂' + 'a'.repeat(79) + literal + 'a'.repeat(79) + '🙂';

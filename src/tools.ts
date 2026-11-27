@@ -4,7 +4,8 @@ import { fileToolGuide, fileToolGuideTopics } from './tool-guide.js';
 import type { FileToolGuideTopic } from './tool-guide.js';
 import { fileToolSchemas } from './tool-schemas.js';
 import { treeBucketLimit } from './tree.js';
-import type { EmbeddingMode, FileDrive, RequestOptions } from './types.js';
+import { requireActor } from './records.js';
+import type { EmbeddingMode, FileActor, FileDrive, RequestOptions } from './types.js';
 
 export { fileToolGuide, fileToolGuideTopics } from './tool-guide.js';
 export type { FileToolGuideTopic } from './tool-guide.js';
@@ -151,13 +152,17 @@ function withoutAt(result: unknown) {
  * drive. Each call forwards its validated input to the SDK method of the same
  * name. With `checkpoint`, every `write` call becomes a checkpointed write named
  * by the hook and returns the plain write result; a failed write then leaves the
- * branch at its latest checkpoint (see the SDK's checkpointed writes).
+ * branch at its latest checkpoint (see the SDK's checkpointed writes). Every
+ * `write` call passes `actor` as `by` and the result of `now` as `time`.
  */
-export function createFileTools(options: { drive: FileDrive<EmbeddingMode>; tools: readonly FileToolName[]; checkpoint?: FileToolCheckpoint | undefined }): FileTools {
-    requireInput(keysOnly(options, ['drive', 'tools', 'checkpoint']) && typeof options.drive === 'object' && options.drive !== null
-        && (options.checkpoint === undefined || typeof options.checkpoint === 'function'),
-    'Provide an authorized drive, an explicit tools allowlist and an optional checkpoint function.');
-    const { drive, tools, checkpoint } = options;
+export function createFileTools(options: { drive: FileDrive<EmbeddingMode>; tools: readonly FileToolName[]; checkpoint?: FileToolCheckpoint | undefined;
+    actor?: FileActor | undefined; now?: (() => Date) | undefined }): FileTools {
+    requireInput(keysOnly(options, ['drive', 'tools', 'checkpoint', 'actor', 'now']) && typeof options.drive === 'object' && options.drive !== null
+        && (options.checkpoint === undefined || typeof options.checkpoint === 'function')
+        && (options.now === undefined || typeof options.now === 'function'),
+    'Provide an authorized drive, an explicit tools allowlist and optional checkpoint and now functions.');
+    const { drive, tools, checkpoint, now } = options;
+    const actor = options.actor === undefined ? undefined : requireActor(options.actor, 'actor');
     validateToolNames(tools);
     const allowed = new Set<FileToolName>(tools);
     const definitions = definitionsFor([...allowed], drive.findText === undefined);
@@ -181,8 +186,10 @@ export function createFileTools(options: { drive: FileDrive<EmbeddingMode>; tool
         requireInput(!Object.hasOwn(input, 'at'), 'File tools always use main; omit at.');
         if (name === 'write') {
             requireInput(!Object.hasOwn(input, 'checkpoint'), 'The host decides checkpoints; omit checkpoint.');
-            if (checkpoint === undefined) return sdk.write(input, requestOptions);
-            try { return (await sdk.write({ ...input, checkpoint: await checkpoint() }, requestOptions) as { result: unknown }).result; }
+            requireInput(!Object.hasOwn(input, 'by') && !Object.hasOwn(input, 'time'), 'The host supplies by and time; omit them.');
+            const request = { ...input, ...(actor === undefined ? {} : { by: actor }), ...(now === undefined ? {} : { time: now() }) };
+            if (checkpoint === undefined) return sdk.write(request, requestOptions);
+            try { return (await sdk.write({ ...request, checkpoint: await checkpoint() }, requestOptions) as { result: unknown }).result; }
             catch (cause) { throw agentFailure(cause); }
         }
         const result = await sdk[name as Exclude<FileToolName, 'guide' | 'write'>]!(input, requestOptions);
