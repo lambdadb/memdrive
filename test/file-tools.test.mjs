@@ -111,7 +111,7 @@ test('in text mode write keeps standing instructions in /preferences.md and read
     assert(!external.find(tool => tool.name === 'write').description.includes(save), 'the write sentence is text-mode only');
 });
 
-test('in text mode write records what the user says as dated entries at the end of a file and leaves earlier entries as they are; external mode keeps the earlier sentence', () => {
+test('in text mode write records what the user says outside /preferences.md as entries at the end of a file and leaves earlier entries as they are; external mode keeps the earlier sentence', () => {
     const keep = 'When new information differs from what is saved, keep the earlier statement and add the new one with when it was said, unless asked to change the saved text.';
     const entries = 'Outside /preferences.md, record what the user says as entries added at the end of a file, each with when it was said if known. '
         + 'Leave earlier entries as they are: when a new statement differs from one, add it as a new entry, and do not rewrite the earlier entry '
