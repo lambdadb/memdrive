@@ -73,8 +73,11 @@ function replaceExact(source: string, edits: TextEdit[]): string {
     return text.join('');
 }
 
-/** Append text after the existing content, separated by one line break when the content does not end with one. */
-const appended = (existing: string, content: string) => existing === '' || existing.endsWith('\n') ? existing + content : `${existing}\n${content}`;
+/**
+ * Append text after the existing content, separated by one `\n` when the content is nonempty and does not
+ * end with a line break. Like ranged reads and findText, `\n`, `\r\n` and a lone `\r` end a line.
+ */
+const appended = (existing: string, content: string) => existing === '' || /[\n\r]$/.test(existing) ? existing + content : `${existing}\n${content}`;
 
 export async function planEdit(edit: EditRequest | AppendById, doc: Record<string, unknown> | undefined, change: WriteChange,
     schema: MetadataSchema, dimensions?: number, chunker?: TextChunker, options?: { signal?: AbortSignal | undefined }) {

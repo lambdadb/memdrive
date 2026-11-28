@@ -38,9 +38,9 @@ test('append by fileId or by path adds content after one line break, and by path
     assert.equal(byId.content, 'First.\nSecond.\nThird.');
     assert.deepEqual(await drive.read({ fileId: created.fileId }), byId);
 
-    // Existing content ending with \n or \r\n gets no extra line break; empty content none either.
-    for (const [existing, expected] of [['a\n', 'a\nb'], ['a\r\n', 'a\r\nb'], ['a', 'a\nb'], ['a\r', 'a\r\nb'], ['', 'b'], ['\n', '\nb']]) {
-        const file = await drive.write({ op: 'create', path: `/break-${JSON.stringify(existing).length}-${expected.length}.md`, content: existing });
+    // Existing content ending with a line break of the SDK's line model (\n, \r\n or a lone \r) gets no separator; empty content none either.
+    for (const [index, [existing, expected]] of [['a\n', 'a\nb'], ['a\r\n', 'a\r\nb'], ['a', 'a\nb'], ['a\r', 'a\rb'], ['', 'b'], ['\n', '\nb'], ['a\r\r', 'a\r\rb']].entries()) {
+        const file = await drive.write({ op: 'create', path: `/break-${index}.md`, content: existing });
         assert.equal((await drive.write(append({ fileId: file.fileId }, 'b'))).content, expected, JSON.stringify(existing));
     }
     // A fork appends on its own branch.
@@ -48,6 +48,26 @@ test('append by fileId or by path adds content after one line break, and by path
     await drive.write({ at: { kind: 'fork', name: 'draft' }, ...append({ path: '/log.md' }, 'Draft only.') });
     assert.equal((await drive.read({ path: '/log.md' })).content, 'First.\nSecond.\nThird.');
     assert.equal((await drive.read({ at: { kind: 'fork', name: 'draft' }, path: '/log.md' })).content, 'First.\nSecond.\nThird.\nDraft only.');
+});
+
+test('the path lookup of an append by path is a consistent read of the written branch, on main and on a fork', async () => {
+    const { fixture, drive } = await setup();
+    await drive.write({ op: 'create', path: '/log.md', content: 'Main.' });
+    await drive.fork({ name: 'draft' });
+    for (const [at, branch] of [[undefined, 'main'], [{ kind: 'fork', name: 'draft' }, 'fork-draft']]) {
+        for (const path of ['/log.md', '/new.md']) {
+            const start = fixture.calls.length;
+            await drive.write({ ...(at ? { at } : {}), ...append({ path }, 'Entry.') });
+            // The lookup is the call's first query; a creating append then also checks its destination.
+            const lookup = fixture.calls.slice(start).find(call => call.kind === 'query').request;
+            assert.deepEqual(lookup, { size: 1000, ref: { kind: 'branch', name: branch }, consistentRead: true, includeVectors: false,
+                query: { bool: [{ queryString: { query: '"file"', defaultField: 'kind' }, occur: 'filter' },
+                    { queryString: { defaultField: 'path', query: JSON.stringify(path) }, occur: 'filter' }] },
+                fields: { include: ['id', 'kind', 'fileId', 'path'] } }, `${branch} ${path}`);
+        }
+    }
+    assert.deepEqual([(await drive.read({ path: '/log.md' })).content, (await drive.read({ at: { kind: 'fork', name: 'draft' }, path: '/log.md' })).content],
+        ['Main.\nEntry.', 'Main.\nEntry.']);
 });
 
 test('append replaces the chunks: the old generation is removed and search and findText see only the new text', async () => {

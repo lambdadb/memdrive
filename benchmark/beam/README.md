@@ -541,7 +541,9 @@ the mean over its rubric items, or null when any item failed. For
 an LLM alignment of events; it is not computed here, and only the rubric judge
 score is reported. This is not a reproduction of the BEAM paper's scores.
 
-`NEW_DIR/manifest.json` records the run directory and manifest hash, store
+`NEW_DIR/manifest.json` records the run directory, manifest hash and replay
+protocol (`run.protocol`; a stage manifest without it read a v3 run, the only
+protocol accepted before), store
 name, source hashes, scope, limit, models, budgets, the instruction hash, the
 guide setting, the read-only tool definitions and their hash, the judge prompt hash and upstream
 revision, and the classification. Each asked question has a directory with
@@ -561,7 +563,9 @@ Injected test transports report `measured: false`. With `--amendments on`
 (default) the stage also judges amended rubric items and reports
 `amendedScores` beside `scores`; see [amendments](#amendments). The stage
 protocol is `memdrive-beam-replay-questions-v4`; `-v3` was the same stage
-without amendments.
+without amendments. Accepting v4 replay runs and recording `run.protocol` add
+no question, tool or judging change and keep the output format readable by
+rejudge, so the stage protocol stays v4.
 
 ### Judging stored answers again
 

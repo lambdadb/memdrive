@@ -176,8 +176,11 @@ export type UpdateFileRequest = {
 /**
  * Add text at the end of a text file without reading it. By path, a missing file
  * is created with `content`, and several files at the path fail with
- * `PATH_AMBIGUOUS`. A line break separates `content` from existing content that
- * is nonempty and does not end with one.
+ * `PATH_AMBIGUOUS`. One `\n` separates `content` from existing content that is
+ * nonempty and does not end with a line break (`\n` or `\r`). In a batch, an
+ * append by path claims its path before any read: two appends by one path, or an
+ * append and a create at one path, fail with `INVALID_INPUT`; an append also
+ * targets the file it resolves to, which no other operation may target.
  */
 export type AppendFileRequest = {
     op: 'append';

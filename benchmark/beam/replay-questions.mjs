@@ -351,7 +351,8 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
             'replay-sessions.mjs', 'replay-store.mjs', 'original-config.json', 'original-judge-prompt.json']
             .map(async name => [`benchmark/beam/${name}`, hash(await readFile(path.join(root, 'benchmark/beam', name)))]))),
         ...await fingerprint(path.join(root, 'dist/esm'), root), 'package-lock.json': hash(await readFile(path.join(root, 'package-lock.json'))) },
-        run: { directory: path.relative(root, runDirectory) || '.', manifestSha256: hash(runManifestBytes), transport: runManifest.transport,
+        // The stage reads runs of two replay protocols; stages that omit it read v3 runs, the only ones accepted before.
+        run: { directory: path.relative(root, runDirectory) || '.', manifestSha256: hash(runManifestBytes), protocol: runManifest.protocol, transport: runManifest.transport,
             model: runManifest.model, guide: runManifest.guide, complete: runSummary.complete },
         store: { name: ledger.name },
         source: { split: source.split, conversationId: id, manifestSha256: source.manifestSha256, runtimeSha256: source.runtimeSha256,

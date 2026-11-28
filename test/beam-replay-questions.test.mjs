@@ -637,5 +637,10 @@ test('runs without a retained store, ledgers from elsewhere and existing outputs
     await writeFile(path.join(files.run, 'summary.json'), JSON.stringify({ ...runSummary, protocol: 'memdrive-beam-session-replay-v3' }));
     const earlier = await files.stage('v3-run');
     assert.deepEqual([runManifest.protocol, earlier.manifest.run.manifestSha256 === hash(JSON.stringify({ ...runManifest, protocol: 'memdrive-beam-session-replay-v3' })),
-        earlier.summary.questions.complete, earlier.summary.store.unchanged], ['memdrive-beam-session-replay-v4', true, true, true]);
+        earlier.manifest.run.protocol, earlier.summary.questions.complete, earlier.summary.store.unchanged],
+    ['memdrive-beam-session-replay-v4', true, 'memdrive-beam-session-replay-v3', true, true]);
+    // The stage manifest records the replay protocol of the run it read.
+    await writeFile(path.join(files.run, 'manifest.json'), JSON.stringify(runManifest));
+    await writeFile(path.join(files.run, 'summary.json'), JSON.stringify(runSummary));
+    assert.equal((await files.stage('v4-run')).manifest.run.protocol, 'memdrive-beam-session-replay-v4');
 });
