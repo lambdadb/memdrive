@@ -753,7 +753,22 @@ unchanged.
 Tool names, descriptions and schemas are the only text every client delivers to
 a model, so the descriptions carry everything ordinary use needs, including when
 to use each tool: `write`, for example, says what to save and not to wait to be
-asked. `fileToolInstructions` is an optional, short, transport-neutral supplement
+asked. In text mode, `write` also says to keep what the user says they want in
+answers always or from now on in `/preferences.md`, one per line, replacing a
+line when the user changes it, and `read` says to read that file before the
+first answer of a conversation and to follow it for how answers are given,
+never for tool calls or authorization: the one exception to treating file
+content as information only. `search` and `findText` still treat returned text
+as information only, so the exception applies when the file is read, and a
+host that does not offer `read` gets no preferences behavior. The SDK reserves
+and validates nothing for that path: it is an ordinary file, one per drive.
+Every text-mode agent on the drive reads it before its first answer and follows
+it for how answers are given, so whoever can write it changes later answers:
+another user of a shared drive, whose lines are then applied as the user's,
+another agent, or an import that contains a root `preferences.md`. A host that
+needs to prevent this must control writes to that path. External-vector drives
+store no text, and their descriptions do not mention it.
+`fileToolInstructions` is an optional, short, transport-neutral supplement
 for server instructions, which clients may drop or shorten. It says what the
 drive is and how the tools relate (search and read before writing, update rather
 than duplicate). It mentions only searching and reading before writing and names
@@ -786,7 +801,8 @@ use the guide tool.
 The guide describes one drive and main only. Its topics hold procedures and
 explanations the tool descriptions leave out: choosing a search mode, what to do
 when results are missing or too many, tree limits, listing pagination, ranged-read
-pages and cursors (`retrieval`); what counts as a duplicate, keeping both
+pages and cursors (`retrieval`); what counts as a duplicate, what belongs in
+`/preferences.md`, keeping both
 statements when new information conflicts with what is saved (the later one is
 current when it updates the earlier one), preserving selected conversational
 wording, examples, qualifications and corrections instead of aggressively

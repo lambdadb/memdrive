@@ -143,8 +143,12 @@ Protocol `memdrive-tool-use-v4` runs offered the main-only catalog without
 and listed files in path order with consistent reads, but used the earlier wording: the
 instructions asked for a save each turn and for reading the guide, the `write`
 description did not say when to save and the scripted tool channel read the
-guide index and `retrieval` topic first. None of them validates the current
-wording (protocol `memdrive-tool-use-v6`). `--instruction` independently
+guide index and `retrieval` topic first. Protocol `memdrive-tool-use-v6` runs
+lacked the `/preferences.md` sentences of the text-mode `write` and `read`
+descriptions. None of them validates the current wording
+(protocol `memdrive-tool-use-v7`). Model runs of v7 are expected to start with a read of
+`/preferences.md`, so their first-tool and read-count metrics are not comparable
+with v6. `--instruction` independently
 selects `server` (default), `workflow` (additional developer workflow text), or
 `user` (an explicit reminder appended to the task). Workflow injection approximates
 a loaded bundled skill; skill discovery/loading itself is not tested. Compare
