@@ -10,7 +10,7 @@ import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { MemDrive, fileToolInstructions, getFileToolDefinitions } from '@functional-systems/memdrive';
 import { amendmentSettings, amendmentsFile, amendmentsFor, loadAmendments, withAmended } from './replay-amendments.mjs';
-import { createToolHost, failureCodes, limits, openAI, protocol as replayProtocol, ReplayFailure, runSession, withGuide } from './replay-agent.mjs';
+import { createToolHost, failureCodes, limits, openAI, readableProtocols, ReplayFailure, runSession, withGuide } from './replay-agent.mjs';
 import { toolUse, toolUseTotals } from './replay-metrics.mjs';
 import { fingerprint, groupSessions, hash } from './replay-sessions.mjs';
 import { assertOwner, lambdadbConnection, ledgerFile, observeStore, readLedger } from './replay-store.mjs';
@@ -290,11 +290,11 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
     const runManifestBytes = await readFile(path.join(runDirectory, 'manifest.json'));
     const runManifest = JSON.parse(runManifestBytes);
     assert(typeof runManifest.protocol === 'string' && runManifest.protocol.startsWith('memdrive-beam-session-replay-'), 'Use a BEAM session replay run');
-    assert.equal(runManifest.protocol, replayProtocol, `The run used ${runManifest.protocol}; the question stage reads only ${replayProtocol} runs, `
-        + 'whose store layout and tools it knows');
+    assert(readableProtocols.includes(runManifest.protocol), `The run used ${runManifest.protocol}; the question stage reads only `
+        + `${readableProtocols.join(' and ')} runs, whose store layout it knows`);
     assert(runManifest.backend === 'lambdadb' && runManifest.store?.ledger === ledgerFile, 'Use a LambdaDB replay run; a fixture run keeps no store');
     const runSummary = await readJSON(path.join(runDirectory, 'summary.json'));
-    assert(runSummary.protocol === replayProtocol && runSummary.cleanup === 'retained' && runSummary.store?.name === runManifest.store.name,
+    assert(runSummary.protocol === runManifest.protocol && runSummary.cleanup === 'retained' && runSummary.store?.name === runManifest.store.name,
         'The replay run is unfinished or did not retain its store');
     const ledger = await readLedger(runDirectory, connection);
     assert(ledger.name === runManifest.store.name && ledger.status === 'ready', 'The run\'s store is not ready or was cleaned up');
@@ -351,7 +351,8 @@ export async function runQuestions({ run, manifest: manifestFile, output, scope 
             'replay-sessions.mjs', 'replay-store.mjs', 'original-config.json', 'original-judge-prompt.json']
             .map(async name => [`benchmark/beam/${name}`, hash(await readFile(path.join(root, 'benchmark/beam', name)))]))),
         ...await fingerprint(path.join(root, 'dist/esm'), root), 'package-lock.json': hash(await readFile(path.join(root, 'package-lock.json'))) },
-        run: { directory: path.relative(root, runDirectory) || '.', manifestSha256: hash(runManifestBytes), transport: runManifest.transport,
+        // The stage reads runs of two replay protocols; stages that omit it read v3 runs, the only ones accepted before.
+        run: { directory: path.relative(root, runDirectory) || '.', manifestSha256: hash(runManifestBytes), protocol: runManifest.protocol, transport: runManifest.transport,
             model: runManifest.model, guide: runManifest.guide, complete: runSummary.complete },
         store: { name: ledger.name },
         source: { split: source.split, conversationId: id, manifestSha256: source.manifestSha256, runtimeSha256: source.runtimeSha256,

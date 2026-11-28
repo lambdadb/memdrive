@@ -111,22 +111,28 @@ test('in text mode write keeps standing instructions in /preferences.md and read
     assert(!external.find(tool => tool.name === 'write').description.includes(save), 'the write sentence is text-mode only');
 });
 
-test('in text mode write records what the user says outside /preferences.md as entries at the end of a file and leaves earlier entries as they are; external mode keeps the earlier sentence', () => {
+test('in text mode write records what the user says as appended entries, offers append and returns files without content; external mode keeps the earlier sentences', () => {
     const keep = 'When new information differs from what is saved, keep the earlier statement and add the new one with when it was said, unless asked to change the saved text.';
-    const entries = 'Outside /preferences.md, record what the user says as entries added at the end of a file, each with when it was said if known. '
+    const create = 'Create by path; update, move or delete by fileId after reading the original.';
+    const append = 'Append adds content at the end of a file by path or fileId without reading it, and creates the file when the path has none.';
+    const entries = 'Outside /preferences.md, record what the user says as entries appended to a file, each with when it was said if known. '
         + 'Leave earlier entries as they are: when a new statement differs from one, add it as a new entry, and do not rewrite the earlier entry '
         + 'or note which is correct or current, unless asked to change the saved text.';
+    const result = 'The result identifies each file without its content; read the file to see it.';
     const [managed] = getFileToolDefinitions({ embeddingMode: 'managed', tools: ['write'] });
     const [external] = getFileToolDefinitions({ embeddingMode: 'external', tools: ['write'] });
-    // The two sentences follow the /preferences.md sentence directly and precede the metadata rule.
+    // The append sentence follows the create sentence; the entry sentences follow the /preferences.md sentence and precede the metadata rule.
+    assert(managed.description.includes(`with 1–100 operations. ${create} ${append} Prefer exact oldText/newText edits`));
     assert.equal(managed.description.split(entries).length, 2, 'the entry sentences appear once, together and in order');
     assert(managed.description.includes(`and nothing else in that file. ${entries} Metadata given on update replaces the whole map.`));
+    assert(managed.description.endsWith(`read the affected files before retrying. ${result}`), 'the result sentence comes last');
     assert(!managed.description.includes(keep), 'text mode no longer has the earlier sentence');
-    assert(external.description.includes(`after reading the original. ${keep} Metadata given on update replaces the whole map.`));
+    assert(external.description.includes(`with 1–100 operations. ${create} ${keep} Metadata given on update replaces the whole map.`));
+    assert(external.description.endsWith('read the affected files before retrying.'));
     // The new wording appears only in the text-mode write description and the editing topic.
-    const wording = /end of a file|new entry|earlier entr|correct or current|if known|Outside \/preferences/i;
+    const wording = /end of a file|append|new entry|earlier entr|correct or current|if known|Outside \/preferences|without its content/i;
     assert.doesNotMatch(external.description, wording, 'external drives store no text');
-    assert.doesNotMatch(fileToolInstructions, /\bentr(?:y|ies)\b|preferences\.md/);
+    assert.doesNotMatch(fileToolInstructions, /\bentr(?:y|ies)\b|preferences\.md|append/);
     for (const embeddingMode of ['managed', 'external'])
         for (const tool of getFileToolDefinitions({ embeddingMode, tools: embeddingMode === 'managed'
             ? ['guide', 'read', 'tree', 'list', 'search', 'findText'] : ['guide', 'read', 'tree', 'list', 'search'] }))
@@ -134,7 +140,25 @@ test('in text mode write records what the user says outside /preferences.md as e
     assert.doesNotMatch(fileToolGuideTopics.retrieval.content, wording);
     assert.doesNotMatch(fileToolGuide.content, wording);
     const editing = fileToolGuideTopics.editing.content;
-    assert.match(editing, /it records what was said then\. In text mode, add the new statement as an entry at the end of a file and leave earlier entries as they are, without noting which is correct or current\. When the later statement updates/);
+    assert.match(editing, /it records what was said then\. In text mode, add the new statement as an entry at the end of a file with append and leave earlier entries as they are, without noting which is correct or current\. When the later statement updates/);
+});
+
+test('the text-mode write schema offers append by exactly one of path or fileId with nonempty content; the external schema has no append', () => {
+    const [managed] = getFileToolDefinitions({ embeddingMode: 'managed', tools: ['write'] });
+    const [external] = getFileToolDefinitions({ embeddingMode: 'external', tools: ['write'] });
+    const schema = managed.inputSchema;
+    assert.deepEqual(schema.properties.op.enum, ['create', 'update', 'append', 'delete']);
+    assert.deepEqual(external.inputSchema.properties.op.enum, ['create', 'update', 'delete']);
+    const appendOf = list => list.filter(option => option.properties?.op?.const === 'append');
+    const [single] = appendOf(schema.oneOf), [batched] = appendOf(schema.properties.operations.items.oneOf);
+    assert.deepEqual(single, batched);
+    assert.deepEqual([Object.keys(single.properties), single.required, single.additionalProperties, single.oneOf],
+        [['op', 'fileId', 'path', 'content'], ['op', 'content'], false, [{ required: ['fileId'] }, { required: ['path'] }]]);
+    assert.deepEqual([single.properties.content.type, single.properties.content.minLength], ['string', 1]);
+    assert.match(single.properties.op.description, /exactly one of path or stable fileId, without reading it\. By path, creates the file when the path has none\./);
+    assert.match(schema.properties.content.description, /On append, the text to add at the end, after a line break when the file does not end with one\.$/);
+    assert.deepEqual([appendOf(external.inputSchema.oneOf), appendOf(external.inputSchema.properties.operations.items.oneOf)], [[], []]);
+    assert.doesNotMatch(JSON.stringify(external.inputSchema), /append/i);
 });
 
 test('each tool forwards its input object unchanged to the SDK method of the same name and drops view selectors from results', async () => {
@@ -172,13 +196,13 @@ test('tools work on main only: inputs with at are rejected before storage and re
             await assert.rejects(tools.execute(name, { at, op: 'create', path: '/x', content: 'x', query: 'x' }), { code: 'INVALID_INPUT' });
     assert.equal(fixture.calls.length, before);
     const file = await tools.execute('write', { op: 'create', path: '/notes/plan.txt', content: 'Meet on Monday.', metadata: { topic: 'plan' } });
-    assert.deepEqual(await drive.read({ fileId: file.fileId }), file);
+    assert.deepEqual(await drive.read({ fileId: file.fileId }), { ...file, content: 'Meet on Monday.' });
     assert.equal(await drive.read({ at: draft, fileId: file.fileId }), null);
-    assert.deepEqual(await tools.execute('read', { paths: [file.path, '/missing.txt'] }), [file]);
+    assert.deepEqual(await tools.execute('read', { paths: [file.path, '/missing.txt'] }), [await drive.read({ fileId: file.fileId })]);
     assert.deepEqual(await tools.execute('search', { query: 'Monday', rerank: false }), await drive.search({ query: 'Monday', rerank: false }));
     assert.equal((await tools.execute('findText', { query: 'monday' })).hits[0].fileId, file.fileId);
-    const edited = await tools.execute('write', { op: 'update', fileId: file.fileId, edits: [{ oldText: 'Monday', newText: 'Tuesday' }] });
-    assert.equal(edited.content, 'Meet on Tuesday.');
+    await tools.execute('write', { op: 'update', fileId: file.fileId, edits: [{ oldText: 'Monday', newText: 'Tuesday' }] });
+    assert.equal((await drive.read({ fileId: file.fileId })).content, 'Meet on Tuesday.');
     await assert.rejects(tools.execute('write', { op: 'update', fileId: file.fileId, edits: [{ oldText: 'Monday', newText: 'Wednesday' }] }),
         { code: 'EDIT_CONFLICT' });
     for (const path of ['/a.txt', '/b.txt']) await tools.execute('write', { op: 'create', path, content: 'needle' });
@@ -198,11 +222,11 @@ test('a host checkpoint hook makes every write tool call a checkpointed write an
     let turn = 0;
     const tools = createFileTools({ drive, tools: ['write', 'read'], checkpoint: async () => ({ name: `turn-${++turn}` }) });
     const first = await tools.execute('write', { op: 'create', path: '/note.md', content: 'First turn.' });
-    assert.deepEqual(first, await drive.read({ fileId: first.fileId }));
+    assert.deepEqual({ ...first, content: 'First turn.' }, await drive.read({ fileId: first.fileId }));
     assert.equal(Object.hasOwn(first, 'checkpoint'), false);
     assert.deepEqual((await drive.describe()).latestCheckpoint, { at: { kind: 'checkpoint', name: 'turn-1' } });
-    const second = await tools.execute('write', { operations: [{ op: 'update', fileId: first.fileId, content: 'Second turn.' }] });
-    assert.equal(second[0].content, 'Second turn.');
+    const second = await tools.execute('write', { operations: [{ op: 'append', fileId: first.fileId, content: 'Second turn.' }] });
+    assert.deepEqual([second[0].fileId, 'content' in second[0]], [first.fileId, false]);
     assert.deepEqual((await drive.describe()).latestCheckpoint, { at: { kind: 'checkpoint', name: 'turn-2' } });
     assert.equal((await drive.read({ at: { kind: 'checkpoint', name: 'turn-1' }, fileId: first.fileId })).content, 'First turn.');
     // The agent cannot choose or skip a checkpoint.
@@ -230,7 +254,7 @@ test('a host checkpoint hook makes every write tool call a checkpointed write an
     assert.doesNotMatch(JSON.stringify(unrestored), /turn-|checkpoint-/);
     await drive.write({ op: 'delete', fileId: (await drive.read({ path: '/partial.md' })).fileId });
     assert.equal(await drive.read({ path: '/lost.md' }), null);
-    assert.equal((await drive.read({ fileId: first.fileId })).content, 'Second turn.');
+    assert.equal((await drive.read({ fileId: first.fileId })).content, 'First turn.\nSecond turn.');
     // A hook result is validated by the SDK before any mutation.
     const invalid = createFileTools({ drive, tools: ['write'], checkpoint: () => ({ name: 'x' }) });
     const start = mutations(fixture.calls).length;

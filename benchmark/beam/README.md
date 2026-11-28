@@ -209,8 +209,9 @@ lists its folder with `prefix: '/notes/'` in its first turn; in its second it
 reads the note, edits it with an exact edit and tries to create it again,
 which fails with `PATH_EXISTS` and changes nothing. Session 2 calls `tree`
 with `prefix: '/notes/'`, creates a file without a lookup (a `tree` call is
-none), finds the note with `findText` and deletes it. Every other turn only
-replies. With `--guide off` the guide calls are skipped.
+none), finds the note with `findText` and deletes it, then appends in one batch
+by path to the file it created and to a new log, which the append creates. Every
+other turn only replies. With `--guide off` the guide calls are skipped.
 
 Model mode uses OpenAI Responses with the explicit model ID (`gpt-6.1-sol` by
 default, or `--model`), low reasoning, `store: false`, sequential tool calls
@@ -323,16 +324,23 @@ per-session values. A turn is one user utterance.
   successful or not. The SDK instructions ask for one per turn;
 - `operations`: operations in successful `write` calls by kind: `create`,
   `updateEdits` (exact `edits`), `updateContent` (replaced `content`),
-  `updateOther` (only a new path or metadata) and `delete`. A batch counts each
-  of its operations;
+  `updateOther` (only a new path or metadata), `append` and `delete`. A batch
+  counts each of its operations;
+- the metrics below treat an `append` that created its file as a create and
+  every other `append` as an update of the file it returned. Write results carry
+  no content, so an append counts as a create when it was by path, no earlier
+  operation of the session wrote the file ID it returned, and that result's
+  `createdAt` equals its `modifiedAt`. An append to a file from an earlier
+  session made within the same millisecond as that file's creation would count
+  as a create; in model runs a model request separates them;
 - `filesCreated`, `filesUpdated`: distinct file IDs created, and distinct file
   IDs updated, by successful `write` calls in the session;
   `filesWrittenInSeveralTurns`: distinct file IDs that successful operations
-  (create, update or delete) touched in more than one turn of the session;
-- `createsAfterLookup`, `createsWithoutLookup`: create operations in
-  successful `write` calls that came after, or before, the session's first
-  successful `search`, `findText`, `list` or `read` call. The SDK
-  instructions ask to search and read before writing;
+  (create, update, append or delete) touched in more than one turn of the session;
+- `createsAfterLookup`, `createsWithoutLookup`: creates, including appends that
+  created their file, in successful `write` calls that came after, or before,
+  the session's first successful `search`, `findText`, `list` or `read` call.
+  The SDK instructions ask to search and read before writing;
 - `noSuccessfulWrite` (per session) and `sessionsWithoutWrite` (total);
 - `filesAfter`: files in the inventory after the session, null when the
   observation failed; `finalFiles` is the last session's value;
@@ -413,12 +421,16 @@ tool name, and `perTurn`, the model request time and tool-call time of each
 turn, in milliseconds. Wall time per turn is not recorded. Fixture timings
 show only local overhead.
 
-This is protocol `memdrive-beam-session-replay-v3`. Runs of
+This is protocol `memdrive-beam-session-replay-v4`: text-mode `write` offers
+`append` and its results identify files without their content. Runs of
+`memdrive-beam-session-replay-v3` offered no `append` and returned each written
+file's content to the model, so their token and operation metrics are not
+comparable with v4; their stores have the same layout. Runs of
 `memdrive-beam-session-replay-v2` offered six tools without `tree`, with a
 `list` that was unordered, paginated per storage page and eventual; runs of
 `memdrive-beam-session-replay-v1` used 16 tools with an `at` view selector and
 published forks with `merge`. Their metrics are not comparable with these,
-and the question stage refuses those runs.
+and the question stage refuses v1 and v2 runs.
 
 ### Limits of this measurement
 
@@ -448,9 +460,11 @@ node benchmark/beam/replay.mjs --questions --run artifacts/beam-replay/live-1 \
   --output artifacts/beam-replay/live-1-questions --env-file /path/to/evaluation.env
 ```
 
-The run must use the current replay protocol and `--backend lambdadb`, have
+The run must use replay protocol `memdrive-beam-session-replay-v4` or `-v3`
+(whose stores have the same layout; the stage offers only read tools, which did
+not change) and `--backend lambdadb`, have
 finished (`summary.json` reports `cleanup: "retained"`) and still hold its
-store (`store.json` status `ready`). A run of an earlier protocol is rejected
+store (`store.json` status `ready`). A run of an older protocol is rejected
 with its protocol named, and a fixture run because its store is gone. The run does not record
 where its prepared data lives, so `--manifest` names it; the stage checks the
 SHA-256 of that manifest and of the runtime file against the run's manifest,
@@ -527,7 +541,9 @@ the mean over its rubric items, or null when any item failed. For
 an LLM alignment of events; it is not computed here, and only the rubric judge
 score is reported. This is not a reproduction of the BEAM paper's scores.
 
-`NEW_DIR/manifest.json` records the run directory and manifest hash, store
+`NEW_DIR/manifest.json` records the run directory, manifest hash and replay
+protocol (`run.protocol`; a stage manifest without it read a v3 run, the only
+protocol accepted before), store
 name, source hashes, scope, limit, models, budgets, the instruction hash, the
 guide setting, the read-only tool definitions and their hash, the judge prompt hash and upstream
 revision, and the classification. Each asked question has a directory with
@@ -547,7 +563,9 @@ Injected test transports report `measured: false`. With `--amendments on`
 (default) the stage also judges amended rubric items and reports
 `amendedScores` beside `scores`; see [amendments](#amendments). The stage
 protocol is `memdrive-beam-replay-questions-v4`; `-v3` was the same stage
-without amendments.
+without amendments. Accepting v4 replay runs and recording `run.protocol` add
+no question, tool or judging change and keep the output format readable by
+rejudge, so the stage protocol stays v4.
 
 ### Judging stored answers again
 

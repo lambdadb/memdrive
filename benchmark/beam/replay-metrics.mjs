@@ -16,7 +16,7 @@ const sumMaps = maps => {
 const validUsage = usage => ['input_tokens', 'output_tokens'].every(key => Number.isSafeInteger(usage?.[key]) && usage[key] >= 0);
 // `tree` returns folders and counts but no files, so it is not a lookup before a create.
 const lookups = new Set(['search', 'findText', 'list', 'read']);
-const operationKinds = ['create', 'updateEdits', 'updateContent', 'updateOther', 'delete'];
+const operationKinds = ['create', 'updateEdits', 'updateContent', 'updateOther', 'append', 'delete'];
 
 /** The operations of a write call paired with their results; a batch returns results in input order. */
 function writeOperations(event) {
@@ -27,8 +27,25 @@ function writeOperations(event) {
 const kindOf = operation => operation?.op === 'update'
     ? operation.edits !== undefined ? 'updateEdits' : operation.content !== undefined ? 'updateContent' : 'updateOther'
     : operation?.op;
-/** The file an operation wrote: a create's returned ID, otherwise the requested one. */
-const fileOf = ({ operation, result }) => operation?.op === 'create' ? result?.fileId : operation?.fileId;
+/** The file an operation wrote: a create's or append's returned ID, otherwise the requested one. */
+const fileOf = ({ operation, result }) => ['create', 'append'].includes(operation?.op) ? result?.fileId : operation?.fileId;
+
+/**
+ * Whether each operation created, updated or deleted its file, in call order. An append
+ * created its file when it was by path, no earlier operation of the session wrote that
+ * file ID and the result's createdAt equals its modifiedAt; every other append updated it.
+ */
+function classify(operations) {
+    const written = new Set();
+    return operations.map(item => {
+        const { operation, result } = item, file = fileOf(item);
+        const change = operation?.op !== 'append' ? operation?.op
+            : operation.path !== undefined && !written.has(file) && typeof result?.createdAt === 'string' && result.createdAt === result.modifiedAt
+                ? 'create' : 'update';
+        if (typeof file === 'string') written.add(file);
+        return { ...item, change };
+    });
+}
 
 /** Mean and maximum of per-turn counts; the mean is null without turns. */
 const perTurn = counts => ({ mean: counts.length ? counts.reduce((sum, count) => sum + count, 0) / counts.length : null,
@@ -108,16 +125,16 @@ export function sessionMetrics({ userTurns, requests, events, observation = null
     const turns = Array.from({ length: userTurns }, (_, turn) => events.filter(event => event.turn === turn));
     const writes = events.filter(event => event.name === 'write');
     const saved = writes.filter(event => event.ok);
-    const operations = saved.flatMap(event => writeOperations(event).map(item => ({ ...item, event })));
+    const operations = classify(saved.flatMap(event => writeOperations(event).map(item => ({ ...item, event }))));
     const turnsByFile = new Map();
     for (const item of operations) {
         const file = fileOf(item);
         if (typeof file === 'string') turnsByFile.set(file, (turnsByFile.get(file) ?? new Set()).add(item.event.turn));
     }
-    const distinct = kind => new Set(operations.filter(item => item.operation?.op === kind).map(fileOf).filter(file => typeof file === 'string')).size;
-    // A create counts as looked up when a successful search, findText, list or read came earlier in the session.
+    const distinct = change => new Set(operations.filter(item => item.change === change).map(fileOf).filter(file => typeof file === 'string')).size;
+    // A create, or an append that created its file, counts as looked up when a successful search, findText, list or read came earlier in the session.
     const firstLookup = events.findIndex(event => event.ok && lookups.has(event.name));
-    const creates = operations.filter(item => item.operation?.op === 'create');
+    const creates = operations.filter(item => item.change === 'create');
     const lookedUp = creates.filter(item => firstLookup >= 0 && events.indexOf(item.event) > firstLookup).length;
     const guides = events.filter(event => event.name === 'guide');
     // Every successful write moved main's latest checkpoint to its own; a failed one left it.

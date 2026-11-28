@@ -142,16 +142,18 @@ LambdaDB lacks; callers build them when they need them.
   Writes from separate processes or SDK copies to the same view interleave. The
   original written last decides a file's path, content and metadata, and exact
   `edits` apply to the original read at the start of that write call, so a
-  concurrent replacement in between is overwritten. Racing writers to one file
+  concurrent replacement in between is overwritten; so is an append, which
+  reads the original the same way. Racing writers to one file
   can remove each other's chunks: the file stays readable but search may miss it
   until another update of that file (even with unchanged content or only a new
-  path) chunks it again. Racing creates can leave two files at one path; see
-  below.
+  path) chunks it again. Racing creates, including appends by a path without a
+  file, can leave two files at one path; see below.
 - **No other cross-call state.** The SDK keeps no caches, fences or
   registries. Retries and the ordering and ownership of a store or view across
   processes are the caller's responsibility.
 - **Path uniqueness within one process.** `create` and path changes check the
-  destination with a read before writing (`PATH_EXISTS`). Writes on one branch
+  destination with a read before writing (`PATH_EXISTS`), and an append by path
+  looks its path up before deciding to create. Writes on one branch
   in one process run one at a time, so the check holds there, except right after
   a write that was aborted or failed with an unknown outcome: a request it already
   sent can still be applied after the next write's check. Writers in separate
@@ -354,7 +356,15 @@ main changes main directly; use a fork when changes should stay separate.
 
 A file keeps its ID across moves and replacements. Pass `content` to replace the entire original, including with an empty string. Exact edits each require a distinct nonempty `oldText` that occurs exactly once in the current original. Their spans must be disjoint and all are resolved before applying replacements; a mismatch fails with `EDIT_CONFLICT`. Passing `metadata` replaces the user metadata object, and `{}` clears it. Files without metadata omit the field. A move with only `newPath` preserves both content and metadata and updates the existing chunk metadata without submitting document text for re-embedding. A content or metadata replacement creates a new chunk generation and can re-embed unchanged text.
 
-A batch can mix up to 100 `create`, `update`, and `delete` operations and returns results in input order. Duplicate file targets and destination paths fail before any write. Destinations must be free or already belong to the same file when checked, so a batch cannot reuse a path vacated by another operation in that batch. Updates to missing files fail with `FILE_NOT_FOUND`. A delete removes the original, which makes the file disappear, and then its chunks; deleting an absent file ID succeeds and removes any chunks an interrupted write left behind.
+In text mode, `{ op: 'append', path, content }` or `{ op: 'append', fileId, content }` adds `content` at the end of a file without reading it first, which suits a log of entries:
+
+```ts
+await drive.write({ op: 'append', path: '/notes/meetings.md', content: '- 2026-03-02: The user moved the review to Friday.' });
+```
+
+The new content is the existing content, one `\n` when that content is nonempty and does not end with a line break, then `content` unchanged. As in ranged reads and `findText`, `\n`, `\r\n` and a lone `\r` end a line, so existing `'a\r'` plus `'b'` gives `'a\rb'`. `content` must be nonempty text, and an append takes no `newPath`, `metadata` or `edits`. By `fileId`, a missing file fails with `FILE_NOT_FOUND`. By path, the SDK looks the path up in the same queue turn: without a file there it creates one with `content`, exactly as `create` would; with one file it appends to it; with several it fails with `PATH_AMBIGUOUS`, as `read` does. An append by path can also fail with `FILE_NOT_FOUND` when another process deletes the file between the path lookup and the read of its original. Otherwise an append is a content update: it records the modification, keeps the file's chunking strategy, chunks the whole file again under a new generation and is subject to the same 5 MiB original limit. It has no conflict check, since it does not depend on the existing text. External-vector stores reject `append` with `INVALID_INPUT`.
+
+A batch can mix up to 100 `create`, `update`, `append` and `delete` operations and returns results in input order. Duplicate file targets and destination paths fail before any write. An append by path claims its path before the path lookup, so two appends by one path, or an append and a create with the same path, fail with `INVALID_INPUT` ("Destination paths must be distinct within one write.") before any read, whether or not a file exists there. An append by `fileId`, and an append by path that resolves to an existing file, target that file, so another operation on the same file in the batch fails with `INVALID_INPUT` before any write. Destinations must be free or already belong to the same file when checked, so a batch cannot reuse a path vacated by another operation in that batch. Updates to missing files fail with `FILE_NOT_FOUND`. A delete removes the original, which makes the file disappear, and then its chunks; deleting an absent file ID succeeds and removes any chunks an interrupted write left behind.
 
 Within one call, a file becomes visible only after its chunks are written: chunks
 go first and the original last, and each request is confirmed with a consistent
@@ -704,7 +714,7 @@ try {
     await tools.execute('write', {
         operations: [{ op: 'update', fileId: file.fileId,
             edits: [{ oldText: 'Earlier decision', newText: 'Current decision and reason' }] }],
-    }, { signal: controller.signal }); // the plain write result
+    }, { signal: controller.signal }); // the plain write result, without file content
 } catch (error) {
     // { ok: false, error: { code, message, status?, details? } }
     const toolFailure = fileToolError(error);
@@ -719,8 +729,13 @@ drive method and rejects with SDK errors. No schema has an `at`, and an input
 with `at` fails with `INVALID_INPUT` before any storage request. Results carry no
 view selector either: `read` range pages and their `next`, and the `next` of
 `list` and `findText`, omit `at`, so a model forwards `next` unchanged. Other
-results are the SDK's. `write` accepts one SDK operation or
-`{ operations: [...] }` and returns one file/deletion result or an array.
+results are the SDK's, except `write`: it accepts one SDK operation or
+`{ operations: [...] }` (text mode adds `append`) and returns one result or an
+array in operation order, in which each created, updated or appended file is a
+`FileListEntry` (`fileId`, `path`, `createdAt`, `createdBy` when present,
+`modifiedAt`, `modifiedBy` when present, `metadata` when present) without
+`content`, and each deletion is `{ fileId }`. A model reads a file to see its
+text; `drive.write()` itself still returns `DriveFile` with content.
 `findText` requires text mode; selecting it for an external-vector drive fails
 with `TOOL_UNAVAILABLE`. External-vector definitions advertise vector inputs for
 `search` and `write` and return the SDK's file references. No embeddings or local
@@ -753,8 +768,10 @@ unchanged.
 Tool names, descriptions and schemas are the only text every client delivers to
 a model, so the descriptions carry everything ordinary use needs, including when
 to use each tool: `write`, for example, says what to save and not to wait to be
-asked. In text mode, `write` says to record what the user says outside
-`/preferences.md` as entries added at the end of a file, each with when
+asked. In text mode, `write` offers `append`, says it adds content at the end
+of a file without reading it, says its results identify files without their
+content, and says to record what the user says outside
+`/preferences.md` as entries appended to a file, each with when
 it was said if known, and to leave earlier entries as they are: a
 differing statement is added as a new entry, without rewriting the
 earlier one or noting which is correct or current, unless the user asks
@@ -811,7 +828,7 @@ when results are missing or too many, tree limits, listing pagination, ranged-re
 pages and cursors (`retrieval`); what counts as a duplicate, what belongs in
 `/preferences.md`, keeping both
 statements when new information conflicts with what is saved (in text
-mode, the new one as an entry at the end of a file, without noting
+mode, the new one as an entry at the end of a file with append, without noting
 which is correct or current; the later one is current when it updates
 the earlier one), preserving selected conversational wording, examples,
 qualifications and corrections instead of aggressively summarizing

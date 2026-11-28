@@ -8,10 +8,14 @@ import { performance } from 'node:perf_hooks';
 import { get_encoding } from 'tiktoken';
 import { createFileTools, fileToolError, getFileToolDefinitions } from '@functional-systems/memdrive';
 
-// v3: the seven main-only tools, with `tree` and a path-ordered, consistent `list`.
-// v2 offered six tools without `tree` and an unordered, eventual `list`; v1 used 16
-// tools with an `at` view selector and published forks with merge. Their runs are not comparable.
-export const protocol = 'memdrive-beam-session-replay-v3';
+// v4: text-mode `write` offers `append` and its results carry no file content.
+// v3 offered the seven main-only tools, with `tree` and a path-ordered, consistent
+// `list`, and returned each written file's content; v2 offered six tools without
+// `tree` and an unordered, eventual `list`; v1 used 16 tools with an `at` view
+// selector and published forks with merge. Their runs are not comparable.
+export const protocol = 'memdrive-beam-session-replay-v4';
+/** Replay protocols whose retained stores the question stage reads: v3 stores have the same layout. */
+export const readableProtocols = Object.freeze(['memdrive-beam-session-replay-v3', protocol]);
 /** The SDK's whole agent catalog, in its documented order. `--guide off` leaves out `guide`. */
 export const toolNames = Object.freeze(['guide', 'read', 'tree', 'list', 'search', 'findText', 'write']);
 export const guideSettings = Object.freeze(['on', 'off']);
@@ -210,7 +214,8 @@ export function openAI({ key, fetcher = fetch, endpoint = 'responses' }) {
  * has one, it reads the note, edits it exactly and tries to create it again
  * (`PATH_EXISTS`, which changes nothing). Session 1 describes the note's folder with
  * `tree`, creates a file without a lookup (`tree` is none), finds the note literally
- * and deletes it. Every other turn only replies. A step whose tool the run does not
+ * and deletes it, then appends by path to the file it created and to a new log, which
+ * the append creates. Every other turn only replies. A step whose tool the run does not
  * offer (`guide` with `--guide off`) is skipped.
  */
 export function scriptedTransport() {
@@ -234,6 +239,8 @@ export function scriptedTransport() {
             add('write', { op: 'create', path: '/notes/unsearched.md', content: 'Saved without looking first.\n' });
             add('findText', { query: 'revised', prefix: '/notes/' });
             add('write', previous => ({ op: 'delete', fileId: previous.hits[0].fileId }));
+            add('write', { operations: [{ op: 'append', path: '/notes/unsearched.md', content: 'An entry appended later.\n' },
+                { op: 'append', path: '/notes/log.md', content: 'First log entry.\n' }] });
         }
         return list;
     };

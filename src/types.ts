@@ -173,6 +173,21 @@ export type UpdateFileRequest = {
     | { content?: never; edits: TextEdit[] }
 );
 
+/**
+ * Add text at the end of a text file without reading it. By path, a missing file
+ * is created with `content`, and several files at the path fail with
+ * `PATH_AMBIGUOUS`. One `\n` separates `content` from existing content that is
+ * nonempty and does not end with a line break (`\n` or `\r`). In a batch, an
+ * append by path claims its path before any read: two appends by one path, or an
+ * append and a create at one path, fail with `INVALID_INPUT`; an append also
+ * targets the file it resolves to, which no other operation may target.
+ */
+export type AppendFileRequest = {
+    op: 'append';
+    /** Nonempty text to add. */
+    content: string;
+} & ({ fileId: string; path?: never } | { path: string; fileId?: never });
+
 export interface DeleteFileRequest {
     op: 'delete';
     fileId: string;
@@ -180,7 +195,7 @@ export interface DeleteFileRequest {
 export interface DeleteFileResult {
     fileId: string;
 }
-export type WriteFileRequest = CreateFileRequest | UpdateFileRequest | DeleteFileRequest;
+export type WriteFileRequest = CreateFileRequest | UpdateFileRequest | AppendFileRequest | DeleteFileRequest;
 export type WriteFileResult = DriveFile | DeleteFileResult;
 
 export interface CreateExternalFileRequest {
@@ -201,7 +216,7 @@ export interface UpdateExternalFileRequest {
 
 type FileMutation<Mode extends EmbeddingMode> = Mode extends 'external'
     ? CreateExternalFileRequest | UpdateExternalFileRequest
-    : CreateFileRequest | UpdateFileRequest;
+    : CreateFileRequest | UpdateFileRequest | AppendFileRequest;
 type ViewFile<Mode extends EmbeddingMode> = Mode extends 'external' ? FileListEntry : DriveFile;
 type ViewSearch<Mode extends EmbeddingMode> = Mode extends 'external' ? SearchExternalFilesRequest : SearchFilesRequest;
 type ViewSearchResult<Mode extends EmbeddingMode> = Mode extends 'external' ? SearchExternalFilesResult : SearchFilesResult;

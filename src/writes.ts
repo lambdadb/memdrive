@@ -18,6 +18,9 @@ type NativeRecord = Identity & { id: string; kind: 'file' | 'chunk'; revision?: 
 type WriteRecord = { doc: NativeRecord; inputBytes: number; wireBytes: number };
 type Mutation = WriteFileRequest | CreateExternalFileRequest | UpdateExternalFileRequest;
 type FileRecords = Awaited<ReturnType<typeof createRecords>>;
+type Input = { op: 'create'; records: FileRecords } | ReturnType<typeof editRequest>;
+/** An input after appends by path are resolved to a create or an append by fileId. */
+type Resolved = Exclude<Input, { op: 'append'; path: string }>;
 type Plan = { op: 'create'; records: FileRecords } | Awaited<ReturnType<typeof planEdit>>;
 type Stage = 'write-chunks' | 'write-original' | 'delete-original' | 'cleanup-chunks';
 /** Filled by a tracked write: created and targeted file IDs, and whether a native mutation was sent. */
@@ -151,6 +154,44 @@ export function fileWriter(handle: Handle, name: string, schema: MetadataSchema,
     }
 
     /**
+     * Resolve appends by path with one consistent lookup in the caller's queue
+     * turn: a path without a file becomes a create, a path with one file an
+     * append by its fileId, and a path several files share fails as on read.
+     * Append paths must differ from each other and from the paths of creates.
+     */
+    async function resolveAppends(inputs: Input[], branchSettings: ReturnType<typeof branchRead>, change: WriteChange, signal?: AbortSignal) {
+        const paths = inputs.flatMap(input => input.op === 'append' && input.path !== undefined ? [input.path] : []);
+        const creates = new Set(inputs.flatMap(input => input.op === 'create' ? [input.records.file.path] : []));
+        requireInput(new Set(paths).size === paths.length && !paths.some(path => creates.has(path)),
+            'Destination paths must be distinct within one write.');
+        const found = new Map<string, string[]>(paths.map(path => [path, []]));
+        if (paths.length) {
+            let response;
+            try {
+                response = await nativeRequest(() => handle.query({ size: maximumRequestDocuments, ...branchSettings,
+                    query: pathQuery(paths), fields: { include: ['id', 'kind', 'fileId', 'path'] } }, nativeOptions(signal)), signal);
+            } catch (cause) { throw databaseError(cause, 'Could not look up the files to append to.'); }
+            checkAbort(signal);
+            for (const doc of resultDocs(response, name, maximumRequestDocuments)) {
+                if (doc.kind !== 'file' || !validFileId(doc.fileId) || doc.id !== originalId(doc.fileId)
+                    || typeof doc.path !== 'string' || !found.has(doc.path))
+                    throw new MemDriveError('INVALID_RESULT', 'Append path lookup returned an unexpected file.');
+                found.get(doc.path)!.push(doc.fileId);
+            }
+        }
+        const ambiguous = [...found].filter(([, fileIds]) => fileIds.length > 1);
+        if (ambiguous.length) throw new MemDriveError('PATH_AMBIGUOUS', 'Several files share a requested path. Read or change them by fileId.',
+            { details: { paths: ambiguous.map(([path, fileIds]) => ({ path, fileIds: fileIds.sort() })) } });
+        return Promise.all(inputs.map(async (input): Promise<Resolved> => {
+            if (input.op !== 'append' || input.path === undefined) return input;
+            const [fileId] = found.get(input.path)!;
+            return fileId === undefined
+                ? { op: 'create', records: await createRecords({ op: 'create', path: input.path, content: input.content }, change, schema, dimensions, chunker, { signal }) }
+                : { op: 'append', fileId, content: input.content };
+        }));
+    }
+
+    /**
      * `track`, when given, receives the file IDs this call creates and the
      * existing file IDs it targets, before the first native mutation.
      */
@@ -160,17 +201,18 @@ export function fileWriter(handle: Handle, name: string, schema: MetadataSchema,
         const multi = Array.isArray(request);
         const operations = multi ? [...request] : [request];
         requireInput(operations.length >= 1 && operations.length <= writeBatchLimit, 'Submit 1–100 file operations.');
-        const inputs = await Promise.all(operations.map(async operation => operation?.op === 'create'
+        const parsed: Input[] = await Promise.all(operations.map(async operation => operation?.op === 'create'
             ? { op: 'create' as const, records: await createRecords(operation, change, schema, dimensions, chunker, { signal }) }
             : editRequest(operation, schema, dimensions)));
         checkAbort(signal);
+        const branchSettings = branchRead(branch);
+        const inputs = await resolveAppends(parsed, branchSettings, change, signal);
         const targetIds = inputs.flatMap(input => input.op === 'create' ? [] : [input.fileId]);
         requireInput(new Set(targetIds).size === targetIds.length, 'Target file IDs must be distinct within one write.');
         if (track) {
             track.created.push(...inputs.flatMap(input => input.op === 'create' ? [input.records.file.fileId] : []));
             track.changed.push(...targetIds);
         }
-        const branchSettings = branchRead(branch);
 
         const originals = await fetchOriginals(handle, name, branchRef(branch), targetIds, signal, dimensions !== undefined);
         const plans: Plan[] = await Promise.all(inputs.map(input =>

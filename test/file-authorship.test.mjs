@@ -233,7 +233,8 @@ test('file tools pass the host actor and time on every write and reject them fro
     assert.deepEqual(attribution(file), stamp(t1, alice));
     const [updated] = await tools.execute('write', { operations: [{ op: 'update', fileId: file.fileId, content: 'Alpha, revised.' }] });
     assert.deepEqual(attribution(updated), stamp(t1, alice, t2, alice));
-    assert.deepEqual(await tools.execute('read', { fileId: file.fileId }), updated);
+    const { content, ...entry } = await tools.execute('read', { fileId: file.fileId });
+    assert.deepEqual([content, entry], ['Alpha, revised.', updated]);
 
     let turn = 0;
     const checkpointed = createFileTools({ drive, tools: ['write'], actor: bob, now, checkpoint: () => ({ name: `turn-${++turn}` }) });

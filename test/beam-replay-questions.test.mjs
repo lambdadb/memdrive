@@ -623,9 +623,24 @@ test('runs without a retained store, ledgers from elsewhere and existing outputs
     const runManifest = await json(path.join(files.run, 'manifest.json'));
     for (const earlier of ['memdrive-beam-session-replay-v1', 'memdrive-beam-session-replay-v2']) {
         await writeFile(path.join(files.run, 'manifest.json'), JSON.stringify({ ...runManifest, protocol: earlier }));
-        await rejected('old-run', {}, new RegExp(`used ${earlier}; the question stage reads only memdrive-beam-session-replay-v3 runs`));
+        await rejected('old-run', {}, new RegExp(`used ${earlier}; the question stage reads only memdrive-beam-session-replay-v3 and memdrive-beam-session-replay-v4 runs`));
     }
     await writeFile(path.join(files.run, 'manifest.json'), JSON.stringify({ ...runManifest, protocol: 'memdrive-tool-use-v4' }));
     await rejected('other-run', {}, /Use a BEAM session replay run/);
+    // The run's summary must carry the protocol of its manifest.
+    const runSummary = await json(path.join(files.run, 'summary.json'));
+    await writeFile(path.join(files.run, 'manifest.json'), JSON.stringify({ ...runManifest, protocol: 'memdrive-beam-session-replay-v3' }));
+    await rejected('mixed-run', {}, /unfinished or did not retain its store/);
     assert.deepEqual(files.counts, { ask: 0, judge: 0 });
+    // A v3 run, whose write tool had no append and returned content, has the same store layout and is still asked.
+    await writeFile(path.join(files.run, 'store.json'), JSON.stringify(ledger));
+    await writeFile(path.join(files.run, 'summary.json'), JSON.stringify({ ...runSummary, protocol: 'memdrive-beam-session-replay-v3' }));
+    const earlier = await files.stage('v3-run');
+    assert.deepEqual([runManifest.protocol, earlier.manifest.run.manifestSha256 === hash(JSON.stringify({ ...runManifest, protocol: 'memdrive-beam-session-replay-v3' })),
+        earlier.manifest.run.protocol, earlier.summary.questions.complete, earlier.summary.store.unchanged],
+    ['memdrive-beam-session-replay-v4', true, 'memdrive-beam-session-replay-v3', true, true]);
+    // The stage manifest records the replay protocol of the run it read.
+    await writeFile(path.join(files.run, 'manifest.json'), JSON.stringify(runManifest));
+    await writeFile(path.join(files.run, 'summary.json'), JSON.stringify(runSummary));
+    assert.equal((await files.stage('v4-run')).manifest.run.protocol, 'memdrive-beam-session-replay-v4');
 });
