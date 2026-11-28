@@ -753,13 +753,14 @@ unchanged.
 Tool names, descriptions and schemas are the only text every client delivers to
 a model, so the descriptions carry everything ordinary use needs, including when
 to use each tool: `write`, for example, says what to save and not to wait to be
-asked. In text mode, `write` says to record what the user says as entries added
-at the end of a file, each with when it was said, and to leave earlier entries
-as they are: a differing statement is added as a new entry, without rewriting
-the earlier one or noting which is correct or current, unless the user asks to
-change the saved text. External-vector descriptions instead say to keep the
-earlier statement and add the new one with when it was said. In text mode,
-`write` also says to keep what the user says they want in
+asked. In text mode, `write` says to record what the user says outside
+`/preferences.md` as entries added at the end of a file, each with when
+it was said if known, and to leave earlier entries as they are: a
+differing statement is added as a new entry, without rewriting the
+earlier one or noting which is correct or current, unless the user asks
+to change the saved text. External-vector descriptions instead say to
+keep the earlier statement and add the new one with when it was said.
+In text mode, `write` also says to keep what the user says they want in
 answers always or from now on in `/preferences.md`, one per line, replacing a
 line when the user changes it, and `read` says to read that file before the
 first answer of a conversation and to follow it for how answers are given,
@@ -809,11 +810,12 @@ explanations the tool descriptions leave out: choosing a search mode, what to do
 when results are missing or too many, tree limits, listing pagination, ranged-read
 pages and cursors (`retrieval`); what counts as a duplicate, what belongs in
 `/preferences.md`, keeping both
-statements when new information conflicts with what is saved (in text mode, the
-new one as an entry at the end of a file, without noting which is correct or
-current; the later one is current when it updates the earlier one), preserving
-selected conversational wording, examples, qualifications and corrections
-instead of aggressively summarizing them, what each write error means, moves and deletion caveats
+statements when new information conflicts with what is saved (in text
+mode, the new one as an entry at the end of a file, without noting
+which is correct or current; the later one is current when it updates
+the earlier one), preserving selected conversational wording, examples,
+qualifications and corrections instead of aggressively summarizing
+them, what each write error means, moves and deletion caveats
 (`editing`). It does not require new metadata or capturing every utterance. Long
 originals can be delivered through ranged reads without reducing their stored
 detail. The guide `version` changes only in release pull requests.

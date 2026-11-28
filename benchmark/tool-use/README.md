@@ -145,7 +145,7 @@ instructions asked for a save each turn and for reading the guide, the `write`
 description did not say when to save and the scripted tool channel read the
 guide index and `retrieval` topic first. Protocol `memdrive-tool-use-v6` runs
 lacked the `/preferences.md` sentences of the text-mode `write` and `read`
-descriptions. Model runs of v7 are expected to start with a read of
+descriptions. Model runs of v7 and later are expected to start with a read of
 `/preferences.md`, so their first-tool and read-count metrics are not comparable
 with v6. Protocol `memdrive-tool-use-v7` runs used the earlier text-mode `write`
 sentence that kept a differing earlier statement beside the new one, instead of
