@@ -19,14 +19,7 @@
       "exclude": "The premise does not hold: the expected answer is that no information exists, but user turn 64 says a \"weaving threads\" metaphor was added \"per Shawn's advice\". The rubric item is also garbled (\"related related\")."
     },
     "9_knowledge_update_1": {
-      "rubric": [
-        {
-          "index": 0,
-          "original": "LLM response should state: May 22",
-          "replacement": "LLM response should state: May 20",
-          "reason": "\"May 22\" appears nowhere in the conversation: the planned rescheduling message was never generated, and the updated_info evidence turn is the original_info turn. The user states the session date as May 20 in user turns 138, 140, 154 and 156. The amended question tests recall of the stated date, not an update, although its category stays knowledge_update."
-        }
-      ]
+      "exclude": "The expected \"May 22\" appears nowhere in the conversation: the planned rescheduling message was never generated, and the updated_info evidence turn is the original_info turn. The user only ever states May 20 (user turns 138, 140, 154 and 156), so the question cannot test an update, and correcting the key would change it into a recall question."
     },
     "9_preference_following_1": {
       "exclude": "The tested preference (writing in quiet places) is never stated: no user turn contains it, and the dataset names no evidence turn."

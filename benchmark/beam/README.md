@@ -587,8 +587,9 @@ the dataset.
 
 Recorded so far, for the 100K split: one rule for every contradiction question
 (`contradiction-ask`), and question entries only for conversations 6 and 9,
-the only ones audited. They amend one item of `9_knowledge_update_1` and exclude
-`6_multi_session_reasoning_0`, `9_abstention_0` and `9_preference_following_1`.
+the only ones audited. They are four exclusions, `6_multi_session_reasoning_0`,
+`9_abstention_0`, `9_knowledge_update_1` and `9_preference_following_1`, and no
+per-question rubric amendments.
 Other conversations have known defects that are not recorded; they are not
 amended until they are audited the same way.
 
