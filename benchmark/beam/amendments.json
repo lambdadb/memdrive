@@ -1,0 +1,15 @@
+{
+  "protocol": "memdrive-beam-amendments-v1",
+  "split": "100k",
+  "datasetRevision": "3205395e897e7318c7b094ef4e6047b9b82dbb03",
+  "rules": [
+    {
+      "id": "contradiction-ask",
+      "category": "contradiction_resolution",
+      "original": "LLM response should mention: which statement is correct?",
+      "replacement": "LLM response should ask the user which statement is correct",
+      "reason": "The dataset's ideal answers and tests_for ask for a request for clarification instead of a definitive answer, and judges read the original wording both ways: as asking the user which statement is correct, or as stating which one is."
+    }
+  ],
+  "questions": {}
+}

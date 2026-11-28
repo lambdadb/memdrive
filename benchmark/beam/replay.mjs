@@ -197,7 +197,7 @@ const help = `Replay one prepared original-BEAM conversation against the MemDriv
 Ask and judge the BEAM questions against the store a LambdaDB run retained:
   --questions --run RUN_DIR --manifest FILE --output NEW_DIR [--scope replayed|all]
   [--model ID] [--judge-model ID] [--judge-effort low|medium|high] [--limit N]
-  [--answer-policy-file FILE] [--guide on|off] [--env-file FILE]
+  [--answer-policy-file FILE] [--guide on|off] [--amendments on|off] [--env-file FILE]
 Delete the LambdaDB store a run retained:
   --cleanup --output RUN_DIR [--env-file FILE]
 Model mode needs LLM_API_KEY and makes paid requests. Scripted mode makes none.
@@ -207,14 +207,16 @@ Questions need LLM_API_KEY and the LambdaDB settings, make paid model and
 database requests, and leave the store unchanged.
 Judge the stored answers of a question stage again:
   --rejudge --answers QUESTIONS_DIR --manifest FILE --output NEW_DIR
-  [--judge-model ID] [--judge-effort low|medium|high] [--repeats N] [--env-file FILE]
+  [--judge-model ID] [--judge-effort low|medium|high] [--repeats N] [--amendments on|off] [--env-file FILE]
 Rejudge needs only LLM_API_KEY and makes paid judge requests.
+--amendments on (default) also judges the items benchmark/beam/amendments.json amends
+and reports amended scores beside the original ones, which it never changes.
 `;
 
 async function main() {
     const { values } = parseArgs({ options: Object.fromEntries([
         ...['manifest', 'conversation', 'output', 'mode', 'model', 'instructions', 'policy-file', 'guide', 'sessions', 'turns', 'env-file',
-            'backend', 'session-tokens', 'session-seconds', 'context-tokens', 'run', 'scope', 'judge-model', 'judge-effort', 'limit', 'answer-policy-file', 'answers', 'repeats'].map(option => [option, { type: 'string' }]),
+            'backend', 'session-tokens', 'session-seconds', 'context-tokens', 'run', 'scope', 'judge-model', 'judge-effort', 'limit', 'answer-policy-file', 'answers', 'repeats', 'amendments'].map(option => [option, { type: 'string' }]),
         ['help', { type: 'boolean' }], ['cleanup', { type: 'boolean' }], ['questions', { type: 'boolean' }], ['rejudge', { type: 'boolean' }],
     ]) });
     if (values.help) { console.log(help); return; }
@@ -226,28 +228,30 @@ async function main() {
         return;
     }
     const count = value => value === undefined ? undefined : Number(value);
-    const questionOptions = ['questions', 'run', 'manifest', 'output', 'scope', 'model', 'judge-model', 'judge-effort', 'limit', 'answer-policy-file', 'guide', 'env-file'];
+    const questionOptions = ['questions', 'run', 'manifest', 'output', 'scope', 'model', 'judge-model', 'judge-effort', 'limit', 'answer-policy-file', 'guide', 'amendments',
+        'env-file'];
     if (values.questions) {
         assert(values.run && values.manifest && values.output && Object.keys(values).every(option => questionOptions.includes(option)),
-            'Questions take --run RUN_DIR --manifest FILE --output NEW_DIR and optionally --scope, --model, --judge-model, --judge-effort, --limit, --answer-policy-file, --guide and --env-file');
+            'Questions take --run RUN_DIR --manifest FILE --output NEW_DIR and optionally --scope, --model, --judge-model, --judge-effort, --limit, --answer-policy-file, --guide, '
+            + '--amendments and --env-file');
         const { summary } = await runQuestions({ run: values.run, manifest: values.manifest, output: values.output, scope: values.scope,
             model: values.model, judgeModel: values['judge-model'], judgeEffort: values['judge-effort'], limit: count(values.limit),
-            answerPolicyFile: values['answer-policy-file'], guide: values.guide, env, key: env.LLM_API_KEY });
+            answerPolicyFile: values['answer-policy-file'], guide: values.guide, amendments: values.amendments, env, key: env.LLM_API_KEY });
         console.log(json(summary));
         if (!questionsSucceeded(summary)) process.exitCode = 1;
         return;
     }
     if (values.rejudge) {
         assert(values.answers && values.manifest && values.output
-            && Object.keys(values).every(option => ['rejudge', 'answers', 'manifest', 'output', 'judge-model', 'judge-effort', 'repeats', 'env-file'].includes(option)),
-        'Rejudge takes --answers QUESTIONS_DIR --manifest FILE --output NEW_DIR and optionally --judge-model, --judge-effort, --repeats and --env-file');
+            && Object.keys(values).every(option => ['rejudge', 'answers', 'manifest', 'output', 'judge-model', 'judge-effort', 'repeats', 'amendments', 'env-file'].includes(option)),
+        'Rejudge takes --answers QUESTIONS_DIR --manifest FILE --output NEW_DIR and optionally --judge-model, --judge-effort, --repeats, --amendments and --env-file');
         const { summary } = await runRejudge({ answers: values.answers, manifest: values.manifest, output: values.output,
-            judgeModel: values['judge-model'], judgeEffort: values['judge-effort'], repeats: count(values.repeats), key: env.LLM_API_KEY });
+            judgeModel: values['judge-model'], judgeEffort: values['judge-effort'], repeats: count(values.repeats), amendments: values.amendments, key: env.LLM_API_KEY });
         console.log(json(summary));
-        if (!summary.questions.complete || summary.tokens.failedRequests) process.exitCode = 1;
+        if (!summary.questions.complete || summary.tokens.failedRequests || summary.amendedTokens?.failedRequests) process.exitCode = 1;
         return;
     }
-    assert(values.manifest && values.conversation && values.output && !['run', 'scope', 'judge-model', 'judge-effort', 'limit', 'answer-policy-file', 'answers', 'repeats'].some(option => option in values), help);
+    assert(values.manifest && values.conversation && values.output && !['run', 'scope', 'judge-model', 'judge-effort', 'limit', 'answer-policy-file', 'answers', 'repeats', 'amendments'].some(option => option in values), help);
     const { summary } = await runReplay({ manifest: values.manifest, conversation: values.conversation, output: values.output,
         mode: values.mode, model: values.model, instructions: values.instructions, policyFile: values['policy-file'], guide: values.guide,
         sessions: count(values.sessions), turns: count(values.turns), sessionTokens: count(values['session-tokens']),

@@ -66,8 +66,14 @@ async function prepared(t) {
         datasetRevision: cohort.datasetRevision, sourceFiles: Object.fromEntries(cohort.files.map(file => [file.name, file.sha256])),
         conversations: [{ id: '7', runtime: 'conversations/7.json', runtimeSha256: hash(runtime), questions: questions.length,
             evaluation: 'evaluation/7.json', evaluationSha256: hash(evaluationBytes) }] }));
-    return { root, manifest, questions, evaluation };
+    // Synthetic amendments, so that the committed file's entries never meet the fixture's question IDs.
+    const amendments = path.join(root, 'amendments.json');
+    await writeFile(amendments, JSON.stringify(amendmentData({})));
+    return { root, manifest, questions, evaluation, amendments };
 }
+
+const amendmentData = ({ rules = [], questions = {} }) => ({ protocol: 'memdrive-beam-amendments-v1', split: '100k',
+    datasetRevision: config.cohorts['100k'].datasetRevision, rules, questions });
 
 const endpoint = 'https://lambdadb.example', project = 'replay-test';
 const message = (request, text) => ({ model: request.model, status: 'completed', usage: { input_tokens: 3, output_tokens: 2 },
@@ -94,7 +100,7 @@ async function replayed(t) {
     // A new client object, as in a separate process: the stage opens the store cold.
     const connect = () => ({ client: { ...fixture.client }, endpoint, project });
     const counts = { ask: 0, judge: 0 };
-    const stage = (name, options = {}) => runQuestions({ run, manifest: files.manifest, output: path.join(files.root, name), connect,
+    const stage = (name, options = {}) => runQuestions({ run, manifest: files.manifest, output: path.join(files.root, name), connect, amendmentsSource: files.amendments,
         ask: async request => { counts.ask++; return message(request, 'answer'); },
         judge: async request => { counts.judge++; return scored(1)(request); }, ...options });
     return { ...files, fixture, run, replay, connect, stage, counts };
@@ -139,7 +145,7 @@ test('each question is a fresh read-only conversation with the run instructions 
         return context.session === 0 && context.round === 0 ? toolCall(request, 'search-1', 'search', { query: 'note' }) : message(request, `Answer ${context.session}`);
     } });
     const definitions = getFileToolDefinitions({ embeddingMode: 'managed', tools: readToolNames });
-    assert.deepEqual([[...readToolNames], manifest.protocol], [['guide', 'read', 'tree', 'list', 'search', 'findText'], 'memdrive-beam-replay-questions-v3']);
+    assert.deepEqual([[...readToolNames], manifest.protocol], [['guide', 'read', 'tree', 'list', 'search', 'findText'], 'memdrive-beam-replay-questions-v4']);
     assert.deepEqual([manifest.tools, manifest.toolDefinitions, manifest.model, manifest.judgeModel], [readToolNames, definitions, 'gpt-6.1-sol', defaultJudgeModel]);
     assert.deepEqual([manifest.guide, manifest.run.guide, summary.guide], ['on', 'on', 'on']);
     assert.equal(manifest.instructions.sha256, hash(fileToolInstructions));
@@ -360,7 +366,7 @@ test('stored answers are judged again without asking, and agreement is counted p
     // Repeat 0 agrees with the original; repeat 1 changes item 0.1 and fails on item 1.0.
     const calls = new Map(), requests = [];
     const again = await runRejudge({ answers: path.join(files.root, 'first'), manifest: files.manifest, output: path.join(files.root, 'again'),
-        judgeModel: 'stronger-judge', repeats: 2, judge: async request => {
+        amendmentsSource: files.amendments, judgeModel: 'stronger-judge', repeats: 2, judge: async request => {
             requests.push(request);
             const [question, item] = marker(request), key = `${question}.${item}`, repeat = calls.get(key) ?? 0;
             calls.set(key, repeat + 1);
@@ -388,24 +394,25 @@ test('stored answers are judged again without asking, and agreement is counted p
     assert.deepEqual(judgeAgreement([{ original: null, scores: [1, 1] }, { original: 0, scores: [1, 1] }, { original: 1, scores: [null] }]),
         { items: 3, scored: 2, stable: 2, unstable: 0, comparable: 1, sameAsOriginal: 0 });
     const reject = (options, message) => assert.rejects(runRejudge({ answers: path.join(files.root, 'first'), manifest: files.manifest,
-        output: path.join(files.root, 'rejected'), judge: scored(1), ...options }), message);
+        output: path.join(files.root, 'rejected'), judge: scored(1), amendmentsSource: files.amendments, ...options }), message);
     await reject({ answers: files.run }, /question-stage output/);
     await reject({ repeats: 0 }, /repeats/);
     await reject({ judgeEffort: 'extreme' }, /judge-effort/);
     // A reasoning judge rejects temperature 0: the effort replaces it and is recorded.
     const efforts = [];
     const reasoned = await runRejudge({ answers: path.join(files.root, 'first'), manifest: files.manifest, output: path.join(files.root, 'reasoned'),
-        judgeModel: 'reasoning-judge', judgeEffort: 'high', judge: async request => { efforts.push(request); return scored(1)(request); } });
+        amendmentsSource: files.amendments, judgeModel: 'reasoning-judge', judgeEffort: 'high', judge: async request => { efforts.push(request); return scored(1)(request); } });
     assert(efforts.length === 7 && efforts.every(request => request.reasoning_effort === 'high' && !('temperature' in request)));
     assert.deepEqual([reasoned.manifest.judgeRequest, reasoned.summary.judgeRequest],
         [{ reasoning_effort: 'high', perRubricItem: true, retries: 0 }, { reasoning_effort: 'high', perRubricItem: true, retries: 0 }]);
     await reject({ output: path.join(files.root, 'again') }, { code: 'EEXIST' });
     // Stored answers of the earlier question protocols share this format and are judged the same way.
     const stage = await json(path.join(files.root, 'first', 'manifest.json'));
-    assert.equal(stage.protocol, 'memdrive-beam-replay-questions-v3');
-    for (const protocol of ['memdrive-beam-replay-questions-v1', 'memdrive-beam-replay-questions-v2']) {
+    assert.equal(stage.protocol, 'memdrive-beam-replay-questions-v4');
+    for (const protocol of ['memdrive-beam-replay-questions-v1', 'memdrive-beam-replay-questions-v2', 'memdrive-beam-replay-questions-v3']) {
         await writeFile(path.join(files.root, 'first', 'manifest.json'), JSON.stringify({ ...stage, protocol }));
-        const earlier = await runRejudge({ answers: path.join(files.root, 'first'), manifest: files.manifest, output: path.join(files.root, protocol), judge: scored(1) });
+        const earlier = await runRejudge({ answers: path.join(files.root, 'first'), manifest: files.manifest, output: path.join(files.root, protocol), judge: scored(1),
+            amendmentsSource: files.amendments });
         assert.deepEqual(earlier.summary.questions, { stored: 4, judged: 4, complete: true });
     }
     await writeFile(path.join(files.root, 'first', 'manifest.json'), JSON.stringify({ ...stage, protocol: 'memdrive-beam-replay-questions-v0' }));
@@ -414,6 +421,162 @@ test('stored answers are judged again without asking, and agreement is counted p
     await writeFile(path.join(files.root, 'evaluation', '7.json'), '[]');
     await reject({}, /Prepared evaluation differs/);
     assert.equal(await exists(path.join(files.root, 'rejected')), false);
+});
+
+// A rule amends the contradiction question's item 1.1, a question entry item 0.2, question 9 is
+// excluded, and an entry for another conversation does not apply.
+async function amended(t) {
+    const files = await replayed(t);
+    const file = path.join(files.root, 'amended.json');
+    await writeFile(file, JSON.stringify(amendmentData({
+        rules: [{ id: 'r1', category: 'contradiction_resolution', original: 'RUBRIC-MARKER 1.1', replacement: 'AMENDED-RUBRIC 1.1', reason: 'Read both ways' }],
+        questions: { [ids[0]]: { rubric: [{ index: 2, original: 'RUBRIC-MARKER 0.2', replacement: 'AMENDED-RUBRIC 0.2', reason: 'Contradicts the answer' }] },
+            [ids[9]]: { exclude: 'The premise does not hold' }, '8_abstention_0': { exclude: 'Another conversation' } } })));
+    // Original items score [1, 0.5, 0] for question 0, [1, 0] for question 1 and 1 elsewhere; amended items score 1 unless `amendedScore` gives another response.
+    const original = { 0: [1, 0.5, 0], 1: [1, 0] };
+    const item = request => /(RUBRIC-MARKER|AMENDED-RUBRIC) (\d+)\.(\d+)/.exec(request.messages[0].content);
+    const judge = (seen, amendedScore = () => scored(1)) => async request => {
+        const [marker, kind, question, index] = item(request);
+        seen.push(marker);
+        return kind === 'AMENDED-RUBRIC' ? amendedScore(marker)(request) : scored(original[question]?.[index] ?? 1)(request);
+    };
+    return { ...files, file, sha256: hash(await readFile(file)), judge };
+}
+
+test('amended items are judged apart from the original rubric, which keeps its requests and scores', async t => {
+    const files = await amended(t);
+    const onRequests = [], offRequests = [];
+    const on = await files.stage('on', { amendmentsSource: files.file, judge: files.judge(onRequests) });
+    const off = await files.stage('off', { amendmentsSource: files.file, amendments: 'off', judge: files.judge(offRequests) });
+    // One more request per amended item, after the question's original items; the original requests are unchanged.
+    assert.deepEqual(onRequests, ['RUBRIC-MARKER 0.0', 'RUBRIC-MARKER 0.1', 'RUBRIC-MARKER 0.2', 'AMENDED-RUBRIC 0.2', 'RUBRIC-MARKER 1.0', 'RUBRIC-MARKER 1.1',
+        'AMENDED-RUBRIC 1.1', 'RUBRIC-MARKER 6.0', 'RUBRIC-MARKER 7.0', 'RUBRIC-MARKER 9.0']);
+    assert.deepEqual(offRequests, onRequests.filter(marker => marker.startsWith('RUBRIC-MARKER')));
+    assert.deepEqual(on.results.map(result => result.judge), off.results.map(result => result.judge));
+
+    // The amended score uses the amended judgment where an item is amended and the original elsewhere.
+    assert.deepEqual(on.results.map(result => [result.id, result.excluded, result.score, result.amendedScore]), [[ids[0], undefined, 0.5, 2.5 / 3],
+        [ids[1], undefined, 0.5, 1], [ids[6], undefined, 1, undefined], [ids[7], undefined, 1, undefined], [ids[9], 'The premise does not hold', 1, undefined]]);
+    const usage = { prompt_tokens: 10, completion_tokens: 5 };
+    assert.deepEqual([on.results[0].amendedJudge, on.results[1].amendedJudge], [
+        { status: 'judged', items: [{ index: 2, rubricItem: 'AMENDED-RUBRIC 0.2', amendment: { reason: 'Contradicts the answer' }, status: 'scored', score: 1, usage }] },
+        { status: 'judged', items: [{ index: 1, rubricItem: 'AMENDED-RUBRIC 1.1', amendment: { rule: 'r1' }, status: 'scored', score: 1, usage }] }]);
+    const log = await jsonl(path.join(files.root, 'on', `question-001-${ids[0]}`, 'amended-judge.jsonl'));
+    assert.deepEqual(log.map(entry => [entry.index, entry.rubricItem, entry.amendment, entry.score, entry.reason]),
+        [[2, 'AMENDED-RUBRIC 0.2', { reason: 'Contradicts the answer' }, 1, 'scored 1']]);
+    assert.equal(await exists(path.join(files.root, 'on', `question-003-${ids[6]}`, 'amended-judge.jsonl')), false);
+    assert(off.results.every(result => !['excluded', 'amendedScore', 'amendedJudge'].some(key => key in result)));
+
+    const stats = (asked, judged, meanOverJudged) => ({ asked, answered: asked, failed: 0, judged, unjudged: asked - judged, meanOverJudged });
+    // Excluded questions stay in the original scores and leave the amended ones.
+    assert.deepEqual(on.summary.scores.overall, stats(5, 5, (0.5 + 0.5 + 1 + 1 + 1) / 5));
+    assert.deepEqual(on.summary.amendedScores.overall, stats(4, 4, (2.5 / 3 + 1 + 1 + 1) / 4));
+    assert.deepEqual(Object.keys(on.summary.amendedScores.byCategory), ['abstention', 'contradiction_resolution', 'information_extraction', 'preference_following']);
+    assert.deepEqual(on.summary.amendedScores.byCategory.contradiction_resolution, stats(1, 1, 1));
+    assert.deepEqual(on.summary.amendments, { setting: 'on', sha256: files.sha256, amendedQuestions: 2, amendedItems: 2, excludedQuestions: 1 });
+    assert.deepEqual(on.manifest.amendments, { setting: 'on', sha256: files.sha256, questions: {
+        [ids[0]]: { items: [{ index: 2, replacement: 'AMENDED-RUBRIC 0.2', reason: 'Contradicts the answer' }] },
+        [ids[1]]: { items: [{ index: 1, replacement: 'AMENDED-RUBRIC 1.1', rule: 'r1' }] }, [ids[9]]: { excluded: 'The premise does not hold' } } });
+    assert.deepEqual(on.summary.tokens.amendedJudge, { requests: 2, failedRequests: 0, prompt: 20, completion: 10, unknownUsageRequests: 0 });
+    assert.deepEqual([on.summary.questionResults[0].amendedScore, on.summary.questionResults[0].amendedJudge, on.summary.questionResults[4].excluded],
+        [2.5 / 3, 'judged', 'The premise does not hold']);
+    assert.deepEqual([questionsSucceeded(on.summary), questionsSucceeded(off.summary)], [true, true]);
+    assert.deepEqual(await json(path.join(files.root, 'on', 'summary.json')), JSON.parse(JSON.stringify(on.summary)));
+
+    // Off records only its setting and has the summary fields of the stage before amendments.
+    assert.deepEqual([off.manifest.amendments, off.summary.amendments], [{ setting: 'off', sha256: null }, { setting: 'off', sha256: null }]);
+    assert.deepEqual(Object.keys(off.summary), ['protocol', 'transport', 'judgeTransport', 'measured', 'conversationId', 'run', 'scope', 'limit', 'model', 'judgeModel',
+        'guide', 'amendments', 'questions', 'scores', 'retrieval', 'tokens', 'timing', 'store', 'questionResults', 'limitations']);
+    const unamended = ({ amendments, amendedScores, timing, tokens: { amendedJudge, ...tokens }, questionResults, limitations, ...rest }) => ({ ...rest, tokens,
+        questionResults: questionResults.map(({ excluded, amendedScore, amendedJudge: status, ...result }) => result),
+        limitations: limitations.filter(text => !text.startsWith('amendedScores')) });
+    assert.deepEqual(unamended(on.summary), unamended(off.summary));
+    assert.equal(off.summary.limitations.length, on.summary.limitations.length - 1);
+
+    // Amended judgments must be complete for a successful stage; an unanswered question has no amended score.
+    const failing = await files.stage('failing', { amendmentsSource: files.file, limit: 2,
+        ask: async (request, { session }) => { if (session === 0) throw new Error('offline'); return message(request, 'answer'); },
+        judge: files.judge([], () => request => verdict(request, 'not json')) });
+    assert.deepEqual(failing.results.map(result => [result.status, result.score, result.amendedScore, result.amendedJudge?.status ?? null]),
+        [['failed', null, null, null], ['answered', 0.5, null, 'failed']]);
+    assert.deepEqual(failing.results[1].amendedJudge.items.map(item => [item.status, item.code]), [['failed', 'JUDGE_OUTPUT_INVALID']]);
+    assert.deepEqual([failing.summary.amendedScores.overall.unjudged, failing.summary.tokens.amendedJudge.failedRequests], [2, 1]);
+    const answeredOnly = await files.stage('answered-only', { amendmentsSource: files.file, limit: 2, judge: files.judge([], () => request => verdict(request, 'not json')) });
+    assert.deepEqual([answeredOnly.summary.scores.overall.unjudged, answeredOnly.summary.amendedScores.overall.unjudged, questionsSucceeded(answeredOnly.summary)], [0, 2, false]);
+});
+
+test('amendments that do not fit the conversation are refused before any model request', async t => {
+    const files = await amended(t);
+    const rejected = async (name, data, pattern) => {
+        await writeFile(files.file, JSON.stringify(amendmentData(data)));
+        await assert.rejects(files.stage(name, { amendmentsSource: files.file }), pattern);
+        assert.equal(await exists(path.join(files.root, name)), false, name);
+    };
+    await rejected('missing-question', { questions: { '7_abstention_9': { exclude: 'x' } } }, /7_abstention_9: conversation 7 has no such question/);
+    await rejected('changed-text', { questions: { [ids[0]]: { rubric: [{ index: 0, original: 'RUBRIC-MARKER 0.9', replacement: 'r', reason: 'r' }] } } },
+        /rubric item 0 is not the quoted original text/);
+    await rejected('out-of-range', { questions: { [ids[0]]: { rubric: [{ index: 3, original: 'RUBRIC-MARKER 0.2', replacement: 'r', reason: 'r' }] } } },
+        /rubric item 3 does not exist/);
+    await writeFile(files.file, JSON.stringify({ ...amendmentData({}), split: '1m' }));
+    await assert.rejects(files.stage('other-split', { amendmentsSource: files.file }), /for split 1m/);
+    await assert.rejects(runRejudge({ answers: files.run, manifest: files.manifest, output: path.join(files.root, 'rejudge-split'), judge: scored(1),
+        amendmentsSource: files.file }), /question-stage output/);
+    assert.deepEqual(files.counts, { ask: 0, judge: 0 });
+    // With amendments off the file is not read.
+    const off = await files.stage('off', { amendmentsSource: files.file, amendments: 'off', limit: 1 });
+    assert.equal(off.manifest.amendments.setting, 'off');
+    await assert.rejects(files.stage('bad-setting', { amendments: 'maybe' }), /--amendments on or off/);
+});
+
+test('stored answers from before amendments are judged again under them, with agreement and means kept apart', async t => {
+    const files = await amended(t);
+    await files.stage('off', { amendmentsSource: files.file, amendments: 'off', judge: files.judge([]) });
+    await files.stage('on', { amendmentsSource: files.file, judge: files.judge([]) });
+    // A stage directory as the earlier protocol wrote it: no amendments in the manifest or the results.
+    const stageFile = path.join(files.root, 'off', 'manifest.json');
+    const { amendments, ...earlier } = await json(stageFile);
+    assert.deepEqual(amendments, { setting: 'off', sha256: null });
+    await writeFile(stageFile, JSON.stringify({ ...earlier, protocol: 'memdrive-beam-replay-questions-v3' }));
+    const rejudge = (name, answers, options) => runRejudge({ answers: path.join(files.root, answers), manifest: files.manifest, output: path.join(files.root, name),
+        amendmentsSource: files.file, ...options });
+
+    // Amended item 0.2 scores 1 and then 0.5; amended item 1.1 scores 1 twice.
+    const calls = new Map(), seen = [];
+    const again = await rejudge('again', 'off', { repeats: 2, judge: files.judge(seen, marker => {
+        const repeat = calls.get(marker) ?? 0;
+        calls.set(marker, repeat + 1);
+        return scored(marker === 'AMENDED-RUBRIC 0.2' && repeat === 1 ? 0.5 : 1);
+    }) });
+    assert.equal(again.manifest.protocol, 'memdrive-beam-replay-rejudge-v2');
+    assert.deepEqual(seen.filter(marker => marker.startsWith('AMENDED')), ['AMENDED-RUBRIC 0.2', 'AMENDED-RUBRIC 0.2', 'AMENDED-RUBRIC 1.1', 'AMENDED-RUBRIC 1.1']);
+    assert.deepEqual(again.results.map(result => [result.id, result.excluded, result.scores, result.amendedScores]), [
+        [ids[0], undefined, [0.5, 0.5], [2.5 / 3, 2 / 3]], [ids[1], undefined, [0.5, 0.5], [1, 1]], [ids[6], undefined, [1, 1], undefined],
+        [ids[7], undefined, [1, 1], undefined], [ids[9], 'The premise does not hold', [1, 1], undefined]]);
+    assert.deepEqual(again.results[0].amendedItems, [{ index: 2, rubricItem: 'AMENDED-RUBRIC 0.2', amendment: { reason: 'Contradicts the answer' }, original: null,
+        scores: [1, 0.5] }]);
+    assert.deepEqual((await jsonl(path.join(files.root, 'again', `question-001-${ids[0]}`, 'amended-judge.jsonl'))).map(entry => [entry.repeat, entry.index, entry.score]),
+        [[0, 2, 1], [1, 2, 0.5]]);
+    const { summary } = again;
+    assert.deepEqual(summary, JSON.parse(JSON.stringify(await json(path.join(files.root, 'again', 'summary.json')))));
+    assert.deepEqual(summary.agreement, { items: 8, scored: 8, stable: 8, unstable: 0, comparable: 8, sameAsOriginal: 8 });
+    // The earlier stage made no amended judgments to compare with.
+    assert.deepEqual(summary.amendedAgreement, { items: 2, scored: 2, stable: 1, unstable: 1, comparable: 0, sameAsOriginal: 0 });
+    assert.deepEqual(summary.scores, { original: { questions: 5, mean: 0.8 }, repeats: [{ questions: 5, mean: 0.8 }, { questions: 5, mean: 0.8 }] });
+    assert.deepEqual(summary.amendedScores, { repeats: [{ questions: 4, mean: (2.5 / 3 + 1 + 1 + 1) / 4 }, { questions: 4, mean: (2 / 3 + 1 + 1 + 1) / 4 }] });
+    assert.deepEqual(summary.amendments, { setting: 'on', sha256: files.sha256, amendedQuestions: 2, amendedItems: 2, excludedQuestions: 1 });
+    assert.deepEqual([summary.tokens, summary.amendedTokens], [{ requests: 16, failedRequests: 0, prompt: 160, completion: 80 },
+        { requests: 4, failedRequests: 0, prompt: 40, completion: 20 }]);
+    assert.deepEqual(summary.questionResults.map(result => [result.excluded, result.amendedScores]), [[undefined, [2.5 / 3, 2 / 3]], [undefined, [1, 1]],
+        [undefined, undefined], [undefined, undefined], ['The premise does not hold', undefined]]);
+
+    // A stage that judged with the same amendments is the original for the amended agreement.
+    const later = await rejudge('later', 'on', { judge: files.judge([]) });
+    assert.deepEqual(later.summary.amendedAgreement, { items: 2, scored: 2, stable: 2, unstable: 0, comparable: 2, sameAsOriginal: 2 });
+    // Off judges the original rubric only.
+    const plain = [];
+    const unamended = await rejudge('plain', 'on', { amendments: 'off', judge: files.judge(plain) });
+    assert.deepEqual([plain.length, unamended.summary.amendments, 'amendedScores' in unamended.summary, 'amendedAgreement' in unamended.summary,
+        'amendedItems' in unamended.results[0]], [8, { setting: 'off', sha256: null }, false, false, false]);
 });
 
 test('the stored judge prompt is the pinned upstream text with two placeholders', async () => {

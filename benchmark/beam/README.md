@@ -543,17 +543,23 @@ class and by category, and reports judge scores for the asked questions
 overall, per class and per category. Each mean is over judged questions only
 and comes with its counts: asked, answered, failed (not answered), judged and
 unjudged (failed or with a failed judge request). Compare classes separately.
-Injected test transports report `measured: false`.
+Injected test transports report `measured: false`. With `--amendments on`
+(default) the stage also judges amended rubric items and reports
+`amendedScores` beside `scores`; see [amendments](#amendments). The stage
+protocol is `memdrive-beam-replay-questions-v4`; `-v3` was the same stage
+without amendments.
 
 ### Judging stored answers again
 
 `--rejudge --answers QUESTIONS_DIR --manifest FILE --output NEW_DIR
-[--judge-model ID] [--judge-effort low|medium|high] [--repeats N]` judges the answers a question stage already
+[--judge-model ID] [--judge-effort low|medium|high] [--repeats N] [--amendments on|off]`
+judges the answers a question stage already
 stored, without asking anything and without a store. It needs only
-`LLM_API_KEY`. It reads only stored answers and judgments, so it also accepts
-the output of the earlier question protocols
-(`memdrive-beam-replay-questions-v1` and `-v2`), whose files have the same
-format. The current stage protocol is `memdrive-beam-replay-questions-v3`. Each rubric item of each answered question is judged
+`LLM_API_KEY`. It reads only stored answers and original judgments, so it also
+accepts the output of the earlier question protocols
+(`memdrive-beam-replay-questions-v1` to `-v3`), whose files have the same
+format. Its own protocol is `memdrive-beam-replay-rejudge-v2`; `-v1` had no
+amendments. Each rubric item of each answered question is judged
 `--repeats` times (1 to 10, default 1) with the same upstream prompt and
 request as the stage, and any judge model. Use it to see whether the judge
 repeats its own scores and whether another judge model agrees.
@@ -565,3 +571,118 @@ score of the original stage and of each repeat with the number of questions
 behind it; and every item whose scores differ, with its rubric text. Judge
 reasons are in each question's `judge.jsonl`. A different model changes the
 judge, so its scores are not comparable with upstream BEAM's `gpt-4.1-mini`.
+With `--amendments on` (default) it also judges amended items; see
+[re-scoring stored answers under amendments](#re-scoring-stored-answers-under-amendments).
+
+### Amendments
+
+Some BEAM questions are defective: a rubric item is malformed or contradicts
+the question's own answer key, or the question's premise does not hold in its
+conversation. One item, `LLM response should mention: which statement is
+correct?`, is in every contradiction question and judges read it in opposite
+ways: the dataset means that the answer asks the user which statement is
+correct, and judges often reward an answer that picks one itself.
+[amendments.json](amendments.json) records corrections for such cases next to
+the dataset.
+
+Amendments never change the prepared dataset, the original judge requests or
+the original scores. With `--amendments on` (the default for `--questions`
+and `--rejudge`) a stage judges every rubric item as before and reports
+`scores` exactly as without amendments. It then judges each amended item once
+more with its replacement text, with the same judge model, prompt and
+settings, and reports `amendedScores` as well. Both are always reported;
+neither replaces the other. `--amendments off` judges and reports the original
+rubric only, without reading the file.
+
+An amendment is added only when an audit that does not look at any system's
+answers finds the defect, or uniformly by a rule over all items with the same
+text. It keeps the dataset's intent, as shown by the question, its answer key
+and its other annotations, and never adds a requirement. A question that
+cannot be repaired without writing a new one is excluded instead. Each entry
+states its reason.
+
+The file has five keys, all required, and no others:
+
+```json
+{
+  "protocol": "memdrive-beam-amendments-v1",
+  "split": "100k",
+  "datasetRevision": "3205395e897e7318c7b094ef4e6047b9b82dbb03",
+  "rules": [
+    { "id": "contradiction-ask", "category": "contradiction_resolution",
+      "original": "LLM response should mention: which statement is correct?",
+      "replacement": "LLM response should ask the user which statement is correct",
+      "reason": "..." }
+  ],
+  "questions": {
+    "<question ID>": { "exclude": "<reason>" },
+    "<another question ID>": { "rubric": [
+      { "index": 2, "original": "<the item's exact dataset text>", "replacement": "<text>", "reason": "<reason>" }
+    ] }
+  }
+}
+```
+
+Question IDs are the dataset's, such as `7_contradiction_resolution_0`. `split` and
+`datasetRevision` must equal the prepared manifest's. A rule replaces the text
+of every rubric item, in questions of its `category`, whose text equals
+`original` exactly. A question entry either excludes the question or amends
+items by zero-based `index`, quoting each item's dataset text exactly in
+`original`. An excluded question is still asked and judged on its original
+rubric, so `scores` stay complete, and is left out of `amendedScores`.
+
+The file is checked against the conversation's evaluation before any model
+request, and the stage fails with the reason when it finds unknown keys, a
+missing field, another split or revision, a question ID with this
+conversation's prefix (`<conversation>_`) that its evaluation lacks, an index
+out of range, an `original` that is not the item's exact text (which also
+catches a changed dataset), an empty replacement or one equal to `original`,
+an entry with both `exclude` and `rubric`, or an item amended twice, by two
+rules, two entries or a rule and an entry. Entries for other conversations do
+not apply and are not checked. Whether a rule matches anything in the whole
+dataset is not checked, because a stage loads one conversation, in which a
+rule can legitimately match nothing; the manifest lists what applied.
+
+The stage manifest records the setting, the file's SHA-256 and, for each
+question of the conversation with an amendment, its exclusion or its amended
+items with their replacement text and rule ID or reason. A question with
+amended items gets `amended-judge.jsonl`, one record per amended item like
+`judge.jsonl` plus `amendment` (`{ "rule": ID }` or `{ "reason": TEXT }`),
+and in `result.json` `amendedJudge` (`status`, and per item `index`,
+`rubricItem`, `amendment`, `status`, `score` or `code`, `usage`) and
+`amendedScore`: the mean over all its items, with the amended judgment where
+an item is amended and the original one elsewhere, or null unless every one of
+them scored. An excluded question's `result.json` has `excluded` with the
+reason. The summary adds `amendments` (`setting`, `sha256`, and over the asked
+questions `amendedQuestions`, `amendedItems` and `excludedQuestions`),
+`amendedScores` (the score summary of the asked questions that are not
+excluded, with `amendedScore` where a question has one and `score`
+otherwise), `tokens.amendedJudge`, and `excluded`, `amendedScore` and
+`amendedJudge` in `questionResults`. The stage succeeds only when the amended
+judgments are complete too. With `--amendments off` the summary has only
+`amendments: { "setting": "off", "sha256": null }` in addition to the fields
+without amendments.
+
+#### Re-scoring stored answers under amendments
+
+`--rejudge` applies the current file to any stored answers, including stage
+directories written before amendments existed, without answering again:
+
+```sh
+node benchmark/beam/replay.mjs --rejudge --answers artifacts/beam-replay/live-1-questions \
+  --manifest artifacts/beam-original-100k/manifest.json \
+  --output artifacts/beam-replay/live-1-amended --env-file /path/to/model.env
+```
+
+It judges the original rubric `--repeats` times as before and each amended
+item of a question that is not excluded as many times. Each question's
+`result.json` adds `amendedScores` (per repeat), `amendedItems` (per item the
+replacement text, `amendment`, `original` and `scores`) and `amendedOutcomes`,
+and `excluded` where it applies; amended judgments go to
+`amended-judge.jsonl`. The summary keeps `agreement`, `scores` and `tokens`
+for the original rubric and adds `amendments`, `amendedAgreement` (the
+original of an amended item is the stage's own amended judgment when it judged
+the same replacement text, otherwise none, so earlier stages have no
+`comparable` items), `amendedScores.repeats` (the mean per repeat over the
+questions that are not excluded) and `amendedTokens`. The summary's
+`questionResults` add `excluded` and `amendedScores`.
