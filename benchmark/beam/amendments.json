@@ -1,0 +1,28 @@
+{
+  "protocol": "memdrive-beam-amendments-v1",
+  "split": "100k",
+  "datasetRevision": "3205395e897e7318c7b094ef4e6047b9b82dbb03",
+  "rules": [
+    {
+      "id": "contradiction-ask",
+      "category": "contradiction_resolution",
+      "original": "LLM response should mention: which statement is correct?",
+      "replacement": "LLM response should ask the user: which statement is correct?",
+      "reason": "The dataset asks for a request for clarification instead of a definitive answer: all 40 contradiction questions have tests_for \"LLM should detect contradiction and request clarification instead of giving definitive answer\", and all 40 ideal answers end by asking the user. Judges read the original wording both ways: as asking the user which statement is correct, or as stating which one is."
+    }
+  ],
+  "questions": {
+    "6_multi_session_reasoning_0": {
+      "exclude": "The expected count \"Four areas\" is not determined by the conversation: the user describes more areas of resume, portfolio and salary work than the four the dataset picked (for example user turns 66, 108, 114 and 140)."
+    },
+    "9_abstention_0": {
+      "exclude": "The premise does not hold: the expected answer is that no information exists, but user turn 64 says a \"weaving threads\" metaphor was added \"per Shawn's advice\". The rubric item is also garbled (\"related related\")."
+    },
+    "9_knowledge_update_1": {
+      "exclude": "The expected \"May 22\" appears nowhere in the conversation: the planned rescheduling message was never generated, and the updated_info evidence turn is the original_info turn. The user only ever states May 20 (user turns 138, 140, 154 and 156), so the question cannot test an update, and correcting the key would change it into a recall question."
+    },
+    "9_preference_following_1": {
+      "exclude": "The tested preference (writing in quiet places) is never stated: no user turn contains it, and the dataset names no evidence turn."
+    }
+  }
+}
