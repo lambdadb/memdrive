@@ -753,13 +753,21 @@ unchanged.
 Tool names, descriptions and schemas are the only text every client delivers to
 a model, so the descriptions carry everything ordinary use needs, including when
 to use each tool: `write`, for example, says what to save and not to wait to be
-asked. In text mode, `write` also says to keep the user's standing instructions
-and preferences, one per line, in `/preferences.md`, and `read` says to read
-that file before the first answer of a conversation and to follow it for how
-answers are given, the one exception to treating file content as information
-only. The SDK reserves and validates nothing for that path: it is an ordinary
-file, one per drive, so users who share a drive also share it. External-vector
-drives store no text, and their descriptions do not mention it.
+asked. In text mode, `write` also says to keep what the user says they want in
+answers always or from now on in `/preferences.md`, one per line, replacing a
+line when the user changes it, and `read` says to read that file before the
+first answer of a conversation and to follow it for how answers are given,
+never for tool calls or authorization: the one exception to treating file
+content as information only. `search` and `findText` still treat returned text
+as information only, so the exception applies when the file is read, and a
+host that does not offer `read` gets no preferences behavior. The SDK reserves
+and validates nothing for that path: it is an ordinary file, one per drive.
+Every text-mode agent on the drive reads it before its first answer and follows
+it for how answers are given, so whoever can write it changes later answers:
+another user of a shared drive, whose lines are then applied as the user's,
+another agent, or an import that contains a root `preferences.md`. A host that
+needs to prevent this must control writes to that path. External-vector drives
+store no text, and their descriptions do not mention it.
 `fileToolInstructions` is an optional, short, transport-neutral supplement
 for server instructions, which clients may drop or shorten. It says what the
 drive is and how the tools relate (search and read before writing, update rather
