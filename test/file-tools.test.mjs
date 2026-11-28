@@ -67,7 +67,6 @@ test('tool descriptions carry when to use each tool, the data rule and abstentio
         assert.match(write, /^Save information to the drive\. Use it whenever/);
         assert.match(write, /do not wait to be asked/);
         assert.match(write, /one call: one operation, or \{ operations: \[\.\.\.\] \} with 1–100 operations/);
-        assert.match(write, /keep the earlier statement and add the new one with when it was said/);
     }
     assert.match(managed.write, /oldText\/newText/);
     assert.doesNotMatch(external.write, /oldText|EDIT_CONFLICT|user's wording/, 'external writes store vectors without exact edits');
@@ -110,6 +109,32 @@ test('in text mode write keeps standing instructions in /preferences.md and read
     for (const text of [fileToolInstructions, ...external.map(tool => tool.description)])
         assert.doesNotMatch(text, /preferences\.md|standing instructions/);
     assert(!external.find(tool => tool.name === 'write').description.includes(save), 'the write sentence is text-mode only');
+});
+
+test('in text mode write records what the user says outside /preferences.md as entries at the end of a file and leaves earlier entries as they are; external mode keeps the earlier sentence', () => {
+    const keep = 'When new information differs from what is saved, keep the earlier statement and add the new one with when it was said, unless asked to change the saved text.';
+    const entries = 'Outside /preferences.md, record what the user says as entries added at the end of a file, each with when it was said if known. '
+        + 'Leave earlier entries as they are: when a new statement differs from one, add it as a new entry, and do not rewrite the earlier entry '
+        + 'or note which is correct or current, unless asked to change the saved text.';
+    const [managed] = getFileToolDefinitions({ embeddingMode: 'managed', tools: ['write'] });
+    const [external] = getFileToolDefinitions({ embeddingMode: 'external', tools: ['write'] });
+    // The two sentences follow the /preferences.md sentence directly and precede the metadata rule.
+    assert.equal(managed.description.split(entries).length, 2, 'the entry sentences appear once, together and in order');
+    assert(managed.description.includes(`and nothing else in that file. ${entries} Metadata given on update replaces the whole map.`));
+    assert(!managed.description.includes(keep), 'text mode no longer has the earlier sentence');
+    assert(external.description.includes(`after reading the original. ${keep} Metadata given on update replaces the whole map.`));
+    // The new wording appears only in the text-mode write description and the editing topic.
+    const wording = /end of a file|new entry|earlier entr|correct or current|if known|Outside \/preferences/i;
+    assert.doesNotMatch(external.description, wording, 'external drives store no text');
+    assert.doesNotMatch(fileToolInstructions, /\bentr(?:y|ies)\b|preferences\.md/);
+    for (const embeddingMode of ['managed', 'external'])
+        for (const tool of getFileToolDefinitions({ embeddingMode, tools: embeddingMode === 'managed'
+            ? ['guide', 'read', 'tree', 'list', 'search', 'findText'] : ['guide', 'read', 'tree', 'list', 'search'] }))
+            assert.doesNotMatch(tool.description, wording, `${embeddingMode} ${tool.name}`);
+    assert.doesNotMatch(fileToolGuideTopics.retrieval.content, wording);
+    assert.doesNotMatch(fileToolGuide.content, wording);
+    const editing = fileToolGuideTopics.editing.content;
+    assert.match(editing, /it records what was said then\. In text mode, add the new statement as an entry at the end of a file and leave earlier entries as they are, without noting which is correct or current\. When the later statement updates/);
 });
 
 test('each tool forwards its input object unchanged to the SDK method of the same name and drops view selectors from results', async () => {
