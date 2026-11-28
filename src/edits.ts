@@ -1,13 +1,25 @@
 import { resolvedChunking, type TextChunker } from './text-chunks.js';
-import { keysOnly, metadataValues, vectorValues } from './config.js';
+import { isObject, keysOnly, metadataValues, vectorValues } from './config.js';
 import { MemDriveError, requireInput } from './errors.js';
-import { validFileId, validPath, validText, decodeStoredFile, fileOriginal, fileRecords, metadataKey, fingerprintOf, updatedFields,
+import { validFileId, validPath, validText, requirePath, decodeStoredFile, fileOriginal, fileRecords, metadataKey, fingerprintOf, updatedFields,
     type StoredFile, type WriteChange } from './records.js';
-import type { DeleteFileRequest, MetadataSchema, TextEdit, UpdateExternalFileRequest, UpdateFileRequest } from './types.js';
+import type { AppendFileRequest, DeleteFileRequest, MetadataSchema, TextEdit, UpdateExternalFileRequest, UpdateFileRequest } from './types.js';
 
 type EditRequest = UpdateFileRequest | UpdateExternalFileRequest | DeleteFileRequest;
+type AppendById = Extract<AppendFileRequest, { fileId: string }>;
 
-export function editRequest(request: unknown, schema: MetadataSchema, dimensions?: number): EditRequest {
+/** Validate an update, delete or append; an append by path is resolved by the writer. */
+export function editRequest(request: unknown, schema: MetadataSchema, dimensions?: number): EditRequest | AppendFileRequest {
+    if (isObject(request) && request.op === 'append') {
+        requireInput(dimensions === undefined, 'Append requires a text-mode drive; external-vector drives store no text.');
+        requireInput(keysOnly(request, ['op', 'fileId', 'path', 'content']) && (request.fileId === undefined) !== (request.path === undefined),
+            'Append requires exactly one of fileId or path, and content.');
+        requireInput(request.fileId === undefined || validFileId(request.fileId), 'Provide a fileId returned by MemDrive.');
+        if (request.path !== undefined) requirePath(request.path);
+        requireInput(validText(request.content) && request.content.length > 0, 'Append requires nonempty UTF-8 content.');
+        return request.fileId === undefined ? { op: 'append', path: request.path as string, content: request.content }
+            : { op: 'append', fileId: request.fileId, content: request.content };
+    }
     const fields = dimensions === undefined ? ['op', 'fileId', 'newPath', 'metadata', 'content', 'edits']
         : ['op', 'fileId', 'newPath', 'metadata', 'content'];
     requireInput(keysOnly(request, fields) && validFileId(request.fileId),
@@ -61,13 +73,19 @@ function replaceExact(source: string, edits: TextEdit[]): string {
     return text.join('');
 }
 
-export async function planEdit(request: EditRequest, doc: Record<string, unknown> | undefined, change: WriteChange,
+/** Append text after the existing content, separated by one line break when the content does not end with one. */
+const appended = (existing: string, content: string) => existing === '' || existing.endsWith('\n') ? existing + content : `${existing}\n${content}`;
+
+export async function planEdit(edit: EditRequest | AppendById, doc: Record<string, unknown> | undefined, change: WriteChange,
     schema: MetadataSchema, dimensions?: number, chunker?: TextChunker, options?: { signal?: AbortSignal | undefined }) {
-    const { fileId } = request;
+    const { fileId } = edit;
     const current = doc?.kind === 'file' ? decodeStoredFile(doc, schema, dimensions) : undefined;
     // Deleting an absent file still removes any chunks left by an interrupted write or delete.
-    if (request.op === 'delete') return { op: 'delete' as const, fileId, path: current?.path, removeOriginal: !!current };
+    if (edit.op === 'delete') return { op: 'delete' as const, fileId, path: current?.path, removeOriginal: !!current };
     if (!current) throw new MemDriveError('FILE_NOT_FOUND', 'No current file with this ID exists in this view.', { details: { fileId } });
+    // An append is an update that replaces the content with the appended text.
+    const request: UpdateFileRequest | UpdateExternalFileRequest = edit.op === 'append'
+        ? { op: 'update', fileId, content: appended('content' in current ? current.content : '', edit.content) } : edit;
     const path = request.newPath ?? current.path;
     const metadata = request.metadata === undefined ? current.metadata : metadataValues(request.metadata, schema);
     const settings = { path, ...(metadata === undefined ? {} : { metadata }) };

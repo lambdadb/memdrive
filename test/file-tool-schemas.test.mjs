@@ -36,6 +36,8 @@ test('advertised tool schemas accept main-only SDK inputs and reject view select
                 ]),
                 ['search', { query: 'plan', embeddingQuery: 'travel plan', rerank: { fields: ['content'], onFailure: 'returnOriginal' } }],
                 ['write', { op: 'update', fileId: 'returned-id', edits: [{ oldText: 'Original', newText: '' }] }],
+                ['write', { op: 'append', path: '/log', content: 'Entry.' }], ['write', { op: 'append', fileId: 'returned-id', content: 'Entry.' }],
+                ['write', { operations: [{ op: 'append', path: '/log', content: 'Entry.' }, { op: 'create', path: '/plan', content }] }],
                 ['findText', { query: 'a.b', prefix: '/notes/', filter: { field: 'metadata.topic', op: 'eq', value: 'plan' } }],
                 ['findText', { cursor: 'opaque' }],
             ]),
@@ -62,6 +64,7 @@ test('advertised tool schemas accept main-only SDK inputs and reject view select
             ['write', { operations: [{ at: fork, op: 'delete', fileId: 'id' }] }],
             ['write', { op: 'create', path: '/one', content: external ? 'text' : [1] }],
             ...(external ? [
+                ['write', { op: 'append', path: '/log', content }], ['write', { operations: [{ op: 'append', fileId: 'id', content }] }],
                 ['read', { path: '/one', startLine: 1 }],
                 ['search', { query: 'text' }], ['search', { query: content, rerank: false }],
                 ['search', { query: content, mode: 'semantic' }],
@@ -72,6 +75,10 @@ test('advertised tool schemas accept main-only SDK inputs and reject view select
                 ['search', { query: 'plan', mode: 'keyword', rerank: false, embeddingQuery: 'unused' }],
                 ['findText', { query: '' }], ['findText', { cursor: 'opaque', query: 'a' }], ['findText', { query: 'a', at: fork }],
                 ['write', { op: 'update', fileId: 'id', content: '', edits: [{ oldText: 'a', newText: 'b' }] }],
+                ['write', { op: 'append', content: 'Entry.' }], ['write', { op: 'append', path: '/log', fileId: 'id', content: 'Entry.' }],
+                ['write', { op: 'append', path: '/log', content: '' }], ['write', { op: 'append', path: '/log' }],
+                ['write', { op: 'append', fileId: 'id', content: 'Entry.', newPath: '/moved' }],
+                ['write', { operations: [{ op: 'append', path: '/log', content: 'Entry.', metadata: {} }] }],
             ]),
         ];
         for (const [name, input] of invalid) assert.equal(validators[name](input), false, `${name}: ${JSON.stringify(input)}`);

@@ -297,6 +297,18 @@ test('live file store writes main and forks, searches, lists, checkpoints and ro
         t.diagnostic(`Stored modifiedBy after the move without an actor: ${shape(await storedModifier())}.`);
         assert.deepEqual(await attributed(), [undefined, undefined, undefined]);
 
+        // An append by path creates the file, a second one adds a line, and search and findText see the appended text.
+        const log = await main.write({ op: 'append', path: '/log/entries.md', content: 'First synthetic entry.' }, options());
+        assert.deepEqual([log.content, log.createdAt === log.modifiedAt], ['First synthetic entry.', true]);
+        const appended = await main.write({ op: 'append', path: '/log/entries.md', content: 'Second entry about zephyrine lanterns.' }, options());
+        assert.deepEqual([appended.fileId, appended.createdAt], [log.fileId, log.createdAt]);
+        assert.equal((await reopened.read({ path: '/log/entries.md' }, options())).content, 'First synthetic entry.\nSecond entry about zephyrine lanterns.');
+        const appendHits = (await main.search({ query: 'zephyrine lanterns', mode: 'keyword', rerank: false, limit: 10 }, options())).hits
+            .filter(hit => hit.fileId === log.fileId);
+        assert(appendHits.length > 0 && appendHits.every(hit => hit.content.includes('zephyrine lanterns')), 'search finds the appended text');
+        assert.deepEqual((await main.findText({ query: 'zephyrine' }, options())).hits.map(hit => [hit.fileId, hit.range.startLine]), [[log.fileId, 2]]);
+        t.diagnostic('Appends by path created a file, extended it and were found by search and findText.');
+
         await MemDrive.destroy({ client, name }, options());
         await assert.rejects(main.read({ path: '/main.txt' }, options()), { code: 'STORE_NOT_FOUND', status: 404 });
         await assert.rejects(client.collection(name).get(options()), error => statusOf(error) === 404);

@@ -1,4 +1,4 @@
-import type { CheckpointedWriteResult, LambdaDBClient, RollbackResult, WritableAt } from '@functional-systems/memdrive';
+import type { AppendFileRequest, CheckpointedWriteResult, LambdaDBClient, RollbackResult, WritableAt } from '@functional-systems/memdrive';
 import { create, open, type DriveFile, type FileActor, type FileAt, type ForkAt, type CheckpointAt, type FileFilter, type FindTextResult, type DeleteFileResult,
     type SearchFilesResult, type ListFilesResult, type TreeFolder, type TreeRequest, type TreeResult, type FileDrive, type EmbeddingMode, type OpenFileStoreOptions, type FileRef } from '@functional-systems/memdrive';
 
@@ -25,6 +25,18 @@ export async function fileConsumer(client: LambdaDBClient, options: OpenFileStor
     await reopened.write({ at, operations: [{ op: 'update', fileId: deleted.fileId, content: '' }, { op: 'delete', fileId: deleted.fileId }] });
     // @ts-expect-error Choose a full replacement or exact edits.
     await reopened.write({ at, op: 'update', fileId: update.fileId, content: '', edits: [] });
+    // Append adds text by path, creating a missing file, or by fileId; the result is the whole file.
+    const appended: DriveFile = await reopened.write({ at, op: 'append', path: '/log.md', content: 'Entry.' });
+    const appendedBatch: DriveFile[] = await reopened.write({ at, operations: [{ op: 'append', fileId: appended.fileId, content: 'Entry.' }] });
+    const appendSaved: CheckpointedWriteResult<DriveFile> = await reopened.write({ op: 'append', path: '/log.md', content: 'Entry.', checkpoint: { name: 'turn-0' } });
+    const appendRequest: AppendFileRequest = { op: 'append', fileId: appendSaved.result.fileId, content: appendedBatch[0]!.content };
+    await reopened.write({ operations: [appendRequest, { op: 'delete', fileId: appended.fileId }] });
+    // @ts-expect-error Append takes exactly one of path or fileId.
+    await reopened.write({ op: 'append', path: '/log.md', fileId: appended.fileId, content: 'Entry.' });
+    // @ts-expect-error Append takes path or fileId.
+    await reopened.write({ op: 'append', content: 'Entry.' });
+    // @ts-expect-error Append does not move files or change metadata.
+    await reopened.write({ op: 'append', fileId: appended.fileId, content: 'Entry.', newPath: '/moved.md' });
     // Omitted at writes to main.
     const onMain: DriveFile = await reopened.write({ op: 'create', path: '/main.md', content: '' });
     await reopened.write({ at: { kind: 'main' }, operations: [{ op: 'delete', fileId: onMain.fileId }] });
@@ -186,6 +198,8 @@ export async function externalFileConsumer(client: LambdaDBClient, options: Open
     await drive.write({ at, op: 'create', path: '/text', content: 'text' });
     // @ts-expect-error External search accepts vectors only.
     await drive.search({ query: 'text' });
+    // @ts-expect-error External drives store no text to append to.
+    await reopened.write({ op: 'append', path: '/vector', content: 'Entry.' });
     // @ts-expect-error External writes accept vectors through content.
     await drive.write({ at, op: 'create', path: '/old-shape', embedding: vector });
     // @ts-expect-error External updates accept vectors through content.

@@ -150,8 +150,9 @@ descriptions. Model runs of v7 and later are expected to start with a read of
 with v6. Protocol `memdrive-tool-use-v7` runs used the earlier text-mode `write`
 sentence that kept a differing earlier statement beside the new one, instead of
 recording what the user says as entries at the end of a file and leaving earlier
-entries as they are. None of them validates the current wording
-(protocol `memdrive-tool-use-v8`). `--instruction` independently
+entries as they are. Protocol `memdrive-tool-use-v8` runs had no `append`
+operation and returned each written file's content from `write`. None of them
+validates the current wording and catalog (protocol `memdrive-tool-use-v9`). `--instruction` independently
 selects `server` (default), `workflow` (additional developer workflow text), or
 `user` (an explicit reminder appended to the task). Workflow injection approximates
 a loaded bundled skill; skill discovery/loading itself is not tested. Compare

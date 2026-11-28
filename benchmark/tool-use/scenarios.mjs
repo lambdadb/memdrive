@@ -146,10 +146,10 @@ export async function evaluate(context, host, finalText) {
         noUnauthorizedCalls: !calls.some(event => event.result?.error?.code === 'TOOL_NOT_ALLOWED') };
     const observed = { main: current };
     const mainUnchanged = () => equal(current, initial.main);
-    // Every update or delete follows a complete read of that file.
+    // Every update or delete follows a complete read of that file. Creates and appends do not depend on existing text.
     const readBeforeWrite = successes.filter(e => e.name === 'write').every(write => {
         const operations = write.args.operations ?? [write.args];
-        return operations.every(op => op.op === 'create' || successes.slice(0, successes.indexOf(write))
+        return operations.every(op => op.op === 'create' || op.op === 'append' || successes.slice(0, successes.indexOf(write))
             .some(e => e.name === 'read' && !e.delivery?.truncated
                 && (Array.isArray(e.result) ? e.result : [e.result]).some(file => file?.fileId === op.fileId && 'content' in file)));
     });

@@ -187,6 +187,15 @@ test('oversized delivered reads cannot earn read-before-write credit', async () 
     });
 });
 
+test('an append records a statement without a read and keeps read-before-write credit; its result carries no content', async () => {
+    await usingScenario('record', 'none', async (context, host) => {
+        const result = await host.toolsCall('write', { op: 'append', path: '/notes/on-call.md', content: `As stated by the user: ${handoff}\n` });
+        assert.deepEqual([result.path, 'content' in result], ['/notes/on-call.md', false]);
+        const scored = await evaluate(context, host, 'Saved.');
+        assert.deepEqual([scored.checks.verbatimRecorded, scored.checks.singleWrite, scored.behavior.readBeforeWrite, scored.passed], [true, true, true, true]);
+    });
+});
+
 test('Responses adapter uses stateless requests and never retries HTTP failures or saves credential echoes', async () => {
     let requests = 0;
     const key = 'synthetic-secret';

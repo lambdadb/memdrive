@@ -24,7 +24,10 @@ export interface FileTools {
     readonly definitions: readonly FileToolDefinition[];
     /**
      * Runs the matching SDK method on main and returns its result without view
-     * selectors (`at`). Rejects with SDK or tool errors.
+     * selectors (`at`). A `write` result holds each created, updated or appended
+     * file as a `FileListEntry`, without content, and each deletion as
+     * `{ fileId }`: one result, or an array in operation order for `operations`.
+     * Rejects with SDK or tool errors.
      */
     execute(name: string, input: unknown, options?: RequestOptions): Promise<unknown>;
 }
@@ -55,16 +58,18 @@ const writeParts = (external: boolean) => [
     'Save information to the drive. Use it whenever the conversation produces something a later conversation or another agent will need, such as facts about the user and their work, decisions and their reasons, plans, preferences, and changes to what is already saved.',
     'Nothing persists unless it is written, so do not wait to be asked.',
     'Put all of a turn\'s changes in one call: one operation, or { operations: [...] } with 1–100 operations.',
-    'Create by path; update, move or delete by fileId after reading the original.',
+    external ? 'Create by path; update, move or delete by fileId after reading the original.'
+        : 'Create by path; update, move or delete by fileId after reading the original. Append adds content at the end of a file by path or fileId without reading it, and creates the file when the path has none.',
     ...(external ? [] : ['Prefer exact oldText/newText edits for partial changes; reread on EDIT_CONFLICT.']),
     ...(external ? [] : ['Keep the user\'s wording for what they said.']),
     ...(external ? [] : ['Save what the user says they want in your answers always or from now on (standing instructions and preferences) in /preferences.md, one per line, replacing the line when the user changes one, and nothing else in that file.']),
     ...(external
         ? ['When new information differs from what is saved, keep the earlier statement and add the new one with when it was said, unless asked to change the saved text.']
-        : ['Outside /preferences.md, record what the user says as entries added at the end of a file, each with when it was said if known.',
+        : ['Outside /preferences.md, record what the user says as entries appended to a file, each with when it was said if known.',
             'Leave earlier entries as they are: when a new statement differs from one, add it as a new entry, and do not rewrite the earlier entry or note which is correct or current, unless asked to change the saved text.']),
     'Metadata given on update replaces the whole map.',
     'On CHECKPOINT_WRITE_FAILED nothing from the call was kept; on WRITE_UNCONFIRMED or CHECKPOINT_RESTORE_FAILED read the affected files before retrying.',
+    ...(external ? [] : ['The result identifies each file without its content; read the file to see it.']),
 ].join(' ');
 
 const descriptions: Record<FileToolName, string> = {
@@ -140,6 +145,18 @@ function agentFailure(cause: unknown) {
     return failure;
 }
 
+/**
+ * A text-mode write result for the agent: each written file as a listing
+ * identifies it (fileId, path, creation and modification fields, metadata),
+ * without content; delete results are unchanged.
+ */
+function withoutContent(result: unknown): unknown {
+    if (Array.isArray(result)) return result.map(withoutContent);
+    if (!isObject(result) || !Object.hasOwn(result, 'content')) return result;
+    const { content: _content, ...entry } = result;
+    return entry;
+}
+
 /** Drop the view selectors of a read page, tree, list or findText result: tools always use main. */
 function withoutAt(result: unknown) {
     if (!isObject(result)) return result;
@@ -192,8 +209,8 @@ export function createFileTools(options: { drive: FileDrive<EmbeddingMode>; tool
             requireInput(!Object.hasOwn(input, 'checkpoint'), 'The host decides checkpoints; omit checkpoint.');
             requireInput(!Object.hasOwn(input, 'by') && !Object.hasOwn(input, 'time'), 'The host supplies by and time; omit them.');
             const request = { ...input, ...(actor === undefined ? {} : { by: actor }), ...(now === undefined ? {} : { time: now() }) };
-            if (checkpoint === undefined) return sdk.write(request, requestOptions);
-            try { return (await sdk.write({ ...request, checkpoint: await checkpoint() }, requestOptions) as { result: unknown }).result; }
+            if (checkpoint === undefined) return withoutContent(await sdk.write(request, requestOptions));
+            try { return withoutContent((await sdk.write({ ...request, checkpoint: await checkpoint() }, requestOptions) as { result: unknown }).result); }
             catch (cause) { throw agentFailure(cause); }
         }
         const result = await sdk[name as Exclude<FileToolName, 'guide' | 'write'>]!(input, requestOptions);

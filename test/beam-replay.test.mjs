@@ -109,7 +109,7 @@ test('loading verifies the prepared manifest and runtime checksum without readin
     await assert.rejects(loadSessions(files.manifest, '7'), /Unexpected prepared dataset source hashes/);
 });
 
-test('a scripted replay records tree and list use, lookups, checkpointed writes, a rejected write, a deletion and the inventory per session', async t => {
+test('a scripted replay records tree and list use, lookups, checkpointed writes, a rejected write, a deletion, appends and the inventory per session', async t => {
     const files = await prepared(t);
     let now = 0;
     const { summary, manifest, results } = await runReplay({ manifest: files.manifest, conversation: '7', output: files.output, mode: 'scripted', instructions: 'none',
@@ -121,7 +121,7 @@ test('a scripted replay records tree and list use, lookups, checkpointed writes,
     assert.equal(summary.modelBehavior, null, 'A scripted run is never a model measurement');
     assert.deepEqual([manifest.guide, manifest.tools, summary.guide, manifest.writes.checkpointed], ['on', [...toolNames], 'on', true]);
 
-    const operations = (counts = {}) => ({ create: 0, updateEdits: 0, updateContent: 0, updateOther: 0, delete: 0, ...counts });
+    const operations = (counts = {}) => ({ create: 0, updateEdits: 0, updateContent: 0, updateOther: 0, append: 0, delete: 0, ...counts });
     const tokens = { inputTokens: 0, outputTokens: 0, unknownUsageRequests: 0 };
     const noList = { listings: 0, continuations: 0, afterTree: 0, withPrefix: 0, withNameContains: 0, withDelimiter: 0, stoppedBeforeEnd: 0 };
     const used = fields => ({ firstTool: 'none', firstNonGuideTool: 'none', tree: { withPrefix: 0, withoutPrefix: 0 }, list: noList, search: 0, findText: 0,
@@ -138,28 +138,29 @@ test('a scripted replay records tree and list use, lookups, checkpointed writes,
         toolUse: used({ firstTool: 'guide', firstNonGuideTool: 'tree', tree: { withPrefix: 0, withoutPrefix: 1 },
             list: { ...noList, listings: 1, afterTree: 1, withPrefix: 1 }, search: 1,
             read: { whole: 1, ranged: 0, wholeChars: 'Scripted note.\n'.length, rangedChars: 0 } }) });
-    assert.deepEqual(second, { userTurns: 1, modelRequests: 5, ...tokens, toolCalls: 4,
-        toolCallsByName: { findText: 1, tree: 1, write: 2 }, toolErrorsByCode: {},
-        toolCallsPerTurn: { mean: 4, max: 4 }, toolRounds: 4, toolRoundsPerTurn: { mean: 4, max: 4 },
-        guideCalls: { index: 0, byTopic: {} }, writeCalls: 2, failedWritesByCode: {},
-        noSuccessfulWrite: false, turnsWithWrite: 1, turnsWithMultipleWriteCalls: 1, operations: operations({ create: 1, delete: 1 }),
-        // A tree call returns no files, so the create after it still counts as without a lookup.
-        filesCreated: 1, filesUpdated: 0, filesWrittenInSeveralTurns: 0, createsAfterLookup: 0, createsWithoutLookup: 1,
-        filesAfter: 1, latestCheckpointAsExpected: true,
+    assert.deepEqual(second, { userTurns: 1, modelRequests: 6, ...tokens, toolCalls: 5,
+        toolCallsByName: { findText: 1, tree: 1, write: 3 }, toolErrorsByCode: {},
+        toolCallsPerTurn: { mean: 5, max: 5 }, toolRounds: 5, toolRoundsPerTurn: { mean: 5, max: 5 },
+        guideCalls: { index: 0, byTopic: {} }, writeCalls: 3, failedWritesByCode: {},
+        noSuccessfulWrite: false, turnsWithWrite: 1, turnsWithMultipleWriteCalls: 1, operations: operations({ create: 1, append: 2, delete: 1 }),
+        // A tree call returns no files, so the create after it still counts as without a lookup. Of the appends after
+        // findText, the one to the file created earlier is an update and the one creating the log a create after a lookup.
+        filesCreated: 2, filesUpdated: 1, filesWrittenInSeveralTurns: 0, createsAfterLookup: 1, createsWithoutLookup: 1,
+        filesAfter: 2, latestCheckpointAsExpected: true,
         toolUse: used({ firstTool: 'tree', firstNonGuideTool: 'tree', tree: { withPrefix: 1, withoutPrefix: 0 }, findText: 1 }) });
     assert.deepEqual(third, { userTurns: 2, modelRequests: 2, ...tokens, toolCalls: 0, toolCallsByName: {}, toolErrorsByCode: {},
         toolCallsPerTurn: { mean: 0, max: 0 }, toolRounds: 0, toolRoundsPerTurn: { mean: 0, max: 0 },
         guideCalls: { index: 0, byTopic: {} }, writeCalls: 0, failedWritesByCode: {},
         noSuccessfulWrite: true, turnsWithWrite: 0, turnsWithMultipleWriteCalls: 0, operations: operations(),
         filesCreated: 0, filesUpdated: 0, filesWrittenInSeveralTurns: 0, createsAfterLookup: 0, createsWithoutLookup: 0,
-        filesAfter: 1, latestCheckpointAsExpected: true, toolUse: used({}) });
-    assert.deepEqual(summary.smoke, { sessions: 4, userTurns: 8, modelRequests: 21, ...tokens, toolCalls: 13,
-        toolCallsByName: { findText: 1, guide: 2, list: 1, read: 1, search: 1, tree: 2, write: 5 }, toolErrorsByCode: { PATH_EXISTS: 1 },
-        toolCallsPerTurn: { mean: 13 / 8, max: 6 }, toolRounds: 13, toolRoundsPerTurn: { mean: 13 / 8, max: 6 },
-        guideCalls: { index: 1, byTopic: { editing: 1 } }, writeCalls: 5, failedWritesByCode: { PATH_EXISTS: 1 },
-        sessionsWithoutWrite: 2, turnsWithWrite: 3, turnsWithMultipleWriteCalls: 2, operations: operations({ create: 2, updateEdits: 1, delete: 1 }),
-        filesCreated: 2, filesUpdated: 1, filesWrittenInSeveralTurns: 1, createsAfterLookup: 1, createsWithoutLookup: 1,
-        finalFiles: 1, sessionsWithUnexpectedLatestCheckpoint: 0,
+        filesAfter: 2, latestCheckpointAsExpected: true, toolUse: used({}) });
+    assert.deepEqual(summary.smoke, { sessions: 4, userTurns: 8, modelRequests: 22, ...tokens, toolCalls: 14,
+        toolCallsByName: { findText: 1, guide: 2, list: 1, read: 1, search: 1, tree: 2, write: 6 }, toolErrorsByCode: { PATH_EXISTS: 1 },
+        toolCallsPerTurn: { mean: 14 / 8, max: 6 }, toolRounds: 14, toolRoundsPerTurn: { mean: 14 / 8, max: 6 },
+        guideCalls: { index: 1, byTopic: { editing: 1 } }, writeCalls: 6, failedWritesByCode: { PATH_EXISTS: 1 },
+        sessionsWithoutWrite: 2, turnsWithWrite: 3, turnsWithMultipleWriteCalls: 2, operations: operations({ create: 2, updateEdits: 1, append: 2, delete: 1 }),
+        filesCreated: 3, filesUpdated: 2, filesWrittenInSeveralTurns: 1, createsAfterLookup: 2, createsWithoutLookup: 1,
+        finalFiles: 2, sessionsWithUnexpectedLatestCheckpoint: 0,
         toolUse: { conversations: 4, firstTool: { guide: 1, none: 2, tree: 1 }, firstNonGuideTool: { none: 2, tree: 2 },
             tree: { withPrefix: 1, withoutPrefix: 1 }, list: { ...noList, listings: 1, afterTree: 1, withPrefix: 1 },
             search: { calls: 1, mean: 0.25, max: 1 }, findText: { calls: 1, mean: 0.25, max: 1 }, withoutSearchOrFindText: 2,
@@ -185,7 +186,12 @@ test('a scripted replay records tree and list use, lookups, checkpointed writes,
         { latestCheckpointBefore: null, latestCheckpointAfter: names[1], tree: { fileCount: 1, folders: [{ path: '/notes/', fileCount: 1 }], truncated: false },
             inventory: [{ path: '/notes/scripted.md', chars: 'Scripted note, revised.\n'.length }], errors: [] });
     const later = await json(path.join(files.output, 'session-002-s001', 'observation.json'));
-    assert.deepEqual([later.latestCheckpointBefore, later.inventory.map(file => file.path)], [names[1], ['/notes/unsearched.md']]);
+    assert.deepEqual([later.latestCheckpointBefore, later.inventory.map(({ path: file, chars }) => [file, chars])], [names[1],
+        [['/notes/log.md', 'First log entry.\n'.length], ['/notes/unsearched.md', 'Saved without looking first.\nAn entry appended later.\n'.length]]]);
+    // Write results identify files without their content.
+    const appended = (await jsonl(path.join(files.output, 'session-002-s001', 'events.jsonl'))).at(-1);
+    assert.deepEqual(appended.result.map(file => [file.path, Object.keys(file).sort()]), ['/notes/unsearched.md', '/notes/log.md']
+        .map(file => [file, ['createdAt', 'fileId', 'modifiedAt', 'path']]));
     // Each clock reading advances by one, so every timed request and tool call lasts exactly 1.
     const receipts = await jsonl(path.join(sessionDirectory, 'requests.jsonl'));
     assert(receipts.every(receipt => receipt.status === 'pending' ? !('elapsedMs' in receipt) : receipt.elapsedMs === 1));
@@ -226,7 +232,7 @@ test('the model request holds only utterances, SDK tool definitions and the sele
     const both = await run('both', { instructions: 'sdk', policyFile });
     const expected = fileToolInstructions + '\n\n' + policy;
     assert.deepEqual(both.manifest.instructions, { source: 'sdk', policySha256: hash(policy), text: expected, sha256: hash(expected) });
-    assert.deepEqual([both.manifest.tools, both.manifest.protocol], [['guide', 'read', 'tree', 'list', 'search', 'findText', 'write'], 'memdrive-beam-session-replay-v3']);
+    assert.deepEqual([both.manifest.tools, both.manifest.protocol], [['guide', 'read', 'tree', 'list', 'search', 'findText', 'write'], 'memdrive-beam-session-replay-v4']);
     assert.deepEqual(both.manifest.toolDefinitions, definitions);
     assert.equal(both.manifest.transport, 'injected-test');
     assert.equal(both.summary.modelBehavior, null, 'An injected transport is never a model measurement');
@@ -358,7 +364,7 @@ test('malformed arguments, rejected calls and oversized results reach the model 
         } });
     assert.equal(summary.complete, true);
     assert.deepEqual(outputs.slice(0, 4).map(output => output.error?.code), ['INVALID_JSON', 'TOOL_NOT_ALLOWED', 'INVALID_INPUT', 'TOOL_RESULT_TOO_LARGE']);
-    assert.deepEqual([outputs[4].path, outputs[4].content, 'checkpoint' in outputs[4]], ['/a.md', 'x', false]);
+    assert.deepEqual([outputs[4].path, 'content' in outputs[4], 'checkpoint' in outputs[4]], ['/a.md', false, false]);
     const events = await jsonl(path.join(files.output, 'session-001-s000', 'events.jsonl'));
     assert.deepEqual(events.map(event => [event.name, event.ok, event.delivered, event.error?.code, typeof event.checkpoint]), [
         ['write', false, true, 'INVALID_JSON', 'undefined'], ['merge', false, true, 'TOOL_NOT_ALLOWED', 'undefined'],
@@ -403,7 +409,7 @@ test('metrics count operations, files, lookups, guide topics and the latest chec
         toolCallsPerTurn: { mean: 11 / 4, max: 5 }, toolRounds: 9, toolRoundsPerTurn: { mean: 9 / 4, max: 4 },
         guideCalls: { index: 1, byTopic: { editing: 1, publication: 1 } }, writeCalls: 6, failedWritesByCode: { CHECKPOINT_WRITE_FAILED: 1, EDIT_CONFLICT: 1 },
         noSuccessfulWrite: false, turnsWithWrite: 3, turnsWithMultipleWriteCalls: 2,
-        operations: { create: 2, updateEdits: 1, updateContent: 1, updateOther: 1, delete: 1 },
+        operations: { create: 2, updateEdits: 1, updateContent: 1, updateOther: 1, append: 0, delete: 1 },
         filesCreated: 2, filesUpdated: 2, filesWrittenInSeveralTurns: 2,
         // The first create came before any successful lookup; the failed search does not count.
         createsAfterLookup: 1, createsWithoutLookup: 1, filesAfter: 1, latestCheckpointAsExpected: true,
@@ -422,6 +428,27 @@ test('metrics count operations, files, lookups, guide topics and the latest chec
         totals.sessionsWithUnexpectedLatestCheckpoint, totals.operations.updateEdits, totals.guideCalls],
     [2, 5, { mean: 11 / 5, max: 5 }, { mean: 9 / 5, max: 4 }, 1, null, 0, 1, { index: 1, byTopic: { editing: 1, publication: 1 } }]);
     assert.deepEqual(conversationMetrics([]).toolCallsPerTurn, { mean: null, max: null });
+});
+
+test('metrics count appends as their own operation and classify each as a create or an update of its file', () => {
+    const write = (turn, round, args, result) => ({ turn, round, name: 'write', args, ok: true, result, checkpoint: `c${turn}${round}` });
+    const file = (fileId, createdAt, modifiedAt) => ({ fileId, path: `/${fileId}.md`, createdAt, modifiedAt });
+    const events = [
+        // Before any lookup, an append by path creates its file: its creation and modification times are equal.
+        write(0, 0, { op: 'append', path: '/f.md', content: 'x' }, file('f', 'T1', 'T1')),
+        { turn: 0, round: 1, name: 'read', args: { path: '/o.md' }, ok: true, result: { fileId: 'o' } },
+        // A file of an earlier session was modified now; the new log was created now.
+        write(1, 0, { operations: [{ op: 'append', path: '/o.md', content: 'y' }, { op: 'append', path: '/l.md', content: 'z' }] },
+            [file('o', 'T0', 'T2'), file('l', 'T2', 'T2')]),
+        // The session already wrote this file, so equal times within one millisecond still make an update.
+        write(1, 1, { op: 'append', path: '/l.md', content: 'w' }, file('l', 'T2', 'T2')),
+        // An append by fileId always updates.
+        write(2, 0, { op: 'append', fileId: 'f', content: 'v' }, file('f', 'T1', 'T1')),
+    ];
+    const metrics = sessionMetrics({ userTurns: 3, requests: [], events });
+    assert.deepEqual([metrics.operations, metrics.filesCreated, metrics.filesUpdated, metrics.filesWrittenInSeveralTurns,
+        metrics.createsAfterLookup, metrics.createsWithoutLookup], [{ create: 0, updateEdits: 0, updateContent: 0, updateOther: 0, append: 5, delete: 0 }, 2, 3, 1, 1, 1]);
+    assert.equal(conversationMetrics([metrics, metrics]).operations.append, 10);
 });
 
 test('a CLI failure names the error code and status without its message, cause or stack', () => {

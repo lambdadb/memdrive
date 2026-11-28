@@ -34,7 +34,7 @@ export function fileToolSchemas(external: boolean) {
     const withFilter = <T extends Schema>(schema: T) => ({ ...schema, $defs: { filter } });
     const content = external
         ? described(array({ type: 'number' }), 'Finite vector with the dimensions and embedding identity configured for this drive.')
-        : described(string, 'Original text to store. On update, replaces the full content; prefer exact edits for partial changes.');
+        : described(string, 'Original text to store. On update, replaces the full content; prefer exact edits for partial changes. On append, the text to add at the end, after a line break when the file does not end with one.');
     const create = object({ op: { type: 'string', const: 'create', description: 'Create a new file by path.' }, path, content, metadata }, ['op', 'path', 'content']);
     const updateProperties = { op: { type: 'string', const: 'update', description: 'Update, move or edit an existing file by stable fileId.' }, fileId, newPath: described(path, 'New absolute path for an existing file; its fileId remains stable.'), content, metadata,
         ...(external ? {} : { edits: described(array(object({ oldText: { type: 'string', minLength: 1, description: 'Exact nonempty text that must occur once in the current original.' }, newText: described(string, 'Replacement text; use an empty string to remove the match.') }, ['oldText', 'newText'])), 'Exact nonoverlapping text replacements. Cannot accompany content; reread on EDIT_CONFLICT.') }) };
@@ -42,7 +42,10 @@ export function fileToolSchemas(external: boolean) {
         anyOf: ['newPath', 'content', 'metadata', ...(external ? [] : ['edits'])].map(key => ({ required: [key] })),
         ...(external ? {} : { not: { required: ['content', 'edits'] } }) };
     const remove = object({ op: { type: 'string', const: 'delete', description: 'Delete a file and its chunks by stable fileId.' }, fileId }, ['op', 'fileId']);
-    const operation = { type: 'object', oneOf: [create, update, remove] };
+    // Text mode only: external-vector files have no text to append to.
+    const append = external ? [] : [{ ...object({ op: { type: 'string', const: 'append', description: 'Add content at the end of a file by exactly one of path or stable fileId, without reading it. By path, creates the file when the path has none.' },
+        fileId, path, content: { ...content, minLength: 1 } }, ['op', 'content']), oneOf: [{ required: ['fileId'] }, { required: ['path'] }] }];
+    const operation = { type: 'object', oneOf: [create, update, ...append, remove] };
     const operations = described(array(operation, 100), 'One to 100 write operations. Not transactional; a failure can leave partial work.');
     const searchProperties = { query: external ? described(array({ type: 'number' }), 'Query vector matching the configured dimensions and embedding identity.') : { type: 'string', minLength: 1,
         description: 'Describe what you need for semantic search. For keyword search, supply focused names, identifiers or terms; not a whole conversation. Keyword input is analyzed, not query syntax or an exact-match guarantee.' },
@@ -75,8 +78,8 @@ export function fileToolSchemas(external: boolean) {
         }) }),
         findText: withFilter(continuation({ query: { type: 'string', minLength: 1, description: 'Nonempty literal string to find case-insensitively in originals.', examples: ['E-4172'] }, prefix: described(string, 'Absolute path prefix to narrow the literal scan.', ['/notes/']),
             filter: { type: 'object', $ref: '#/$defs/filter', description: 'Optional declared-metadata filter; use metadata.<field> names.' }, limit: { ...limit(100), description: 'Maximum literal matches per page, 1–100; defaults to 20. An empty page may still return next.' } }, ['query'])),
-        write: { ...object({ ...create.properties, ...updateProperties, op: { type: 'string', enum: ['create', 'update', 'delete'], description: 'Single write operation. Omit when using operations for a batch.' },
+        write: { ...object({ ...create.properties, ...updateProperties, op: { type: 'string', enum: ['create', 'update', ...(external ? [] : ['append']), 'delete'], description: 'Single write operation. Omit when using operations for a batch.' },
             fileId, operations }),
-        oneOf: [create, update, remove, object({ operations }, ['operations'])] },
+        oneOf: [create, update, ...append, remove, object({ operations }, ['operations'])] },
     };
 }

@@ -75,7 +75,7 @@ and deletes isolated test collections, including a structured-text store. Use a
 dedicated test project; missing settings fail rather than silently skipping. The
 publication workflow runs the live suite against the exact installed tarball.
 The default suite creates stores, forks them, writes on forks and on main,
-reads, lists files and counts folders with `tree` right after writing, searches and matches text, checkpoints a fork and rolls it back to
+reads, lists files and counts folders with `tree` right after writing, searches and matches text, appends by path to a new file and to that file, checkpoints a fork and rolls it back to
 that checkpoint, deletes the refs it created (deleting a fork before its latest
 checkpoint), and destroys every store, confirming each collection's deletion
 with a native not-found response.
