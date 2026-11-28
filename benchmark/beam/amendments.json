@@ -7,9 +7,29 @@
       "id": "contradiction-ask",
       "category": "contradiction_resolution",
       "original": "LLM response should mention: which statement is correct?",
-      "replacement": "LLM response should ask the user which statement is correct",
-      "reason": "The dataset's ideal answers and tests_for ask for a request for clarification instead of a definitive answer, and judges read the original wording both ways: as asking the user which statement is correct, or as stating which one is."
+      "replacement": "LLM response should ask the user: which statement is correct?",
+      "reason": "The dataset asks for a request for clarification instead of a definitive answer: all 40 contradiction questions have tests_for \"LLM should detect contradiction and request clarification instead of giving definitive answer\", and all 40 ideal answers end by asking the user. Judges read the original wording both ways: as asking the user which statement is correct, or as stating which one is."
     }
   ],
-  "questions": {}
+  "questions": {
+    "6_multi_session_reasoning_0": {
+      "exclude": "The expected count \"Four areas\" is not determined by the conversation: the user describes more areas of resume, portfolio and salary work than the four the dataset picked (for example user turns 66, 108, 114 and 140)."
+    },
+    "9_abstention_0": {
+      "exclude": "The premise does not hold: the expected answer is that no information exists, but user turn 64 says a \"weaving threads\" metaphor was added \"per Shawn's advice\". The rubric item is also garbled (\"related related\")."
+    },
+    "9_knowledge_update_1": {
+      "rubric": [
+        {
+          "index": 0,
+          "original": "LLM response should state: May 22",
+          "replacement": "LLM response should state: May 20",
+          "reason": "\"May 22\" appears nowhere in the conversation: the planned rescheduling message was never generated, and the updated_info evidence turn is the original_info turn. The user states the session date as May 20 in user turns 138, 140, 154 and 156. The amended question tests recall of the stated date, not an update, although its category stays knowledge_update."
+        }
+      ]
+    },
+    "9_preference_following_1": {
+      "exclude": "The tested preference (writing in quiet places) is never stated: no user turn contains it, and the dataset names no evidence turn."
+    }
+  }
 }

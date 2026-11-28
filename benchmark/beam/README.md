@@ -585,6 +585,13 @@ correct, and judges often reward an answer that picks one itself.
 [amendments.json](amendments.json) records corrections for such cases next to
 the dataset.
 
+Recorded so far, for the 100K split: one rule for every contradiction question
+(`contradiction-ask`), and question entries only for conversations 6 and 9,
+the only ones audited. They amend one item of `9_knowledge_update_1` and exclude
+`6_multi_session_reasoning_0`, `9_abstention_0` and `9_preference_following_1`.
+Other conversations have known defects that are not recorded; they are not
+amended until they are audited the same way.
+
 Amendments never change the prepared dataset, the original judge requests or
 the original scores. With `--amendments on` (the default for `--questions`
 and `--rejudge`) a stage judges every rubric item as before and reports
@@ -611,7 +618,7 @@ The file has five keys, all required, and no others:
   "rules": [
     { "id": "contradiction-ask", "category": "contradiction_resolution",
       "original": "LLM response should mention: which statement is correct?",
-      "replacement": "LLM response should ask the user which statement is correct",
+      "replacement": "LLM response should ask the user: which statement is correct?",
       "reason": "..." }
   ],
   "questions": {
@@ -640,8 +647,25 @@ catches a changed dataset), an empty replacement or one equal to `original`,
 an entry with both `exclude` and `rubric`, or an item amended twice, by two
 rules, two entries or a rule and an entry. Entries for other conversations do
 not apply and are not checked. Whether a rule matches anything in the whole
-dataset is not checked, because a stage loads one conversation, in which a
-rule can legitimately match nothing; the manifest lists what applied.
+dataset is not checked by a stage, because a stage loads one conversation, in
+which a rule can legitimately match nothing; the manifest lists what applied.
+
+Check the committed file against a whole prepared dataset after every change
+to it:
+
+```sh
+node benchmark/beam/replay.mjs --check-amendments \
+  --manifest artifacts/beam-original-100k/manifest.json
+```
+
+It makes no request. It verifies each evaluation file's SHA-256 against the
+manifest, applies the file to every conversation with the checks above, and
+fails when a question entry names a question that no conversation has or a
+rule matches no rubric item. It prints only the file's SHA-256, the split,
+revision and conversation count, and the counts of `rules`, `matchedItems`
+(items the rules match, excluded questions included), `amendedQuestions`,
+`amendedItems` and `excludedQuestions`. The dataset is not in the repository,
+so `npm test` does not run it.
 
 The stage manifest records the setting, the file's SHA-256 and, for each
 question of the conversation with an amendment, its exclusion or its amended

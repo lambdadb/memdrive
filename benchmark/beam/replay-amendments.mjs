@@ -3,6 +3,7 @@
 // and judge amended items again with their replacement text for a separate amended score.
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import path from 'node:path';
 import { hash } from './replay-sessions.mjs';
 
 export const amendmentsProtocol = 'memdrive-beam-amendments-v1';
@@ -116,3 +117,37 @@ export function amendmentsFor(amendments, prepared, conversationId, evaluation) 
 
 /** The question's rubric outcomes with each amended item's outcome in its place. */
 export const withAmended = (outcomes, amended) => outcomes.map(outcome => amended.find(item => item.index === outcome.index) ?? outcome);
+
+/**
+ * Check amendments against a whole prepared dataset, which no stage does: every conversation's
+ * evaluation must accept them, every question entry must name a question of some conversation,
+ * and every rule must match at least one rubric item. Returns counts only.
+ */
+export async function checkAmendments({ manifest: manifestFile, amendmentsSource = amendmentsFile }) {
+    assert(typeof manifestFile === 'string' && manifestFile, 'Provide --manifest FILE');
+    const { sha256, amendments } = await loadAmendments(amendmentsSource);
+    const prepared = JSON.parse(await readFile(manifestFile, 'utf8'));
+    const questionIds = new Set(), matches = new Map(amendments.rules.map(rule => [rule.id, 0]));
+    const counts = { amendedQuestions: 0, amendedItems: 0, excludedQuestions: 0 };
+    for (const entry of prepared.conversations) {
+        const bytes = await readFile(path.join(path.dirname(manifestFile), entry.evaluation));
+        assert.equal(hash(bytes), entry.evaluationSha256, `The evaluation of conversation ${entry.id} differs from the prepared manifest`);
+        const evaluation = JSON.parse(bytes);
+        for (const question of evaluation) {
+            questionIds.add(question.id);
+            // Counted before exclusion, so that a rule matching only excluded questions still counts as matching.
+            for (const rule of amendments.rules) if (question.category === rule.category)
+                matches.set(rule.id, matches.get(rule.id) + question.rubric.filter(item => item === rule.original).length);
+        }
+        for (const change of amendmentsFor(amendments, prepared, entry.id, evaluation).values()) {
+            if (change.excluded) counts.excludedQuestions++;
+            else { counts.amendedQuestions++; counts.amendedItems += change.items.length; }
+        }
+    }
+    const unknown = Object.keys(amendments.questions).filter(id => !questionIds.has(id));
+    assert(!unknown.length, `Amendments name questions that no conversation has: ${unknown.join(', ')}`);
+    const unmatched = [...matches].filter(([, count]) => count === 0).map(([id]) => id);
+    assert(!unmatched.length, `Amendment rules match no rubric item: ${unmatched.join(', ')}`);
+    return { sha256, split: prepared.split, datasetRevision: prepared.datasetRevision, conversations: prepared.conversations.length,
+        rules: amendments.rules.length, matchedItems: [...matches.values()].reduce((total, count) => total + count, 0), ...counts };
+}

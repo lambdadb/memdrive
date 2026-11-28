@@ -16,6 +16,7 @@ import { checkpointName, createToolHost, failureCodes, limits, openAI, protocol,
     withGuide } from './replay-agent.mjs';
 import { conversationMetrics, sessionMetrics } from './replay-metrics.mjs';
 import { dateOf, fingerprint, hash, loadSessions } from './replay-sessions.mjs';
+import { checkAmendments } from './replay-amendments.mjs';
 import { questionsSucceeded, runQuestions, runRejudge } from './replay-questions.mjs';
 import { cleanupStore, lambdadbConnection, ledgerFile, newStoreName, observeStore, storeLabels, storeProtocol, writeLedger } from './replay-store.mjs';
 
@@ -211,6 +212,8 @@ Judge the stored answers of a question stage again:
 Rejudge needs only LLM_API_KEY and makes paid judge requests.
 --amendments on (default) also judges the items benchmark/beam/amendments.json amends
 and reports amended scores beside the original ones, which it never changes.
+Check that file against a whole prepared dataset, without any request:
+  --check-amendments --manifest FILE
 `;
 
 async function main() {
@@ -218,8 +221,14 @@ async function main() {
         ...['manifest', 'conversation', 'output', 'mode', 'model', 'instructions', 'policy-file', 'guide', 'sessions', 'turns', 'env-file',
             'backend', 'session-tokens', 'session-seconds', 'context-tokens', 'run', 'scope', 'judge-model', 'judge-effort', 'limit', 'answer-policy-file', 'answers', 'repeats', 'amendments'].map(option => [option, { type: 'string' }]),
         ['help', { type: 'boolean' }], ['cleanup', { type: 'boolean' }], ['questions', { type: 'boolean' }], ['rejudge', { type: 'boolean' }],
+        ['check-amendments', { type: 'boolean' }],
     ]) });
     if (values.help) { console.log(help); return; }
+    if (values['check-amendments']) {
+        assert(values.manifest && Object.keys(values).every(option => ['check-amendments', 'manifest'].includes(option)), 'The amendments check takes only --manifest FILE');
+        console.log(json(await checkAmendments({ manifest: values.manifest })));
+        return;
+    }
     const env = { ...process.env, ...(values['env-file'] ? parseEnv(await readFile(values['env-file'], 'utf8')) : {}) };
     if (values.cleanup) {
         assert(values.output && Object.keys(values).every(option => ['cleanup', 'output', 'env-file'].includes(option)),

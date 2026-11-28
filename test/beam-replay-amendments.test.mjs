@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { amendmentsFor, amendmentsProtocol, loadAmendments, parseAmendments } from '../benchmark/beam/replay-amendments.mjs';
+import { amendmentsFor, amendmentsProtocol, checkAmendments, loadAmendments, parseAmendments } from '../benchmark/beam/replay-amendments.mjs';
 import { hash } from '../benchmark/beam/replay-sessions.mjs';
 
 const config = JSON.parse(await readFile(new URL('../benchmark/beam/original-config.json', import.meta.url), 'utf8'));
@@ -83,4 +83,34 @@ test('the committed amendments file validates against the committed configuratio
     t.after(() => rm(directory, { recursive: true, force: true }));
     await writeFile(path.join(directory, 'amendments.json'), '{');
     await assert.rejects(loadAmendments(path.join(directory, 'amendments.json')), /not valid JSON/);
+});
+
+test('the whole-file check applies the amendments to every conversation and reports counts only', async t => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'beam-amendments-check-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    await mkdir(path.join(directory, 'evaluation'));
+    // Conversation 3 is the evaluation above; conversation 4 has one more matching item and nothing else.
+    const conversations = { 3: evaluation, 4: [{ id: '4_contradiction_0', category: 'contradiction', rubric: ['Says which is correct'] }] };
+    const entries = [];
+    for (const [id, items] of Object.entries(conversations)) {
+        const bytes = JSON.stringify(items);
+        await writeFile(path.join(directory, `evaluation/${id}.json`), bytes);
+        entries.push({ id, evaluation: `evaluation/${id}.json`, evaluationSha256: hash(bytes) });
+    }
+    const manifest = path.join(directory, 'manifest.json'), amendments = path.join(directory, 'amendments.json');
+    await writeFile(manifest, JSON.stringify({ ...prepared, conversations: entries }));
+    const check = async value => {
+        await writeFile(amendments, JSON.stringify(value));
+        return checkAmendments({ manifest, amendmentsSource: amendments });
+    };
+    const value = file({ rules: [rule()], questions: { '3_contradiction_1': { exclude: 'x' }, '3_extraction_0': { rubric: [change()] } } });
+    const { sha256, ...counts } = await check(value);
+    assert.equal(sha256, hash(JSON.stringify(value)));
+    // A rule match in an excluded question still counts as a match, not as an amended item.
+    assert.deepEqual(counts, { ...prepared, conversations: 2, rules: 1, matchedItems: 3, amendedQuestions: 3, amendedItems: 3, excludedQuestions: 1 });
+    await assert.rejects(check(file({ questions: { '5_extraction_0': { exclude: 'x' } } })), /questions that no conversation has: 5_extraction_0/);
+    await assert.rejects(check(file({ rules: [rule({ category: 'summary', original: 'Never written' })] })), /rules match no rubric item: ask/);
+    await assert.rejects(check(file({ questions: { '3_extraction_0': { rubric: [change({ original: 'b' })] } } })), /not the quoted original text/);
+    await writeFile(path.join(directory, 'evaluation/4.json'), '[]');
+    await assert.rejects(check(value), /evaluation of conversation 4 differs from the prepared manifest/);
 });
