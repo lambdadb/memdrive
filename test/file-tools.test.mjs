@@ -67,7 +67,6 @@ test('tool descriptions carry when to use each tool, the data rule and abstentio
         assert.match(write, /^Save information to the drive\. Use it whenever/);
         assert.match(write, /do not wait to be asked/);
         assert.match(write, /one call: one operation, or \{ operations: \[\.\.\.\] \} with 1–100 operations/);
-        assert.match(write, /keep the earlier statement and add the new one with when it was said/);
     }
     assert.match(managed.write, /oldText\/newText/);
     assert.doesNotMatch(external.write, /oldText|EDIT_CONFLICT|user's wording/, 'external writes store vectors without exact edits');
@@ -110,6 +109,35 @@ test('in text mode write keeps standing instructions in /preferences.md and read
     for (const text of [fileToolInstructions, ...external.map(tool => tool.description)])
         assert.doesNotMatch(text, /preferences\.md|standing instructions/);
     assert(!external.find(tool => tool.name === 'write').description.includes(save), 'the write sentence is text-mode only');
+});
+
+test('in text mode write records what the user says as dated entries at the end of a file and leaves earlier entries as they are; external mode keeps the earlier sentence', () => {
+    const keep = 'When new information differs from what is saved, keep the earlier statement and add the new one with when it was said, unless asked to change the saved text.';
+    const entries = 'Record what the user says as entries added at the end of a file, each with when it was said. '
+        + 'Leave earlier entries as they are: when a new statement differs from one, add it as a new entry, and do not rewrite the earlier entry '
+        + 'or note which is correct or current, unless asked to change the saved text.';
+    const [managed] = getFileToolDefinitions({ embeddingMode: 'managed', tools: ['write'] });
+    const [external] = getFileToolDefinitions({ embeddingMode: 'external', tools: ['write'] });
+    // The two sentences follow the /preferences.md sentence directly and precede the metadata rule.
+    assert.equal(managed.description.split(entries).length, 2, 'the entry sentences appear once, together and in order');
+    assert(managed.description.includes(`and nothing else in that file. ${entries} Metadata given on update replaces the whole map.`));
+    assert(!managed.description.includes(keep), 'text mode no longer has the earlier sentence');
+    assert(external.description.includes(`after reading the original. ${keep} Metadata given on update replaces the whole map.`));
+    assert.doesNotMatch(external.description, /end of a file|new entry|earlier entr|correct or current/, 'external drives store no text');
+    // The rule is stated in the text-mode write description only; the external description and the instructions are unchanged.
+    assert.equal(external.description, 'Save information to the drive. Use it whenever the conversation produces something a later conversation or another agent will need, '
+        + 'such as facts about the user and their work, decisions and their reasons, plans, preferences, and changes to what is already saved. '
+        + 'Nothing persists unless it is written, so do not wait to be asked. '
+        + 'Put all of a turn\'s changes in one call: one operation, or { operations: [...] } with 1–100 operations. '
+        + `Create by path; update, move or delete by fileId after reading the original. ${keep} Metadata given on update replaces the whole map. `
+        + 'On CHECKPOINT_WRITE_FAILED nothing from the call was kept; on WRITE_UNCONFIRMED or CHECKPOINT_RESTORE_FAILED read the affected files before retrying.');
+    assert.equal(fileToolInstructions, 'This drive keeps the user\'s information across conversations and is shared with their other agents; '
+        + 'a later conversation knows only what the drive holds. Search and read before writing, and update a file you have read instead of creating a duplicate.');
+    for (const embeddingMode of ['managed', 'external'])
+        for (const tool of getFileToolDefinitions({ embeddingMode, tools: ['guide', 'read', 'tree', 'list', 'search'] }))
+            assert.doesNotMatch(tool.description, /end of a file|new entry|earlier entr|correct or current/, `${embeddingMode} ${tool.name}`);
+    const editing = fileToolGuideTopics.editing.content;
+    assert.match(editing, /it records what was said then\. In text mode, add the new statement as an entry at the end of a file and leave earlier entries as they are, without noting which is correct or current\. When the later statement updates/);
 });
 
 test('each tool forwards its input object unchanged to the SDK method of the same name and drops view selectors from results', async () => {

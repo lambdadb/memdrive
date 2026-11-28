@@ -3,14 +3,16 @@ import { get_encoding } from 'tiktoken';
 import { fileToolInstructions } from '@functional-systems/memdrive';
 import { guideURI } from './host.mjs';
 
-// v7: text-mode write and read descriptions keep standing instructions in
+// v8: the text-mode write description records what the user says as dated
+// entries at the end of a file and leaves earlier entries as they are; v7:
+// text-mode write and read descriptions keep standing instructions in
 // /preferences.md and read it first; v6: agent-facing wording: tool descriptions
 // say when to use each tool, the instructions only relate the tools and the guide
 // is on-demand reference; v5:
 // adds tree and path-ordered, consistent list; v4: six main-only tools and
 // host-checkpointed writes; v3 wrote to main or a fork with at and restored views
 // with rollback; v2 published forks with merge; v1 used host view rebinding.
-export const protocol = 'memdrive-tool-use-v7';
+export const protocol = 'memdrive-tool-use-v8';
 export const limits = Object.freeze({ rounds: 16, toolCalls: 40, contextTokens: 32000, totalTokens: 160000, outputTokens: 4096, resultBytes: 64000, requestSeconds: 180 });
 export const serverInstructions = fileToolInstructions + ' Writing to the shared drive is authorized when the task asks for a change. Report the actual outcome and any blocker honestly.';
 export const workflowInstructions = 'Workflow guidance: search and read the relevant originals and related current guidance before editing. Preserve dated evidence and the original wording of what you save. Prefer exact edits for small changes and save each turn\'s changes with one write call. If someone else changed the text you are editing, stop and report it; do not overwrite their change or claim yours was applied.';

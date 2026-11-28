@@ -59,7 +59,10 @@ const writeParts = (external: boolean) => [
     ...(external ? [] : ['Prefer exact oldText/newText edits for partial changes; reread on EDIT_CONFLICT.']),
     ...(external ? [] : ['Keep the user\'s wording for what they said.']),
     ...(external ? [] : ['Save what the user says they want in your answers always or from now on (standing instructions and preferences) in /preferences.md, one per line, replacing the line when the user changes one, and nothing else in that file.']),
-    'When new information differs from what is saved, keep the earlier statement and add the new one with when it was said, unless asked to change the saved text.',
+    ...(external
+        ? ['When new information differs from what is saved, keep the earlier statement and add the new one with when it was said, unless asked to change the saved text.']
+        : ['Record what the user says as entries added at the end of a file, each with when it was said.',
+            'Leave earlier entries as they are: when a new statement differs from one, add it as a new entry, and do not rewrite the earlier entry or note which is correct or current, unless asked to change the saved text.']),
     'Metadata given on update replaces the whole map.',
     'On CHECKPOINT_WRITE_FAILED nothing from the call was kept; on WRITE_UNCONFIRMED or CHECKPOINT_RESTORE_FAILED read the affected files before retrying.',
 ].join(' ');
